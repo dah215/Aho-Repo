@@ -2,7 +2,6 @@ package com.BocTem
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import com.lagradost.cloudstream3.app
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
 
@@ -48,9 +47,7 @@ class BocTem : MainAPI() {
 
         return newAnimeSearchResponse(title, href, TvType.Anime) {
             this.posterUrl = posterUrl
-            if (episodeInfo != null) {
-                addSub(episodeInfo)
-            }
+            episodeInfo?.let { addSub(it) }
         }
     }
 
@@ -75,8 +72,8 @@ class BocTem : MainAPI() {
             ?: document.selectFirst("meta[property=og:description]")?.attr("content")
 
         val episodeLinks = document.select("a[href*=/xem-phim/]")
-            .filter { link -> link.attr("href").contains("-tap-") }
-            .distinctBy { link -> link.attr("href") }
+            .filter { it.attr("href").contains("-tap-") }
+            .distinctBy { it.attr("href") }
 
         val episodes = episodeLinks.mapNotNull { link ->
             val epUrl = link.attr("href")
@@ -84,12 +81,15 @@ class BocTem : MainAPI() {
             val epNum = Regex("""tap-(\d+)""").find(epUrl)?.groupValues?.get(1)?.toIntOrNull()
                 ?: epText.toIntOrNull()
 
-            newEpisode(epUrl) {
-                this.name = epText
-                this.episode = epNum
-                this.posterUrl = poster
-            }
-        }.sortedBy { ep -> ep.episode }
+            Episode(
+                data = epUrl,
+                name = epText,
+                season = null,
+                episode = epNum,
+                posterUrl = poster,
+                date = null
+            )
+        }.sortedBy { it.episode }
 
         val tags = document.select(".halim-movie-genres a, .post-category a").map { it.text() }
 
@@ -121,10 +121,10 @@ class BocTem : MainAPI() {
 
         val episode = Regex("""tap-(\d+)""").find(data)?.groupValues?.get(1) ?: "1"
 
-        val nonce = document.select("script").find { script -> script.data().contains("ajax_player") }
-            ?.data()?.let { scriptData -> Regex("""nonce["']?\s*:\s*["']([^"']+)["']""").find(scriptData)?.groupValues?.get(1) }
-            ?: document.select("script").find { script -> script.data().contains("nonce") }
-                ?.data()?.let { scriptData -> Regex("""nonce["']?\s*:\s*["']([^"']+)["']""").find(scriptData)?.groupValues?.get(1) }
+        val nonce = document.select("script").firstOrNull { it.data().contains("ajax_player") }
+            ?.data()?.let { Regex("""nonce["']?\s*:\s*["']([^"']+)["']""").find(it)?.groupValues?.get(1) }
+            ?: document.select("script").firstOrNull { it.data().contains("nonce") }
+                ?.data()?.let { Regex("""nonce["']?\s*:\s*["']([^"']+)["']""").find(it)?.groupValues?.get(1) }
             ?: return false
 
         val ajaxUrl = "$mainUrl/wp-admin/admin-ajax.php"
@@ -153,8 +153,8 @@ class BocTem : MainAPI() {
 
         if (m3u8Url != null) {
             callback.invoke(
-                newExtractorLink(
-                    source = this.name,
+                ExtractorLink(
+                    source = name,
                     name = "$name - Server 1",
                     url = m3u8Url,
                     referer = mainUrl,

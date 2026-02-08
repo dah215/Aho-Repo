@@ -1,7 +1,19 @@
 package com.BocTem
 
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.Qualities
+import com.lagradost.cloudstream3.utils.loadExtractor
+import com.lagradost.cloudstream3.LoadResponse
+import com.lagradost.cloudstream3.SearchResponse
+import com.lagradost.cloudstream3.HomePageResponse
+import com.lagradost.cloudstream3.MainPageRequest
+import com.lagradost.cloudstream3.TvType
+import com.lagradost.cloudstream3.Episode
+import com.lagradost.cloudstream3.DubStatus
+import com.lagradost.cloudstream3.SubtitleFile
+import com.lagradost.nicehttp.Requests
+import com.lagradost.nicehttp.Session
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
 
@@ -13,6 +25,8 @@ class BocTem : MainAPI() {
     override val hasDownloadSupport = true
     override val hasQuickSearch = false
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie)
+    
+    private val session = Session(Requests())
 
     override val mainPage = mainPageOf(
         "anime-moi/page/" to "Anime Mới",
@@ -23,8 +37,10 @@ class BocTem : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = "$mainUrl/${request.data}$page"
-        val document = app.get(url, referer = mainUrl).document
-        val items = document.select("article.thumb.grid-item").mapNotNull { it.toSearchResult() }
+        val document = session.get(url, referer = mainUrl).document
+        val items = document.select("article.thumb.grid-item").mapNotNull { element ->
+            element.toSearchResult()
+        }
         return newHomePageResponse(
             list = HomePageList(
                 name = request.name,
@@ -41,57 +57,63 @@ class BocTem : MainAPI() {
             ?: this.selectFirst("a")?.attr("title")
             ?: return null
         val posterUrl = this.selectFirst("img")?.let { img ->
-            img.attr("data-src").ifEmpty { img.attr("src") }
+            val dataSrc = img.attr("data-src")
+            if (dataSrc.isNotEmpty()) dataSrc else img.attr("src")
         }
         val episodeInfo = this.selectFirst(".status")?.text()
 
         return newAnimeSearchResponse(title, href, TvType.Anime) {
             this.posterUrl = posterUrl
-            episodeInfo?.let { addSub(it) }
+            if (episodeInfo != null) {
+                addSub(episodeInfo)
+            }
         }
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/?s=${URLEncoder.encode(query, "UTF-8")}"
-        val document = app.get(url, referer = mainUrl).document
-        return document.select("article.thumb.grid-item").mapNotNull { it.toSearchResult() }
+        val document = session.get(url, referer = mainUrl).document
+        return document.select("article.thumb.grid-item").mapNotNull { element ->
+            element.toSearchResult()
+        }
     }
 
     override suspend fun load(url: String): LoadResponse? {
-        val document = app.get(url, referer = mainUrl).document
+        val document = session.get(url, referer = mainUrl).document
 
         val title = document.selectFirst("h1.entry-title")?.text()
             ?: document.selectFirst(".halim-movie-title")?.text()
             ?: return null
 
         val poster = document.selectFirst(".halim-movie-poster img")?.let { img ->
-            img.attr("data-src").ifEmpty { img.attr("src") }
+            val dataSrc = img.attr("data-src")
+            if (dataSrc.isNotEmpty()) dataSrc else img.attr("src")
         } ?: document.selectFirst("meta[property=og:image]")?.attr("content")
 
         val description = document.selectFirst(".entry-content")?.text()
             ?: document.selectFirst("meta[property=og:description]")?.attr("content")
 
-        val episodeLinks = document.select("a[href*=/xem-phim/]")
-            .filter { it.attr("href").contains("-tap-") }
-            .distinctBy { it.attr("href") }
+        val episodeLinks = document.select("a[href*=/xem-phim/]").filter { link ->
+            link.attr("href").contains("-tap-")
+        }.distinctBy { link ->
+            link.attr("href")
+        }
 
         val episodes = episodeLinks.mapNotNull { link ->
             val epUrl = link.attr("href")
             val epText = link.text().trim()
             val epNum = Regex("""tap-(\d+)""").find(epUrl)?.groupValues?.get(1)?.toIntOrNull()
-                ?: epText.toIntOrNull()
 
-            Episode(
-                data = epUrl,
-                name = epText,
-                season = null,
-                episode = epNum,
-                posterUrl = poster,
-                date = null
-            )
-        }.sortedBy { it.episode }
+            newEpisode(epUrl) {
+                this.name = epText
+                this.episode = epNum
+                this.posterUrl = poster
+            }
+        }.sortedBy { ep -> ep.episode }
 
-        val tags = document.select(".halim-movie-genres a, .post-category a").map { it.text() }
+        val tags = document.select(".halim-movie-genres a, .post-category a").map { element ->
+            element.text()
+        }
 
         val year = Regex("""/release/(\d+)/""").find(url)?.groupValues?.get(1)?.toIntOrNull()
             ?: document.selectFirst(".halim-movie-year")?.text()?.toIntOrNull()
@@ -111,21 +133,27 @@ class BocTem : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val document = app.get(data, referer = mainUrl).document
+        val document = session.get(data, referer = mainUrl).document
 
-        val postId = document.selectFirst("body")?.attr("class")
-            ?.let { classAttr -> Regex("""postid-(\d+)""").find(classAttr)?.groupValues?.get(1) }
-            ?: document.selectFirst("article")?.attr("id")
-                ?.let { idAttr -> Regex("""post-(\d+)""").find(idAttr)?.groupValues?.get(1) }
-            ?: return false
+        val bodyClass = document.selectFirst("body")?.attr("class") ?: ""
+        val postId = Regex("""postid-(\d+)""").find(bodyClass)?.groupValues?.get(1)
+            ?: run {
+                val articleId = document.selectFirst("article")?.attr("id") ?: ""
+                Regex("""post-(\d+)""").find(articleId)?.groupValues?.get(1)
+            } ?: return false
 
         val episode = Regex("""tap-(\d+)""").find(data)?.groupValues?.get(1) ?: "1"
 
-        val nonce = document.select("script").firstOrNull { it.data().contains("ajax_player") }
-            ?.data()?.let { Regex("""nonce["']?\s*:\s*["']([^"']+)["']""").find(it)?.groupValues?.get(1) }
-            ?: document.select("script").firstOrNull { it.data().contains("nonce") }
-                ?.data()?.let { Regex("""nonce["']?\s*:\s*["']([^"']+)["']""").find(it)?.groupValues?.get(1) }
-            ?: return false
+        val scripts = document.select("script")
+        val nonce = scripts.firstOrNull { script ->
+            script.data().contains("ajax_player")
+        }?.data()?.let { scriptData ->
+            Regex("""nonce["']?\s*:\s*["']([^"']+)["']""").find(scriptData)?.groupValues?.get(1)
+        } ?: scripts.firstOrNull { script ->
+            script.data().contains("nonce")
+        }?.data()?.let { scriptData ->
+            Regex("""nonce["']?\s*:\s*["']([^"']+)["']""").find(scriptData)?.groupValues?.get(1)
+        } ?: return false
 
         val ajaxUrl = "$mainUrl/wp-admin/admin-ajax.php"
         val ajaxData = mapOf(
@@ -136,7 +164,7 @@ class BocTem : MainAPI() {
             "server" to "1"
         )
 
-        val ajaxResponse = app.post(
+        val ajaxResponse = session.post(
             ajaxUrl,
             data = ajaxData,
             headers = mapOf(
@@ -153,14 +181,12 @@ class BocTem : MainAPI() {
 
         if (m3u8Url != null) {
             callback.invoke(
-                ExtractorLink(
+                M3u8Helper.generateM3u8(
                     source = name,
-                    name = "$name - Server 1",
-                    url = m3u8Url,
+                    streamUrl = m3u8Url,
                     referer = mainUrl,
-                    quality = Qualities.Unknown.value,
-                    isM3u8 = true
-                )
+                    quality = Qualities.Unknown.value
+                ).first()
             )
             return true
         }

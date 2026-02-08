@@ -1,6 +1,5 @@
 import com.android.build.gradle.BaseExtension
 import com.lagradost.cloudstream3.gradle.CloudstreamExtension
-import org.gradle.kotlin.dsl.register
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile
 
@@ -25,46 +24,43 @@ allprojects {
     }
 }
 
-fun Project.cloudstream(configuration: CloudstreamExtension.() -> Unit) =
-    extensions.getByName("cloudstream").configuration()
-
-fun Project.android(configuration: BaseExtension.() -> Unit) =
-    extensions.getByName("android").configuration()
-
 subprojects {
     apply(plugin = "com.android.library")
     apply(plugin = "kotlin-android")
     apply(plugin = "com.lagradost.cloudstream3.gradle")
 
-    // THÊM DEPENDENCIES NÀY - QUAN TRỌNG NHẤT
-    dependencies {
-        // CloudStream API - bắt buộc phải có
-        compileOnly("com.github.recloudstream:cloudstream:4.3.0")
-        
-        // Jsoup cho HTML parsing
-        implementation("org.jsoup:jsoup:1.17.2")
-    }
-
-    cloudstream {
-        setRepo(System.getenv("GITHUB_REPOSITORY") ?: "https://github.com/dah215/Aho-Repo")
-        authors = listOf("CloudStream Builder")
-    }
-
-    android {
-        namespace = "com.boctem"
-        defaultConfig {
-            minSdk = 21
-            compileSdkVersion(35)
-            targetSdk = 35
+    // Sửa: Dùng afterEvaluate để đảm bảo plugin đã apply xong
+    afterEvaluate {
+        // Cấu hình CloudStream extension
+        configure<CloudstreamExtension> {
+            setRepo(System.getenv("GITHUB_REPOSITORY") ?: "https://github.com/dah215/Aho-Repo")
+            authors = listOf("CloudStream Builder")
         }
-        compileOptions {
-            sourceCompatibility = JavaVersion.VERSION_1_8
-            targetCompatibility = JavaVersion.VERSION_1_8
-        }
-        tasks.withType<KotlinJvmCompile> {
-            compilerOptions {
-                jvmTarget.set(JvmTarget.JVM_1_8)
+
+        // Cấu hình Android
+        configure<BaseExtension> {
+            namespace = "com.boctem"
+            defaultConfig {
+                minSdk = 21
+                compileSdkVersion(35)
+                targetSdk = 35
             }
+            compileOptions {
+                sourceCompatibility = JavaVersion.VERSION_1_8
+                targetCompatibility = JavaVersion.VERSION_1_8
+            }
+        }
+
+        // Sửa: Dùng dependencies block đúng cách
+        dependencies {
+            "compileOnly"("com.github.recloudstream:cloudstream:4.3.0")
+            "implementation"("org.jsoup:jsoup:1.17.2")
+        }
+    }
+
+    tasks.withType<KotlinJvmCompile> {
+        compilerOptions {
+            jvmTarget.set(JvmTarget.JVM_1_8)
         }
     }
 }

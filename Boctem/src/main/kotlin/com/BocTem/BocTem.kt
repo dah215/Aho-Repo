@@ -1,30 +1,7 @@
 package com.BocTem
 
-import com.lagradost.cloudstream3.AnimeSearchResponse
-import com.lagradost.cloudstream3.DubStatus
-import com.lagradost.cloudstream3.Episode
-import com.lagradost.cloudstream3.ExtractorLink
-import com.lagradost.cloudstream3.HomePageList
-import com.lagradost.cloudstream3.HomePageResponse
-import com.lagradost.cloudstream3.LoadResponse
-import com.lagradost.cloudstream3.MainAPI
-import com.lagradost.cloudstream3.MainPageRequest
-import com.lagradost.cloudstream3.Qualities
-import com.lagradost.cloudstream3.SearchResponse
-import com.lagradost.cloudstream3.SubtitleFile
-import com.lagradost.cloudstream3.TvType
-import com.lagradost.cloudstream3.addEpisodes
-import com.lagradost.cloudstream3.addSub
-import com.lagradost.cloudstream3.app
-import com.lagradost.cloudstream3.fixUrl
-import com.lagradost.cloudstream3.fixUrlNull
-import com.lagradost.cloudstream3.loadExtractor
-import com.lagradost.cloudstream3.newAnimeLoadResponse
-import com.lagradost.cloudstream3.newAnimeSearchResponse
-import com.lagradost.cloudstream3.newHomePageResponse
-import com.lagradost.cloudstream3.utils.ExtractorLink
-import com.lagradost.cloudstream3.utils.Qualities
-import com.lagradost.cloudstream3.utils.loadExtractor
+import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
 
@@ -94,14 +71,12 @@ class BocTem : MainAPI() {
         val description = document.selectFirst(".entry-content")?.text()
             ?: document.selectFirst("meta[property=og:description]")?.attr("content")
 
-        // Get post ID from body class or scripts
         val postId = document.selectFirst("body")?.attr("class")
             ?.let { Regex("""postid-(\d+)""").find(it)?.groupValues?.get(1) }
             ?: document.selectFirst("article")?.attr("id")
                 ?.let { Regex("""post-(\d+)""").find(it)?.groupValues?.get(1) }
             ?: return null
 
-        // Get episodes
         val episodeLinks = document.select("a[href*=/xem-phim/]")
             .filter { it.attr("href").contains("-tap-") }
             .distinctBy { it.attr("href") }
@@ -121,10 +96,8 @@ class BocTem : MainAPI() {
             )
         }.sortedBy { it.episode }
 
-        // Get tags/genres
         val tags = document.select(".halim-movie-genres a, .post-category a").map { it.text() }
 
-        // Get year from URL or meta
         val year = Regex("""/release/(\d+)/""").find(url)?.groupValues?.get(1)?.toIntOrNull()
             ?: document.selectFirst(".halim-movie-year")?.text()?.toIntOrNull()
 
@@ -143,27 +116,22 @@ class BocTem : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // Get the watch page
         val document = app.get(data, referer = mainUrl).document
 
-        // Extract post ID
         val postId = document.selectFirst("body")?.attr("class")
             ?.let { Regex("""postid-(\d+)""").find(it)?.groupValues?.get(1) }
             ?: document.selectFirst("article")?.attr("id")
                 ?.let { Regex("""post-(\d+)""").find(it)?.groupValues?.get(1) }
             ?: return false
 
-        // Extract episode number from URL
         val episode = Regex("""tap-(\d+)""").find(data)?.groupValues?.get(1) ?: "1"
 
-        // Get nonce from script
         val nonce = document.select("script").find { it.data().contains("ajax_player") }
             ?.data()?.let { Regex("""nonce["']?\s*:\s*["']([^"']+)["']""").find(it)?.groupValues?.get(1) }
             ?: document.select("script").find { it.data().contains("nonce") }
                 ?.data()?.let { Regex("""nonce["']?\s*:\s*["']([^"']+)["']""").find(it)?.groupValues?.get(1) }
             ?: return false
 
-        // Call AJAX to get player
         val ajaxUrl = "$mainUrl/wp-admin/admin-ajax.php"
         val ajaxData = mapOf(
             "action" to "halim_ajax_player",
@@ -185,7 +153,6 @@ class BocTem : MainAPI() {
 
         val responseText = ajaxResponse.text
 
-        // Extract m3u8 URL from response
         val m3u8Url = Regex("""file["']?\s*:\s*["']([^"']+\.m3u8)["']""").find(responseText)?.groupValues?.get(1)
             ?: Regex("""https?://[^"'<>\s]+\.m3u8""").find(responseText)?.value
 
@@ -203,7 +170,6 @@ class BocTem : MainAPI() {
             return true
         }
 
-        // Try to extract iframe URL as fallback
         val iframeUrl = Regex("""iframe[^>]+src=["']([^"']+)["']""").find(responseText)?.groupValues?.get(1)
             ?: Regex("""src["']?\s*:\s*["']([^"']+embed[^"']*)["']""").find(responseText)?.groupValues?.get(1)
 

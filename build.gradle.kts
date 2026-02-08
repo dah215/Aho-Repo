@@ -26,15 +26,24 @@ allprojects {
 }
 
 fun Project.cloudstream(configuration: CloudstreamExtension.() -> Unit) =
-    extensions.getByName<CloudstreamExtension>("cloudstream").configuration()
+    extensions.getByName("cloudstream").configuration()
 
 fun Project.android(configuration: BaseExtension.() -> Unit) =
-    extensions.getByName<BaseExtension>("android").configuration()
+    extensions.getByName("android").configuration()
 
 subprojects {
     apply(plugin = "com.android.library")
     apply(plugin = "kotlin-android")
     apply(plugin = "com.lagradost.cloudstream3.gradle")
+
+    // THÊM DEPENDENCIES NÀY - QUAN TRỌNG NHẤT
+    dependencies {
+        // CloudStream API - bắt buộc phải có
+        compileOnly("com.github.recloudstream:cloudstream:4.3.0")
+        
+        // Jsoup cho HTML parsing
+        implementation("org.jsoup:jsoup:1.17.2")
+    }
 
     cloudstream {
         setRepo(System.getenv("GITHUB_REPOSITORY") ?: "https://github.com/dah215/Aho-Repo")

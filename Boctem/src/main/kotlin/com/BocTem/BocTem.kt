@@ -2,6 +2,7 @@ package com.BocTem
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.app
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
 
@@ -47,7 +48,9 @@ class BocTem : MainAPI() {
 
         return newAnimeSearchResponse(title, href, TvType.Anime) {
             this.posterUrl = posterUrl
-            addSub(episodeInfo)
+            if (episodeInfo != null) {
+                addSub(episodeInfo)
+            }
         }
     }
 
@@ -71,12 +74,6 @@ class BocTem : MainAPI() {
         val description = document.selectFirst(".entry-content")?.text()
             ?: document.selectFirst("meta[property=og:description]")?.attr("content")
 
-        val postId = document.selectFirst("body")?.attr("class")
-            ?.let { classAttr -> Regex("""postid-(\d+)""").find(classAttr)?.groupValues?.get(1) }
-            ?: document.selectFirst("article")?.attr("id")
-                ?.let { idAttr -> Regex("""post-(\d+)""").find(idAttr)?.groupValues?.get(1) }
-            ?: return null
-
         val episodeLinks = document.select("a[href*=/xem-phim/]")
             .filter { link -> link.attr("href").contains("-tap-") }
             .distinctBy { link -> link.attr("href") }
@@ -86,14 +83,12 @@ class BocTem : MainAPI() {
             val epText = link.text().trim()
             val epNum = Regex("""tap-(\d+)""").find(epUrl)?.groupValues?.get(1)?.toIntOrNull()
                 ?: epText.toIntOrNull()
-                ?: 0
 
-            Episode(
-                data = epUrl,
-                name = epText,
-                episode = epNum,
-                posterUrl = poster
-            )
+            newEpisode(epUrl) {
+                this.name = epText
+                this.episode = epNum
+                this.posterUrl = poster
+            }
         }.sortedBy { ep -> ep.episode }
 
         val tags = document.select(".halim-movie-genres a, .post-category a").map { it.text() }
@@ -158,7 +153,7 @@ class BocTem : MainAPI() {
 
         if (m3u8Url != null) {
             callback.invoke(
-                ExtractorLink(
+                newExtractorLink(
                     source = this.name,
                     name = "$name - Server 1",
                     url = m3u8Url,

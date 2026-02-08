@@ -39,7 +39,7 @@ dependencies {
     // compileOnly("com.github.recloudstream:cloudstream:master-SNAPSHOT")
     
     // Cách 2: Dùng commit hash cụ thể (ỔN ĐỊNH NHẤT - thay bằng hash mới nhất)
-  ##  compileOnly("com.github.recloudstream:cloudstream:9c6c9c7e6a")  // Hash từ tháng 2/2025
+  // compileOnly("com.github.recloudstream:cloudstream:9c6c9c7e6a")  // Hash từ tháng 2/2025
     
     // Cách 3: Dùng version tag nếu có
     // compileOnly("com.github.recloudstream:cloudstream:4.2.1")

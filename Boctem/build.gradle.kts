@@ -26,13 +26,8 @@ android {
 }
 
 dependencies {
-    // ✅ Dùng version tag chính xác từ JitPack
-    compileOnly("com.github.recloudstream:cloudstream:4.6.0") {
-        isChanging = true  // Cho phép snapshot thay đổi
-    }
-    
-    // ✅ Hoặc dùng master-SNAPSHOT nếu 4.3.0 không tồn tại
-    // compileOnly("com.github.recloudstream:cloudstream:master-SNAPSHOT")
+    // ✅ ĐÚNG CÚ PHÁP theo hình ảnh bạn gửi
+    compileOnly("com.github.recloudstream.cloudstream:library:v4.6.0")
     
     implementation("org.jsoup:jsoup:1.17.2")
 }

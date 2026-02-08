@@ -27,7 +27,7 @@ android {
 
 dependencies {
     // ✅ ĐÚNG CÚ PHÁP theo hình ảnh bạn gửi
-    compileOnly("com.github.recloudstream.cloudstream:library:v4.6.0")
+    implementation("com.github.recloudstream.cloudstream:library:v4.6.0")
     
     implementation("org.jsoup:jsoup:1.17.2")
 }

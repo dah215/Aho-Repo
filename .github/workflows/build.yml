@@ -1,0 +1,111 @@
+name: Build CloudStream Plugins
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Cache Gradle packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Build Plugins
+        run: |
+          chmod +x gradlew
+          ./gradlew make makePluginsJson
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugins
+          path: |
+            build/*.cs3
+            build/plugins.json
+
+  deploy-builds-branch:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download Build Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: plugins
+          path: ./build-artifacts
+
+      - name: Setup Builds Branch
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git checkout Builds 2>/dev/null || git checkout --orphan Builds
+          git rm -rf . 2>/dev/null || true
+
+      - name: Create Builds Structure
+        run: |
+          mkdir -p latest
+          cp ./build-artifacts/*.cs3 latest/ 2>/dev/null || echo "No .cs3 files"
+          cp ./build-artifacts/plugins.json latest/ 2>/dev/null || echo "No plugins.json"
+          
+          # Create repository.json for CloudStream
+          cat > latest/repository.json << 'EOF'
+          {
+            "name": "BocTem Repository",
+            "description": "Vietnamese Anime (Anime Vietsub) - BocTem.com",
+            "author": "CloudStream Builder",
+            "version": 1,
+            "plugins": [
+              {
+                "name": "BocTem",
+                "version": "1.0.0",
+                "url": "https://raw.githubusercontent.com/${{ github.repository }}/Builds/latest/BocTem.cs3",
+                "status": 1,
+                "types": ["anime"]
+              }
+            ]
+          }
+          EOF
+          
+          # Create build info
+          echo "Build Date: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" > latest/build-info.txt
+          echo "Commit: ${{ github.sha }}" >> latest/build-info.txt
+          echo "Branch: ${{ github.ref_name }}" >> latest/build-info.txt
+
+      - name: Push to Builds Branch
+        run: |
+          git add -A
+          git commit -m "Build: $(date -u +'%Y-%m-%d %H:%M:%S UTC') - ${{ github.sha }}" || echo "Nothing to commit"
+          git push origin Builds --force
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

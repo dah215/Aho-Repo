@@ -1,4 +1,3 @@
-// use an integer for version numbers
 version = 1
 
 cloudstream {
@@ -11,4 +10,22 @@ cloudstream {
     isCrossPlatform = true
 }
 
-// KHÔNG CÓ dependencies block ở đây nữa vì đã khai báo ở root
+android {
+    namespace = "com.boctem"
+    compileSdk = 35
+    
+    defaultConfig {
+        minSdk = 21
+        targetSdk = 35
+    }
+    
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_1_8
+        targetCompatibility = JavaVersion.VERSION_1_8
+    }
+}
+
+dependencies {
+    compileOnly("com.github.recloudstream:cloudstream:4.3.0")
+    implementation("org.jsoup:jsoup:1.17.2")
+}

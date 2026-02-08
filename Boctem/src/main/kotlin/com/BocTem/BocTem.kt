@@ -40,8 +40,8 @@ class BocTem : MainAPI() {
         val title = this.selectFirst(".entry-title")?.text()
             ?: this.selectFirst("a")?.attr("title")
             ?: return null
-        val posterUrl = this.selectFirst("img")?.let {
-            it.attr("data-src").ifEmpty { it.attr("src") }
+        val posterUrl = this.selectFirst("img")?.let { img ->
+            img.attr("data-src").ifEmpty { img.attr("src") }
         }
         val episodeInfo = this.selectFirst(".status")?.text()
 
@@ -64,22 +64,22 @@ class BocTem : MainAPI() {
             ?: document.selectFirst(".halim-movie-title")?.text()
             ?: return null
 
-        val poster = document.selectFirst(".halim-movie-poster img")?.let {
-            it.attr("data-src").ifEmpty { it.attr("src") }
+        val poster = document.selectFirst(".halim-movie-poster img")?.let { img ->
+            img.attr("data-src").ifEmpty { img.attr("src") }
         } ?: document.selectFirst("meta[property=og:image]")?.attr("content")
 
         val description = document.selectFirst(".entry-content")?.text()
             ?: document.selectFirst("meta[property=og:description]")?.attr("content")
 
         val postId = document.selectFirst("body")?.attr("class")
-            ?.let { Regex("""postid-(\d+)""").find(it)?.groupValues?.get(1) }
+            ?.let { classAttr -> Regex("""postid-(\d+)""").find(classAttr)?.groupValues?.get(1) }
             ?: document.selectFirst("article")?.attr("id")
-                ?.let { Regex("""post-(\d+)""").find(it)?.groupValues?.get(1) }
+                ?.let { idAttr -> Regex("""post-(\d+)""").find(idAttr)?.groupValues?.get(1) }
             ?: return null
 
         val episodeLinks = document.select("a[href*=/xem-phim/]")
-            .filter { it.attr("href").contains("-tap-") }
-            .distinctBy { it.attr("href") }
+            .filter { link -> link.attr("href").contains("-tap-") }
+            .distinctBy { link -> link.attr("href") }
 
         val episodes = episodeLinks.mapNotNull { link ->
             val epUrl = link.attr("href")
@@ -94,7 +94,7 @@ class BocTem : MainAPI() {
                 episode = epNum,
                 posterUrl = poster
             )
-        }.sortedBy { it.episode }
+        }.sortedBy { ep -> ep.episode }
 
         val tags = document.select(".halim-movie-genres a, .post-category a").map { it.text() }
 
@@ -119,17 +119,17 @@ class BocTem : MainAPI() {
         val document = app.get(data, referer = mainUrl).document
 
         val postId = document.selectFirst("body")?.attr("class")
-            ?.let { Regex("""postid-(\d+)""").find(it)?.groupValues?.get(1) }
+            ?.let { classAttr -> Regex("""postid-(\d+)""").find(classAttr)?.groupValues?.get(1) }
             ?: document.selectFirst("article")?.attr("id")
-                ?.let { Regex("""post-(\d+)""").find(it)?.groupValues?.get(1) }
+                ?.let { idAttr -> Regex("""post-(\d+)""").find(idAttr)?.groupValues?.get(1) }
             ?: return false
 
         val episode = Regex("""tap-(\d+)""").find(data)?.groupValues?.get(1) ?: "1"
 
-        val nonce = document.select("script").find { it.data().contains("ajax_player") }
-            ?.data()?.let { Regex("""nonce["']?\s*:\s*["']([^"']+)["']""").find(it)?.groupValues?.get(1) }
-            ?: document.select("script").find { it.data().contains("nonce") }
-                ?.data()?.let { Regex("""nonce["']?\s*:\s*["']([^"']+)["']""").find(it)?.groupValues?.get(1) }
+        val nonce = document.select("script").find { script -> script.data().contains("ajax_player") }
+            ?.data()?.let { scriptData -> Regex("""nonce["']?\s*:\s*["']([^"']+)["']""").find(scriptData)?.groupValues?.get(1) }
+            ?: document.select("script").find { script -> script.data().contains("nonce") }
+                ?.data()?.let { scriptData -> Regex("""nonce["']?\s*:\s*["']([^"']+)["']""").find(scriptData)?.groupValues?.get(1) }
             ?: return false
 
         val ajaxUrl = "$mainUrl/wp-admin/admin-ajax.php"

@@ -10,9 +10,9 @@ buildscript {
         maven("https://jitpack.io")
     }
     dependencies {
-        classpath("com.android.tools.build:gradle:8.13.2")
-        classpath("com.github.recloudstream:gradle:cce1b8d84d")
-        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.3.0")
+        classpath("com.android.tools.build:gradle:8.2.2")  // Giảm xuống ổn định hơn
+        classpath("com.github.recloudstream:gradle:master-SNAPSHOT")  // Dùng master thay vì commit hash cố định
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.22")  // Kotlin ổn định
     }
 }
 

@@ -7,7 +7,7 @@ cloudstream {
     status = 1
     tvTypes = listOf("Anime", "AnimeMovie")
     iconUrl = "https://boctem.com/wp-content/uploads/2022/06/x-logo-2.png"
-    isCrossPlatform = true
+    isCrossPlatform = false
 }
 
 android {

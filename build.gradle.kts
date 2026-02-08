@@ -16,18 +16,7 @@ buildscript {
     }
 }
 
-allprojects {
-    repositories {
-        google()
-        mavenCentral()
-        maven { 
-            url = uri("https://jitpack.io")
-            content {
-                includeGroupByRegex("com\\.github\\..*")
-            }
-        }
-    }
-}
+// KHÔNG CÓ allprojects block vì đã có dependencyResolutionManagement
 
 subprojects {
     apply(plugin = "com.android.library")

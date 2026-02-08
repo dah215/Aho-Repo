@@ -12,37 +12,27 @@ cloudstream {
 
 android {
     namespace = "com.boctem"
-    compileSdk = 34  // Ổn định, không dùng 35 beta
+    compileSdk = 35
     
     defaultConfig {
         minSdk = 21
-        // KHÔNG DÙNG targetSdk ở đây nữa (deprecated)
+        targetSdk = 35
     }
     
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_1_8
         targetCompatibility = JavaVersion.VERSION_1_8
     }
-    
-    // Thêm nếu cần test
-    testOptions {
-        targetSdk = 34
-    }
-    
-    lint {
-        targetSdk = 34
-    }
 }
 
 dependencies {
-    // Cách 1: Dùng master-SNAPSHOT (luôn mới nhất, có thể unstable)
+    // ✅ Dùng version tag chính xác từ JitPack
+    compileOnly("com.github.recloudstream:cloudstream:4.6.0") {
+        isChanging = true  // Cho phép snapshot thay đổi
+    }
+    
+    // ✅ Hoặc dùng master-SNAPSHOT nếu 4.3.0 không tồn tại
     // compileOnly("com.github.recloudstream:cloudstream:master-SNAPSHOT")
-    
-    // Cách 2: Dùng commit hash cụ thể (ỔN ĐỊNH NHẤT - thay bằng hash mới nhất)
-  // compileOnly("com.github.recloudstream:cloudstream:9c6c9c7e6a")  // Hash từ tháng 2/2025
-    
-    // Cách 3: Dùng version tag nếu có
-    // compileOnly("com.github.recloudstream:cloudstream:4.2.1")
     
     implementation("org.jsoup:jsoup:1.17.2")
 }

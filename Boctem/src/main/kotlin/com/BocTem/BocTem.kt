@@ -1,7 +1,30 @@
 package com.BocTem
 
-import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.AnimeSearchResponse
+import com.lagradost.cloudstream3.DubStatus
+import com.lagradost.cloudstream3.Episode
+import com.lagradost.cloudstream3.ExtractorLink
+import com.lagradost.cloudstream3.HomePageList
+import com.lagradost.cloudstream3.HomePageResponse
+import com.lagradost.cloudstream3.LoadResponse
+import com.lagradost.cloudstream3.MainAPI
+import com.lagradost.cloudstream3.MainPageRequest
+import com.lagradost.cloudstream3.Qualities
+import com.lagradost.cloudstream3.SearchResponse
+import com.lagradost.cloudstream3.SubtitleFile
+import com.lagradost.cloudstream3.TvType
+import com.lagradost.cloudstream3.addEpisodes
+import com.lagradost.cloudstream3.addSub
+import com.lagradost.cloudstream3.app
+import com.lagradost.cloudstream3.fixUrl
+import com.lagradost.cloudstream3.fixUrlNull
+import com.lagradost.cloudstream3.loadExtractor
+import com.lagradost.cloudstream3.newAnimeLoadResponse
+import com.lagradost.cloudstream3.newAnimeSearchResponse
+import com.lagradost.cloudstream3.newHomePageResponse
+import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.Qualities
+import com.lagradost.cloudstream3.utils.loadExtractor
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
 
@@ -73,9 +96,9 @@ class BocTem : MainAPI() {
 
         // Get post ID from body class or scripts
         val postId = document.selectFirst("body")?.attr("class")
-            ?.let { Regex("postid-(\\d+)").find(it)?.groupValues?.get(1) }
+            ?.let { Regex("""postid-(\d+)""").find(it)?.groupValues?.get(1) }
             ?: document.selectFirst("article")?.attr("id")
-                ?.let { Regex("post-(\\d+)").find(it)?.groupValues?.get(1) }
+                ?.let { Regex("""post-(\d+)""").find(it)?.groupValues?.get(1) }
             ?: return null
 
         // Get episodes
@@ -86,7 +109,7 @@ class BocTem : MainAPI() {
         val episodes = episodeLinks.mapNotNull { link ->
             val epUrl = link.attr("href")
             val epText = link.text().trim()
-            val epNum = Regex("tap-(\\d+)").find(epUrl)?.groupValues?.get(1)?.toIntOrNull()
+            val epNum = Regex("""tap-(\d+)""").find(epUrl)?.groupValues?.get(1)?.toIntOrNull()
                 ?: epText.toIntOrNull()
                 ?: 0
 
@@ -102,7 +125,7 @@ class BocTem : MainAPI() {
         val tags = document.select(".halim-movie-genres a, .post-category a").map { it.text() }
 
         // Get year from URL or meta
-        val year = Regex("/release/(\\d+)/").find(url)?.groupValues?.get(1)?.toIntOrNull()
+        val year = Regex("""/release/(\d+)/""").find(url)?.groupValues?.get(1)?.toIntOrNull()
             ?: document.selectFirst(".halim-movie-year")?.text()?.toIntOrNull()
 
         return newAnimeLoadResponse(title, url, TvType.Anime) {
@@ -125,13 +148,13 @@ class BocTem : MainAPI() {
 
         // Extract post ID
         val postId = document.selectFirst("body")?.attr("class")
-            ?.let { Regex("postid-(\\d+)").find(it)?.groupValues?.get(1) }
+            ?.let { Regex("""postid-(\d+)""").find(it)?.groupValues?.get(1) }
             ?: document.selectFirst("article")?.attr("id")
-                ?.let { Regex("post-(\\d+)").find(it)?.groupValues?.get(1) }
+                ?.let { Regex("""post-(\d+)""").find(it)?.groupValues?.get(1) }
             ?: return false
 
         // Extract episode number from URL
-        val episode = Regex("tap-(\\d+)").find(data)?.groupValues?.get(1) ?: "1"
+        val episode = Regex("""tap-(\d+)""").find(data)?.groupValues?.get(1) ?: "1"
 
         // Get nonce from script
         val nonce = document.select("script").find { it.data().contains("ajax_player") }

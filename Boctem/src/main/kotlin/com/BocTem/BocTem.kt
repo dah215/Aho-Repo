@@ -80,7 +80,9 @@ class BocTem : MainAPI() {
         return newAnimeSearchResponse(title, href, TvType.Anime) {
             this.posterUrl = posterUrl
             if (episodeInfo != null && episodeInfo.isNotEmpty()) {
-                addSub(episodeInfo)
+                // Lọc lấy các ký tự số từ chuỗi và chuyển thành Int
+                val epNum = episodeInfo.filter { it.isDigit() }.toIntOrNull()
+                addSub(epNum)
             }
         }
     }

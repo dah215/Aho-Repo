@@ -19,4 +19,4 @@ dependencyResolutionManagement {
     }
 }
 
-include(":Boctem")
+include(":boctem")

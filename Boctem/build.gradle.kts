@@ -16,12 +16,8 @@ android {
         sourceCompatibility = JavaVersion.VERSION_1_8
         targetCompatibility = JavaVersion.VERSION_1_8
     }
-
-    // Cấu hình chuẩn cho Kotlin 2.x bên trong block android
-    compilerOptions {
-        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_1_8)
-        freeCompilerArgs.add("-Xskip-metadata-version-check")
-    }
+    
+    // KHÔNG ĐẶT compilerOptions ở đây nữa vì đã có ở file gốc xử lý
 }
 
 dependencies {

@@ -1,144 +1,87 @@
-name: Build and Deploy CloudStream Plugins (robust)
+name: Build & Deploy Plugins
 
 on:
   push:
     branches: [ main ]
   workflow_dispatch:
 
-permissions:
-  contents: write
-
-env:
-  JAVA_VERSION: 17
-  ARTIFACT_NAME: plugins
-  ARTIFACT_DIR: temp_artifacts
-
 jobs:
   build:
-    name: Build Plugins
     runs-on: ubuntu-24.04
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Setup JDK
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: ${{ env.JAVA_VERSION }}
+          java-version: 17
 
-      - name: Make gradlew executable
-        run: chmod +x ./gradlew
+      - name: Build
+        run: ./gradlew build
 
-      - name: Print Gradle plugin/task debug (optional)
-        run: |
-          echo "=== Gradle plugin repository info ==="
-          cat settings.gradle.kts || true
-          echo "=== List top-level tasks (short) ==="
-          ./gradlew tasks --all --no-daemon || true
-        continue-on-error: true
-
-      - name: Build project (safe)
-        run: |
-          # Build everything; do not fail workflow because of missing custom tasks
-          ./gradlew build --no-daemon --stacktrace
-        # allow this step to fail if you want it to stop early, otherwise remove continue-on-error
-        # continue-on-error: false
-
-      - name: Discover artifacts produced by build
-        id: find-artifacts
-        run: |
-          echo "Looking for .cs3 and plugins.json in workspace..."
-          # produce a list; exit code 0 even if none found
-          find_out=$(find . -type f \( -name "*.cs3" -o -name "plugins.json" \) -print || true)
-          echo "found_files<<EOF" >> $GITHUB_OUTPUT
-          printf "%s\n" "$find_out" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-          if [ -z "$find_out" ]; then
-            echo "No artifacts found"
-            exit 0
-          else
-            echo "Artifacts found:"
-            printf "%s\n" "$find_out"
-          fi
-
-      - name: Upload plugin artifacts (only if present)
-        if: steps.find-artifacts.outputs.found_files != ''
+      # CHỈ upload nếu có output thật
+      - name: Upload plugins artifact
+        if: |
+          hashFiles('**/*.cs3') != '' || hashFiles('plugins.json') != ''
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.ARTIFACT_NAME }}
+          name: plugins
           path: |
             **/*.cs3
-            **/plugins.json
-          if-no-files-found: error
+            plugins.json
 
-  deploy-builds-branch:
-    name: Deploy to Builds branch
-    needs: build
+  deploy:
     runs-on: ubuntu-24.04
+    needs: build
+
     steps:
-      - name: Checkout repo (full)
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Download plugin artifacts (if any)
+      - name: Download artifact
         id: download
         uses: actions/download-artifact@v4
         with:
-          name: ${{ env.ARTIFACT_NAME }}
-          path: ${{ env.ARTIFACT_DIR }}
+          name: plugins
+          path: temp_artifacts
         continue-on-error: true
 
-      - name: Check downloaded artifacts
+      - name: Check artifacts
         id: check
         run: |
-          echo "Listing downloaded artifact directory:"
-          ls -la ${{ env.ARTIFACT_DIR }} || true
-          if [ ! -d "${{ env.ARTIFACT_DIR }}" ] || [ -z "$(ls -A ${{ env.ARTIFACT_DIR }} 2>/dev/null)" ]; then
+          if [ ! -d "temp_artifacts" ] || [ -z "$(ls -A temp_artifacts 2>/dev/null)" ]; then
             echo "NO_ARTIFACTS=true" >> $GITHUB_OUTPUT
           else
             echo "NO_ARTIFACTS=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Exit if no artifacts (skip deploy)
-        if: steps.check.outputs.NO_ARTIFACTS == 'true'
-        run: |
-          echo "No artifacts to deploy; skipping push to Builds branch."
-          exit 0
+      # ====== TẤT CẢ CÁC STEP DƯỚI ĐÂY CHỈ CHẠY KHI CÓ ARTIFACT ======
 
-      - name: Prepare Builds branch
+      - name: Checkout Builds branch
+        if: steps.check.outputs.NO_ARTIFACTS == 'false'
         run: |
           git fetch origin Builds || true
           git checkout Builds || git checkout -b Builds
           git pull origin Builds || true
 
-      - name: Replace artifacts in repo root
+      - name: Replace artifacts
+        if: steps.check.outputs.NO_ARTIFACTS == 'false'
         run: |
-          # remove old artifacts (adjust paths if necessary)
           rm -f *.cs3 plugins.json || true
-          cp -r ${{ env.ARTIFACT_DIR }}/* .
+          cp -r temp_artifacts/* .
           ls -la
 
-      - name: Configure git identity
+      - name: Git commit & push
+        if: steps.check.outputs.NO_ARTIFACTS == 'false'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
-      - name: Commit changes (if any)
-        run: |
           git add -A
           if git diff --cached --quiet; then
-            echo "No changes to commit"
             exit 0
           fi
-          git commit -m "Auto update plugin builds: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
-
-      - name: Push to Builds branch
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # push using token from checkout action (persisted credential) or explicit remote URL
-          git push origin Builds --force
+          git commit -m "Update plugin builds"
+          git push origin Builds

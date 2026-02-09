@@ -24,10 +24,10 @@ dependencies {
     val cloudstream by configurations
     
     // SỬA: Đổi "pre-release" thành "master-SNAPSHOT"
-    cloudstream("com.github.recloudstream:cloudstream:master-SNAPSHOT")
+    cloudstream("com.github.recloudstream:cloudstream:pre-release-SNAPSHOT")
     
     // SỬA: Đổi "pre-release" thành "master-SNAPSHOT"
-    compileOnly("com.github.recloudstream:cloudstream:master-SNAPSHOT")
+    compileOnly("com.github.recloudstream:cloudstream:pre-release-SNAPSHOT")
     
     // Thêm OkHttp để hỗ trợ Requests
     implementation("com.squareup.okhttp3:okhttp:4.12.0")

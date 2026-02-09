@@ -1,4 +1,4 @@
-name: Build and Push Plugins (single-job, direct push)
+name: Build and Push Plugins (debug-verbose)
 
 on:
   push:
@@ -16,7 +16,7 @@ jobs:
   build-and-push:
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout repository (full)
+      - name: Checkout full
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -30,60 +30,60 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x ./gradlew
 
-      - name: Run Gradle build (no fail on missing custom tasks)
-        run: |
-          ./gradlew build --no-daemon --stacktrace || true
+      - name: Run Gradle build (non-fatal)
+        run: ./gradlew build --no-daemon --stacktrace || true
 
-      - name: List produced artifact files (debug)
+      - name: List artifacts in workspace (debug)
         run: |
-          echo "=== workspace .cs3 & plugins.json ==="
+          echo "=== workspace artifacts ==="
           find . -type f \( -name "*.cs3" -o -name "plugins.json" \) -print -exec ls -l {} \; || true
 
       - name: Detect artifacts (set output)
         id: detect
         run: |
-          FIRST=$(find . -type f \( -name "*.cs3" -o -name "plugins.json" \) -print | head -n 1 || true)
-          if [ -z "$FIRST" ]; then
+          ARTS=$(find . -type f \( -name "*.cs3" -o -name "plugins.json" \) -print | paste -sd ' ' - || true)
+          if [ -z "$ARTS" ]; then
             echo "HAS_ARTIFACTS=false" >> $GITHUB_OUTPUT
           else
             echo "HAS_ARTIFACTS=true" >> $GITHUB_OUTPUT
-            echo "ARTIFACTS=$(find . -type f \( -name \"*.cs3\" -o -name \"plugins.json\" \) -print | paste -sd ' ' -)" >> $GITHUB_OUTPUT
+            echo "ARTIFACTS=$ARTS" >> $GITHUB_OUTPUT
+            printf "%s\n" $ARTS
           fi
 
-      - name: Prepare Builds branch and push artifacts
+      - name: Prepare Builds branch and copy artifacts (only if present)
         if: steps.detect.outputs.HAS_ARTIFACTS == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BUILD_BRANCH: ${{ env.BUILD_BRANCH }}
         run: |
-          # ensure git identity
+          set -xe
+          # identity
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # fetch remote and create or checkout branch
+          # fetch/create branch
           git fetch origin $BUILD_BRANCH || true
           if git rev-parse --verify origin/$BUILD_BRANCH >/dev/null 2>&1; then
             git checkout $BUILD_BRANCH
             git reset --hard origin/$BUILD_BRANCH || true
           else
             git checkout --orphan $BUILD_BRANCH
-            # remove all files from index/worktree to start fresh
             git rm -rf . || true
           fi
 
-          # copy artifacts into repo root (preserve subdirs if needed)
-          # Use the list provided by detect output
+          # create dir with run id to avoid collisions
+          RUNDIR="builds/${GITHUB_RUN_ID}"
+          mkdir -p "$RUNDIR"
+
+          # copy artifacts preserving relative paths
           IFS=' ' read -r -a ARTS <<< "${{ steps.detect.outputs.ARTIFACTS }}"
           for f in "${ARTS[@]}"; do
-            # ensure destination directory exists
-            dest_dir=$(dirname "$f")
-            # copy file to repo root (flatten) - adjust if you want subfolders
-            cp --parents "$f" .
+            mkdir -p "$RUNDIR/$(dirname "$f")"
+            cp --parents "$f" "$RUNDIR" || cp "$f" "$RUNDIR/" || true
           done
 
-          # show files in repo
-          echo "=== artifacts in repo after copy ==="
-          find . -maxdepth 5 -type f \( -name "*.cs3" -o -name "plugins.json" \) -print -exec ls -l {} \; || true
+          echo "=== files after copy into $RUNDIR ==="
+          find "$RUNDIR" -type f -print -exec ls -l {} \; || true
 
           # force add .cs3 if ignored
           IGNORED=$(git ls-files --others --exclude-standard | grep '\.cs3$' || true)
@@ -92,15 +92,19 @@ jobs:
           fi
 
           git add -A
+          git status --porcelain
+
           if git diff --cached --quiet; then
             echo "No changes to commit"
             exit 0
           fi
 
-          git commit -m "Auto update plugin builds: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          git commit -m "Auto update plugin builds: ${GITHUB_RUN_ID} ${GITHUB_SHA}"
+          # show commit contents
+          git --no-pager show --name-only --pretty=format:"%h %s" HEAD
 
-          # push using token-authenticated remote to ensure permissions
+          # push verbose
+          export GIT_TRACE=1 GIT_CURL_VERBOSE=1
           remote_url="https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
           git remote set-url origin "$remote_url"
-          # use force-with-lease to reduce chance of clobbering unexpected changes
           git push origin $BUILD_BRANCH --force-with-lease

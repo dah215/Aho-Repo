@@ -1,6 +1,7 @@
 package com.boctem
 
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.app // Import trực tiếp app
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
@@ -24,10 +25,10 @@ class BocTem : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = "$mainUrl/${request.data}$page"
-        val document = app.get(url).document
+        val document: Document = app.get(url).document
         
-        // SỬA: Thêm ": Element" để định rõ kiểu dữ liệu
-        val items = document.select("article.thumb.grid-item").mapNotNull { article: Element ->
+        // Ép kiểu List<Element> để sửa lỗi iterator
+        val items = (document.select("article.thumb.grid-item") as List<Element>).mapNotNull { article ->
             articleToSearchResponse(article)
         }
         
@@ -70,16 +71,15 @@ class BocTem : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/?s=${URLEncoder.encode(query, "UTF-8")}"
-        val document = app.get(url).document
+        val document: Document = app.get(url).document
         
-        // SỬA: Thêm ": Element"
-        return document.select("article.thumb.grid-item").mapNotNull { article: Element ->
+        return (document.select("article.thumb.grid-item") as List<Element>).mapNotNull { article ->
             articleToSearchResponse(article)
         }
     }
 
     override suspend fun load(url: String): LoadResponse? {
-        val document = app.get(url).document
+        val document: Document = app.get(url).document
 
         val titleElement = document.selectFirst("h1.entry-title")
             ?: document.selectFirst(".halim-movie-title")
@@ -100,8 +100,7 @@ class BocTem : MainAPI() {
         val episodeLinks = ArrayList<Element>()
         val seenUrls = HashSet<String>()
         
-        // SỬA: Thêm ": Element"
-        document.select("a[href*=/xem-phim/]").forEach { link: Element ->
+        (document.select("a[href*=/xem-phim/]") as List<Element>).forEach { link ->
             val linkHref = link.attr("href")
             if (linkHref.contains("-tap-") && !seenUrls.contains(linkHref)) {
                 episodeLinks.add(link)
@@ -109,8 +108,7 @@ class BocTem : MainAPI() {
             }
         }
 
-        // SỬA: Thêm ": Element"
-        val episodes = episodeLinks.map { link: Element ->
+        val episodes = episodeLinks.map { link ->
             val epUrl = link.attr("href")
             val epText = link.text().trim()
             
@@ -124,10 +122,11 @@ class BocTem : MainAPI() {
             }
         }.toMutableList()
         
-        episodes.sortBy { it.episode ?: 0 }
+        // Ép kiểu rõ ràng cho Episode để tránh lỗi "it"
+        episodes.sortBy { ep: Episode -> ep.episode ?: 0 }
 
         val tagElements = document.select(".halim-movie-genres a, .post-category a")
-        val tags = tagElements.map { it.text() }
+        val tags = (tagElements as List<Element>).map { it.text() }
 
         val yearMatch = Regex("""/release/(\d+)/""").find(url)
         val year = yearMatch?.groupValues?.get(1)?.toIntOrNull() 
@@ -148,7 +147,7 @@ class BocTem : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val document = app.get(data).document
+        val document: Document = app.get(data).document
 
         val bodyElement = document.selectFirst("body")
         val bodyClass = bodyElement?.attr("class") ?: ""
@@ -167,8 +166,7 @@ class BocTem : MainAPI() {
         val scripts = document.select("script")
         var nonce: String? = null
         
-        // SỬA: Thêm ": Element"
-        scripts.forEach { script: Element ->
+        (scripts as List<Element>).forEach { script ->
             val scriptContent = script.data()
             if (scriptContent.contains("ajax_player") || scriptContent.contains("nonce")) {
                 val nonceMatch = Regex("""nonce["']?\s*:\s*["']([^"']+)["']""").find(scriptContent)

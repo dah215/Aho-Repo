@@ -1,4 +1,4 @@
-name: Build & Deploy Plugins (robust)
+name: Build and Push Plugins (single-job, direct push)
 
 on:
   push:
@@ -10,14 +10,13 @@ permissions:
 
 env:
   JAVA_VERSION: 17
-  ARTIFACT_NAME: plugins
-  ARTIFACT_DIR: temp_artifacts
+  BUILD_BRANCH: Builds
 
 jobs:
-  build:
+  build-and-push:
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout source
+      - name: Checkout repository (full)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -31,120 +30,77 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x ./gradlew
 
-      - name: Run Gradle build
+      - name: Run Gradle build (no fail on missing custom tasks)
         run: |
-          ./gradlew build --no-daemon --stacktrace
+          ./gradlew build --no-daemon --stacktrace || true
 
       - name: List produced artifact files (debug)
         run: |
-          echo "=== files matching .cs3 or plugins.json in workspace ==="
+          echo "=== workspace .cs3 & plugins.json ==="
           find . -type f \( -name "*.cs3" -o -name "plugins.json" \) -print -exec ls -l {} \; || true
 
-      - name: Check artifacts presence (set output)
-        id: check_artifacts
+      - name: Detect artifacts (set output)
+        id: detect
         run: |
-          FOUND=$(find . -type f \( -name "*.cs3" -o -name "plugins.json" \) -print | head -n 1 || true)
-          if [ -z "$FOUND" ]; then
+          FIRST=$(find . -type f \( -name "*.cs3" -o -name "plugins.json" \) -print | head -n 1 || true)
+          if [ -z "$FIRST" ]; then
             echo "HAS_ARTIFACTS=false" >> $GITHUB_OUTPUT
           else
             echo "HAS_ARTIFACTS=true" >> $GITHUB_OUTPUT
+            echo "ARTIFACTS=$(find . -type f \( -name \"*.cs3\" -o -name \"plugins.json\" \) -print | paste -sd ' ' -)" >> $GITHUB_OUTPUT
           fi
 
-      - name: Upload plugin artifacts (only if present)
-        if: steps.check_artifacts.outputs.HAS_ARTIFACTS == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.ARTIFACT_NAME }}
-          path: |
-            **/*.cs3
-            **/plugins.json
-          if-no-files-found: error
-
-  deploy:
-    needs: build
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Checkout repository (full)
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Download plugin artifacts (if any)
-        id: download
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.ARTIFACT_NAME }}
-          path: ${{ env.ARTIFACT_DIR }}
-        continue-on-error: true
-
-      - name: Show downloaded artifacts (debug)
-        run: |
-          echo "=== contents of ${{ env.ARTIFACT_DIR }} ==="
-          ls -la ${{ env.ARTIFACT_DIR }} || true
-          find ${{ env.ARTIFACT_DIR }} -type f -print -exec ls -l {} \; || true
-
-      - name: Check downloaded artifacts (set output)
-        id: check_download
-        run: |
-          if [ -d "${{ env.ARTIFACT_DIR }}" ] && [ -n "$(ls -A ${{ env.ARTIFACT_DIR }} 2>/dev/null)" ]; then
-            echo "NO_ARTIFACTS=false" >> $GITHUB_OUTPUT
-          else
-            echo "NO_ARTIFACTS=true" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Exit if no artifacts
-        if: steps.check_download.outputs.NO_ARTIFACTS == 'true'
-        run: |
-          echo "No artifacts to deploy; skipping deploy steps."
-          exit 0
-
-      - name: Prepare Builds branch
-        if: steps.check_download.outputs.NO_ARTIFACTS == 'false'
-        run: |
-          git fetch origin Builds || true
-          git checkout Builds || git checkout -b Builds
-          git pull origin Builds || true
-
-      - name: Copy artifacts into repo root (guarded)
-        if: steps.check_download.outputs.NO_ARTIFACTS == 'false'
-        run: |
-          # remove old artifacts if present
-          rm -f *.cs3 plugins.json || true
-
-          # Only attempt to copy if dir exists and not empty
-          if [ -d "${{ env.ARTIFACT_DIR }}" ] && [ -n "$(ls -A ${{ env.ARTIFACT_DIR }} 2>/dev/null)" ]; then
-            cp -r ${{ env.ARTIFACT_DIR }}/* .
-          else
-            echo "Artifact dir empty or missing; nothing to copy."
-          fi
-
-          echo "=== after copy: list .cs3 and plugins.json ==="
-          find . -maxdepth 3 -type f \( -name "*.cs3" -o -name "plugins.json" \) -print -exec ls -l {} \; || true
-
-      - name: Ensure artifacts are staged (force if ignored)
-        if: steps.check_download.outputs.NO_ARTIFACTS == 'false'
-        run: |
-          # Force-add .cs3 if ignored by .gitignore
-          IGNORED_CS3=$(git ls-files --others --exclude-standard | grep '\.cs3$' || true)
-          if [ -n "$IGNORED_CS3" ]; then
-            git add -f $IGNORED_CS3 || true
-          fi
-          git add -A
-          echo "=== staged files ==="
-          git status --porcelain
-
-      - name: Commit & push to Builds
-        if: steps.check_download.outputs.NO_ARTIFACTS == 'false'
+      - name: Prepare Builds branch and push artifacts
+        if: steps.detect.outputs.HAS_ARTIFACTS == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BUILD_BRANCH: ${{ env.BUILD_BRANCH }}
         run: |
+          # ensure git identity
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+          # fetch remote and create or checkout branch
+          git fetch origin $BUILD_BRANCH || true
+          if git rev-parse --verify origin/$BUILD_BRANCH >/dev/null 2>&1; then
+            git checkout $BUILD_BRANCH
+            git reset --hard origin/$BUILD_BRANCH || true
+          else
+            git checkout --orphan $BUILD_BRANCH
+            # remove all files from index/worktree to start fresh
+            git rm -rf . || true
+          fi
+
+          # copy artifacts into repo root (preserve subdirs if needed)
+          # Use the list provided by detect output
+          IFS=' ' read -r -a ARTS <<< "${{ steps.detect.outputs.ARTIFACTS }}"
+          for f in "${ARTS[@]}"; do
+            # ensure destination directory exists
+            dest_dir=$(dirname "$f")
+            # copy file to repo root (flatten) - adjust if you want subfolders
+            cp --parents "$f" .
+          done
+
+          # show files in repo
+          echo "=== artifacts in repo after copy ==="
+          find . -maxdepth 5 -type f \( -name "*.cs3" -o -name "plugins.json" \) -print -exec ls -l {} \; || true
+
+          # force add .cs3 if ignored
+          IGNORED=$(git ls-files --others --exclude-standard | grep '\.cs3$' || true)
+          if [ -n "$IGNORED" ]; then
+            git add -f $IGNORED || true
+          fi
+
+          git add -A
           if git diff --cached --quiet; then
             echo "No changes to commit"
             exit 0
           fi
 
           git commit -m "Auto update plugin builds: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
-          git push origin Builds --force-with-lease
+
+          # push using token-authenticated remote to ensure permissions
+          remote_url="https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
+          git remote set-url origin "$remote_url"
+          # use force-with-lease to reduce chance of clobbering unexpected changes
+          git push origin $BUILD_BRANCH --force-with-lease

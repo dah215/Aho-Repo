@@ -1,6 +1,3 @@
-import com.android.build.api.dsl.LibraryExtension
-import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
-
 plugins {
     // Declared with apply false so subprojects can apply them without repeating versions
     id("com.android.library") version "8.2.2" apply false

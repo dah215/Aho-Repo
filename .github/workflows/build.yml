@@ -1,120 +1,73 @@
-name: Build CloudStream Plugins
+name: Build & Deploy Plugins
 
 on:
-  workflow_dispatch:
   push:
     branches:
       - main
-      - master
-  pull_request:
-    branches:
-      - main
-      - master
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Set up JDK
         uses: actions/setup-java@v4
         with:
-          java-version: '21'
-          distribution: 'temurin'
+          distribution: temurin
+          java-version: 17
 
-      - name: Cache Gradle packages
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
-          restore-keys: |
-            ${{ runner.os }}-gradle-
+      - name: Grant execute permission for gradlew
+        run: chmod +x ./gradlew
 
-      - name: Build Plugins (safe)
+      - name: Build plugins
         run: |
-          chmod +x gradlew
+          ./gradlew build makePluginsJson --no-daemon --stacktrace
 
-          # 1) Build project (prints stacktrace on failure)
-          ./gradlew build --no-daemon --stacktrace
-
-          # 2) Run makePluginsJson if task exists (plugin may not be present)
-          if ./gradlew tasks --all | grep -q 'makePluginsJson'; then
-            ./gradlew makePluginsJson --no-daemon --stacktrace
-          else
-            echo "Task makePluginsJson not found; skipping."
-          fi
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload Build Artifacts
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: plugins
           path: |
             **/*.cs3
             **/plugins.json
+          if-no-files-found: error
 
   deploy-builds-branch:
     needs: build
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    runs-on: ubuntu-24.04
+
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Download Build Artifacts
+      - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
           name: plugins
           path: temp_artifacts
 
-      - name: Setup Builds Branch
+      - name: Prepare Builds branch
         run: |
-          git config user.name "GitHub Actions"
-          git config user.email "actions@github.com"
-          git checkout Builds 2>/dev/null || git checkout --orphan Builds
-          git rm -rf . 2>/dev/null || true
+          git checkout Builds || git checkout -b Builds
+          git pull origin Builds || true
 
-      - name: Move Files to Root
-        run: |
-          find temp_artifacts -name "*.cs3" -exec mv {} . \; || true
-          find temp_artifacts -name "plugins.json" -exec mv {} . \; || true
-          rm -rf temp_artifacts
-          ls -la
+          rm -rf plugins.json *.cs3
+          cp -r temp_artifacts/* .
 
-      - name: Create repository.json
-        run: |
-          cat > repository.json << EOF
-          {
-            "name": "BocTem Repository",
-            "description": "Vietnamese Anime (Anime Vietsub) - BocTem.com",
-            "author": "CloudStream Builder",
-            "version": 1,
-            "plugins": [
-              {
-                "name": "BocTem",
-                "version": "1.0.0",
-                "url": "https://raw.githubusercontent.com/${{ github.repository }}/Builds/BocTem.cs3",
-                "status": 1,
-                "types": ["anime"]
-              }
-            ]
-          }
-          EOF
+          git add .
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
 
-      - name: Push to Builds Branch
-        run: |
-          git add -A
-          git commit -m "Build: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" || echo "Nothing to commit"
-          git push origin Builds --force
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git commit -m "Update build artifacts"
+          git push origin Builds

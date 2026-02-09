@@ -2,6 +2,7 @@ package com.boctem
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import org.jsoup.nodes.Document // Thêm import này
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
 
@@ -21,11 +22,9 @@ class BocTem : MainAPI() {
         "release/2025/page/" to "Anime 2025",
     )
 
-    // XÓA hàm getDocument cũ đi, dùng app.get() của CloudStream
-
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = "$mainUrl/${request.data}$page"
-        // SỬA: Dùng app.get() thay vì Jsoup.connect()
+        // app.get() trả về NiceResponse, .document trả về Jsoup Document
         val document = app.get(url).document 
         val items = ArrayList<SearchResponse>()
         
@@ -75,7 +74,6 @@ class BocTem : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/?s=${URLEncoder.encode(query, "UTF-8")}"
-        // SỬA: Dùng app.get()
         val document = app.get(url).document
         val results = ArrayList<SearchResponse>()
         
@@ -90,7 +88,6 @@ class BocTem : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse? {
-        // SỬA: Dùng app.get()
         val document = app.get(url).document
 
         val titleElement = document.selectFirst("h1.entry-title")
@@ -161,7 +158,6 @@ class BocTem : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // SỬA: Dùng app.get()
         val document = app.get(data).document
 
         val bodyElement = document.selectFirst("body")
@@ -194,7 +190,6 @@ class BocTem : MainAPI() {
         
         if (nonce == null) return false
 
-        // SỬA: Dùng app.post() thay vì Jsoup.connect().post()
         val ajaxUrl = "$mainUrl/wp-admin/admin-ajax.php"
         
         val formData = mapOf(
@@ -217,7 +212,6 @@ class BocTem : MainAPI() {
             ?: Regex("""https?://[^"'<>\s]+\.m3u8""").find(ajaxResponse)?.value
 
         if (m3u8Url != null) {
-            // Sửa lại logic m3u8 một chút để an toàn hơn
             val safeM3u8Url = m3u8Url.replace("\\/", "/")
             M3u8Helper.generateM3u8(
                 source = name,

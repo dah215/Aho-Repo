@@ -20,12 +20,13 @@ android {
 
 dependencies {
     val cloudstream by configurations
-    
-    // Sử dụng Commit Hash cụ thể thay vì SNAPSHOT để tránh lỗi "Cannot access class Requests"
-    val csVersion = "4960766663" 
-    
+    val csVersion = "master-SNAPSHOT"
+
+    // Dòng này để đóng gói plugin
     cloudstream("com.github.recloudstream:cloudstream:$csVersion")
-    implementation("com.github.recloudstream:cloudstream:$csVersion")
+    
+    // Dòng này để trình biên dịch Kotlin thấy class Requests, app, v.v.
+    compileOnly("com.github.recloudstream:cloudstream:$csVersion")
     
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.jsoup:jsoup:1.17.2")

@@ -11,6 +11,9 @@ on:
       - main
       - master
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -46,9 +49,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: plugins
+          # Tìm file ở mọi ngóc ngách
           path: |
-            build/*.cs3
-            build/plugins.json
+            **/*.cs3
+            **/plugins.json
 
   deploy-builds-branch:
     needs: build
@@ -63,23 +67,38 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: plugins
-          path: ./build-artifacts
+          path: temp_artifacts # Tải vào thư mục tạm trước
 
       - name: Setup Builds Branch
         run: |
           git config user.name "GitHub Actions"
           git config user.email "actions@github.com"
+          # Chuyển sang nhánh Builds (hoặc tạo mới dạng orphan - nhánh trống)
           git checkout Builds 2>/dev/null || git checkout --orphan Builds
+          # Xóa sạch mọi thứ cũ trên nhánh này để đảm bảo file mới nhất nằm ở root
           git rm -rf . 2>/dev/null || true
 
-      - name: Create Builds Structure
+      - name: Move Files to Root
         run: |
-          mkdir -p latest
-          cp ./build-artifacts/*.cs3 latest/ 2>/dev/null || echo "No .cs3 files"
-          cp ./build-artifacts/plugins.json latest/ 2>/dev/null || echo "No plugins.json"
+          echo "Moving files to root directory..."
           
-          # Create repository.json for CloudStream
-          cat > latest/repository.json << 'EOF'
+          # Tìm file .cs3 trong thư mục tạm và di chuyển ra ngoài cùng (.)
+          find temp_artifacts -name "*.cs3" -exec mv {} . \;
+          
+          # Tìm file plugins.json và di chuyển ra ngoài cùng (.)
+          find temp_artifacts -name "plugins.json" -exec mv {} . \;
+          
+          # Xóa thư mục tạm
+          rm -rf temp_artifacts
+          
+          # Kiểm tra xem file đã ra ngoài chưa
+          ls -la
+
+      - name: Create repository.json
+        run: |
+          # Tạo repository.json ngay tại root
+          # Lưu ý: URL đã được sửa để trỏ thẳng vào nhánh Builds (bỏ /latest/)
+          cat > repository.json << EOF
           {
             "name": "BocTem Repository",
             "description": "Vietnamese Anime (Anime Vietsub) - BocTem.com",
@@ -89,23 +108,18 @@ jobs:
               {
                 "name": "BocTem",
                 "version": "1.0.0",
-                "url": "https://raw.githubusercontent.com/${{ github.repository }}/Builds/latest/BocTem.cs3",
+                "url": "https://raw.githubusercontent.com/${{ github.repository }}/Builds/BocTem.cs3",
                 "status": 1,
                 "types": ["anime"]
               }
             ]
           }
           EOF
-          
-          # Create build info
-          echo "Build Date: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" > latest/build-info.txt
-          echo "Commit: ${{ github.sha }}" >> latest/build-info.txt
-          echo "Branch: ${{ github.ref_name }}" >> latest/build-info.txt
 
       - name: Push to Builds Branch
         run: |
           git add -A
-          git commit -m "Build: $(date -u +'%Y-%m-%d %H:%M:%S UTC') - ${{ github.sha }}" || echo "Nothing to commit"
+          git commit -m "Build: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" || echo "Nothing to commit"
           git push origin Builds --force
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

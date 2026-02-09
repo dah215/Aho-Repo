@@ -1,8 +1,3 @@
-import com.android.build.gradle.BaseExtension
-import com.lagradost.cloudstream3.gradle.CloudstreamExtension
-import org.jetbrains.kotlin.gradle.dsl.JvmTarget
-import org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile
-
 buildscript {
     repositories {
         google()
@@ -10,13 +5,11 @@ buildscript {
         maven { url = uri("https://jitpack.io") }
     }
     dependencies {
-        classpath("com.android.tools.build:gradle:8.13.0")
-        classpath("com.github.recloudstream:gradle:cce1b8d84d")
-        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.0.21")
+        classpath("com.android.tools.build:gradle:8.1.1")
+        classpath("com.github.recloudstream:gradle:master-SNAPSHOT")
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.24") // Dùng bản 1.9.24 cực kỳ ổn định
     }
 }
-
-// KHÔNG CÓ allprojects block vì đã có dependencyResolutionManagement
 
 subprojects {
     apply(plugin = "com.android.library")
@@ -24,15 +17,9 @@ subprojects {
     apply(plugin = "com.lagradost.cloudstream3.gradle")
 
     afterEvaluate {
-        configure<CloudstreamExtension> {
+        configure<com.lagradost.cloudstream3.gradle.CloudstreamExtension> {
             setRepo(System.getenv("GITHUB_REPOSITORY") ?: "https://github.com/dah215/Aho-Repo")
             authors = listOf("CloudStream Builder")
-        }
-    }
-
-    tasks.withType<KotlinJvmCompile> {
-        compilerOptions {
-            jvmTarget.set(JvmTarget.JVM_1_8)
         }
     }
 }

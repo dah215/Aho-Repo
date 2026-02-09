@@ -10,6 +10,7 @@ cloudstream {
 }
 
 android {
+    namespace = "com.boctem"  // ← DÒNG QUAN TRỌNG!
     compileSdk = 34
 }
 

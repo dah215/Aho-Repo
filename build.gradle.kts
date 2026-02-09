@@ -1,5 +1,6 @@
 import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import com.android.build.gradle.BaseExtension // THÊM DÒNG NÀY
 
 buildscript {
     repositories {
@@ -19,19 +20,30 @@ subprojects {
     apply(plugin = "kotlin-android")
     apply(plugin = "com.lagradost.cloudstream3.gradle")
 
+    // ÉP CẤU HÌNH ANDROID CHO TẤT CẢ MODULE CON
+    extensions.configure<BaseExtension> {
+        compileSdkVersion(34)
+        defaultConfig {
+            minSdk = 21
+            targetSdk = 34
+        }
+        
+        compileOptions {
+            sourceCompatibility = JavaVersion.VERSION_1_8
+            targetCompatibility = JavaVersion.VERSION_1_8
+        }
+    }
+
     afterEvaluate {
-        // Cấu hình CloudStream Extension
         extensions.configure<com.lagradost.cloudstream3.gradle.CloudstreamExtension> {
             setRepo(System.getenv("GITHUB_REPOSITORY") ?: "https://github.com/dah215/Aho-Repo")
             authors = listOf("CloudStream Builder")
         }
     }
 
-    // ÉP CẤU HÌNH CHO TẤT CẢ CÁC TÁC VỤ BIÊN DỊCH KOTLIN
     tasks.withType<KotlinCompile>().configureEach {
         compilerOptions {
             jvmTarget.set(JvmTarget.JVM_1_8)
-            // Bỏ qua kiểm tra phiên bản metadata để đọc được class từ CloudStream
             freeCompilerArgs.add("-Xskip-metadata-version-check")
         }
     }

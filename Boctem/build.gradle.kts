@@ -20,11 +20,13 @@ android {
 
 dependencies {
     val cloudstream by configurations
-    // Sử dụng bản master-SNAPSHOT cho plugin system
-    cloudstream("com.github.recloudstream:cloudstream:master-SNAPSHOT")
     
-    // Ép kiểu implementation để trình biên dịch thấy class Requests và OkHttp
-    implementation("com.github.recloudstream:cloudstream:master-SNAPSHOT")
+    // Sử dụng Commit Hash cụ thể thay vì SNAPSHOT để tránh lỗi "Cannot access class Requests"
+    val csVersion = "4960766663" 
+    
+    cloudstream("com.github.recloudstream:cloudstream:$csVersion")
+    implementation("com.github.recloudstream:cloudstream:$csVersion")
+    
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.jsoup:jsoup:1.17.2")
 }

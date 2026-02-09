@@ -1,53 +1,59 @@
+import com.android.build.api.dsl.LibraryExtension
 import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
-import org.jetbrains.kotlin.gradle.dsl.JvmTarget
-import com.android.build.gradle.BaseExtension
 
-buildscript {
+plugins {
+    // Không áp dụng plugin Android ở root
+    id("org.jetbrains.kotlin.jvm") version "1.9.22" apply false
+}
+
+allprojects {
     repositories {
         google()
         mavenCentral()
-        maven { url = uri("https://jitpack.io") }
-    }
-    dependencies {
-        classpath("com.android.tools.build:gradle:8.2.2")
-        classpath("com.github.recloudstream:gradle:master-SNAPSHOT")
-        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.1.0")
+        maven("https://jitpack.io")
     }
 }
 
-// Áp dụng plugin cho Root để có thể chạy lệnh makePluginsJson
-apply(plugin = "com.lagradost.cloudstream3.gradle")
-
 subprojects {
-    apply(plugin = "com.android.library")
-    apply(plugin = "kotlin-android")
-    apply(plugin = "com.lagradost.cloudstream3.gradle")
+    // Chỉ áp dụng cho module Android thực sự (có src/main)
+    if (file("${project.projectDir}/src/main").exists()) {
 
-    // Cấu hình Android cho tất cả module con (như boctem)
-    extensions.configure<BaseExtension> {
-        compileSdkVersion(34)
-        defaultConfig {
-            minSdk = 21
+        apply(plugin = "com.android.library")
+        apply(plugin = "org.jetbrains.kotlin.android")
+        apply(plugin = "com.lagradost.cloudstream3.gradle")
+
+        extensions.configure<LibraryExtension> {
+            compileSdk = 34
+
+            defaultConfig {
+                minSdk = 21
+            }
+
+            compileOptions {
+                sourceCompatibility = JavaVersion.VERSION_1_8
+                targetCompatibility = JavaVersion.VERSION_1_8
+            }
         }
-        compileOptions {
-            sourceCompatibility = JavaVersion.VERSION_1_8
-            targetCompatibility = JavaVersion.VERSION_1_8
+
+        tasks.withType<KotlinCompile>().configureEach {
+            compilerOptions {
+                jvmTarget.set(
+                    org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_1_8
+                )
+                freeCompilerArgs.add("-Xskip-metadata-version-check")
+            }
+        }
+
+        afterEvaluate {
+            extensions.findByName("cloudstream")?.let {
+                val ext =
+                    it as com.lagradost.cloudstream3.gradle.CloudstreamExtension
+                ext.setRepo(
+                    System.getenv("GITHUB_REPOSITORY")
+                        ?: "https://github.com/dah215/Aho-Repo"
+                )
+                ext.authors = listOf("CloudStream Builder")
+            }
         }
     }
-
-    // Cấu hình CloudStream cho từng plugin
-    afterEvaluate {
-        extensions.findByType<com.lagradost.cloudstream3.gradle.CloudstreamExtension>()?.apply {
-            setRepo(System.getenv("GITHUB_REPOSITORY") ?: "https://github.com/dah215/Aho-Repo")
-            authors = listOf("CloudStream Builder")
-        }
-    }
-
-    // Ép JVM 1.8 và bỏ qua kiểm tra Metadata (Sửa lỗi Incompatible Kotlin)
-    tasks.withType<KotlinCompile>().configureEach {
-        compilerOptions {
-            jvmTarget.set(JvmTarget.JVM_1_8)
-            freeCompilerArgs.add("-Xskip-metadata-version-check")
-        }
-    }
-} // Đóng ngoặc subprojects ở ĐÂY
+}

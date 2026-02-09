@@ -1,9 +1,8 @@
-name: Build & Deploy Plugins
+name: Build & Deploy Plugins (robust)
 
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
   workflow_dispatch:
 
 permissions:
@@ -100,21 +99,30 @@ jobs:
           exit 0
 
       - name: Prepare Builds branch
+        if: steps.check_download.outputs.NO_ARTIFACTS == 'false'
         run: |
           git fetch origin Builds || true
           git checkout Builds || git checkout -b Builds
           git pull origin Builds || true
 
-      - name: Copy artifacts into repo root
+      - name: Copy artifacts into repo root (guarded)
+        if: steps.check_download.outputs.NO_ARTIFACTS == 'false'
         run: |
+          # remove old artifacts if present
           rm -f *.cs3 plugins.json || true
-          mkdir -p tmp_deploy
-          cp -r ${{ env.ARTIFACT_DIR }}/* tmp_deploy/ || true
-          cp -r tmp_deploy/* .
+
+          # Only attempt to copy if dir exists and not empty
+          if [ -d "${{ env.ARTIFACT_DIR }}" ] && [ -n "$(ls -A ${{ env.ARTIFACT_DIR }} 2>/dev/null)" ]; then
+            cp -r ${{ env.ARTIFACT_DIR }}/* .
+          else
+            echo "Artifact dir empty or missing; nothing to copy."
+          fi
+
           echo "=== after copy: list .cs3 and plugins.json ==="
           find . -maxdepth 3 -type f \( -name "*.cs3" -o -name "plugins.json" \) -print -exec ls -l {} \; || true
 
       - name: Ensure artifacts are staged (force if ignored)
+        if: steps.check_download.outputs.NO_ARTIFACTS == 'false'
         run: |
           # Force-add .cs3 if ignored by .gitignore
           IGNORED_CS3=$(git ls-files --others --exclude-standard | grep '\.cs3$' || true)
@@ -126,14 +134,17 @@ jobs:
           git status --porcelain
 
       - name: Commit & push to Builds
+        if: steps.check_download.outputs.NO_ARTIFACTS == 'false'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
           if git diff --cached --quiet; then
             echo "No changes to commit"
             exit 0
           fi
+
           git commit -m "Auto update plugin builds: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
           git push origin Builds --force-with-lease

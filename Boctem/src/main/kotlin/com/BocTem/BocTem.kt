@@ -26,8 +26,8 @@ class BocTem : MainAPI() {
         val url = "$mainUrl/${request.data}$page"
         val document = app.get(url).document
         
-        // SỬA LỖI ITERATOR: Dùng mapNotNull thay vì for loop
-        val items = document.select("article.thumb.grid-item").mapNotNull { article ->
+        // SỬA: Thêm ": Element" để định rõ kiểu dữ liệu
+        val items = document.select("article.thumb.grid-item").mapNotNull { article: Element ->
             articleToSearchResponse(article)
         }
         
@@ -72,8 +72,8 @@ class BocTem : MainAPI() {
         val url = "$mainUrl/?s=${URLEncoder.encode(query, "UTF-8")}"
         val document = app.get(url).document
         
-        // SỬA LỖI ITERATOR: Dùng mapNotNull
-        return document.select("article.thumb.grid-item").mapNotNull { article ->
+        // SỬA: Thêm ": Element"
+        return document.select("article.thumb.grid-item").mapNotNull { article: Element ->
             articleToSearchResponse(article)
         }
     }
@@ -97,11 +97,11 @@ class BocTem : MainAPI() {
         val descElement = document.selectFirst(".entry-content")
         val description = descElement?.text() ?: document.selectFirst("meta[property=og:description]")?.attr("content")
 
-        // SỬA LỖI ITERATOR: Dùng forEach hoặc map
         val episodeLinks = ArrayList<Element>()
         val seenUrls = HashSet<String>()
         
-        document.select("a[href*=/xem-phim/]").forEach { link ->
+        // SỬA: Thêm ": Element"
+        document.select("a[href*=/xem-phim/]").forEach { link: Element ->
             val linkHref = link.attr("href")
             if (linkHref.contains("-tap-") && !seenUrls.contains(linkHref)) {
                 episodeLinks.add(link)
@@ -109,7 +109,8 @@ class BocTem : MainAPI() {
             }
         }
 
-        val episodes = episodeLinks.map { link ->
+        // SỬA: Thêm ": Element"
+        val episodes = episodeLinks.map { link: Element ->
             val epUrl = link.attr("href")
             val epText = link.text().trim()
             
@@ -166,14 +167,14 @@ class BocTem : MainAPI() {
         val scripts = document.select("script")
         var nonce: String? = null
         
-        // SỬA LỖI ITERATOR: Dùng forEach loop
-        scripts.forEach { script ->
+        // SỬA: Thêm ": Element"
+        scripts.forEach { script: Element ->
             val scriptContent = script.data()
             if (scriptContent.contains("ajax_player") || scriptContent.contains("nonce")) {
                 val nonceMatch = Regex("""nonce["']?\s*:\s*["']([^"']+)["']""").find(scriptContent)
                 if (nonceMatch != null) {
                     nonce = nonceMatch.groupValues[1]
-                    return@forEach // break loop
+                    return@forEach
                 }
             }
         }

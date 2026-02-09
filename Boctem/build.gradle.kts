@@ -5,7 +5,7 @@ plugins {
 }
 
 android {
-    namespace = "com.boctem" // Viết thường toàn bộ cho chuẩn
+    namespace = "com.boctem"
     compileSdk = 34
 
     defaultConfig {
@@ -17,6 +17,6 @@ dependencies {
     val cloudstream by configurations
     cloudstream("com.github.recloudstream:cloudstream:pre-release")
     
-    // XÓA DÒNG JSOUP ĐI VÌ CLOUDSTREAM ĐÃ CÓ SẴN
-    // implementation("org.jsoup:jsoup:1.17.2") 
+    // THÊM LẠI DÒNG NÀY ĐỂ FIX LỖI BUILD
+    implementation("org.jsoup:jsoup:1.17.2")
 }

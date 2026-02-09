@@ -22,9 +22,19 @@ jobs:
 
       - run: chmod +x ./gradlew
 
+      - name: Detect makePluginsJson task
+        id: detect
+        run: |
+          TASK=$(./gradlew tasks --all | grep makePluginsJson | awk '{print $1}' | head -n 1)
+          if [ -z "$TASK" ]; then
+            echo "No makePluginsJson task found"
+            exit 1
+          fi
+          echo "task=$TASK" >> $GITHUB_OUTPUT
+
       - name: Build plugins
         run: |
-          ./gradlew build makePluginsJson --no-daemon --stacktrace
+          ./gradlew build ${{ steps.detect.outputs.task }} --no-daemon --stacktrace
 
       - name: Upload plugin artifacts
         uses: actions/upload-artifact@v4

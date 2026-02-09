@@ -1,8 +1,17 @@
 rootProject.name = "CloudstreamBocTem"
 
-// Thêm dependencyResolutionManagement theo hướng dẫn JitPack
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+        maven { url = uri("https://jitpack.io") }
+    }
+}
+
 dependencyResolutionManagement {
-    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    // Chuyển sang PREFER_SETTINGS để đảm bảo JitPack được ưu tiên
+    repositoriesMode.set(RepositoriesMode.PREFER_SETTINGS)
     repositories {
         google()
         mavenCentral()
@@ -10,13 +19,4 @@ dependencyResolutionManagement {
     }
 }
 
-// Include tất cả modules
-File(rootDir, ".").eachDir { dir ->
-    if (File(dir, "build.gradle.kts").exists()) {
-        include(dir.name)
-    }
-}
-
-fun File.eachDir(block: (File) -> Unit) {
-    listFiles()?.filter { it.isDirectory }?.forEach { block(it) }
-}
+include(":Boctem")

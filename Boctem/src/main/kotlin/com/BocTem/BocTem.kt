@@ -2,7 +2,7 @@ package com.boctem
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import org.jsoup.nodes.Document // Thêm import này
+import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
 
@@ -24,15 +24,11 @@ class BocTem : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = "$mainUrl/${request.data}$page"
-        // app.get() trả về NiceResponse, .document trả về Jsoup Document
-        val document = app.get(url).document 
-        val items = ArrayList<SearchResponse>()
+        val document = app.get(url).document
         
-        for (article in document.select("article.thumb.grid-item")) {
-            val result = articleToSearchResponse(article)
-            if (result != null) {
-                items.add(result)
-            }
+        // SỬA LỖI ITERATOR: Dùng mapNotNull thay vì for loop
+        val items = document.select("article.thumb.grid-item").mapNotNull { article ->
+            articleToSearchResponse(article)
         }
         
         return newHomePageResponse(
@@ -75,16 +71,11 @@ class BocTem : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/?s=${URLEncoder.encode(query, "UTF-8")}"
         val document = app.get(url).document
-        val results = ArrayList<SearchResponse>()
         
-        for (article in document.select("article.thumb.grid-item")) {
-            val result = articleToSearchResponse(article)
-            if (result != null) {
-                results.add(result)
-            }
+        // SỬA LỖI ITERATOR: Dùng mapNotNull
+        return document.select("article.thumb.grid-item").mapNotNull { article ->
+            articleToSearchResponse(article)
         }
-        
-        return results
     }
 
     override suspend fun load(url: String): LoadResponse? {
@@ -106,11 +97,11 @@ class BocTem : MainAPI() {
         val descElement = document.selectFirst(".entry-content")
         val description = descElement?.text() ?: document.selectFirst("meta[property=og:description]")?.attr("content")
 
-        val allLinks = document.select("a[href*=/xem-phim/]")
+        // SỬA LỖI ITERATOR: Dùng forEach hoặc map
         val episodeLinks = ArrayList<Element>()
         val seenUrls = HashSet<String>()
         
-        for (link in allLinks) {
+        document.select("a[href*=/xem-phim/]").forEach { link ->
             val linkHref = link.attr("href")
             if (linkHref.contains("-tap-") && !seenUrls.contains(linkHref)) {
                 episodeLinks.add(link)
@@ -118,21 +109,19 @@ class BocTem : MainAPI() {
             }
         }
 
-        val episodes = ArrayList<Episode>()
-        for (link in episodeLinks) {
+        val episodes = episodeLinks.map { link ->
             val epUrl = link.attr("href")
             val epText = link.text().trim()
             
             val tapMatch = Regex("""tap-(\d+)""").find(epUrl)
             val epNum = tapMatch?.groupValues?.get(1)?.toIntOrNull()
 
-            val episode = newEpisode(epUrl) {
+            newEpisode(epUrl) {
                 this.name = epText
                 this.episode = epNum
                 this.posterUrl = poster
             }
-            episodes.add(episode)
-        }
+        }.toMutableList()
         
         episodes.sortBy { it.episode ?: 0 }
 
@@ -177,13 +166,14 @@ class BocTem : MainAPI() {
         val scripts = document.select("script")
         var nonce: String? = null
         
-        for (script in scripts) {
+        // SỬA LỖI ITERATOR: Dùng forEach loop
+        scripts.forEach { script ->
             val scriptContent = script.data()
             if (scriptContent.contains("ajax_player") || scriptContent.contains("nonce")) {
                 val nonceMatch = Regex("""nonce["']?\s*:\s*["']([^"']+)["']""").find(scriptContent)
                 if (nonceMatch != null) {
                     nonce = nonceMatch.groupValues[1]
-                    break
+                    return@forEach // break loop
                 }
             }
         }

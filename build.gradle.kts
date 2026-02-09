@@ -16,10 +16,7 @@ buildscript {
 }
 
 subprojects {
-    apply(plugin = "com.android.library")
-    apply(plugin = "kotlin-android")
-    apply(plugin = "com.lagradost.cloudstream3.gradle")
-
+    }
     // ÉP CẤU HÌNH ANDROID CHO TẤT CẢ MODULE CON
     extensions.configure<BaseExtension> {
         compileSdkVersion(34)

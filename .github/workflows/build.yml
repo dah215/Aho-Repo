@@ -38,10 +38,19 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-gradle-
 
-      - name: Build Plugins
+      - name: Build Plugins (safe)
         run: |
           chmod +x gradlew
-          ./gradlew make makePluginsJson
+
+          # 1) Build project (prints stacktrace on failure)
+          ./gradlew build --no-daemon --stacktrace
+
+          # 2) Run makePluginsJson if task exists (plugin may not be present)
+          if ./gradlew tasks --all | grep -q 'makePluginsJson'; then
+            ./gradlew makePluginsJson --no-daemon --stacktrace
+          else
+            echo "Task makePluginsJson not found; skipping."
+          fi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -49,7 +58,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: plugins
-          # Tìm file ở mọi ngóc ngách
           path: |
             **/*.cs3
             **/plugins.json
@@ -67,37 +75,24 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: plugins
-          path: temp_artifacts # Tải vào thư mục tạm trước
+          path: temp_artifacts
 
       - name: Setup Builds Branch
         run: |
           git config user.name "GitHub Actions"
           git config user.email "actions@github.com"
-          # Chuyển sang nhánh Builds (hoặc tạo mới dạng orphan - nhánh trống)
           git checkout Builds 2>/dev/null || git checkout --orphan Builds
-          # Xóa sạch mọi thứ cũ trên nhánh này để đảm bảo file mới nhất nằm ở root
           git rm -rf . 2>/dev/null || true
 
       - name: Move Files to Root
         run: |
-          echo "Moving files to root directory..."
-          
-          # Tìm file .cs3 trong thư mục tạm và di chuyển ra ngoài cùng (.)
-          find temp_artifacts -name "*.cs3" -exec mv {} . \;
-          
-          # Tìm file plugins.json và di chuyển ra ngoài cùng (.)
-          find temp_artifacts -name "plugins.json" -exec mv {} . \;
-          
-          # Xóa thư mục tạm
+          find temp_artifacts -name "*.cs3" -exec mv {} . \; || true
+          find temp_artifacts -name "plugins.json" -exec mv {} . \; || true
           rm -rf temp_artifacts
-          
-          # Kiểm tra xem file đã ra ngoài chưa
           ls -la
 
       - name: Create repository.json
         run: |
-          # Tạo repository.json ngay tại root
-          # Lưu ý: URL đã được sửa để trỏ thẳng vào nhánh Builds (bỏ /latest/)
           cat > repository.json << EOF
           {
             "name": "BocTem Repository",

@@ -16,16 +16,18 @@ android {
         sourceCompatibility = JavaVersion.VERSION_1_8
         targetCompatibility = JavaVersion.VERSION_1_8
     }
+
+    // THÊM ĐOẠN NÀY VÀO ĐÂY
+    kotlinOptions {
+        jvmTarget = "1.8"
+    }
 }
 
 dependencies {
     val cloudstream by configurations
     val csVersion = "master-SNAPSHOT"
 
-    // Dòng này để đóng gói plugin
     cloudstream("com.github.recloudstream:cloudstream:$csVersion")
-    
-    // Dòng này để trình biên dịch Kotlin thấy class Requests, app, v.v.
     compileOnly("com.github.recloudstream:cloudstream:$csVersion")
     
     implementation("com.squareup.okhttp3:okhttp:4.12.0")

@@ -1,4 +1,4 @@
-name: Build & Deploy Plugins (robust + debug)
+name: Build & Deploy Plugins (robust debug)
 
 on:
   push:
@@ -9,16 +9,18 @@ permissions:
   contents: write
 
 env:
+  JAVA_VERSION: 17
   ARTIFACT_NAME: plugins
   ARTIFACT_DIR: temp_artifacts
-  JAVA_VERSION: 17
 
 jobs:
   build:
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout
+      - name: Checkout source
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup JDK
         uses: actions/setup-java@v4
@@ -29,17 +31,17 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x ./gradlew
 
-      - name: Build project (no fail on missing plugin task)
+      - name: Run Gradle build (prints outputs)
         run: |
-          ./gradlew build --no-daemon --stacktrace
+          ./gradlew build --no-daemon --stacktrace || true
 
       - name: List produced artifact files (debug)
         run: |
-          echo "=== workspace .cs3 & plugins.json ==="
+          echo "===== workspace files matching .cs3 / plugins.json ====="
           find . -type f \( -name "*.cs3" -o -name "plugins.json" \) -print -exec ls -l {} \; || true
 
       - name: Upload plugin artifacts (only if present)
-        if: steps.build.outcome == 'success' && (hashFiles('**/*.cs3') != '' || hashFiles('**/plugins.json') != '')
+        if: ${{ !contains(steps['build'].outcome, 'failure') && (hashFiles('**/*.cs3') != '' || hashFiles('**/plugins.json') != '') }}
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ARTIFACT_NAME }}
@@ -52,12 +54,12 @@ jobs:
     needs: build
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout (full)
+      - name: Checkout repo (full)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Download artifact (if any)
+      - name: Download plugin artifacts (if any)
         id: download
         uses: actions/download-artifact@v4
         with:
@@ -65,9 +67,9 @@ jobs:
           path: ${{ env.ARTIFACT_DIR }}
         continue-on-error: true
 
-      - name: Show downloaded artifacts (debug)
+      - name: Debug: list downloaded artifacts
         run: |
-          echo "=== temp_artifacts contents ==="
+          echo "===== temp_artifacts listing ====="
           ls -la ${{ env.ARTIFACT_DIR }} || true
           find ${{ env.ARTIFACT_DIR }} -type f -print -exec ls -l {} \; || true
 
@@ -80,58 +82,62 @@ jobs:
             echo "NO_ARTIFACTS=false" >> $GITHUB_OUTPUT
           fi
 
+      - name: Exit early if no artifacts
+        if: steps.check.outputs.NO_ARTIFACTS == 'true'
+        run: |
+          echo "No artifacts to deploy. Skipping push."
+          exit 0
+
       - name: Prepare Builds branch
-        if: steps.check.outputs.NO_ARTIFACTS == 'false'
         run: |
           git fetch origin Builds || true
           git checkout Builds || git checkout -b Builds
           git pull origin Builds || true
 
       - name: Copy artifacts into repo root
-        if: steps.check.outputs.NO_ARTIFACTS == 'false'
         run: |
-          # copy preserving subdirs; verify files after copy
           rm -f *.cs3 plugins.json || true
-          cp -r ${{ env.ARTIFACT_DIR }}/* . || true
-          echo "=== After copy: listing .cs3 and plugins.json in repo root ==="
+          mkdir -p tmp_deploy
+          cp -r ${{ env.ARTIFACT_DIR }}/* tmp_deploy/ || true
+          echo "After copy, listing tmp_deploy:"
+          ls -la tmp_deploy || true
+          find tmp_deploy -type f -print -exec ls -l {} \; || true
+          # Move to repo root
+          cp -r tmp_deploy/* . || true
+          echo "After move to repo root, listing .cs3 and plugins.json"
           find . -maxdepth 3 -type f \( -name "*.cs3" -o -name "plugins.json" \) -print -exec ls -l {} \; || true
 
-      - name: Show git status & ensure files are tracked
-        if: steps.check.outputs.NO_ARTIFACTS == 'false'
+      - name: Ensure files are added (force if ignored)
         run: |
-          echo "=== git status before add ==="
-          git status --porcelain
-          echo "=== files that match cs3 pattern in repo ==="
-          git ls-files --others --exclude-standard | grep '\.cs3$' || true
-          git ls-files | grep '\.cs3$' || true
-
-          # force-add .cs3 if they are ignored
-          IGNORED=$(git status --porcelain --ignored | grep '\.cs3' || true)
+          # Show gitignore-ignored .cs3
+          git status --porcelain --ignored
+          IGNORED=$(git status --porcelain --ignored | awk '/\\.cs3/ {print $2}' | tr '\n' ' ')
           if [ -n "$IGNORED" ]; then
-            echo "Some .cs3 are ignored by .gitignore; force adding them"
-            git add -f $(git ls-files --others --exclude-standard | grep '\.cs3' || true) || true
+            echo "Force-adding ignored .cs3 files: $IGNORED"
+            git add -f $IGNORED || true
           fi
-
-          # normal add for all plugin files
+          # Add any other artifacts
           git add -A
-          echo "=== git status after add (staged) ==="
+          echo "Staged files:"
           git status --porcelain
 
-      - name: Commit & push changes to Builds
-        if: steps.check.outputs.NO_ARTIFACTS == 'false'
+      - name: Commit & show commit content
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
           if git diff --cached --quiet; then
             echo "No changes to commit"
             exit 0
           fi
-
           git commit -m "Auto update plugin builds: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
-          # show what will be pushed
-          echo "=== Commit contents ==="
+          echo "Commit created:"
           git --no-pager show --name-only --pretty=format:"%h %s" HEAD
-          git push origin Builds
+
+      - name: Push to Builds branch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # push; use force-with-lease to be safer
+          git push origin Builds --force-with-lease

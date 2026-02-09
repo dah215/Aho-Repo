@@ -17,18 +17,17 @@ android {
         targetCompatibility = JavaVersion.VERSION_1_8
     }
     
-    // ĐÃ XÓA BLOCK kotlinOptions GÂY LỖI
-    // Việc cấu hình jvmTarget đã được xử lý ở file build.gradle.kts gốc
+    // Đã xóa kotlinOptions để tránh lỗi version
 }
 
 dependencies {
     val cloudstream by configurations
     
-    // Dùng cloudstream cho plugin system
-    cloudstream("com.github.recloudstream:cloudstream:pre-release")
+    // SỬA: Đổi "pre-release" thành "master-SNAPSHOT"
+    cloudstream("com.github.recloudstream:cloudstream:master-SNAPSHOT")
     
-    // Dùng compileOnly để fix lỗi "Cannot access class Requests" khi Build
-    compileOnly("com.github.recloudstream:cloudstream:pre-release")
+    // SỬA: Đổi "pre-release" thành "master-SNAPSHOT"
+    compileOnly("com.github.recloudstream:cloudstream:master-SNAPSHOT")
     
     // Thêm OkHttp để hỗ trợ Requests
     implementation("com.squareup.okhttp3:okhttp:4.12.0")

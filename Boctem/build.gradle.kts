@@ -17,9 +17,8 @@ android {
         targetCompatibility = JavaVersion.VERSION_1_8
     }
     
-    kotlinOptions {
-        jvmTarget = "1.8"
-    }
+    // ĐÃ XÓA BLOCK kotlinOptions GÂY LỖI
+    // Việc cấu hình jvmTarget đã được xử lý ở file build.gradle.kts gốc
 }
 
 dependencies {

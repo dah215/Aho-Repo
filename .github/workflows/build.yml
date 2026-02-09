@@ -2,106 +2,69 @@ name: Build and Deploy CloudStream Plugins
 
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
   workflow_dispatch:
 
 permissions:
   contents: write
 
-env:
-  JAVA_VERSION: 17
-  ARTIFACT_NAME: plugins
-  ARTIFACT_DIR: temp_artifacts
-
 jobs:
   build:
-    name: Build Plugins
     runs-on: ubuntu-24.04
 
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup JDK
-        uses: actions/setup-java@v4
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: ${{ env.JAVA_VERSION }}
+          java-version: 17
 
-      - name: Make gradlew executable
-        run: chmod +x ./gradlew
+      - run: chmod +x ./gradlew
 
-      - name: Clean project
-        run: ./gradlew clean --no-daemon
-
-      - name: Build plugin binaries
+      - name: Build plugins
         run: |
-          ./gradlew build \
-                     makePluginsJson \
-                     --no-daemon \
-                     --stacktrace
-
-      - name: Verify build outputs
-        run: |
-          echo "Listing generated files:"
-          find . -type f \( -name "*.cs3" -o -name "plugins.json" \) || true
+          ./gradlew build makePluginsJson --no-daemon --stacktrace
 
       - name: Upload plugin artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.ARTIFACT_NAME }}
+          name: plugins
           path: |
             **/*.cs3
             **/plugins.json
           if-no-files-found: error
 
   deploy-builds-branch:
-    name: Deploy to Builds Branch
     needs: build
     runs-on: ubuntu-24.04
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
-          name: ${{ env.ARTIFACT_NAME }}
-          path: ${{ env.ARTIFACT_DIR }}
+          name: plugins
+          path: temp_artifacts
 
-      - name: Verify downloaded artifacts
-        run: |
-          echo "Downloaded artifacts:"
-          ls -R ${{ env.ARTIFACT_DIR }}
-
-      - name: Switch to Builds branch
+      - name: Push to Builds branch
         run: |
           git fetch origin Builds || true
           git checkout Builds || git checkout -b Builds
           git pull origin Builds || true
 
-      - name: Replace old artifacts
-        run: |
           rm -f *.cs3 plugins.json
-          cp -r ${{ env.ARTIFACT_DIR }}/* .
+          cp -r temp_artifacts/* .
 
-      - name: Configure git identity
-        run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Commit changes
-        run: |
           git add .
           if git diff --cached --quiet; then
-            echo "No changes detected"
             exit 0
           fi
-          git commit -m "Auto update plugin builds"
 
-      - name: Push to Builds branch
-        run: git push origin Builds
+          git commit -m "Update plugin builds"
+          git push origin Builds

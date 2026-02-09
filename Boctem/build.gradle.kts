@@ -28,7 +28,7 @@ android {
 dependencies {
     // ⚠️ CRITICAL: Dùng cloudstream configuration
     val cloudstream by configurations
-    cloudstream("com.github.recloudstream:cloudstream:pre-release")
+    cloudstream("com.github.recloudstream:cloudstream:abc123def")
     // Jsoup vẫn dùng implementation
     implementation("org.jsoup:jsoup:1.17.2")
 }

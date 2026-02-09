@@ -18,10 +18,12 @@ jobs:
           distribution: temurin
           java-version: 17
 
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
       - name: Build
         run: ./gradlew build
 
-      # CHỈ upload nếu có output thật
       - name: Upload plugins artifact
         if: |
           hashFiles('**/*.cs3') != '' || hashFiles('plugins.json') != ''
@@ -42,7 +44,6 @@ jobs:
           fetch-depth: 0
 
       - name: Download artifact
-        id: download
         uses: actions/download-artifact@v4
         with:
           name: plugins
@@ -58,8 +59,6 @@ jobs:
             echo "NO_ARTIFACTS=false" >> $GITHUB_OUTPUT
           fi
 
-      # ====== TẤT CẢ CÁC STEP DƯỚI ĐÂY CHỈ CHẠY KHI CÓ ARTIFACT ======
-
       - name: Checkout Builds branch
         if: steps.check.outputs.NO_ARTIFACTS == 'false'
         run: |
@@ -74,7 +73,7 @@ jobs:
           cp -r temp_artifacts/* .
           ls -la
 
-      - name: Git commit & push
+      - name: Commit & push
         if: steps.check.outputs.NO_ARTIFACTS == 'false'
         run: |
           git config user.name "github-actions[bot]"

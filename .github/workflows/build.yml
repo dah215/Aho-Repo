@@ -1,86 +1,137 @@
-name: Build & Deploy Plugins
+name: Build & Deploy Plugins (robust + debug)
 
 on:
   push:
     branches: [ main ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
+env:
+  ARTIFACT_NAME: plugins
+  ARTIFACT_DIR: temp_artifacts
+  JAVA_VERSION: 17
+
 jobs:
   build:
     runs-on: ubuntu-24.04
-
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Set up JDK
+      - name: Setup JDK
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 17
+          java-version: ${{ env.JAVA_VERSION }}
 
-      - name: Grant execute permission for gradlew
-        run: chmod +x gradlew
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
 
-      - name: Build
-        run: ./gradlew build
+      - name: Build project (no fail on missing plugin task)
+        run: |
+          ./gradlew build --no-daemon --stacktrace
 
-      - name: Upload plugins artifact
-        if: |
-          hashFiles('**/*.cs3') != '' || hashFiles('plugins.json') != ''
+      - name: List produced artifact files (debug)
+        run: |
+          echo "=== workspace .cs3 & plugins.json ==="
+          find . -type f \( -name "*.cs3" -o -name "plugins.json" \) -print -exec ls -l {} \; || true
+
+      - name: Upload plugin artifacts (only if present)
+        if: steps.build.outcome == 'success' && (hashFiles('**/*.cs3') != '' || hashFiles('**/plugins.json') != '')
         uses: actions/upload-artifact@v4
         with:
-          name: plugins
+          name: ${{ env.ARTIFACT_NAME }}
           path: |
             **/*.cs3
-            plugins.json
+            **/plugins.json
+          if-no-files-found: error
 
   deploy:
-    runs-on: ubuntu-24.04
     needs: build
-
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout (full)
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Download artifact
+      - name: Download artifact (if any)
+        id: download
         uses: actions/download-artifact@v4
         with:
-          name: plugins
-          path: temp_artifacts
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ARTIFACT_DIR }}
         continue-on-error: true
 
-      - name: Check artifacts
+      - name: Show downloaded artifacts (debug)
+        run: |
+          echo "=== temp_artifacts contents ==="
+          ls -la ${{ env.ARTIFACT_DIR }} || true
+          find ${{ env.ARTIFACT_DIR }} -type f -print -exec ls -l {} \; || true
+
+      - name: Check artifacts presence
         id: check
         run: |
-          if [ ! -d "temp_artifacts" ] || [ -z "$(ls -A temp_artifacts 2>/dev/null)" ]; then
+          if [ ! -d "${{ env.ARTIFACT_DIR }}" ] || [ -z "$(ls -A ${{ env.ARTIFACT_DIR }} 2>/dev/null)" ]; then
             echo "NO_ARTIFACTS=true" >> $GITHUB_OUTPUT
           else
             echo "NO_ARTIFACTS=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Checkout Builds branch
+      - name: Prepare Builds branch
         if: steps.check.outputs.NO_ARTIFACTS == 'false'
         run: |
           git fetch origin Builds || true
           git checkout Builds || git checkout -b Builds
           git pull origin Builds || true
 
-      - name: Replace artifacts
+      - name: Copy artifacts into repo root
         if: steps.check.outputs.NO_ARTIFACTS == 'false'
         run: |
+          # copy preserving subdirs; verify files after copy
           rm -f *.cs3 plugins.json || true
-          cp -r temp_artifacts/* .
-          ls -la
+          cp -r ${{ env.ARTIFACT_DIR }}/* . || true
+          echo "=== After copy: listing .cs3 and plugins.json in repo root ==="
+          find . -maxdepth 3 -type f \( -name "*.cs3" -o -name "plugins.json" \) -print -exec ls -l {} \; || true
 
-      - name: Commit & push
+      - name: Show git status & ensure files are tracked
         if: steps.check.outputs.NO_ARTIFACTS == 'false'
+        run: |
+          echo "=== git status before add ==="
+          git status --porcelain
+          echo "=== files that match cs3 pattern in repo ==="
+          git ls-files --others --exclude-standard | grep '\.cs3$' || true
+          git ls-files | grep '\.cs3$' || true
+
+          # force-add .cs3 if they are ignored
+          IGNORED=$(git status --porcelain --ignored | grep '\.cs3' || true)
+          if [ -n "$IGNORED" ]; then
+            echo "Some .cs3 are ignored by .gitignore; force adding them"
+            git add -f $(git ls-files --others --exclude-standard | grep '\.cs3' || true) || true
+          fi
+
+          # normal add for all plugin files
+          git add -A
+          echo "=== git status after add (staged) ==="
+          git status --porcelain
+
+      - name: Commit & push changes to Builds
+        if: steps.check.outputs.NO_ARTIFACTS == 'false'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A
+
           if git diff --cached --quiet; then
+            echo "No changes to commit"
             exit 0
           fi
-          git commit -m "Update plugin builds"
+
+          git commit -m "Auto update plugin builds: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          # show what will be pushed
+          echo "=== Commit contents ==="
+          git --no-pager show --name-only --pretty=format:"%h %s" HEAD
           git push origin Builds

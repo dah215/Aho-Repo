@@ -26,8 +26,10 @@ android {
 }
 
 dependencies {
-    // ✅ ĐÚNG CÚ PHÁP theo hình ảnh bạn gửi
-    implementation("com.github.recloudstream:cloudstream:master-SNAPSHOT")
+    // ⚠️ CRITICAL: Dùng cloudstream configuration
+    val cloudstream by configurations
+    cloudstream("com.github.recloudstream:cloudstream:master-SNAPSHOT")
     
+    // Jsoup vẫn dùng implementation
     implementation("org.jsoup:jsoup:1.17.2")
 }

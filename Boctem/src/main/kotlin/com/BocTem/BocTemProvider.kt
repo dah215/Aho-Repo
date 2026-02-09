@@ -7,7 +7,6 @@ import android.content.Context
 @CloudstreamPlugin
 class BocTemProvider : Plugin() {
     override fun load(context: Context) {
-        // Register main API
         registerMainAPI(BocTem())
     }
 }

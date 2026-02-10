@@ -20,7 +20,6 @@ android {
         jvmTarget = "17"
     }
     
-    // Cấu hình để build ra file .cs3
     buildTypes {
         release {
             isMinifyEnabled = false
@@ -31,10 +30,18 @@ android {
 dependencies {
     implementation(kotlin("stdlib"))
     
-    // Thư viện cần thiết cho Cloudstream
-    compileOnly("com.github.recloudstream:cloudstream:pre-release")
-    // Sửa version NiceHttp từ 0.4.1 thành 0.4.11 (version có sẵn trên JitPack)
+    // Cloudstream dependency - sử dụng commit hash hoặc tag cụ thể thay vì "pre-release"
+    // Option 1: Sử dụng master-SNAPSHOT (luôn lấy latest)
+    compileOnly("com.github.recloudstream:cloudstream:master-SNAPSHOT")
+    
+    // Option 2: Hoặc dùng commit hash cụ thể (ổn định hơn)
+    // compileOnly("com.github.recloudstream:cloudstream:COMMIT_HASH")
+    
+    // NiceHttp - Kiểm tra lại format
+    // JitPack format: com.github.User:Repo:Version
     implementation("com.github.Lagradost:NiceHttp:0.4.11")
+    
+    // JSoup
     implementation("org.jsoup:jsoup:1.17.2")
 }
 
@@ -57,7 +64,6 @@ tasks.register<Copy>("makeCS3") {
     into(layout.buildDirectory.dir("outputs/apk/release"))
 }
 
-// Tự động chạy makeCS3 sau khi build
 tasks.named("build") {
     finalizedBy("makeCS3")
 }

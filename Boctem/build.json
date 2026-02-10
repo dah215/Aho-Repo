@@ -1,0 +1,13 @@
+{
+  "name": "BocTem",
+  "pluginClassName": "com.boctem.BocTemProvider",
+  "version": 1,
+  "requiresResources": false,
+  "description": "Vietnamese anime streaming site",
+  "authors": ["BocTem"],
+  "repositoryUrl": "https://github.com/dah215/Aho-Repo",
+  "status": 3,
+  "tvTypes": ["Anime", "AnimeMovie"],
+  "language": "vi",
+  "iconUrl": "https://boctem.com/favicon.ico"
+}

@@ -17,3 +17,6 @@ dependencyResolutionManagement {
         maven("https://jitpack.io")
     }
 }
+
+// Include module Boctem
+include("Boctem")

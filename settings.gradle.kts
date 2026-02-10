@@ -8,7 +8,6 @@ pluginManagement {
 }
 
 dependencyResolutionManagement {
-    // Thay đổi chế độ này để hỗ trợ các repo khai báo trong buildscript
     repositoriesMode.set(RepositoriesMode.PREFER_SETTINGS)
     repositories {
         google()

@@ -3,7 +3,7 @@ pluginManagement {
         google()
         mavenCentral()
         gradlePluginPortal()
-        maven("https://jitpack.io") // Dòng này giúp tìm thấy plugin Cloudstream
+        maven("https://jitpack.io") // Quan trọng: Nguồn cho plugin
     }
 }
 
@@ -12,7 +12,7 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
-        maven("https://jitpack.io") // Dòng này giúp tìm thấy các thư viện như NiceHttp
+        maven("https://jitpack.io") // Quan trọng: Nguồn cho thư viện
     }
 }
 

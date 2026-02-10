@@ -1,28 +1,14 @@
-buildscript {
-    repositories {
-        google()
-        mavenCentral()
-        maven("https://jitpack.io")
-    }
-    dependencies {
-        // Sử dụng commit hash cụ thể để tránh lỗi Snapshot trên JitPack
-        classpath("com.github.recloudstream:gradle:cce1b8d84d")
-    }
-}
-
 plugins {
     id("com.android.library")
     id("org.jetbrains.kotlin.android")
+    // Sử dụng phiên bản master-SNAPSHOT nhưng lần này thông qua mapping ở settings
+    id("com.lagradost.cloudstream3.gradle") version "master-SNAPSHOT"
 }
-
-// Áp dụng plugin của Cloudstream
-apply(plugin = "com.lagradost.cloudstream3.gradle")
 
 android {
     namespace = "com.boctem"
-    // Sử dụng cả hai cách khai báo để đảm bảo Gradle không báo lỗi SDK
     compileSdk = 34
-    
+
     defaultConfig {
         minSdk = 21
     }
@@ -40,7 +26,7 @@ android {
 dependencies {
     implementation(kotlin("stdlib"))
     
-    // Các thư viện cần thiết để code không bị lỗi đỏ (Unresolved reference)
+    // Thư viện cần thiết cho Cloudstream
     compileOnly("com.github.recloudstream:cloudstream:pre-release")
     implementation("com.github.Lagradost:NiceHttp:0.4.1")
     implementation("org.jsoup:jsoup:1.17.2")

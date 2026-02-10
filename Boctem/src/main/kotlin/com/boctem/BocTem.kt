@@ -1,12 +1,11 @@
 package com.boctem
 
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.*
-import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
 
+@CloudstreamPlugin
 class BocTem : MainAPI() {
     override var mainUrl = "https://boctem.com"
     override var name = "BocTem"
@@ -25,8 +24,7 @@ class BocTem : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = "$mainUrl/${request.data}$page"
-        val res = app.get(url)
-        val document = res.document
+        val document = app.get(url).document
         
         val items = document.select("article.thumb.grid-item").mapNotNull { article ->
             articleToSearchResponse(article)
@@ -165,13 +163,13 @@ class BocTem : MainAPI() {
         val scripts = document.select("script")
         var nonce: String? = null
         
-        scripts.forEach { script ->
+        for (script in scripts) {
             val scriptContent = script.data()
             if (scriptContent.contains("ajax_player") || scriptContent.contains("nonce")) {
                 val nonceMatch = Regex("""nonce["']?\s*:\s*["']([^"']+)["']""").find(scriptContent)
                 if (nonceMatch != null) {
                     nonce = nonceMatch.groupValues[1]
-                    return@forEach
+                    break
                 }
             }
         }

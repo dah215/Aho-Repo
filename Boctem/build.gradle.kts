@@ -1,9 +1,20 @@
+// Sử dụng buildscript để nạp plugin từ JitPack một cách thủ công
+buildscript {
+    repositories {
+        maven("https://jitpack.io")
+    }
+    dependencies {
+        classpath("com.github.recloudstream:gradle:master-SNAPSHOT")
+    }
+}
+
 plugins {
     id("com.android.library")
     id("org.jetbrains.kotlin.android")
-    // Đã thêm version để Gradle tìm được trên JitPack
-    id("com.lagradost.cloudstream3.gradle") version "master-SNAPSHOT"
 }
+
+// Apply plugin Cloudstream theo cách thủ công để tránh lỗi "Plugin not found"
+apply(plugin = "com.lagradost.cloudstream3.gradle")
 
 android {
     namespace = "com.boctem"
@@ -25,8 +36,6 @@ android {
 
 dependencies {
     implementation(kotlin("stdlib"))
-
-    // Thư viện hỗ trợ Cloudstream
     compileOnly("com.github.recloudstream:cloudstream:pre-release")
     implementation("com.github.Lagradost:NiceHttp:0.4.1")
     implementation("org.jsoup:jsoup:1.17.2")

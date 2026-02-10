@@ -33,7 +33,8 @@ dependencies {
     
     // Thư viện cần thiết cho Cloudstream
     compileOnly("com.github.recloudstream:cloudstream:pre-release")
-    implementation("com.github.Lagradost:NiceHttp:0.4.1")
+    // Sửa version NiceHttp từ 0.4.1 thành 0.4.11 (version có sẵn trên JitPack)
+    implementation("com.github.Lagradost:NiceHttp:0.4.11")
     implementation("org.jsoup:jsoup:1.17.2")
 }
 

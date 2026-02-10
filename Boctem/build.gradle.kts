@@ -1,3 +1,6 @@
+// GIẢI PHÁP 3: Build.gradle.kts với OkHttp thay thế
+// Sử dụng file này nếu Giải pháp 1 và 2 đều thất bại
+
 plugins {
     id("com.android.library")
     id("org.jetbrains.kotlin.android")
@@ -30,19 +33,20 @@ android {
 dependencies {
     implementation(kotlin("stdlib"))
     
-    // Cloudstream dependency - sử dụng commit hash hoặc tag cụ thể thay vì "pre-release"
-    // Option 1: Sử dụng master-SNAPSHOT (luôn lấy latest)
-    compileOnly("com.github.recloudstream:cloudstream:master-SNAPSHOT")
+    // LOẠI BỎ cloudstream và NiceHttp
+    // Sẽ được load tại runtime bởi Cloudstream app
     
-    // Option 2: Hoặc dùng commit hash cụ thể (ổn định hơn)
-    // compileOnly("com.github.recloudstream:cloudstream:COMMIT_HASH")
+    // Dùng OkHttp thay vì NiceHttp
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
     
-    // NiceHttp - Kiểm tra lại format
-    // JitPack format: com.github.User:Repo:Version
-    implementation("com.github.Lagradost:NiceHttp:0.4.11")
-    
-    // JSoup
+    // JSoup cho HTML parsing
     implementation("org.jsoup:jsoup:1.17.2")
+    
+    // Coroutines
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+    
+    // JSON
+    implementation("com.google.code.gson:gson:2.10.1")
 }
 
 // Task tùy chỉnh để tạo file .cs3 từ AAR

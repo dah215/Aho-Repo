@@ -1,8 +1,8 @@
 plugins {
     id("com.android.library")
     id("org.jetbrains.kotlin.android")
-    // Gọi plugin Cloudstream (đã được định nghĩa ở file settings phía trên)
-    id("com.lagradost.cloudstream3.gradle")
+    // Đã thêm version để Gradle tìm được trên JitPack
+    id("com.lagradost.cloudstream3.gradle") version "master-SNAPSHOT"
 }
 
 android {
@@ -24,13 +24,10 @@ android {
 }
 
 dependencies {
-    // Kotlin Standard Library
     implementation(kotlin("stdlib"))
 
-    // Fix lỗi CloudstreamPlugin & NiceHttp
+    // Thư viện hỗ trợ Cloudstream
     compileOnly("com.github.recloudstream:cloudstream:pre-release")
     implementation("com.github.Lagradost:NiceHttp:0.4.1")
-    
-    // Thư viện hỗ trợ lấy dữ liệu web
     implementation("org.jsoup:jsoup:1.17.2")
 }

@@ -1,8 +1,6 @@
 plugins {
     id("com.android.library")
     id("org.jetbrains.kotlin.android")
-    // Sử dụng phiên bản master-SNAPSHOT nhưng lần này thông qua mapping ở settings
-    id("com.lagradost.cloudstream3.gradle") version "master-SNAPSHOT"
 }
 
 android {
@@ -21,6 +19,13 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+    
+    // Cấu hình để build ra file .cs3
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+        }
+    }
 }
 
 dependencies {
@@ -30,4 +35,28 @@ dependencies {
     compileOnly("com.github.recloudstream:cloudstream:pre-release")
     implementation("com.github.Lagradost:NiceHttp:0.4.1")
     implementation("org.jsoup:jsoup:1.17.2")
+}
+
+// Task tùy chỉnh để tạo file .cs3 từ AAR
+tasks.register<Copy>("makeCS3") {
+    dependsOn("assembleRelease")
+    
+    val buildJson = file("build.json")
+    val pluginName = if (buildJson.exists()) {
+        val json = groovy.json.JsonSlurper().parse(buildJson) as Map<*, *>
+        json["name"] as? String ?: "BocTem"
+    } else {
+        "BocTem"
+    }
+    
+    from(layout.buildDirectory.dir("outputs/aar")) {
+        include("*-release.aar")
+        rename { "${pluginName}.cs3" }
+    }
+    into(layout.buildDirectory.dir("outputs/apk/release"))
+}
+
+// Tự động chạy makeCS3 sau khi build
+tasks.named("build") {
+    finalizedBy("makeCS3")
 }

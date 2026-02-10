@@ -1,22 +1,20 @@
-rootProject.name = "CloudstreamBocTem"
-
 pluginManagement {
     repositories {
-        gradlePluginPortal()
         google()
         mavenCentral()
-        maven("https://jitpack.io")
+        gradlePluginPortal()
+        maven("https://jitpack.io") // Dòng này giúp tìm thấy plugin Cloudstream
     }
 }
 
 dependencyResolutionManagement {
-    repositoriesMode.set(RepositoriesMode.PREFER_SETTINGS)
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {
         google()
         mavenCentral()
-        maven("https://jitpack.io")
+        maven("https://jitpack.io") // Dòng này giúp tìm thấy các thư viện như NiceHttp
     }
 }
 
-// Include module Boctem
-include("Boctem")
+rootProject.name = "Aho-Repo"
+include(":Boctem")

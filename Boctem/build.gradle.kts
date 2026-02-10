@@ -1,31 +1,49 @@
 plugins {
     id("com.android.library")
-    id("org.jetbrains.kotlin.android")
+    kotlin("android")
+    // Adds the Cloudstream Gradle plugin
+    id("com.lagradost.cloudstream3.gradle")
 }
 
 android {
     namespace = "com.boctem"
-    compileSdk = 34
+    compileSdk = 34 // Updated to standard version
 
     defaultConfig {
         minSdk = 21
-        targetSdk = 34
+        // targetSdk is deprecated in library modules, but if needed, keep it here or remove it.
+        // Usually handled by the main app, but for extensions, we define compatibility.
+        lint.targetSdk = 34 
     }
 
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_1_8
-        targetCompatibility = JavaVersion.VERSION_1_8
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
     }
 
     kotlinOptions {
-        jvmTarget = "1.8"
-        freeCompilerArgs += "-Xskip-metadata-version-check"
+        jvmTarget = "17"
     }
 }
 
+// IMPORTANT: This block tells Gradle where to download the missing libraries
+repositories {
+    google()
+    mavenCentral()
+    maven("https://jitpack.io") 
+}
+
 dependencies {
-    val csVersion = "master-SNAPSHOT"
-    compileOnly("com.github.recloudstream:cloudstream:$csVersion")
-    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    // Kotlin Standard Library
+    implementation(kotlin("stdlib"))
+
+    // Fixes 'Unresolved reference: CloudstreamPlugin'
+    // Provides the core Cloudstream classes
+    compileOnly("com.github.recloudstream:cloudstream:pre-release")
+
+    // Fixes 'Cannot access class com.lagradost.nicehttp.Requests'
+    implementation("com.github.Lagradost:NiceHttp:0.4.1")
+
+    // Required for HTML parsing (Standard in almost all extensions)
     implementation("org.jsoup:jsoup:1.17.2")
 }

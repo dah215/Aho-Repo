@@ -30,68 +30,90 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x ./gradlew
 
-      - name: Run Gradle build (non-fatal)
-        run: ./gradlew build --no-daemon --stacktrace || true
+      - name: Run Gradle build
+        run: ./gradlew build --no-daemon --stacktrace
 
-      - name: List artifacts in workspace (debug)
-        run: |
-          echo "=== workspace artifacts ==="
-          find . -type f \( -name "*.cs3" -o -name "plugins.json" \) -print -exec ls -l {} \; || true
+      - name: Generate plugins.json and repository.json
+        run: ./gradlew makePluginsJson makeRepositoryJson --no-daemon --stacktrace || true
 
-      - name: Detect artifacts (set output)
-        id: detect
+      - name: List all build artifacts (debug)
         run: |
-          ARTS=$(find . -type f \( -name "*.cs3" -o -name "plugins.json" \) -print | paste -sd ' ' - || true)
-          if [ -z "$ARTS" ]; then
-            echo "HAS_ARTIFACTS=false" >> $GITHUB_OUTPUT
-          else
+          echo "=== All .cs3 files ==="
+          find . -type f -name "*.cs3" -ls || true
+          echo ""
+          echo "=== All .json files in build dirs ==="
+          find . -type f -path "*/build/*.json" -ls || true
+          echo ""
+          echo "=== Complete build/ directory structure ==="
+          find . -path "*/build/*" -type f -ls || true
+
+      - name: Collect artifacts to staging directory
+        run: |
+          mkdir -p staging
+          
+          # Copy all .cs3 files
+          echo "=== Copying .cs3 files ==="
+          find . -type f -name "*.cs3" -exec cp -v {} staging/ \; || true
+          
+          # Copy plugins.json and repository.json from root build dir
+          echo "=== Copying JSON files ==="
+          if [ -f "build/plugins.json" ]; then
+            cp -v build/plugins.json staging/
+          fi
+          if [ -f "build/repository.json" ]; then
+            cp -v build/repository.json staging/
+          fi
+          
+          # Also check in subproject build dirs
+          find . -type f -name "plugins.json" -exec cp -v {} staging/ \; || true
+          find . -type f -name "repository.json" -exec cp -v {} staging/ \; || true
+          
+          echo "=== Staging directory contents ==="
+          ls -lah staging/ || true
+
+      - name: Check if artifacts exist
+        id: check
+        run: |
+          if [ -n "$(ls -A staging/ 2>/dev/null)" ]; then
             echo "HAS_ARTIFACTS=true" >> $GITHUB_OUTPUT
-            echo "ARTIFACTS=$ARTS" >> $GITHUB_OUTPUT
-            printf "%s\n" $ARTS
+            echo "Found artifacts to push"
+          else
+            echo "HAS_ARTIFACTS=false" >> $GITHUB_OUTPUT
+            echo "No artifacts found"
           fi
 
-      - name: Prepare Builds branch and copy artifacts (only if present)
-        if: steps.detect.outputs.HAS_ARTIFACTS == 'true'
+      - name: Push to Builds branch
+        if: steps.check.outputs.HAS_ARTIFACTS == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BUILD_BRANCH: ${{ env.BUILD_BRANCH }}
         run: |
           set -xe
-          # identity
+          
+          # Configure git
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # fetch/create branch
+          # Fetch or create Builds branch
           git fetch origin $BUILD_BRANCH || true
           if git rev-parse --verify origin/$BUILD_BRANCH >/dev/null 2>&1; then
             git checkout $BUILD_BRANCH
-            git reset --hard origin/$BUILD_BRANCH || true
+            git reset --hard origin/$BUILD_BRANCH
           else
             git checkout --orphan $BUILD_BRANCH
             git rm -rf . || true
           fi
 
-          # create dir with run id to avoid collisions
-          RUNDIR="builds/${GITHUB_RUN_ID}"
-          mkdir -p "$RUNDIR"
-
-          # copy artifacts preserving relative paths
-          IFS=' ' read -r -a ARTS <<< "${{ steps.detect.outputs.ARTIFACTS }}"
-          for f in "${ARTS[@]}"; do
-            mkdir -p "$RUNDIR/$(dirname "$f")"
-            cp --parents "$f" "$RUNDIR" || cp "$f" "$RUNDIR/" || true
-          done
-
-          echo "=== files after copy into $RUNDIR ==="
-          find "$RUNDIR" -type f -print -exec ls -l {} \; || true
-
-          # force add .cs3 if ignored
-          IGNORED=$(git ls-files --others --exclude-standard | grep '\.cs3$' || true)
-          if [ -n "$IGNORED" ]; then
-            git add -f $IGNORED || true
-          fi
-
+          # Copy artifacts from staging
+          cp -rv staging/* . || true
+          
+          echo "=== Files in Builds branch ==="
+          ls -lah
+          
+          # Force add all files (in case .cs3 is in .gitignore)
+          git add -f *.cs3 *.json || true
           git add -A
+          
           git status --porcelain
 
           if git diff --cached --quiet; then
@@ -99,11 +121,12 @@ jobs:
             exit 0
           fi
 
-          git commit -m "Auto update plugin builds: ${GITHUB_RUN_ID} ${GITHUB_SHA}"
-          # show commit contents
-          git --no-pager show --name-only --pretty=format:"%h %s" HEAD
+          git commit -m "Auto update plugin builds: run ${GITHUB_RUN_ID} (${GITHUB_SHA:0:7})"
+          
+          # Show what we're committing
+          git --no-pager show --name-only --stat HEAD
 
-          # push verbose
+          # Push with verbose output
           export GIT_TRACE=1 GIT_CURL_VERBOSE=1
           remote_url="https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
           git remote set-url origin "$remote_url"

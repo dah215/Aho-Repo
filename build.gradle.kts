@@ -1,40 +1,31 @@
 import groovy.json.JsonBuilder
 
 plugins {
-    // declare plugins with versions but don't apply at root
     id("com.android.library") version "8.2.2" apply false
     id("org.jetbrains.kotlin.android") version "1.9.22" apply false
     id("org.jetbrains.kotlin.jvm") version "1.9.22" apply false
 }
 
 subprojects {
-    // Không khai báo repositories ở đây (đã chuyển vào settings.gradle.kts)
-    // Áp dụng plugin Android chỉ cho những module có mã nguồn Android
     if (file("${project.projectDir}/src/main").exists()) {
         apply(plugin = "com.android.library")
         apply(plugin = "org.jetbrains.kotlin.android")
-        // plugin tuỳ chỉnh: cố gắng apply nếu có trong classpath, không làm sập script nếu không có
-        try {
-            apply(plugin = "com.lagradost.cloudstream3.gradle")
-        } catch (_: Throwable) {
-            // plugin không có -> bỏ qua
-        }
     }
 }
 
-/*
-  Tạo task "make" để tương thích với CI/command gọi "gradle make".
-  Task này sẽ kích hoạt assemble cho tất cả subprojects có task 'assemble'.
-*/
+// Task "make" để tương thích với CI
 tasks.register("make") {
     group = "build"
-    description = "Compatibility task: assemble all Android modules (alias for CI 'make')"
+    description = "Build all Android modules and create plugin files"
+    
     dependsOn(subprojects.flatMap { sp ->
-        sp.tasks.matching { it.name == "assemble" }.toList()
+        sp.tasks.matching { it.name == "build" }.toList()
     })
+    
+    finalizedBy("makePluginsJson", "makeRepositoryJson")
 }
 
-// Task để tạo plugins.json từ tất cả các build.json
+// Task để tạo plugins.json
 tasks.register("makePluginsJson") {
     group = "build"
     description = "Generate plugins.json from all build.json files"
@@ -47,14 +38,33 @@ tasks.register("makePluginsJson") {
             if (buildJsonFile.exists()) {
                 val buildJson = groovy.json.JsonSlurper().parse(buildJsonFile) as Map<*, *>
                 
-                // Sử dụng layout.buildDirectory thay vì buildDir (deprecated)
-                val outputDir = file("${subproject.layout.buildDirectory.get().asFile}/outputs/apk/release")
-                val cs3Files = outputDir.listFiles()?.filter { it.extension == "cs3" }
+                // Tìm file .cs3 trong thư mục outputs
+                val outputDirs = listOf(
+                    file("${subproject.layout.buildDirectory.get().asFile}/outputs/apk/release"),
+                    file("${subproject.layout.buildDirectory.get().asFile}/outputs/aar")
+                )
                 
-                if (!cs3Files.isNullOrEmpty()) {
-                    val cs3File = cs3Files.first()
-                    
-                    // Cast các giá trị về kiểu non-null với default values
+                var cs3File: File? = null
+                for (dir in outputDirs) {
+                    if (dir.exists()) {
+                        val files = dir.listFiles()?.filter { 
+                            it.extension == "cs3" || it.extension == "aar" 
+                        }
+                        if (!files.isNullOrEmpty()) {
+                            cs3File = files.first()
+                            // Nếu là AAR, đổi tên thành CS3
+                            if (cs3File.extension == "aar") {
+                                val newName = "${buildJson["name"]}.cs3"
+                                val newFile = File(dir, newName)
+                                cs3File.copyTo(newFile, overwrite = true)
+                                cs3File = newFile
+                            }
+                            break
+                        }
+                    }
+                }
+                
+                if (cs3File != null) {
                     pluginsList.add(mapOf(
                         "name" to (buildJson["name"] as? String ?: "Unknown"),
                         "url" to cs3File.name,
@@ -70,7 +80,6 @@ tasks.register("makePluginsJson") {
             }
         }
         
-        // Sử dụng layout.buildDirectory thay vì buildDir (deprecated)
         val pluginsJsonFile = file("${rootProject.layout.buildDirectory.get().asFile}/plugins.json")
         pluginsJsonFile.parentFile.mkdirs()
         pluginsJsonFile.writeText(JsonBuilder(pluginsList).toPrettyString())
@@ -94,16 +103,10 @@ tasks.register("makeRepositoryJson") {
             )
         )
         
-        // Sử dụng layout.buildDirectory thay vì buildDir (deprecated)
         val repoJsonFile = file("${rootProject.layout.buildDirectory.get().asFile}/repository.json")
         repoJsonFile.parentFile.mkdirs()
         repoJsonFile.writeText(JsonBuilder(repoData).toPrettyString())
         
         println("Generated repository.json")
     }
-}
-
-// Làm cho build task tự động tạo các file JSON
-tasks.named("make") {
-    finalizedBy("makePluginsJson", "makeRepositoryJson")
 }

@@ -3,7 +3,7 @@ pluginManagement {
         google()
         mavenCentral()
         gradlePluginPortal()
-        maven("https://jitpack.io") // Quan trọng: Nguồn cho plugin
+        maven("https://jitpack.io")
     }
 }
 
@@ -12,7 +12,7 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
-        maven("https://jitpack.io") // Quan trọng: Nguồn cho thư viện
+        maven("https://jitpack.io")
     }
 }
 

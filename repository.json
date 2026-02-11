@@ -1,0 +1,8 @@
+{
+    "name": "Aho-Repo",
+    "description": "Kho Lưu trữ phim của chọc",
+    "manifestVersion": 99,
+    "pluginLists": [
+      "https://raw.githubusercontent.com/dah215/Aho-Repo/refs/heads/builds/plugins.json"
+    ]
+}

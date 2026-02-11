@@ -14,6 +14,9 @@ on:
     paths-ignore:
       - '*.md'
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -28,21 +31,28 @@ jobs:
         with:
           ref: "builds"
           path: "builds"
+          fetch-depth: 0
         continue-on-error: true
 
-      - name: Create builds branch if not exists
+      - name: Setup builds branch
         run: |
           cd $GITHUB_WORKSPACE/builds
           if [ ! -d ".git" ]; then
             echo "Builds branch does not exist, creating it..."
+            rm -rf $GITHUB_WORKSPACE/builds
+            mkdir -p $GITHUB_WORKSPACE/builds
+            cd $GITHUB_WORKSPACE/builds
             git init
-            git remote add origin https://github.com/${{ github.repository }}.git
             git config user.email "actions@github.com"
             git config user.name "GitHub Actions"
             git checkout -b builds
             echo "# Builds" > README.md
             git add README.md
             git commit -m "Initialize builds branch"
+            git remote add origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+            git push -u origin builds
+          else
+            echo "Builds branch already exists"
           fi
 
       - name: Clean old builds
@@ -178,6 +188,7 @@ jobs:
           cd $GITHUB_WORKSPACE/builds
           git config --local user.email "actions@github.com"
           git config --local user.name "GitHub Actions"
+          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
           git add .
-          git commit --amend -m "Build $GITHUB_SHA" || exit 0   # do not error if nothing to commit
-          git push --force
+          git diff --staged --quiet || git commit -m "Build $GITHUB_SHA"
+          git push origin builds

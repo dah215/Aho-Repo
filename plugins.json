@@ -1,0 +1,22 @@
+[
+    {
+        "iconUrl": "https://boctem.com/favicon.ico",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/dah215/Aho-Repo",
+        "fileSize": 15744,
+        "status": 3,
+        "language": "vi",
+        "authors": [
+            "BocTem"
+        ],
+        "tvTypes": [
+            "Anime",
+            "AnimeMovie"
+        ],
+        "version": 1,
+        "internalName": "Boctem",
+        "description": "Vietnamese anime streaming site",
+        "url": "https://raw.githubusercontent.com/dah215/Aho-Repo/builds/Boctem.cs3",
+        "name": "Boctem"
+    }
+]

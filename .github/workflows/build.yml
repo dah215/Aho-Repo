@@ -35,36 +35,37 @@ jobs:
 
       - name: Initialize builds directory
         run: |
-          if [ ! -d "$GITHUB_WORKSPACE/builds/.git" ]; then
-            echo "Creating new builds branch..."
+          cd $GITHUB_WORKSPACE/builds
+          
+          # Check if we have a valid builds branch
+          if git rev-parse --verify builds >/dev/null 2>&1; then
+            echo "Builds branch exists locally, checking it out"
+            git checkout builds
+          elif git ls-remote --heads origin builds | grep builds; then
+            echo "Builds branch exists on remote, fetching it"
+            git fetch origin builds
+            git checkout builds
+            git pull origin builds
+          else
+            echo "Builds branch does not exist, creating it..."
+            
+            # If .git exists but no builds branch, we need to start fresh
             cd $GITHUB_WORKSPACE
             rm -rf builds
             mkdir -p builds
             cd builds
+            
             git init
             git remote add origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
             git config user.name "GitHub Actions"
             git config user.email "actions@github.com"
             
-            # Try to fetch builds branch
-            git fetch origin builds 2>/dev/null || true
-            
-            # Check if builds branch exists on remote
-            if git ls-remote --heads origin builds | grep builds; then
-              git checkout builds
-              git pull origin builds
-            else
-              # Create orphan builds branch
-              git checkout --orphan builds
-              echo "# Builds" > README.md
-              git add README.md
-              git commit -m "Initialize builds branch"
-              git push -u origin builds
-            fi
-          else
-            echo "Builds branch already checked out"
-            cd $GITHUB_WORKSPACE/builds
-            git checkout builds
+            # Create orphan builds branch
+            git checkout --orphan builds
+            echo "# Builds" > README.md
+            git add README.md
+            git commit -m "Initialize builds branch"
+            git push -u origin builds
           fi
 
       - name: Clean old builds

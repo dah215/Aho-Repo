@@ -1,6 +1,6 @@
 {
   "name": "BocTem",
-  "pluginClassName": "com.boctem.BocTemProvider",
+  "pluginClassName": "com.boctem.BocTem",
   "version": 1,
   "requiresResources": false,
   "description": "Vietnamese anime streaming site",

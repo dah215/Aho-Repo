@@ -212,6 +212,9 @@ jobs:
           # Make sure we're on builds branch
           git checkout builds
           
+          # Pull latest changes from remote
+          git pull origin builds --rebase || true
+          
           git add .
           
           if git diff --staged --quiet; then

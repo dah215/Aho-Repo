@@ -2,12 +2,12 @@ package com.boctem
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
+import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
 
-@CloudstreamPlugin
-class BocTem : MainAPI() {
+class BocTemProvider : MainAPI() {
     override var mainUrl = "https://boctem.com"
     override var name = "BocTem"
     override val hasMainPage = true
@@ -144,6 +144,30 @@ class BocTem : MainAPI() {
             val dataUrl = normalizeUrl(data) ?: return false
             val document = app.get(dataUrl).document
 
+            fun tryM3u8FromText(text: String?): Boolean {
+                if (text.isNullOrBlank()) return false
+
+                val m3u8 = Regex("""https?://[^"'<>\s]+\.m3u8[^"'<>\s]*""")
+                    .find(text)
+                    ?.value
+                    ?.replace("\\/", "/")
+
+                if (!m3u8.isNullOrBlank()) {
+                    M3u8Helper.generateM3u8(name, m3u8, mainUrl).forEach(callback)
+                    return true
+                }
+                return false
+            }
+
+            if (tryM3u8FromText(document.html())) return true
+
+            val inlineIframe = document.selectFirst("iframe[src]")?.attr("src")
+            val inlineIframeUrl = normalizeUrl(inlineIframe)
+            if (!inlineIframeUrl.isNullOrBlank()) {
+                loadExtractor(inlineIframeUrl, dataUrl, subtitleCallback, callback)
+                return true
+            }
+
             val bodyClass = document.selectFirst("body")?.attr("class").orEmpty()
             val postId = Regex("""postid-(\d+)""").find(bodyClass)?.groupValues?.get(1)
                 ?: Regex("""post-(\d+)""").find(bodyClass)?.groupValues?.get(1)
@@ -151,7 +175,6 @@ class BocTem : MainAPI() {
                     .find(document.selectFirst("article")?.attr("id").orEmpty())
                     ?.groupValues
                     ?.get(1)
-                ?: return false
 
             val episode = Regex("""tap-(\d+)""").find(dataUrl)?.groupValues?.get(1)
                 ?: Regex("""episode=(\d+)""").find(dataUrl)?.groupValues?.get(1)
@@ -168,52 +191,56 @@ class BocTem : MainAPI() {
                     if (!nonce.isNullOrBlank()) break
                 }
             }
-            if (nonce.isNullOrBlank()) return false
 
-            val ajaxResponse = app.post(
-                "$mainUrl/wp-admin/admin-ajax.php",
-                data = mapOf(
-                    "action" to "halim_ajax_player",
-                    "nonce" to nonce,
-                    "postid" to postId,
-                    "episode" to episode,
-                    "server" to "1"
-                ),
-                referer = dataUrl,
-                headers = mapOf("X-Requested-With" to "XMLHttpRequest")
-            ).text
+            if (!postId.isNullOrBlank() && !nonce.isNullOrBlank()) {
+                val ajaxResponse = app.post(
+                    "$mainUrl/wp-admin/admin-ajax.php",
+                    data = mapOf(
+                        "action" to "halim_ajax_player",
+                        "nonce" to nonce,
+                        "postid" to postId,
+                        "episode" to episode,
+                        "server" to "1"
+                    ),
+                    referer = dataUrl,
+                    headers = mapOf("X-Requested-With" to "XMLHttpRequest")
+                ).text
 
-            val streamUrl = Regex("""file["']?\s*:\s*["']([^"']+\.m3u8[^"']*)["']""")
-                .find(ajaxResponse)
-                ?.groupValues
-                ?.get(1)
-                ?: Regex("""https?://[^"'<>\s]+\.m3u8[^"'<>\s]*""")
-                    .find(ajaxResponse)
-                    ?.value
+                if (tryM3u8FromText(ajaxResponse)) return true
 
-            if (!streamUrl.isNullOrBlank()) {
-                val clean = streamUrl.replace("\\/", "/")
-                M3u8Helper.generateM3u8(name, clean, mainUrl).forEach(callback)
-                return true
-            }
-
-            val iframe = Regex("""iframe[^>]+src=["']([^"']+)["']""")
-                .find(ajaxResponse)
-                ?.groupValues
-                ?.get(1)
-                ?: Regex("""(?:src|embed_url|link)["']?\s*:\s*["']([^"']+)["']""")
+                val iframe = Regex("""iframe[^>]+src=["']([^"']+)["']""")
                     .find(ajaxResponse)
                     ?.groupValues
                     ?.get(1)
-                ?: document.selectFirst("iframe[src]")?.attr("src")
+                    ?: Regex("""(?:src|embed_url|link)["']?\s*:\s*["']([^"']+)["']""")
+                        .find(ajaxResponse)
+                        ?.groupValues
+                        ?.get(1)
 
-            val iframeUrl = normalizeUrl(iframe?.replace("\\/", "/"))
-            if (!iframeUrl.isNullOrBlank()) {
-                loadExtractor(iframeUrl, dataUrl, subtitleCallback, callback)
-                return true
+                val iframeUrl = normalizeUrl(iframe?.replace("\\/", "/"))
+                if (!iframeUrl.isNullOrBlank()) {
+                    loadExtractor(iframeUrl, dataUrl, subtitleCallback, callback)
+                    return true
+                }
             }
 
-            false
+            val iframes = document.select("iframe[src]")
+                .mapNotNull { normalizeUrl(it.attr("src")) }
+                .distinct()
+
+            var extracted = false
+            for (iframe in iframes) {
+                loadExtractor(iframe, dataUrl, subtitleCallback, callback)
+                extracted = true
+            }
+            extracted
         }.getOrElse { false }
+    }
+}
+
+@CloudstreamPlugin
+class BocTem : Plugin() {
+    override fun load() {
+        registerMainAPI(BocTemProvider())
     }
 }

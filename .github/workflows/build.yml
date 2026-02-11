@@ -28,6 +28,22 @@ jobs:
         with:
           ref: "builds"
           path: "builds"
+        continue-on-error: true
+
+      - name: Create builds branch if not exists
+        run: |
+          cd $GITHUB_WORKSPACE/builds
+          if [ ! -d ".git" ]; then
+            echo "Builds branch does not exist, creating it..."
+            git init
+            git remote add origin https://github.com/${{ github.repository }}.git
+            git config user.email "actions@github.com"
+            git config user.name "GitHub Actions"
+            git checkout -b builds
+            echo "# Builds" > README.md
+            git add README.md
+            git commit -m "Initialize builds branch"
+          fi
 
       - name: Clean old builds
         run: |

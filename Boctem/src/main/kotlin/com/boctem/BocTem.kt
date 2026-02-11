@@ -1,12 +1,13 @@
 package com.boctem
 
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.plugins.Plugin
+import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
 
-class BocTemProvider : MainAPI() {
+@CloudstreamPlugin
+class BocTem : MainAPI() {
     override var mainUrl = "https://boctem.com"
     override var name = "BocTem"
     override val hasMainPage = true
@@ -212,11 +213,5 @@ class BocTemProvider : MainAPI() {
         }
 
         return false
-    }
-}
-
-class BocTem : Plugin() {
-    override fun load() {
-        registerMainAPI(BocTemProvider())
     }
 }

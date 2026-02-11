@@ -144,7 +144,7 @@ class BocTemProvider : MainAPI() {
             val dataUrl = normalizeUrl(data) ?: return false
             val document = app.get(dataUrl).document
 
-            fun tryM3u8FromText(text: String?): Boolean {
+            suspend fun tryM3u8FromText(text: String?): Boolean {
                 if (text.isNullOrBlank()) return false
 
                 val m3u8 = Regex("""https?://[^"'<>\s]+\.m3u8[^"'<>\s]*""")

@@ -5,7 +5,6 @@ import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
 
-@CloudstreamPlugin
 class BocTem : MainAPI() {
     override var mainUrl = "https://boctem.com"
     override var name = "BocTem"

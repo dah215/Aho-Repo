@@ -6,7 +6,7 @@
   "description": "Vietnamese anime streaming site",
   "authors": ["BocTem"],
   "repositoryUrl": "https://github.com/dah215/Aho-Repo",
-  "status": 3,
+  "status": 1,
   "tvTypes": ["Anime", "AnimeMovie"],
   "language": "vi",
   "iconUrl": "https://boctem.com/favicon.ico"

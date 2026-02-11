@@ -1,73 +1,28 @@
-// GIẢI PHÁP 3: Build.gradle.kts với OkHttp thay thế
-// Sử dụng file này nếu Giải pháp 1 và 2 đều thất bại
+// use an integer for version numbers
+version = 5
 
-plugins {
-    id("com.android.library")
-    id("org.jetbrains.kotlin.android")
-}
 
-android {
-    namespace = "com.boctem"
-    compileSdk = 34
+cloudstream {
+    // All of these properties are optional, you can safely remove them
 
-    defaultConfig {
-        minSdk = 21
-    }
+    description = "(Mexican) Anime"
+    language    = "mx"
+    authors = listOf("Aho-Repo")
 
-    compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_17
-        targetCompatibility = JavaVersion.VERSION_17
-    }
+    /**
+    * Status int as the following:
+    * 0: Down
+    * 1: Ok
+    * 2: Slow
+    * 3: Beta only
+    * */
+    status = 1 // will be 3 if unspecified
 
-    kotlinOptions {
-        jvmTarget = "17"
-    }
-    
-    buildTypes {
-        release {
-            isMinifyEnabled = false
-        }
-    }
-}
+    // List of video source types. Users are able to filter for extensions in a given category.
+    // You can find a list of available types here:
+    // https://recloudstream.github.io/cloudstream/html/app/com.lagradost.cloudstream3/-tv-type/index.html
+    tvTypes = listOf("Movie","Anime","AnimeMovie")
+    iconUrl = "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcRBY6zyssWF7b3GT1v3Q1-_kwxYqmKm-YjzcyeuHldsHg&s"
 
-dependencies {
-    implementation(kotlin("stdlib"))
-    
-    // LOẠI BỎ cloudstream và NiceHttp
-    // Sẽ được load tại runtime bởi Cloudstream app
-    
-    // Dùng OkHttp thay vì NiceHttp
-    implementation("com.squareup.okhttp3:okhttp:4.12.0")
-    
-    // JSoup cho HTML parsing
-    implementation("org.jsoup:jsoup:1.17.2")
-    
-    // Coroutines
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
-    
-    // JSON
-    implementation("com.google.code.gson:gson:2.10.1")
-}
-
-// Task tùy chỉnh để tạo file .cs3 từ AAR
-tasks.register<Copy>("makeCS3") {
-    dependsOn("assembleRelease")
-    
-    val buildJson = file("build.json")
-    val pluginName = if (buildJson.exists()) {
-        val json = groovy.json.JsonSlurper().parse(buildJson) as Map<*, *>
-        json["name"] as? String ?: "BocTem"
-    } else {
-        "BocTem"
-    }
-    
-    from(layout.buildDirectory.dir("outputs/aar")) {
-        include("*-release.aar")
-        rename { "${pluginName}.cs3" }
-    }
-    into(layout.buildDirectory.dir("outputs/apk/release"))
-}
-
-tasks.named("build") {
-    finalizedBy("makeCS3")
+    isCrossPlatform = false
 }

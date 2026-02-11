@@ -1,13 +1,28 @@
 package com.boctem
 
-import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.utils.*
-import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
+import com.lagradost.cloudstream3.DubStatus
+import com.lagradost.cloudstream3.ExtractorLink
+import com.lagradost.cloudstream3.HomePageList
+import com.lagradost.cloudstream3.HomePageResponse
+import com.lagradost.cloudstream3.LoadResponse
+import com.lagradost.cloudstream3.MainAPI
+import com.lagradost.cloudstream3.MainPageRequest
+import com.lagradost.cloudstream3.SearchResponse
+import com.lagradost.cloudstream3.SubtitleFile
+import com.lagradost.cloudstream3.TvType
+import com.lagradost.cloudstream3.app
+import com.lagradost.cloudstream3.mainPageOf
+import com.lagradost.cloudstream3.newAnimeLoadResponse
+import com.lagradost.cloudstream3.newAnimeSearchResponse
+import com.lagradost.cloudstream3.newEpisode
+import com.lagradost.cloudstream3.newHomePageResponse
+import com.lagradost.cloudstream3.plugins.Plugin
+import com.lagradost.cloudstream3.utils.M3u8Helper
+import com.lagradost.cloudstream3.utils.loadExtractor
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
 
-@CloudstreamPlugin
-class BocTem : MainAPI() {
+class BocTemProvider : MainAPI() {
     override var mainUrl = "https://boctem.com"
     override var name = "BocTem"
     override val hasMainPage = true
@@ -26,18 +41,18 @@ class BocTem : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = "$mainUrl/${request.data}$page"
         val document = app.get(url).document
-        
+
         val items = document.select("article.thumb.grid-item").mapNotNull { article ->
             articleToSearchResponse(article)
         }
-        
+
         return newHomePageResponse(
             list = HomePageList(
                 name = request.name,
                 list = items,
-                isHorizontalImages = false
+                isHorizontalImages = false,
             ),
-            hasNext = items.isNotEmpty()
+            hasNext = items.isNotEmpty(),
         )
     }
 
@@ -45,23 +60,25 @@ class BocTem : MainAPI() {
         val linkElement = article.selectFirst("a") ?: return null
         val href = linkElement.attr("href")
         if (href.isEmpty()) return null
-        
+
         val titleElement = article.selectFirst(".entry-title")
         val title = titleElement?.text() ?: linkElement.attr("title")
         if (title.isEmpty()) return null
-        
+
         val imgElement = article.selectFirst("img")
         val posterUrl = if (imgElement != null) {
             val dataSrc = imgElement.attr("data-src")
             if (dataSrc.isNotEmpty()) dataSrc else imgElement.attr("src")
-        } else null
-        
+        } else {
+            null
+        }
+
         val statusElement = article.selectFirst(".status")
         val episodeInfo = statusElement?.text()
 
         return newAnimeSearchResponse(title, href, TvType.Anime) {
             this.posterUrl = posterUrl
-            if (episodeInfo != null && episodeInfo.isNotEmpty()) {
+            if (!episodeInfo.isNullOrEmpty()) {
                 val epNum = episodeInfo.filter { it.isDigit() }.toIntOrNull()
                 addSub(epNum)
             }
@@ -69,9 +86,10 @@ class BocTem : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val url = "$mainUrl/?s=${URLEncoder.encode(query, "UTF-8")}"
+        val encoded = URLEncoder.encode(query, "UTF-8")
+        val url = "$mainUrl/?s=$encoded"
         val document = app.get(url).document
-        
+
         return document.select("article.thumb.grid-item").mapNotNull { article ->
             articleToSearchResponse(article)
         }
@@ -82,7 +100,7 @@ class BocTem : MainAPI() {
 
         val titleElement = document.selectFirst("h1.entry-title")
             ?: document.selectFirst(".halim-movie-title")
-        if (titleElement == null) return null
+            ?: return null
         val title = titleElement.text()
 
         val posterImg = document.selectFirst(".halim-movie-poster img")
@@ -93,12 +111,12 @@ class BocTem : MainAPI() {
             document.selectFirst("meta[property=og:image]")?.attr("content")
         }
 
-        val descElement = document.selectFirst(".entry-content")
-        val description = descElement?.text() ?: document.selectFirst("meta[property=og:description]")?.attr("content")
+        val description = document.selectFirst(".entry-content")?.text()
+            ?: document.selectFirst("meta[property=og:description]")?.attr("content")
 
         val episodeLinks = ArrayList<Element>()
         val seenUrls = HashSet<String>()
-        
+
         document.select("a[href*=/xem-phim/]").forEach { link ->
             val linkHref = link.attr("href")
             if (linkHref.contains("-tap-") && !seenUrls.contains(linkHref)) {
@@ -110,9 +128,7 @@ class BocTem : MainAPI() {
         val episodes = episodeLinks.map { link ->
             val epUrl = link.attr("href")
             val epText = link.text().trim()
-            
-            val tapMatch = Regex("""tap-(\d+)""").find(epUrl)
-            val epNum = tapMatch?.groupValues?.get(1)?.toIntOrNull()
+            val epNum = Regex("""tap-(\d+)""").find(epUrl)?.groupValues?.get(1)?.toIntOrNull()
 
             newEpisode(epUrl) {
                 this.name = epText
@@ -120,14 +136,11 @@ class BocTem : MainAPI() {
                 this.posterUrl = poster
             }
         }
-        
+
         val sortedEpisodes = episodes.sortedBy { it.episode ?: 0 }
+        val tags = document.select(".halim-movie-genres a, .post-category a").map { it.text() }
 
-        val tagElements = document.select(".halim-movie-genres a, .post-category a")
-        val tags = tagElements.map { it.text() }
-
-        val yearMatch = Regex("""/release/(\d+)/""").find(url)
-        val year = yearMatch?.groupValues?.get(1)?.toIntOrNull() 
+        val year = Regex("""/release/(\d+)/""").find(url)?.groupValues?.get(1)?.toIntOrNull()
             ?: document.selectFirst(".halim-movie-year")?.text()?.toIntOrNull()
 
         return newAnimeLoadResponse(title, url, TvType.Anime) {
@@ -143,81 +156,83 @@ class BocTem : MainAPI() {
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
+        callback: (ExtractorLink) -> Unit,
     ): Boolean {
         val document = app.get(data).document
 
-        val bodyElement = document.selectFirst("body")
-        val bodyClass = bodyElement?.attr("class") ?: ""
-        val postIdMatch = Regex("""postid-(\d+)""").find(bodyClass)
-        
-        val postId = if (postIdMatch != null) {
-            postIdMatch.groupValues[1]
-        } else {
-            val articleId = document.selectFirst("article")?.attr("id") ?: ""
-            Regex("""post-(\d+)""").find(articleId)?.groupValues?.get(1) ?: return false
-        }
+        val bodyClass = document.selectFirst("body")?.attr("class") ?: ""
+        val postIdFromBody = Regex("""postid-(\d+)""").find(bodyClass)?.groupValues?.get(1)
+        val postIdFromArticle = Regex("""post-(\d+)""")
+            .find(document.selectFirst("article")?.attr("id") ?: "")
+            ?.groupValues
+            ?.get(1)
+        val postId = postIdFromBody ?: postIdFromArticle ?: return false
 
-        val episodeMatch = Regex("""tap-(\d+)""").find(data)
-        val episode = episodeMatch?.groupValues?.get(1) ?: "1"
+        val episode = Regex("""tap-(\d+)""").find(data)?.groupValues?.get(1) ?: "1"
 
-        val scripts = document.select("script")
         var nonce: String? = null
-        
-        for (script in scripts) {
+        for (script in document.select("script")) {
             val scriptContent = script.data()
             if (scriptContent.contains("ajax_player") || scriptContent.contains("nonce")) {
-                val nonceMatch = Regex("""nonce["']?\s*:\s*["']([^"']+)["']""").find(scriptContent)
-                if (nonceMatch != null) {
-                    nonce = nonceMatch.groupValues[1]
-                    break
-                }
+                nonce = Regex("""nonce["']?\s*:\s*["']([^"']+)["']""")
+                    .find(scriptContent)
+                    ?.groupValues
+                    ?.get(1)
+                if (!nonce.isNullOrEmpty()) break
             }
         }
-        
-        if (nonce == null) return false
-
-        val ajaxUrl = "$mainUrl/wp-admin/admin-ajax.php"
-        
-        val formData = mapOf(
-            "action" to "halim_ajax_player",
-            "nonce" to nonce,
-            "postid" to postId,
-            "episode" to episode,
-            "server" to "1"
-        )
+        if (nonce.isNullOrEmpty()) return false
 
         val ajaxResponse = app.post(
-            ajaxUrl,
-            data = formData,
+            "$mainUrl/wp-admin/admin-ajax.php",
+            data = mapOf(
+                "action" to "halim_ajax_player",
+                "nonce" to nonce,
+                "postid" to postId,
+                "episode" to episode,
+                "server" to "1",
+            ),
             referer = data,
-            headers = mapOf("X-Requested-With" to "XMLHttpRequest")
+            headers = mapOf("X-Requested-With" to "XMLHttpRequest"),
         ).text
 
-        val m3u8Match = Regex("""file["']?\s*:\s*["']([^"']+\.m3u8)["']""").find(ajaxResponse)
-        val m3u8Url = m3u8Match?.groupValues?.get(1) 
+        val m3u8Url = Regex("""file["']?\s*:\s*["']([^"']+\.m3u8)["']""")
+            .find(ajaxResponse)
+            ?.groupValues
+            ?.get(1)
             ?: Regex("""https?://[^"'<>\s]+\.m3u8""").find(ajaxResponse)?.value
 
-        if (m3u8Url != null) {
+        if (!m3u8Url.isNullOrEmpty()) {
             val safeM3u8Url = m3u8Url.replace("\\/", "/")
             M3u8Helper.generateM3u8(
                 source = name,
                 streamUrl = safeM3u8Url,
-                referer = mainUrl
+                referer = mainUrl,
             ).forEach(callback)
             return true
         }
 
-        val iframeMatch = Regex("""iframe[^>]+src=["']([^"']+)["']""").find(ajaxResponse)
-        val iframeUrl = iframeMatch?.groupValues?.get(1)
-            ?: Regex("""src["']?\s*:\s*["']([^"']+embed[^"']*)["']""").find(ajaxResponse)?.groupValues?.get(1)
+        val iframeUrl = Regex("""iframe[^>]+src=["']([^"']+)["']""")
+            .find(ajaxResponse)
+            ?.groupValues
+            ?.get(1)
+            ?: Regex("""src["']?\s*:\s*["']([^"']+embed[^"']*)["']""")
+                .find(ajaxResponse)
+                ?.groupValues
+                ?.get(1)
 
-        if (iframeUrl != null) {
+        if (!iframeUrl.isNullOrEmpty()) {
             val safeIframeUrl = iframeUrl.replace("\\/", "/")
             loadExtractor(safeIframeUrl, data, subtitleCallback, callback)
             return true
         }
 
         return false
+    }
+}
+
+class BocTem : Plugin() {
+    override fun load() {
+        registerMainAPI(BocTemProvider())
     }
 }

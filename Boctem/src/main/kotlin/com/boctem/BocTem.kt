@@ -144,18 +144,65 @@ class BocTemProvider : MainAPI() {
             val dataUrl = normalizeUrl(data) ?: return false
             val document = app.get(dataUrl).document
 
+            fun cleanStreamUrl(raw: String): String {
+                return raw
+                    .trim()
+                    .trim('"', '\'')
+                    .replace("\\/", "/")
+                    .replace("\\u0026", "&")
+                    .replace("&amp;", "&")
+            }
+
             suspend fun tryM3u8FromText(text: String?): Boolean {
                 if (text.isNullOrBlank()) return false
 
-                val m3u8 = Regex("""https?://[^"'<>\s]+\.m3u8[^"'<>\s]*""")
+                val m3u8 = Regex("""(?:file|src|link|playlist)["']?\s*[:=]\s*["']([^"']+\.m3u8[^"']*)["']""")
                     .find(text)
-                    ?.value
-                    ?.replace("\\/", "/")
+                    ?.groupValues
+                    ?.get(1)
+                    ?: Regex("""https?://[^"'<>\s]+\.m3u8[^"'<>\s]*""")
+                        .find(text)
+                        ?.value
 
-                if (!m3u8.isNullOrBlank()) {
-                    M3u8Helper.generateM3u8(name, m3u8, mainUrl).forEach(callback)
+                val cleanM3u8 = m3u8
+                    ?.let(::cleanStreamUrl)
+                    ?.let { normalizeUrl(it) ?: it }
+
+                if (!cleanM3u8.isNullOrBlank()) {
+                    M3u8Helper.generateM3u8(
+                        source = name,
+                        streamUrl = cleanM3u8,
+                        referer = dataUrl
+                    ).forEach(callback)
                     return true
                 }
+
+                val directVideo = Regex("""(?:file|src|link)["']?\s*[:=]\s*["']([^"']+\.(?:mp4|mkv|webm)(?:\?[^"']*)?)["']""")
+                    .find(text)
+                    ?.groupValues
+                    ?.get(1)
+                    ?: Regex("""https?://[^"'<>\s]+\.(?:mp4|mkv|webm)(?:\?[^"'<>\s]*)?""")
+                        .find(text)
+                        ?.value
+
+                val cleanDirectVideo = directVideo
+                    ?.let(::cleanStreamUrl)
+                    ?.let { normalizeUrl(it) ?: it }
+
+                if (!cleanDirectVideo.isNullOrBlank()) {
+                    callback(
+                        ExtractorLink(
+                            source = name,
+                            name = "$name Direct",
+                            url = cleanDirectVideo,
+                            referer = dataUrl,
+                            quality = Qualities.Unknown.value,
+                            isM3u8 = false
+                        )
+                    )
+                    return true
+                }
+
                 return false
             }
 

@@ -1,112 +1,95 @@
-import groovy.json.JsonBuilder
+import com.android.build.gradle.BaseExtension
+import com.lagradost.cloudstream3.gradle.CloudstreamExtension
+import org.gradle.kotlin.dsl.register
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile
 
-plugins {
-    id("com.android.library") version "8.2.2" apply false
-    id("org.jetbrains.kotlin.android") version "1.9.22" apply false
-    id("org.jetbrains.kotlin.jvm") version "1.9.22" apply false
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+        maven("https://jitpack.io")
+    }
+
+    dependencies {
+        classpath("com.android.tools.build:gradle:8.13.2")
+        classpath("com.github.recloudstream:gradle:cce1b8d84d")
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.3.0")
+    }
 }
+
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+        maven("https://jitpack.io")
+    }
+}
+
+fun Project.cloudstream(configuration: CloudstreamExtension.() -> Unit) = extensions.getByName<CloudstreamExtension>("cloudstream").configuration()
+
+fun Project.android(configuration: BaseExtension.() -> Unit) = extensions.getByName<BaseExtension>("android").configuration()
 
 subprojects {
-    if (file("${project.projectDir}/src/main").exists()) {
-        apply(plugin = "com.android.library")
-        apply(plugin = "org.jetbrains.kotlin.android")
+    apply(plugin = "com.android.library")
+    apply(plugin = "kotlin-android")
+    apply(plugin = "com.lagradost.cloudstream3.gradle")
+
+    cloudstream {
+        setRepo(System.getenv("GITHUB_REPOSITORY") ?: "https://github.com/dah215/Aho-Repo")
+        authors = listOf("Aho-Repo")
     }
-}
 
-// Task "make" để tương thích với CI
-tasks.register("make") {
-    group = "build"
-    description = "Build all Android modules and create plugin files"
-    
-    dependsOn(subprojects.flatMap { sp ->
-        sp.tasks.matching { it.name == "build" }.toList()
-    })
-    
-    finalizedBy("makePluginsJson", "makeRepositoryJson")
-}
+    android {
+        namespace = "com.boctem"
 
-// Task để tạo plugins.json
-tasks.register("makePluginsJson") {
-    group = "build"
-    description = "Generate plugins.json from all build.json files"
-    
-    doLast {
-        val pluginsList = mutableListOf<Map<String, Any>>()
-        
-        subprojects.forEach { subproject ->
-            val buildJsonFile = file("${subproject.projectDir}/build.json")
-            if (buildJsonFile.exists()) {
-                val buildJson = groovy.json.JsonSlurper().parse(buildJsonFile) as Map<*, *>
-                
-                // Tìm file .cs3 trong thư mục outputs
-                val outputDirs = listOf(
-                    file("${subproject.layout.buildDirectory.get().asFile}/outputs/apk/release"),
-                    file("${subproject.layout.buildDirectory.get().asFile}/outputs/aar")
+        defaultConfig {
+            minSdk = 21
+            compileSdkVersion(35)
+            targetSdk = 35
+
+        }
+
+        compileOptions {
+            sourceCompatibility = JavaVersion.VERSION_1_8
+            targetCompatibility = JavaVersion.VERSION_1_8
+        }
+
+
+        tasks.withType<KotlinJvmCompile> {
+            compilerOptions {
+                jvmTarget.set(JvmTarget.JVM_1_8)
+                freeCompilerArgs.addAll(
+                    "-Xno-call-assertions",
+                    "-Xno-param-assertions",
+                    "-Xno-receiver-assertions"
                 )
-                
-                var cs3File: File? = null
-                for (dir in outputDirs) {
-                    if (dir.exists()) {
-                        val files = dir.listFiles()?.filter { 
-                            it.extension == "cs3" || it.extension == "aar" 
-                        }
-                        if (!files.isNullOrEmpty()) {
-                            cs3File = files.first()
-                            // Nếu là AAR, đổi tên thành CS3
-                            if (cs3File.extension == "aar") {
-                                val newName = "${buildJson["name"]}.cs3"
-                                val newFile = File(dir, newName)
-                                cs3File.copyTo(newFile, overwrite = true)
-                                cs3File = newFile
-                            }
-                            break
-                        }
-                    }
-                }
-                
-                if (cs3File != null) {
-                    pluginsList.add(mapOf(
-                        "name" to (buildJson["name"] as? String ?: "Unknown"),
-                        "url" to cs3File.name,
-                        "version" to (buildJson["version"] as? Int ?: 1),
-                        "description" to (buildJson["description"] as? String ?: ""),
-                        "authors" to (buildJson["authors"] as? List<*> ?: emptyList<String>()),
-                        "status" to (buildJson["status"] as? Int ?: 3),
-                        "tvTypes" to (buildJson["tvTypes"] as? List<*> ?: emptyList<String>()),
-                        "language" to (buildJson["language"] as? String ?: ""),
-                        "iconUrl" to (buildJson["iconUrl"] as? String ?: "")
-                    ))
-                }
             }
         }
-        
-        val pluginsJsonFile = file("${rootProject.layout.buildDirectory.get().asFile}/plugins.json")
-        pluginsJsonFile.parentFile.mkdirs()
-        pluginsJsonFile.writeText(JsonBuilder(pluginsList).toPrettyString())
-        
-        println("Generated plugins.json with ${pluginsList.size} plugins")
+    }
+
+    dependencies {
+        val implementation by configurations
+        val cloudstream by configurations
+        cloudstream("com.lagradost:cloudstream3:pre-release")
+
+        // Other dependencies
+        implementation(kotlin("stdlib"))
+        implementation("com.github.Blatzar:NiceHttp:0.4.16")
+        implementation("org.jsoup:jsoup:1.22.1")
+        implementation("androidx.annotation:annotation:1.9.1")
+        implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.20.1")
+        implementation("com.fasterxml.jackson.core:jackson-databind:2.20.1")
+        implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
+        implementation("org.mozilla:rhino:1.9.0")
+        implementation("me.xdrop:fuzzywuzzy:1.4.0")
+        implementation("com.google.code.gson:gson:2.13.2")
+        implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")
+        implementation("com.github.vidstige:jadb:v1.2.1")
+        implementation("org.bouncycastle:bcpkix-jdk15on:1.70")
     }
 }
 
-// Task để tạo repository.json
-tasks.register("makeRepositoryJson") {
-    group = "build"
-    description = "Generate repository.json"
-    
-    doLast {
-        val repoData = mapOf(
-            "name" to "BocTem Repository",
-            "description" to "Vietnamese anime streaming repository",
-            "manifestVersion" to 1,
-            "pluginLists" to listOf(
-                "https://raw.githubusercontent.com/dah215/Aho-Repo/Builds/plugins.json"
-            )
-        )
-        
-        val repoJsonFile = file("${rootProject.layout.buildDirectory.get().asFile}/repository.json")
-        repoJsonFile.parentFile.mkdirs()
-        repoJsonFile.writeText(JsonBuilder(repoData).toPrettyString())
-        
-        println("Generated repository.json")
-    }
+tasks.register<Delete>("clean") {
+    delete(rootProject.layout.buildDirectory)
 }

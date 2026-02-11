@@ -23,6 +23,16 @@ class BocTem : MainAPI() {
         "release/2025/page/" to "Anime 2025",
     )
 
+    private fun toAbsoluteUrl(url: String?): String? {
+        if (url.isNullOrBlank()) return null
+        return when {
+            url.startsWith("http://") || url.startsWith("https://") -> url
+            url.startsWith("//") -> "https:$url"
+            url.startsWith("/") -> "$mainUrl$url"
+            else -> "$mainUrl/$url"
+        }
+    }
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = "$mainUrl/${request.data}$page"
         val document = app.get(url).document
@@ -32,7 +42,7 @@ class BocTem : MainAPI() {
         }
 
         return newHomePageResponse(
-            list = HomePageList(
+            HomePageList(
                 name = request.name,
                 list = items,
                 isHorizontalImages = false,
@@ -43,37 +53,32 @@ class BocTem : MainAPI() {
 
     private fun articleToSearchResponse(article: Element): SearchResponse? {
         val linkElement = article.selectFirst("a") ?: return null
-        val href = linkElement.attr("href")
-        if (href.isEmpty()) return null
+        val href = toAbsoluteUrl(linkElement.attr("href")) ?: return null
 
-        val titleElement = article.selectFirst(".entry-title")
-        val title = titleElement?.text() ?: linkElement.attr("title")
-        if (title.isEmpty()) return null
+        val title = article.selectFirst(".entry-title")?.text()
+            ?.takeIf { it.isNotBlank() }
+            ?: linkElement.attr("title").takeIf { it.isNotBlank() }
+            ?: return null
 
         val imgElement = article.selectFirst("img")
-        val posterUrl = if (imgElement != null) {
-            val dataSrc = imgElement.attr("data-src")
-            if (dataSrc.isNotEmpty()) dataSrc else imgElement.attr("src")
-        } else {
-            null
-        }
+        val posterUrl = toAbsoluteUrl(
+            imgElement?.attr("data-src")?.takeIf { it.isNotBlank() }
+                ?: imgElement?.attr("src")
+        )
 
-        val statusElement = article.selectFirst(".status")
-        val episodeInfo = statusElement?.text()
+        val episodeInfo = article.selectFirst(".status")?.text()
 
         return newAnimeSearchResponse(title, href, TvType.Anime) {
             this.posterUrl = posterUrl
             if (!episodeInfo.isNullOrEmpty()) {
-                val epNum = episodeInfo.filter { it.isDigit() }.toIntOrNull()
-                addSub(epNum)
+                addSub(Regex("""(\d+)""").find(episodeInfo)?.groupValues?.get(1)?.toIntOrNull())
             }
         }
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         val encoded = URLEncoder.encode(query, "UTF-8")
-        val url = "$mainUrl/?s=$encoded"
-        val document = app.get(url).document
+        val document = app.get("$mainUrl/?s=$encoded").document
 
         return document.select("article.thumb.grid-item").mapNotNull { article ->
             articleToSearchResponse(article)
@@ -81,38 +86,28 @@ class BocTem : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse? {
-        val document = app.get(url).document
+        val fixedUrl = toAbsoluteUrl(url) ?: return null
+        val document = app.get(fixedUrl).document
 
-        val titleElement = document.selectFirst("h1.entry-title")
-            ?: document.selectFirst(".halim-movie-title")
+        val title = document.selectFirst("h1.entry-title")?.text()
+            ?: document.selectFirst(".halim-movie-title")?.text()
             ?: return null
-        val title = titleElement.text()
 
-        val posterImg = document.selectFirst(".halim-movie-poster img")
-        val poster = if (posterImg != null) {
-            val dataSrc = posterImg.attr("data-src")
-            if (dataSrc.isNotEmpty()) dataSrc else posterImg.attr("src")
-        } else {
-            document.selectFirst("meta[property=og:image]")?.attr("content")
-        }
+        val poster = toAbsoluteUrl(
+            document.selectFirst(".halim-movie-poster img")?.attr("data-src")?.takeIf { it.isNotBlank() }
+                ?: document.selectFirst(".halim-movie-poster img")?.attr("src")
+                ?: document.selectFirst("meta[property=og:image]")?.attr("content")
+        )
 
         val description = document.selectFirst(".entry-content")?.text()
             ?: document.selectFirst("meta[property=og:description]")?.attr("content")
 
-        val episodeLinks = ArrayList<Element>()
         val seenUrls = HashSet<String>()
+        val episodes = document.select("a[href*=/xem-phim/]").mapNotNull { link ->
+            val epUrl = toAbsoluteUrl(link.attr("href")) ?: return@mapNotNull null
+            if (!epUrl.contains("-tap-") || !seenUrls.add(epUrl)) return@mapNotNull null
 
-        document.select("a[href*=/xem-phim/]").forEach { link ->
-            val linkHref = link.attr("href")
-            if (linkHref.contains("-tap-") && !seenUrls.contains(linkHref)) {
-                episodeLinks.add(link)
-                seenUrls.add(linkHref)
-            }
-        }
-
-        val episodes = episodeLinks.map { link ->
-            val epUrl = link.attr("href")
-            val epText = link.text().trim()
+            val epText = link.text().trim().ifBlank { null }
             val epNum = Regex("""tap-(\d+)""").find(epUrl)?.groupValues?.get(1)?.toIntOrNull()
 
             newEpisode(epUrl) {
@@ -120,20 +115,18 @@ class BocTem : MainAPI() {
                 this.episode = epNum
                 this.posterUrl = poster
             }
-        }
+        }.sortedBy { it.episode ?: Int.MAX_VALUE }
 
-        val sortedEpisodes = episodes.sortedBy { it.episode ?: 0 }
         val tags = document.select(".halim-movie-genres a, .post-category a").map { it.text() }
-
-        val year = Regex("""/release/(\d+)/""").find(url)?.groupValues?.get(1)?.toIntOrNull()
+        val year = Regex("""/release/(\d+)/""").find(fixedUrl)?.groupValues?.get(1)?.toIntOrNull()
             ?: document.selectFirst(".halim-movie-year")?.text()?.toIntOrNull()
 
-        return newAnimeLoadResponse(title, url, TvType.Anime) {
+        return newAnimeLoadResponse(title, fixedUrl, TvType.Anime) {
             this.posterUrl = poster
             this.plot = description
             this.year = year
             this.tags = tags
-            addEpisodes(DubStatus.Subbed, sortedEpisodes)
+            addEpisodes(DubStatus.Subbed, episodes)
         }
     }
 
@@ -143,75 +136,78 @@ class BocTem : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        val document = app.get(data).document
+        return runCatching {
+            val dataUrl = toAbsoluteUrl(data) ?: return false
+            val document = app.get(dataUrl).document
 
-        val bodyClass = document.selectFirst("body")?.attr("class") ?: ""
-        val postIdFromBody = Regex("""postid-(\d+)""").find(bodyClass)?.groupValues?.get(1)
-        val postIdFromArticle = Regex("""post-(\d+)""")
-            .find(document.selectFirst("article")?.attr("id") ?: "")
-            ?.groupValues
-            ?.get(1)
-        val postId = postIdFromBody ?: postIdFromArticle ?: return false
-
-        val episode = Regex("""tap-(\d+)""").find(data)?.groupValues?.get(1) ?: "1"
-
-        var nonce: String? = null
-        for (script in document.select("script")) {
-            val scriptContent = script.data()
-            if (scriptContent.contains("ajax_player") || scriptContent.contains("nonce")) {
-                nonce = Regex("""nonce["']?\s*:\s*["']([^"']+)["']""")
-                    .find(scriptContent)
+            val bodyClass = document.selectFirst("body")?.attr("class") ?: ""
+            val postId = Regex("""postid-(\d+)""").find(bodyClass)?.groupValues?.get(1)
+                ?: Regex("""post-(\d+)""").find(bodyClass)?.groupValues?.get(1)
+                ?: Regex("""post-(\d+)""")
+                    .find(document.selectFirst("article")?.attr("id") ?: "")
                     ?.groupValues
                     ?.get(1)
-                if (!nonce.isNullOrEmpty()) break
+                ?: return false
+
+            val episode = Regex("""tap-(\d+)""").find(dataUrl)?.groupValues?.get(1)
+                ?: Regex("""episode=(\d+)""").find(dataUrl)?.groupValues?.get(1)
+                ?: "1"
+
+            var nonce: String? = null
+            for (script in document.select("script")) {
+                val scriptContent = script.data() + "\n" + script.html()
+                if (scriptContent.contains("ajax_player") || scriptContent.contains("nonce")) {
+                    nonce = Regex("""nonce["']?\s*[:=]\s*["']([^"']+)["']""")
+                        .find(scriptContent)
+                        ?.groupValues
+                        ?.get(1)
+                    if (!nonce.isNullOrEmpty()) break
+                }
             }
-        }
-        if (nonce.isNullOrEmpty()) return false
+            if (nonce.isNullOrEmpty()) return false
 
-        val ajaxResponse = app.post(
-            "$mainUrl/wp-admin/admin-ajax.php",
-            data = mapOf(
-                "action" to "halim_ajax_player",
-                "nonce" to nonce,
-                "postid" to postId,
-                "episode" to episode,
-                "server" to "1",
-            ),
-            referer = data,
-            headers = mapOf("X-Requested-With" to "XMLHttpRequest"),
-        ).text
+            val ajaxResponse = app.post(
+                "$mainUrl/wp-admin/admin-ajax.php",
+                data = mapOf(
+                    "action" to "halim_ajax_player",
+                    "nonce" to nonce,
+                    "postid" to postId,
+                    "episode" to episode,
+                    "server" to "1",
+                ),
+                referer = dataUrl,
+                headers = mapOf("X-Requested-With" to "XMLHttpRequest"),
+            ).text
 
-        val m3u8Url = Regex("""file["']?\s*:\s*["']([^"']+\.m3u8)["']""")
-            .find(ajaxResponse)
-            ?.groupValues
-            ?.get(1)
-            ?: Regex("""https?://[^"'<>\s]+\.m3u8""").find(ajaxResponse)?.value
-
-        if (!m3u8Url.isNullOrEmpty()) {
-            val safeM3u8Url = m3u8Url.replace("\\/", "/")
-            M3u8Helper.generateM3u8(
-                source = name,
-                streamUrl = safeM3u8Url,
-                referer = mainUrl,
-            ).forEach(callback)
-            return true
-        }
-
-        val iframeUrl = Regex("""iframe[^>]+src=["']([^"']+)["']""")
-            .find(ajaxResponse)
-            ?.groupValues
-            ?.get(1)
-            ?: Regex("""src["']?\s*:\s*["']([^"']+embed[^"']*)["']""")
+            val m3u8Url = Regex("""file["']?\s*:\s*["']([^"']+\.m3u8[^"']*)["']""")
                 .find(ajaxResponse)
                 ?.groupValues
                 ?.get(1)
+                ?: Regex("""https?://[^"'<>\s]+\.m3u8[^"'<>\s]*""").find(ajaxResponse)?.value
 
-        if (!iframeUrl.isNullOrEmpty()) {
-            val safeIframeUrl = iframeUrl.replace("\\/", "/")
-            loadExtractor(safeIframeUrl, data, subtitleCallback, callback)
-            return true
-        }
+            if (!m3u8Url.isNullOrEmpty()) {
+                val safeM3u8Url = m3u8Url.replace("\\/", "/")
+                M3u8Helper.generateM3u8(name, safeM3u8Url, mainUrl).forEach(callback)
+                return true
+            }
 
-        return false
+            val iframeUrl = Regex("""iframe[^>]+src=["']([^"']+)["']""")
+                .find(ajaxResponse)
+                ?.groupValues
+                ?.get(1)
+                ?: Regex("""(?:src|embed_url|link)["']?\s*:\s*["']([^"']+)["']""")
+                    .find(ajaxResponse)
+                    ?.groupValues
+                    ?.get(1)
+                ?: document.selectFirst("iframe[src]")?.attr("src")
+
+            val safeIframeUrl = toAbsoluteUrl(iframeUrl?.replace("\\/", "/"))
+            if (!safeIframeUrl.isNullOrEmpty()) {
+                loadExtractor(safeIframeUrl, dataUrl, subtitleCallback, callback)
+                return true
+            }
+
+            false
+        }.getOrElse { false }
     }
 }

@@ -1,133 +1,167 @@
-name: Build and Push Plugins (debug-verbose)
+name: Build
+
+# https://docs.github.com/en/actions/learn-github-actions/workflow-syntax-for-github-actions#concurrency
+concurrency:
+  group: "build"
+  cancel-in-progress: true
 
 on:
   push:
-    branches: [ main ]
-  workflow_dispatch:
-
-permissions:
-  contents: write
-
-env:
-  JAVA_VERSION: 17
-  BUILD_BRANCH: Builds
+    branches:
+      # choose your default branch
+      - master
+      - main
+    paths-ignore:
+      - '*.md'
 
 jobs:
-  build-and-push:
-    runs-on: ubuntu-24.04
+  build:
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout full
-        uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v5
         with:
-          fetch-depth: 0
+          path: "src"
 
-      - name: Setup JDK
-        uses: actions/setup-java@v4
+      - name: Checkout builds
+        uses: actions/checkout@v5
         with:
-          distribution: temurin
-          java-version: ${{ env.JAVA_VERSION }}
+          ref: "builds"
+          path: "builds"
 
-      - name: Make gradlew executable
-        run: chmod +x ./gradlew
-
-      - name: Run Gradle build
-        run: ./gradlew build --no-daemon --stacktrace
-
-      - name: Generate plugins.json and repository.json
-        run: ./gradlew makePluginsJson makeRepositoryJson --no-daemon --stacktrace || true
-
-      - name: List all build artifacts (debug)
+      - name: Clean old builds
         run: |
-          echo "=== All .cs3 files ==="
-          find . -type f -name "*.cs3" -ls || true
-          echo ""
-          echo "=== All .json files in build dirs ==="
-          find . -type f -path "*/build/*.json" -ls || true
-          echo ""
-          echo "=== Complete build/ directory structure ==="
-          find . -path "*/build/*" -type f -ls || true
+          rm $GITHUB_WORKSPACE/builds/*.cs3 || true
+          rm $GITHUB_WORKSPACE/builds/*.jar || true
 
-      - name: Collect artifacts to staging directory
-        run: |
-          mkdir -p staging
-          
-          # Copy all .cs3 files
-          echo "=== Copying .cs3 files ==="
-          find . -type f -name "*.cs3" -exec cp -v {} staging/ \; || true
-          
-          # Copy plugins.json and repository.json from root build dir
-          echo "=== Copying JSON files ==="
-          if [ -f "build/plugins.json" ]; then
-            cp -v build/plugins.json staging/
-          fi
-          if [ -f "build/repository.json" ]; then
-            cp -v build/repository.json staging/
-          fi
-          
-          # Also check in subproject build dirs
-          find . -type f -name "plugins.json" -exec cp -v {} staging/ \; || true
-          find . -type f -name "repository.json" -exec cp -v {} staging/ \; || true
-          
-          echo "=== Staging directory contents ==="
-          ls -lah staging/ || true
+      - name: Setup JDK 17
+        uses: actions/setup-java@v5
+        with:
+          java-version: 17
+          distribution: adopt
+          cache: gradle
 
-      - name: Check if artifacts exist
-        id: check
-        run: |
-          if [ -n "$(ls -A staging/ 2>/dev/null)" ]; then
-            echo "HAS_ARTIFACTS=true" >> $GITHUB_OUTPUT
-            echo "Found artifacts to push"
-          else
-            echo "HAS_ARTIFACTS=false" >> $GITHUB_OUTPUT
-            echo "No artifacts found"
-          fi
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3.2.2
 
-      - name: Push to Builds branch
-        if: steps.check.outputs.HAS_ARTIFACTS == 'true'
+      - name: Access Secrets
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          BUILD_BRANCH: ${{ env.BUILD_BRANCH }}
+          TMDB_API: ${{ secrets.TMDB_API }}
+          DUMP_API: ${{ secrets.DUMP_API }}
+          DUMP_KEY: ${{ secrets.DUMP_KEY }}
+          ANICHI_API: ${{ secrets.ANICHI_API }}
+          ANICHI_SERVER: ${{ secrets.ANICHI_SERVER }}
+          ANICHI_ENDPOINT: ${{ secrets.ANICHI_ENDPOINT }}
+          ANICHI_APP: ${{ secrets.ANICHI_APP }}
+          ZSHOW_API: ${{ secrets.ZSHOW_API }}
+          SFMOVIES_API: ${{ secrets.SFMOVIES_API }}
+          CINEMATV_API: ${{ secrets.CINEMATV_API }}
+          GHOSTX_API: ${{ secrets.GHOSTX_API }}
+          SUPERSTREAM_FIRST_API: ${{ secrets.SUPERSTREAM_FIRST_API }}
+          SUPERSTREAM_SECOND_API: ${{ secrets.SUPERSTREAM_SECOND_API }}
+          SUPERSTREAM_THIRD_API: ${{ secrets.SUPERSTREAM_THIRD_API }}
+          SUPERSTREAM_FOURTH_API: ${{ secrets.SUPERSTREAM_FOURTH_API }}
+          AsianDrama_API: ${{ secrets.AsianDrama_API }}
+          FanCode_API: ${{ secrets.FanCode_API }}
+          Whvx_API: ${{ secrets.Whvx_API }}
+          JapanIPTV: ${{ secrets.JapanIPTV }}
+          SonyIPTV: ${{ secrets.SonyIPTV }}
+          PirateIPTV: ${{ secrets.PirateIPTV }}
+          Su_sports: ${{ secrets.Su_sports }}
+          CatflixAPI: ${{ secrets.CatflixAPI }}
+          ConsumetAPI: ${{ secrets.ConsumetAPI }}
+          FlixHQAPI: ${{ secrets.FlixHQAPI }}
+          WhvxAPI: ${{ secrets.WhvxAPI }}
+          WhvxT: ${{ secrets.WhvxT }}
+          SharmaflixApikey: ${{ secrets.SharmaflixApikey }}
+          SharmaflixApi: ${{ secrets.SharmaflixApi }}
+          Theyallsayflix: ${{ secrets.Theyallsayflix }}
+          HianimeAPI: ${{ secrets.HianimeAPI }}
+          Vidsrccc: ${{ secrets.Vidsrccc }}
+          WASMAPI: ${{ secrets.WASMAPI }}
+          KissKh: ${{ secrets.KissKh }}
+          KisskhSub: ${{ secrets.KisskhSub }}
+          StreamPlayAPI: ${{ secrets.StreamPlayAPI }}
+          PROXYAPI: ${{ secrets.PROXYAPI }}
+          KAISVA: ${{ secrets.KAISVA }}
+          MAL_API: ${{ secrets.MAL_API }}
+          MOVIEBOX_SECRET_KEY_ALT: ${{ secrets.MOVIEBOX_SECRET_KEY_ALT }}
+          MOVIEBOX_SECRET_KEY_DEFAULT: ${{ secrets.MOVIEBOX_SECRET_KEY_DEFAULT }}
+          SuperToken: ${{ secrets.SuperToken }}
+          KAIDEC: ${{ secrets.KAIDEC }}
+          KAIENC: ${{ secrets.KAIENC }}
+          KAIMEG: ${{ secrets.KAIMEG }}
+          NuvioStreams: ${{ secrets.NuvioStreams }}
+          YFXENC: ${{ secrets.YFXENC }}
+          YFXDEC: ${{ secrets.YFXDEC }}
+          VideasyDEC: ${{ secrets.VideasyDEC }}
+          NuvFeb: ${{ secrets.NuvFeb }}
         run: |
-          set -xe
-          
-          # Configure git
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          cd $GITHUB_WORKSPACE/src
+          echo TMDB_API=$TMDB_API >> local.properties
+          echo DUMP_API=$DUMP_API >> local.properties
+          echo DUMP_KEY=$DUMP_KEY >> local.properties
+          echo ANICHI_API=$ANICHI_API >> local.properties
+          echo ANICHI_SERVER=$ANICHI_SERVER >> local.properties
+          echo ANICHI_ENDPOINT=$ANICHI_ENDPOINT >> local.properties
+          echo ANICHI_APP=$ANICHI_APP >> local.properties
+          echo ZSHOW_API=$ZSHOW_API >> local.properties
+          echo SFMOVIES_API=$SFMOVIES_API >> local.properties
+          echo CINEMATV_API=$CINEMATV_API >> local.properties
+          echo GHOSTX_API=$GHOSTX_API >> local.properties
+          echo SUPERSTREAM_FIRST_API=$SUPERSTREAM_FIRST_API >> local.properties
+          echo SUPERSTREAM_SECOND_API=$SUPERSTREAM_SECOND_API >> local.properties
+          echo SUPERSTREAM_THIRD_API=$SUPERSTREAM_THIRD_API >> local.properties
+          echo SUPERSTREAM_FOURTH_API=$SUPERSTREAM_FOURTH_API >> local.properties
+          echo AsianDrama_API=$AsianDrama_API >> local.properties
+          echo FanCode_API=$FanCode_API >> local.properties
+          echo Whvx_API=$Whvx_API >> local.properties
+          echo Su_sports=$Su_sports >> local.properties
+          echo PirateIPTV=$PirateIPTV >> local.properties
+          echo SonyIPTV=$SonyIPTV >> local.properties
+          echo JapanIPTV=$JapanIPTV >> local.properties
+          echo CatflixAPI=$CatflixAPI >> local.properties
+          echo ConsumetAPI=$ConsumetAPI >> local.properties
+          echo FlixHQAPI=$FlixHQAPI >> local.properties
+          echo WhvxAPI=$WhvxAPI >> local.properties
+          echo WhvxT=$WhvxT >> local.properties
+          echo SharmaflixApi=$SharmaflixApi >> local.properties
+          echo SharmaflixApikey=$SharmaflixApikey >> local.properties
+          echo HianimeAPI=$HianimeAPI >> local.properties
+          echo Vidsrccc=$Vidsrccc >> local.properties
+          echo WASMAPI=$WASMAPI >> local.properties
+          echo KissKh=$KissKh >> local.properties
+          echo KisskhSub=$KisskhSub >> local.properties
+          echo StreamPlayAPI=$StreamPlayAPI >> local.properties
+          echo PROXYAPI=$PROXYAPI >> local.properties
+          echo KAISVA=$KAISVA >> local.properties
+          echo MAL_API=$MAL_API >> local.properties
+          echo MOVIEBOX_SECRET_KEY_DEFAULT=$MOVIEBOX_SECRET_KEY_DEFAULT >> local.properties
+          echo MOVIEBOX_SECRET_KEY_ALT=$MOVIEBOX_SECRET_KEY_ALT >> local.properties
+          echo SuperToken=$SuperToken >> local.properties
+          echo KAIDEC=$KAIDEC >> local.properties
+          echo KAIENC=$KAIENC >> local.properties
+          echo KAIMEG=$KAIMEG >> local.properties
+          echo NuvioStreams=$NuvioStreams >> local.properties
+          echo YFXDEC=$YFXDEC >> local.properties
+          echo YFXENC=$YFXENC >> local.properties
+          echo VideasyDEC=$VideasyDEC >> local.properties
+          echo NuvFeb=$NuvFeb >> local.properties
+      - name: Build Plugins
+        run: |
+          cd $GITHUB_WORKSPACE/src
+          chmod +x gradlew
+          ./gradlew make makePluginsJson
+          ./gradlew ensureJarCompatibility
+          cp **/build/*.cs3 $GITHUB_WORKSPACE/builds
+          cp **/build/*.jar $GITHUB_WORKSPACE/builds
+          cp build/plugins.json $GITHUB_WORKSPACE/builds
 
-          # Fetch or create Builds branch
-          git fetch origin $BUILD_BRANCH || true
-          if git rev-parse --verify origin/$BUILD_BRANCH >/dev/null 2>&1; then
-            git checkout $BUILD_BRANCH
-            git reset --hard origin/$BUILD_BRANCH
-          else
-            git checkout --orphan $BUILD_BRANCH
-            git rm -rf . || true
-          fi
-
-          # Copy artifacts from staging
-          cp -rv staging/* . || true
-          
-          echo "=== Files in Builds branch ==="
-          ls -lah
-          
-          # Force add all files (in case .cs3 is in .gitignore)
-          git add -f *.cs3 *.json || true
-          git add -A
-          
-          git status --porcelain
-
-          if git diff --cached --quiet; then
-            echo "No changes to commit"
-            exit 0
-          fi
-
-          git commit -m "Auto update plugin builds: run ${GITHUB_RUN_ID} (${GITHUB_SHA:0:7})"
-          
-          # Show what we're committing
-          git --no-pager show --name-only --stat HEAD
-
-          # Push with verbose output
-          export GIT_TRACE=1 GIT_CURL_VERBOSE=1
-          remote_url="https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
-          git remote set-url origin "$remote_url"
-          git push origin $BUILD_BRANCH --force-with-lease
+      - name: Push builds
+        run: |
+          cd $GITHUB_WORKSPACE/builds
+          git config --local user.email "actions@github.com"
+          git config --local user.name "GitHub Actions"
+          git add .
+          git commit --amend -m "Build $GITHUB_SHA" || exit 0   # do not error if nothing to commit
+          git push --force

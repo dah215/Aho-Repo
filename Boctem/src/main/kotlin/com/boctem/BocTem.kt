@@ -191,14 +191,15 @@ class BocTemProvider : MainAPI() {
 
                 if (!cleanDirectVideo.isNullOrBlank()) {
                     callback(
-                        ExtractorLink(
+                        newExtractorLink(
                             source = name,
                             name = "$name Direct",
                             url = cleanDirectVideo,
-                            referer = dataUrl,
-                            quality = Qualities.Unknown.value,
-                            isM3u8 = false
-                        )
+                            type = ExtractorLinkType.VIDEO
+                        ) {
+                            this.referer = dataUrl
+                            this.quality = Qualities.Unknown.value
+                        }
                     )
                     return true
                 }

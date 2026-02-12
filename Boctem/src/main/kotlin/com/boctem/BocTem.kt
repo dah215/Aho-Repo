@@ -16,6 +16,16 @@ class BocTemProvider : MainAPI() {
     override val hasQuickSearch = false
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie)
 
+    private val defaultHeaders = mapOf(
+        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Cache-Control" to "no-cache",
+        "Pragma" to "no-cache",
+        "Connection" to "keep-alive",
+        "Upgrade-Insecure-Requests" to "1"
+    )
+
     override val mainPage = mainPageOf(
         "anime-moi/page/" to "Anime Mới",
         "anime-hay/page/" to "Anime Hay",
@@ -23,14 +33,41 @@ class BocTemProvider : MainAPI() {
         "release/2025/page/" to "Anime 2025"
     )
 
+    private fun requestHeaders(referer: String? = null, extra: Map<String, String> = emptyMap()): Map<String, String> {
+        val headers = defaultHeaders.toMutableMap()
+        val ref = referer ?: mainUrl
+        headers["Referer"] = ref
+        headers.putAll(extra)
+        return headers
+    }
+
     private fun normalizeUrl(url: String?): String? {
         if (url.isNullOrBlank()) return null
+
         return when {
             url.startsWith("http://") || url.startsWith("https://") -> url
             url.startsWith("//") -> "https:$url"
             url.startsWith("/") -> "$mainUrl$url"
             else -> "$mainUrl/$url"
         }
+    }
+
+    private fun decodeUnicode(text: String): String {
+        return text.replace(Regex("""\\u([0-9a-fA-F]{4})""")) { match ->
+            match.groupValues[1].toInt(16).toChar().toString()
+        }
+    }
+
+    private fun cleanStreamUrl(raw: String): String {
+        return decodeUnicode(raw)
+            .trim()
+            .trim('"', '\'')
+            .replace("\\/", "/")
+            .replace("\\u0026", "&")
+            .replace("&amp;", "&")
+            .replace("\\n", "")
+            .replace("\\t", "")
+            .replace("\\", "")
     }
 
     private fun parseCard(article: Element): SearchResponse? {
@@ -43,7 +80,8 @@ class BocTemProvider : MainAPI() {
 
         val image = article.selectFirst("img")
         val poster = normalizeUrl(
-            image?.attr("data-src")?.takeIf { it.isNotBlank() } ?: image?.attr("src")
+            image?.attr("data-src")?.takeIf { it.isNotBlank() }
+                ?: image?.attr("src")
         )
 
         val statusText = article.selectFirst(".status")?.text().orEmpty()
@@ -57,8 +95,11 @@ class BocTemProvider : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = "$mainUrl/${request.data}$page"
-        val document = app.get(url).document
-        val items = document.select("article.thumb.grid-item").mapNotNull { parseCard(it) }
+        val document = app.get(url, headers = requestHeaders(mainUrl)).document
+
+        val items = document
+            .select("article.thumb.grid-item")
+            .mapNotNull { parseCard(it) }
 
         return newHomePageResponse(
             HomePageList(
@@ -72,13 +113,17 @@ class BocTemProvider : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val encodedQuery = URLEncoder.encode(query, "UTF-8")
-        val document = app.get("$mainUrl/?s=$encodedQuery").document
-        return document.select("article.thumb.grid-item").mapNotNull { parseCard(it) }
+        val url = "$mainUrl/?s=$encodedQuery"
+        val document = app.get(url, headers = requestHeaders(mainUrl)).document
+
+        return document
+            .select("article.thumb.grid-item")
+            .mapNotNull { parseCard(it) }
     }
 
     override suspend fun load(url: String): LoadResponse? {
         val fixedUrl = normalizeUrl(url) ?: return null
-        val document = app.get(fixedUrl).document
+        val document = app.get(fixedUrl, headers = requestHeaders(fixedUrl)).document
 
         val title = document.selectFirst("h1.entry-title")?.text()?.trim()
             ?: document.selectFirst(".halim-movie-title")?.text()?.trim()
@@ -94,20 +139,23 @@ class BocTemProvider : MainAPI() {
             ?: document.selectFirst("meta[property=og:description]")?.attr("content")
 
         val seen = HashSet<String>()
-        val episodes = document.select("a[href*=/xem-phim/]").mapNotNull { link ->
-            val epUrl = normalizeUrl(link.attr("href")) ?: return@mapNotNull null
-            if (!epUrl.contains("-tap-")) return@mapNotNull null
-            if (!seen.add(epUrl)) return@mapNotNull null
+        val episodes = document
+            .select("a[href*=/xem-phim/]")
+            .mapNotNull { link ->
+                val epUrl = normalizeUrl(link.attr("href")) ?: return@mapNotNull null
+                if (!epUrl.contains("-tap-")) return@mapNotNull null
+                if (!seen.add(epUrl)) return@mapNotNull null
 
-            val epName = link.text().trim().ifBlank { null }
-            val epNum = Regex("""tap-(\d+)""").find(epUrl)?.groupValues?.get(1)?.toIntOrNull()
+                val epName = link.text().trim().ifBlank { null }
+                val epNum = Regex("""tap-(\d+)""").find(epUrl)?.groupValues?.get(1)?.toIntOrNull()
 
-            newEpisode(epUrl) {
-                this.name = epName
-                this.episode = epNum
-                this.posterUrl = poster
+                newEpisode(epUrl) {
+                    this.name = epName
+                    this.episode = epNum
+                    this.posterUrl = poster
+                }
             }
-        }.sortedBy { it.episode ?: Int.MAX_VALUE }
+            .sortedBy { it.episode ?: Int.MAX_VALUE }
 
         val tags = document.select(".halim-movie-genres a, .post-category a").map { it.text() }
         val year = Regex("""/release/(\d+)/""").find(fixedUrl)?.groupValues?.get(1)?.toIntOrNull()
@@ -130,21 +178,12 @@ class BocTemProvider : MainAPI() {
     ): Boolean {
         return runCatching {
             val dataUrl = normalizeUrl(data) ?: return false
-            val document = app.get(dataUrl).document
+            val document = app.get(dataUrl, headers = requestHeaders(dataUrl)).document
 
             var hasLinks = false
             val linkCallback: (ExtractorLink) -> Unit = {
                 hasLinks = true
                 callback(it)
-            }
-
-            fun cleanStreamUrl(raw: String): String {
-                return raw
-                    .trim()
-                    .trim('"', '\'')
-                    .replace("\\/", "/")
-                    .replace("\\u0026", "&")
-                    .replace("&amp;", "&")
             }
 
             fun extractIframeUrlsFromText(text: String?): List<String> {
@@ -169,13 +208,16 @@ class BocTemProvider : MainAPI() {
             suspend fun tryM3u8FromText(text: String?): Boolean {
                 if (text.isNullOrBlank()) return false
 
-                val m3u8 = Regex("""(?:file|src|link|playlist)["']?\s*[:=]\s*["']([^"']+\.m3u8[^"']*)["']""")
-                    .find(text)
-                    ?.groupValues
-                    ?.get(1)
-                    ?: Regex("""(?:https?:)?//[^"'<>\s]+\.m3u8[^"'<>\s]*""")
-                        .find(text)
-                        ?.value
+                val m3u8Patterns = listOf(
+                    Regex("""(?:file|src|link|playlist)["']?\s*[:=]\s*["']([^"']+\.m3u8[^"']*)["']"""),
+                    Regex("""(?:https?:)?//[^"'<>\s]+\.m3u8[^"'<>\s]*"""),
+                    Regex("""(?:master|hls|stream)["']?\s*[:=]\s*["']([^"']+\.m3u8[^"']*)["']""")
+                )
+
+                val m3u8 = m3u8Patterns.firstNotNullOfOrNull { pattern ->
+                    val match = pattern.find(text) ?: return@firstNotNullOfOrNull null
+                    if (match.groupValues.size > 1) match.groupValues[1] else match.value
+                }
 
                 val cleanM3u8 = m3u8
                     ?.let(::cleanStreamUrl)
@@ -185,8 +227,23 @@ class BocTemProvider : MainAPI() {
                     M3u8Helper.generateM3u8(
                         source = name,
                         streamUrl = cleanM3u8,
-                        referer = dataUrl
+                        referer = dataUrl,
+                        headers = requestHeaders(dataUrl)
                     ).forEach(linkCallback)
+                    if (hasLinks) return true
+
+                    linkCallback(
+                        newExtractorLink(
+                            source = name,
+                            name = "$name M3U8",
+                            url = cleanM3u8,
+                            type = ExtractorLinkType.M3U8
+                        ) {
+                            this.referer = dataUrl
+                            this.quality = Qualities.Unknown.value
+                            this.headers = requestHeaders(dataUrl)
+                        }
+                    )
                     return hasLinks
                 }
 
@@ -212,6 +269,7 @@ class BocTemProvider : MainAPI() {
                         ) {
                             this.referer = dataUrl
                             this.quality = Qualities.Unknown.value
+                            this.headers = requestHeaders(dataUrl)
                         }
                     )
                     return hasLinks
@@ -253,7 +311,9 @@ class BocTemProvider : MainAPI() {
                 val content = script.data() + "\n" + script.html()
                 if (content.contains("ajax_player") || content.contains("nonce")) {
                     nonce = Regex("""nonce["']?\s*[:=]\s*["']([^"']+)["']""")
-                        .find(content)?.groupValues?.get(1)
+                        .find(content)
+                        ?.groupValues
+                        ?.get(1)
                     if (!nonce.isNullOrBlank()) break
                 }
             }
@@ -284,11 +344,19 @@ class BocTemProvider : MainAPI() {
                             "$mainUrl/wp-admin/admin-ajax.php",
                             data = payload,
                             referer = dataUrl,
-                            headers = mapOf("X-Requested-With" to "XMLHttpRequest")
+                            headers = requestHeaders(
+                                dataUrl,
+                                mapOf(
+                                    "Origin" to mainUrl,
+                                    "X-Requested-With" to "XMLHttpRequest"
+                                )
+                            )
                         ).text
                     }.getOrNull()
+
                     if (!response.isNullOrBlank()) return response
                 }
+
                 return null
             }
 
@@ -297,9 +365,14 @@ class BocTemProvider : MainAPI() {
 
                 if (tryM3u8FromText(ajaxResponse)) return true
 
-                val iframe = Regex("""iframe[^>]+src=["']([^"']+)["']""").find(ajaxResponse)?.groupValues?.get(1)
+                val iframe = Regex("""iframe[^>]+src=["']([^"']+)["']""")
+                    .find(ajaxResponse)
+                    ?.groupValues
+                    ?.get(1)
                     ?: Regex("""(?:src|embed_url|link)["']?\s*:\s*["']([^"']+)["']""")
-                        .find(ajaxResponse)?.groupValues?.get(1)
+                        .find(ajaxResponse)
+                        ?.groupValues
+                        ?.get(1)
 
                 val iframeUrl = normalizeUrl(iframe?.replace("\\/", "/"))
                 if (!iframeUrl.isNullOrBlank()) {

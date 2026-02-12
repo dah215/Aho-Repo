@@ -24,8 +24,8 @@ class PhimMoiChillProvider : MainAPI() {
 
     private val defaultHeaders = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-        "Accept" to "application/json, text/javascript, */*; q=0.01",
-        "X-Requested-With" to "XMLHttpRequest"
+        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7"
     )
 
     override val mainPage = mainPageOf(
@@ -34,28 +34,36 @@ class PhimMoiChillProvider : MainAPI() {
         "list/phim-bo" to "Phim Bộ"
     )
 
-    // Helper function để fix URL ảnh
-    private fun fixPosterUrl(url: String?): String? {
+    // Fix URL - chuyển relative URL thành absolute
+    private fun fixUrl(url: String?): String? {
         if (url.isNullOrEmpty()) return null
-        return if (url.startsWith("http")) url else "$mainUrl$url"
+        return if (url.startsWith("http")) url else {
+            val cleanUrl = if (url.startsWith("/")) url else "/$url"
+            "$mainUrl$cleanUrl"
+        }
     }
 
-    // Helper function để lấy URL ảnh từ nhiều attribute
+    // Lấy URL ảnh từ element, hỗ trợ lazy loading
     private fun getImageUrl(imgElement: org.jsoup.nodes.Element?): String? {
         if (imgElement == null) return null
         
-        // Thử nhiều attribute theo thứ tự ưu tiên (lazy loading)
-        val attributes = listOf("data-src", "data-original", "data-lazy-src", "src")
-        for (attr in attributes) {
+        val lazyAttrs = listOf("data-src", "data-original", "data-lazy-src", "data-lazy")
+        for (attr in lazyAttrs) {
             val url = imgElement.attr(attr)
             if (!url.isNullOrEmpty() && url != "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7") {
-                return fixPosterUrl(url)
+                return fixUrl(url)
             }
+        }
+        
+        // Fallback to src
+        val src = imgElement.attr("src")
+        if (!src.isNullOrEmpty()) {
+            return fixUrl(src)
         }
         return null
     }
 
-    // Helper function để lấy SearchQuality từ string
+    // Lấy SearchQuality từ string
     private fun getSearchQuality(quality: String?): SearchQuality? {
         return when (quality?.uppercase()?.trim()) {
             "4K", "2160P", "UHD" -> SearchQuality.UHD
@@ -73,37 +81,39 @@ class PhimMoiChillProvider : MainAPI() {
             val html = app.get(url, headers = defaultHeaders).text
             val doc = Jsoup.parse(html)
             
-            // Thử nhiều selector khác nhau
-            val items = doc.select(".list-film .item, .movie-list .movie-item, .film-list .film-item").mapNotNull { el ->
+            val items = doc.select(".list-film .item, .movie-list .movie-item, .film-list .film-item, .items .item").mapNotNull { el ->
                 val a = el.selectFirst("a") ?: return@mapNotNull null
                 
-                // Lấy title từ nhiều nguồn
-                val title = el.selectFirst("p.name, .title, .film-name")?.text()?.trim()
+                // Lấy title
+                val title = el.selectFirst("p.name, .title, .film-name, .movie-name")?.text()?.trim()
                     ?: a.attr("title")
                     ?: a.text()
                     ?: return@mapNotNull null
                 
-                // Lấy poster với nhiều cách
+                // Lấy poster URL
                 val poster = getImageUrl(el.selectFirst("img"))
                 
                 // Lấy thông tin bổ sung
-                val episodeInfo = el.selectFirst(".episode, .tap, .current")?.text()?.trim()
-                val year = el.selectFirst(".year, .release-year")?.text()?.trim()
-                val qualityText = el.selectFirst(".quality, .hd, .resolution")?.text()?.trim()
+                val episodeText = el.selectFirst(".episode, .tap, .current, .ep")?.text()?.trim()
+                val qualityText = el.selectFirst(".quality, .hd, .resolution, .tag-quality")?.text()?.trim()
+                val yearText = el.selectFirst(".year, .release-year")?.text()?.trim()
                 
-                // Kiểm tra xem là phim bộ hay phim lẻ
+                // Lấy href
                 val href = a.attr("href") ?: return@mapNotNull null
-                val isTvSeries = episodeInfo != null || href.contains("/phim-bo/") || doc.select("ul.list-episode").isNotEmpty()
+                val fixedHref = fixUrl(href) ?: href
+                
+                // Xác định loại phim
+                val isTvSeries = episodeText != null || href.contains("/phim-bo/")
                 
                 if (isTvSeries) {
-                    newTvSeriesSearchResponse(title, fixPosterUrl(href) ?: href, TvType.TvSeries) {
+                    newTvSeriesSearchResponse(title, fixedHref, TvType.TvSeries) {
                         this.posterUrl = poster
-                        this.year = year?.toIntOrNull()
+                        this.year = yearText?.toIntOrNull()
                     }
                 } else {
-                    newMovieSearchResponse(title, fixPosterUrl(href) ?: href, TvType.Movie) {
+                    newMovieSearchResponse(title, fixedHref, TvType.Movie) {
                         this.posterUrl = poster
-                        this.year = year?.toIntOrNull()
+                        this.year = yearText?.toIntOrNull()
                         this.quality = getSearchQuality(qualityText)
                     }
                 }
@@ -111,7 +121,6 @@ class PhimMoiChillProvider : MainAPI() {
             
             newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
         } catch (e: Exception) {
-            // Log error nhưng không crash
             logError("Error loading main page: ${e.message}")
             newHomePageResponse(request.name, emptyList(), hasNext = false)
         }
@@ -123,7 +132,7 @@ class PhimMoiChillProvider : MainAPI() {
             val html = app.get(url, headers = defaultHeaders).text
             val doc = Jsoup.parse(html)
             
-            doc.select(".list-film .item, .movie-list .movie-item, .search-result .item").mapNotNull { el ->
+            doc.select(".list-film .item, .movie-list .movie-item, .search-result .item, .items .item").mapNotNull { el ->
                 val a = el.selectFirst("a") ?: return@mapNotNull null
                 
                 val title = el.selectFirst("p.name, .title, .film-name")?.text()?.trim()
@@ -133,16 +142,16 @@ class PhimMoiChillProvider : MainAPI() {
                 
                 val poster = getImageUrl(el.selectFirst("img"))
                 val href = a.attr("href") ?: return@mapNotNull null
+                val fixedHref = fixUrl(href) ?: href
                 
-                val episodeInfo = el.selectFirst(".episode, .tap")?.text()?.trim()
-                val isTvSeries = episodeInfo != null || href.contains("/phim-bo/")
+                val isTvSeries = href.contains("/phim-bo/")
                 
                 if (isTvSeries) {
-                    newTvSeriesSearchResponse(title, fixPosterUrl(href) ?: href, TvType.TvSeries) {
+                    newTvSeriesSearchResponse(title, fixedHref, TvType.TvSeries) {
                         this.posterUrl = poster
                     }
                 } else {
-                    newMovieSearchResponse(title, fixPosterUrl(href) ?: href, TvType.Movie) {
+                    newMovieSearchResponse(title, fixedHref, TvType.Movie) {
                         this.posterUrl = poster
                     }
                 }
@@ -159,39 +168,38 @@ class PhimMoiChillProvider : MainAPI() {
             val doc = Jsoup.parse(html)
             
             // Lấy title
-            val title = doc.selectFirst("h1.entry-title, .film-title, .movie-title")?.text()?.trim()
+            val title = doc.selectFirst("h1.entry-title, .film-title, .movie-title, .title")?.text()?.trim()
                 ?: doc.selectFirst("title")?.text()?.substringBefore("-")?.trim()
                 ?: "Phim"
             
             // Lấy poster
-            val poster = getImageUrl(doc.selectFirst(".film-poster img, .poster img, .movie-thumb img"))
+            val poster = getImageUrl(
+                doc.selectFirst(".film-poster img, .poster img, .movie-thumb img, .thumb img, .image img")
+            )
             
             // Lấy mô tả
-            val description = doc.selectFirst(".film-content, .description, .movie-desc")?.text()?.trim()
+            val description = doc.selectFirst(".film-content, .description, .movie-desc, .content, .plot")?.text()?.trim()
             
             // Lấy năm
-            val year = doc.selectFirst(".release-year, .year")?.text()?.trim()?.toIntOrNull()
+            val year = doc.selectFirst(".release-year, .year, [class*='year']")?.text()?.trim()?.toIntOrNull()
             
             // Lấy thể loại
-            val genres = doc.select(".genre a, .categories a").map { it.text() }
+            val genres = doc.select(".genre a, .categories a, .category a").map { it.text() }
             
-            // Lấy thông tin phụ đề/thuyết minh
-            val hasSubtitle = html.contains("phụ đề") || html.contains("vietsub") || html.contains("sub")
-            val hasDubbing = html.contains("thuyết minh") || html.contains("lồng tiếng") || html.contains("dub")
+            // Lấy thông tin chất lượng
+            val qualityText = doc.selectFirst(".quality, .hd, .resolution")?.text()?.trim()
             
             // Lấy danh sách tập
-            val episodes = doc.select("ul.list-episode li a, .episode-list a, a[href*='/xem/']").mapNotNull {
+            val episodes = doc.select("ul.list-episode li a, .episode-list a, .list-ep a, a[href*='/xem/'], a[href*='/watch/']").mapNotNull {
                 val epUrl = it.attr("href") ?: return@mapNotNull null
                 val epName = it.text().trim().ifEmpty { "Tập ${it.attr("data-episode")}" }
-                newEpisode(fixPosterUrl(epUrl) ?: epUrl) {
+                newEpisode(fixUrl(epUrl) ?: epUrl) {
                     this.name = epName
                 }
             }.distinctBy { it.data }
             
-            // Build tags với thông tin phụ đề/thuyết minh
+            // Tags với thông tin phụ đề/thuyết minh
             val tags = genres.toMutableList()
-            if (hasSubtitle) tags.add("Phụ đề")
-            if (hasDubbing) tags.add("Thuyết minh")
             
             // Xác định loại phim
             val isTvSeries = episodes.size > 1 || html.contains("phim-bo") || url.contains("phim-bo")
@@ -204,7 +212,6 @@ class PhimMoiChillProvider : MainAPI() {
                     this.tags = tags
                 }
             } else if (episodes.size == 1) {
-                // Phim lẻ có 1 tập
                 newMovieLoadResponse(title, url, TvType.Movie, episodes.first().data) {
                     this.posterUrl = poster
                     this.plot = description
@@ -212,7 +219,6 @@ class PhimMoiChillProvider : MainAPI() {
                     this.tags = tags
                 }
             } else {
-                // Không có episode info, coi như phim lẻ với URL hiện tại
                 newMovieLoadResponse(title, url, TvType.Movie, url) {
                     this.posterUrl = poster
                     this.plot = description
@@ -239,13 +245,21 @@ class PhimMoiChillProvider : MainAPI() {
             val html = pageResponse.text
             val cookies = pageResponse.cookies
 
-            // Thử nhiều pattern để lấy episode ID
+            // Headers cho video
+            val videoHeaders = mapOf(
+                "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+                "Accept" to "*/*",
+                "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Origin" to mainUrl,
+                "Referer" to "$mainUrl/"
+            )
+
+            // Lấy episode ID
             val episodeId = extractEpisodeId(html)
             
             if (episodeId == null) {
-                // Thử tìm link trực tiếp nếu không có episode ID
-                foundAny = extractDirectLinks(html, data, callback)
-                return foundAny
+                // Tìm link trực tiếp
+                return extractDirectLinks(html, data, callback, videoHeaders)
             }
 
             // Lấy key từ chillsplayer
@@ -253,33 +267,30 @@ class PhimMoiChillProvider : MainAPI() {
                 app.post(
                     "$mainUrl/chillsplayer.php",
                     data = mapOf("qcao" to episodeId, "sv" to "0"),
-                    headers = defaultHeaders.plus("Referer" to data),
+                    headers = defaultHeaders + ("Referer" to data),
                     cookies = cookies
                 ).text
             } catch (e: Exception) {
                 logError("Error calling chillsplayer: ${e.message}")
-                // Thử tìm link trực tiếp
-                return extractDirectLinks(html, data, callback)
+                return extractDirectLinks(html, data, callback, videoHeaders)
             }
 
             // Giải mã key
             val key = extractKey(responseText)
             
             if (key.isNullOrEmpty() || key.length < 5) {
-                // Fallback: tìm link trực tiếp
-                return extractDirectLinks(html, data, callback)
+                return extractDirectLinks(html, data, callback, videoHeaders)
             }
 
-            // Danh sách server với nhiều pattern hơn
+            // Danh sách server
             val serverList = listOf(
-                Triple("https://sotrim.topphimmoi.org/manifest/$key/index.m3u8", "Chill-VIP", true),
-                Triple("https://sotrim.topphimmoi.org/raw/$key/index.m3u8", "Sotrim-Raw", true),
-                Triple("https://dash.megacdn.xyz/raw/$key/index.m3u8", "Mega-HLS", true),
-                Triple("https://dash.megacdn.xyz/dast/$key/index.m3u8", "Mega-BK", true),
-                Triple("https://player.phimmoichill.now/manifest/$key/index.m3u8", "Chill-Player", false)
+                "https://sotrim.topphimmoi.org/manifest/$key/index.m3u8" to "Chill-VIP",
+                "https://sotrim.topphimmoi.org/raw/$key/index.m3u8" to "Sotrim-Raw",
+                "https://dash.megacdn.xyz/raw/$key/index.m3u8" to "Mega-HLS",
+                "https://dash.megacdn.xyz/dast/$key/index.m3u8" to "Mega-BK"
             )
 
-            serverList.forEach { (link, serverName, isPrimary) ->
+            serverList.forEach { (link, serverName) ->
                 try {
                     callback(
                         newExtractorLink(
@@ -289,31 +300,29 @@ class PhimMoiChillProvider : MainAPI() {
                             type = ExtractorLinkType.M3U8
                         ) {
                             this.referer = "$mainUrl/"
-                            this.quality = if (isPrimary) Qualities.P1080.value else Qualities.P720.value
+                            this.origin = mainUrl
+                            this.headers = videoHeaders
+                            this.quality = Qualities.P1080.value
                         }
                     )
                     foundAny = true
                 } catch (e: Exception) {
-                    // Silent fail cho từng server, không throw error
                     logError("Failed to add server $serverName: ${e.message}")
                 }
             }
 
-            // Tìm thêm link trực tiếp trong response
+            // Fallback
             if (!foundAny) {
-                foundAny = extractDirectLinks(responseText, data, callback)
+                foundAny = extractDirectLinks(responseText, data, callback, videoHeaders)
             }
-
-            // Thử tìm link trực tiếp trong HTML gốc nếu vẫn không có
             if (!foundAny) {
-                foundAny = extractDirectLinks(html, data, callback)
+                foundAny = extractDirectLinks(html, data, callback, videoHeaders)
             }
 
             // Tìm phụ đề
             extractSubtitles(html, subtitleCallback)
 
         } catch (e: Exception) {
-            // Không throw error, chỉ log và trả về false
             logError("loadLinks error: ${e.message}")
         }
 
@@ -352,7 +361,7 @@ class PhimMoiChillProvider : MainAPI() {
             }
         }
         
-        // Fallback: parse thủ công
+        // Fallback parse thủ công
         val startMarkers = listOf("iniPlayers(\"", "key\":\"", "key='")
         for (marker in startMarkers) {
             val start = responseText.indexOf(marker)
@@ -365,12 +374,15 @@ class PhimMoiChillProvider : MainAPI() {
                 }
             }
         }
-        
         return null
     }
 
-    // Đổi thành suspend function vì newExtractorLink là suspend
-    private suspend fun extractDirectLinks(html: String, referer: String, callback: (ExtractorLink) -> Unit): Boolean {
+    private suspend fun extractDirectLinks(
+        html: String, 
+        referer: String, 
+        callback: (ExtractorLink) -> Unit,
+        videoHeaders: Map<String, String>
+    ): Boolean {
         var found = false
         
         // Tìm M3U8 links
@@ -393,13 +405,13 @@ class PhimMoiChillProvider : MainAPI() {
                         type = ExtractorLinkType.M3U8
                     ) {
                         this.referer = referer
+                        this.origin = mainUrl
+                        this.headers = videoHeaders
                         this.quality = Qualities.P1080.value
                     }
                 )
                 found = true
-            } catch (e: Exception) {
-                // Silent fail
-            }
+            } catch (e: Exception) { }
         }
 
         // Tìm MP4 links
@@ -415,13 +427,13 @@ class PhimMoiChillProvider : MainAPI() {
                         type = ExtractorLinkType.VIDEO
                     ) {
                         this.referer = referer
+                        this.origin = mainUrl
+                        this.headers = videoHeaders
                         this.quality = Qualities.P1080.value
                     }
                 )
                 found = true
-            } catch (e: Exception) {
-                // Silent fail
-            }
+            } catch (e: Exception) { }
         }
 
         return found
@@ -429,53 +441,29 @@ class PhimMoiChillProvider : MainAPI() {
 
     private fun extractSubtitles(html: String, subtitleCallback: (SubtitleFile) -> Unit) {
         try {
-            // Tìm subtitle trong HTML
-            val subtitlePatterns = listOf(
-                Regex("""subtitle"\s*:\s*\[([^\]]+)\]"""),
-                Regex("""sub"\s*:\s*\[([^\]]+)\]"""),
-                Regex("""tracks\s*=\s*\[([^\]]+)\]""")
-            )
-
-            for (pattern in subtitlePatterns) {
-                pattern.find(html)?.groupValues?.get(1)?.let { subArray ->
-                    // Parse subtitle URLs
-                    val urlPattern = Regex("""https?://[^\s"'<>]+\.vtt[^\s"'<>]*""")
-                    urlPattern.findAll(subArray).forEach { match ->
-                        try {
-                            subtitleCallback(
-                                SubtitleFile(
-                                    lang = "Vietnamese",
-                                    url = match.value
-                                )
-                            )
-                        } catch (e: Exception) {
-                            // Silent fail
-                        }
-                    }
-                }
-            }
-
-            // Tìm direct subtitle links
+            // Tìm VTT subtitles
             val vttPattern = Regex("""https?://[^\s"'<>]+\.vtt[^\s"'<>]*""")
             vttPattern.findAll(html).forEach { match ->
                 try {
                     subtitleCallback(
-                        SubtitleFile(
-                            lang = "Vietnamese",
-                            url = match.value
-                        )
+                        SubtitleFile(lang = "Vietnamese", url = match.value)
                     )
-                } catch (e: Exception) {
-                    // Silent fail
-                }
+                } catch (e: Exception) { }
             }
-        } catch (e: Exception) {
-            // Silent fail - không quan trọng nếu không tìm thấy subtitle
-        }
+            
+            // Tìm SRT subtitles
+            val srtPattern = Regex("""https?://[^\s"'<>]+\.srt[^\s"'<>]*""")
+            srtPattern.findAll(html).forEach { match ->
+                try {
+                    subtitleCallback(
+                        SubtitleFile(lang = "Vietnamese", url = match.value)
+                    )
+                } catch (e: Exception) { }
+            }
+        } catch (e: Exception) { }
     }
 
     private fun logError(message: String) {
-        // Có thể thay bằng logging framework nếu cần
         println("[PhimMoiChill] $message")
     }
 }

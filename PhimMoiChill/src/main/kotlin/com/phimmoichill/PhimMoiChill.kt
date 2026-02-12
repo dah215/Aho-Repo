@@ -5,7 +5,7 @@ import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.Jsoup
-import java.net.URLEncoder 
+import java.net.URLEncoder
 
 @CloudstreamPlugin
 class PhimMoiChillPlugin : Plugin() {
@@ -88,7 +88,7 @@ class PhimMoiChillProvider : MainAPI() {
         val html = pageResponse.text
         val cookies = pageResponse.cookies
 
-        // Lấy episodeID từ filmInfo (Phù hợp với watch_page.html bạn gửi)
+        // Lấy episodeID từ filmInfo (watch_page.html)
         val episodeId = Regex(""""episodeID":\s*"?(\d+)"?""").find(html)?.groupValues?.get(1)
                         ?: Regex("""data-id="(\d+)"""").find(html)?.groupValues?.get(1)
 
@@ -105,7 +105,7 @@ class PhimMoiChillProvider : MainAPI() {
             val cleanRes = res.replace("\\/", "/")
             var found = false
             
-            // Tìm m3u8
+            // Xử lý link m3u8
             Regex("""https?://[^"'<>\s]+?\.m3u8[^"'<>\s]*""").findAll(cleanRes).forEach {
                 M3u8Helper.generateM3u8(name, it.value, data).forEach { m3u8 ->
                     callback(m3u8)
@@ -113,17 +113,17 @@ class PhimMoiChillProvider : MainAPI() {
                 }
             }
             
-            // Tìm mp4 - SỬA LỖI BUILD BẰNG CÁCH DÙNG HÀM KHỞI TẠO CHUẨN
+            // Xử lý link mp4 - CÁCH VIẾT MỚI ĐỂ KHÔNG BỊ LỖI DEPRECATED & NO PARAMETER
             if (!found) {
                 Regex("""https?://[^"'<>\s]+?\.mp4[^"'<>\s]*""").findAll(cleanRes).forEach {
                     callback(
-                        ExtractorLink(
-                            source = name,
-                            name = name,
-                            url = it.value,
-                            referer = data,
-                            quality = Qualities.P1080.value,
-                            isM3u8 = false
+                        newExtractorLink(
+                            name,
+                            name,
+                            it.value,
+                            data,
+                            Qualities.P1080.value,
+                            false
                         )
                     )
                     found = true

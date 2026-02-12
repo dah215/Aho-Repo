@@ -88,8 +88,9 @@ class PhimMoiChillProvider : MainAPI() {
         val html = pageResponse.text
         val cookies = pageResponse.cookies
 
-        // Lấy episodeID từ filmInfo trong HTML
+        // Lấy episodeID từ filmInfo (Phù hợp với watch_page.html bạn gửi)
         val episodeId = Regex(""""episodeID":\s*"?(\d+)"?""").find(html)?.groupValues?.get(1)
+                        ?: Regex("""data-id="(\d+)"""").find(html)?.groupValues?.get(1)
 
         if (episodeId == null) return false
 
@@ -104,25 +105,25 @@ class PhimMoiChillProvider : MainAPI() {
             val cleanRes = res.replace("\\/", "/")
             var found = false
             
-            // 1. Xử lý link m3u8 thông qua helper
+            // Tìm m3u8
             Regex("""https?://[^"'<>\s]+?\.m3u8[^"'<>\s]*""").findAll(cleanRes).forEach {
-                val link = it.value
-                M3u8Helper.generateM3u8(name, link, data).forEach { m3u8 ->
+                M3u8Helper.generateM3u8(name, it.value, data).forEach { m3u8 ->
                     callback(m3u8)
                     found = true
                 }
             }
             
-            // 2. Xử lý link mp4 (SỬA LỖI THAM SỐ BUILD TẠI ĐÂY)
+            // Tìm mp4 - SỬA LỖI BUILD BẰNG CÁCH DÙNG HÀM KHỞI TẠO CHUẨN
             if (!found) {
                 Regex("""https?://[^"'<>\s]+?\.mp4[^"'<>\s]*""").findAll(cleanRes).forEach {
                     callback(
-                        newExtractorLink(
+                        ExtractorLink(
                             source = name,
                             name = name,
                             url = it.value,
-                            referer = data, // Đã kiểm tra: trong phiên bản SDK này tham số là 'referer' (viết thường)
-                            quality = Qualities.P1080.value
+                            referer = data,
+                            quality = Qualities.P1080.value,
+                            isM3u8 = false
                         )
                     )
                     found = true

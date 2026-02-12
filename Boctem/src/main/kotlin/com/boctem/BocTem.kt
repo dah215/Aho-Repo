@@ -153,6 +153,16 @@ class BocTemProvider : MainAPI() {
                     .replace("&amp;", "&")
             }
 
+            fun extractIframeUrlsFromText(text: String?): List<String> {
+                if (text.isNullOrBlank()) return emptyList()
+
+                val regex = Regex("""(?:src|file|link|embed_url|iframe)["']?\s*[:=]\s*["'](https?://[^"'<>\s]+)["']""")
+                return regex.findAll(text)
+                    .mapNotNull { normalizeUrl(cleanStreamUrl(it.groupValues[1])) }
+                    .distinct()
+                    .toList()
+            }
+
             suspend fun tryM3u8FromText(text: String?): Boolean {
                 if (text.isNullOrBlank()) return false
 
@@ -216,6 +226,17 @@ class BocTemProvider : MainAPI() {
                 return true
             }
 
+            for (script in document.select("script")) {
+                val scriptText = script.data() + "\n" + script.html()
+                if (tryM3u8FromText(scriptText)) return true
+
+                val embeddedUrls = extractIframeUrlsFromText(scriptText)
+                if (embeddedUrls.isNotEmpty()) {
+                    embeddedUrls.forEach { loadExtractor(it, dataUrl, subtitleCallback, callback) }
+                    return true
+                }
+            }
+
             val bodyClass = document.selectFirst("body")?.attr("class").orEmpty()
             val postId = Regex("""postid-(\d+)""").find(bodyClass)?.groupValues?.get(1)
                 ?: Regex("""post-(\d+)""").find(bodyClass)?.groupValues?.get(1)
@@ -240,19 +261,44 @@ class BocTemProvider : MainAPI() {
                 }
             }
 
-            if (!postId.isNullOrBlank() && !nonce.isNullOrBlank()) {
-                val ajaxResponse = app.post(
-                    "$mainUrl/wp-admin/admin-ajax.php",
-                    data = mapOf(
+            suspend fun requestAjax(server: String): String? {
+                if (postId.isNullOrBlank() || nonce.isNullOrBlank()) return null
+
+                val payloads = listOf(
+                    mapOf(
                         "action" to "halim_ajax_player",
                         "nonce" to nonce,
                         "postid" to postId,
                         "episode" to episode,
-                        "server" to "1"
+                        "server" to server
                     ),
-                    referer = dataUrl,
-                    headers = mapOf("X-Requested-With" to "XMLHttpRequest")
-                ).text
+                    mapOf(
+                        "action" to "ajax_player",
+                        "nonce" to nonce,
+                        "postid" to postId,
+                        "episode" to episode,
+                        "server" to server
+                    )
+                )
+
+                for (payload in payloads) {
+                    val response = runCatching {
+                        app.post(
+                            "$mainUrl/wp-admin/admin-ajax.php",
+                            data = payload,
+                            referer = dataUrl,
+                            headers = mapOf("X-Requested-With" to "XMLHttpRequest")
+                        ).text
+                    }.getOrNull()
+
+                    if (!response.isNullOrBlank()) return response
+                }
+
+                return null
+            }
+
+            for (server in listOf("1", "2", "3", "4", "5")) {
+                val ajaxResponse = requestAjax(server) ?: continue
 
                 if (tryM3u8FromText(ajaxResponse)) return true
 
@@ -268,6 +314,12 @@ class BocTemProvider : MainAPI() {
                 val iframeUrl = normalizeUrl(iframe?.replace("\\/", "/"))
                 if (!iframeUrl.isNullOrBlank()) {
                     loadExtractor(iframeUrl, dataUrl, subtitleCallback, callback)
+                    return true
+                }
+
+                val embeddedUrls = extractIframeUrlsFromText(ajaxResponse)
+                if (embeddedUrls.isNotEmpty()) {
+                    embeddedUrls.forEach { loadExtractor(it, dataUrl, subtitleCallback, callback) }
                     return true
                 }
             }

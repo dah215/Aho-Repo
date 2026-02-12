@@ -24,8 +24,7 @@ class PhimMoiChillProvider : MainAPI() {
 
     private val defaultHeaders = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-        "X-Requested-With" to "XMLHttpRequest",
-        "Referer" to "$mainUrl/"
+        "X-Requested-With" to "XMLHttpRequest"
     )
 
     override val mainPage = mainPageOf(
@@ -34,35 +33,31 @@ class PhimMoiChillProvider : MainAPI() {
         "list/phim-bo" to "Phim Bộ"
     )
 
-    // FIX LỖI 2: Hiển thị poster và nhãn (Tập/Phụ đề) trên trang chủ
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page <= 1) "$mainUrl/${request.data}" else "$mainUrl/${request.data}?page=$page"
         val html = app.get(url, headers = defaultHeaders).text
         val doc = Jsoup.parse(html)
+        
         val items = doc.select(".list-film .item, .list-film li").mapNotNull { el ->
             val a = el.selectFirst("a") ?: return@mapNotNull null
             val title = el.selectFirst("p, .title, .name")?.text()?.trim() ?: a.attr("title")
-            // Ưu tiên lấy data-src để fix lỗi ảnh trống trong video
             val poster = el.selectFirst("img")?.let { 
                 if (it.hasAttr("data-src")) it.attr("data-src") else it.attr("src") 
             }
-            val label = el.selectFirst(".label, .status")?.text()?.trim() // Hiện "Tập 1", "Vietsub"...
+            // Lấy nhãn (Tập phim/Vietsub)
+            val label = el.selectFirst(".label, .status")?.text()?.trim()
 
             newMovieSearchResponse(title, a.attr("href"), TvType.Movie) {
                 this.posterUrl = poster
+                // FIX LỖI 55:40: Sử dụng hàm addQuality thay vì gán trực tiếp String vào biến quality
                 if (label != null) {
-                    if (label.contains(Regex("\\d"))) {
-                        this.quality = label // Hiện số tập
-                    } else {
-                        addQuality(label) // Hiện Vietsub/Thuyết minh
-                    }
+                    addQuality(label) 
                 }
             }
         }
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
 
-    // FIX LỖI 1: Hiện danh sách tập phim bộ
     override suspend fun load(url: String): LoadResponse {
         val html = app.get(url, headers = defaultHeaders).text
         val doc = Jsoup.parse(html)
@@ -73,13 +68,17 @@ class PhimMoiChillProvider : MainAPI() {
         }
         val description = doc.selectFirst("#film-content, .entry-content")?.text()?.trim()
         
-        // Cập nhật Selector danh sách tập mới nhất theo trang web hiện tại
-        val episodeElements = doc.select("ul.list-episode li a, #list_episodes li a, .list-episodes a")
-        val episodes = episodeElements.mapIndexed { index, it ->
+        // Fix lỗi không hiện tập: Tìm link xem phim trước để lấy danh sách tập
+        val watchUrl = doc.selectFirst("a.btn-see, a[href*='/xem/']")?.attr("href") ?: url
+        val watchPageHtml = app.get(watchUrl, headers = defaultHeaders).text
+        val watchDoc = Jsoup.parse(watchPageHtml)
+
+        // Selector danh sách tập mới nhất dựa trên HTML thực tế
+        val episodes = watchDoc.select("ul.list-episode li a, .list-episodes a, #list_episodes li a").mapIndexed { index, it ->
             val epName = it.text().trim()
             newEpisode(it.attr("href")) {
                 this.name = if (epName.isEmpty()) "Tập ${index + 1}" else epName
-                this.episode = epName.replace(Regex("[^0-9]"), "").toIntOrNull() ?: (index + 1)
+                this.episode = index + 1
             }
         }.distinctBy { it.data }
 
@@ -92,7 +91,7 @@ class PhimMoiChillProvider : MainAPI() {
                 this.tags = tags
             }
         } else {
-            newMovieLoadResponse(title, url, TvType.Movie, episodes.firstOrNull()?.data ?: url) {
+            newMovieLoadResponse(title, url, TvType.Movie, watchUrl) {
                 this.posterUrl = poster
                 this.plot = description
                 this.tags = tags
@@ -100,7 +99,6 @@ class PhimMoiChillProvider : MainAPI() {
         }
     }
 
-    // FIX LỖI 3: Sửa lỗi load phim (Parsing Manifest Malformed)
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -110,8 +108,8 @@ class PhimMoiChillProvider : MainAPI() {
         val response = app.get(data, headers = defaultHeaders)
         val html = response.text
         
-        // Trích xuất ID tập phim chính xác từ script filmInfo
-        val episodeId = Regex("""episodeID"\s*:\s*(\d+)""").find(html)?.groupValues?.get(1)
+        // Trích xuất ID tập phim từ script
+        val episodeId = Regex("""episodeID"\s*:\s*"(\d+)"""").find(html)?.groupValues?.get(1)
             ?: Regex("""episodeID\s*=\s*parseInt\('(\d+)'\)""").find(html)?.groupValues?.get(1)
             ?: return false
 
@@ -125,7 +123,7 @@ class PhimMoiChillProvider : MainAPI() {
 
             val key = Regex("""iniPlayers\("([^"]+)""").find(res)?.groupValues?.get(1) ?: return false
             
-            // Chỉ sử dụng các Server ổn định nhất và thêm Header cần thiết để tránh lỗi 3002
+            // Server CDN
             val servers = listOf(
                 "https://sotrim.topphimmoi.org/manifest/$key/index.m3u8" to "Chill VIP",
                 "https://dash.megacdn.xyz/raw/$key/index.m3u8" to "DASH Fast"
@@ -139,7 +137,6 @@ class PhimMoiChillProvider : MainAPI() {
                         url = link,
                         type = ExtractorLinkType.M3U8
                     ) {
-                        // Header quan trọng để fix lỗi Malformed Manifest
                         this.referer = "$mainUrl/"
                         this.quality = Qualities.P1080.value
                     }

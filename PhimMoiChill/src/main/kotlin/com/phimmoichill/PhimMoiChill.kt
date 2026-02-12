@@ -8,7 +8,7 @@ import org.jsoup.nodes.Element
 import java.net.URLEncoder
 
 class PhimMoiChillProvider : MainAPI() {
-    // ✅ Cập nhật domain sang .net (hoặc bạn có thể thử .tv nếu .net bị chặn)
+    // Tự động cập nhật domain nếu cần, hiện tại .net đang ổn định nhất
     override var mainUrl = "https://phimmoichill.net" 
     override var name    = "PhimMoiChill"
     override val hasMainPage        = true
@@ -19,9 +19,8 @@ class PhimMoiChillProvider : MainAPI() {
         TvType.Movie, TvType.TvSeries, TvType.Anime
     )
 
-    // Headers giả lập trình duyệt di động để tránh bị chặn
     private val defaultHeaders = mapOf(
-        "User-Agent" to "Mozilla/5.0 (Linux; Android 10; SM-G981B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36",
+        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
         "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Referer" to "$mainUrl/"
     )
@@ -42,38 +41,29 @@ class PhimMoiChillProvider : MainAPI() {
         }
     }
 
-    // ✅ HÀM QUAN TRỌNG: Quét dữ liệu cực mạnh (Fix lỗi màn hình trống)
     private fun parseHtmlPage(html: String): List<SearchResponse> {
         val doc = org.jsoup.Jsoup.parse(html)
         val items = mutableListOf<SearchResponse>()
         val seenUrls = mutableSetOf<String>()
 
-        // Danh sách các vùng chứa phim tiềm năng trên web mới
-        val containers = doc.select(".block-body li, .list-film li, .movies-list .ml-item, .item")
+        // Selector bao quát các phiên bản web khác nhau
+        val containers = doc.select(".block-body li, .list-film li, .movies-list .ml-item, .item, .flw-item")
         
         for (el in containers) {
             val a = el.selectFirst("a") ?: continue
             val href = normalizeUrl(a.attr("href")) ?: continue
-            
-            // Lọc bỏ các link rác (genre, country, dmca...)
-            if (href.contains("/the-loai/") || href.contains("/quoc-gia/") || href == "$mainUrl/") continue
-            if (!seenUrls.add(href)) continue
+            if (href.contains("/the-loai/") || href.contains("/quoc-gia/") || !seenUrls.add(href)) continue
 
             val title = el.selectFirst("h2, .title, .name, .movie-title")?.text()?.trim() 
-                ?: a.attr("title").takeIf { it.isNotBlank() }
-                ?: a.text().trim()
-
+                ?: a.attr("title").takeIf { it.isNotBlank() } ?: a.text().trim()
             if (title.isBlank()) continue
 
             val img = el.selectFirst("img")
             val poster = normalizeUrl(
-                img?.attr("data-src")?.takeIf { it.isNotBlank() }
-                ?: img?.attr("data-original")?.takeIf { it.isNotBlank() }
-                ?: img?.attr("src")
+                img?.attr("data-src") ?: img?.attr("data-original") ?: img?.attr("src")
             )
 
-            // Kiểm tra xem là phim bộ hay phim lẻ dựa vào label
-            val isSeries = el.select(".label, .ep, .status").text().lowercase().let {
+            val isSeries = el.select(".label, .ep, .status, .mli-eps").text().lowercase().let {
                 it.contains("tập") || it.contains("/") || it.contains("full")
             }
 
@@ -87,7 +77,7 @@ class PhimMoiChillProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = if (page <= 1) "$mainUrl/${request.data}" else "$mainUrl/${request.data}/page/$page"
+        val url = if (page <= 1) "$mainUrl/${request.data}" else "$mainUrl/${request.data}?page=$page"
         val html = app.get(url, headers = defaultHeaders).text
         val items = parseHtmlPage(html)
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
@@ -103,27 +93,28 @@ class PhimMoiChillProvider : MainAPI() {
         val html = app.get(url, headers = defaultHeaders).text
         val doc = org.jsoup.Jsoup.parse(html)
 
-        val title = doc.selectFirst("h1.title, .movie-info h1")?.text()?.trim() 
+        val title = doc.selectFirst("h1.title, .movie-info h1, .entry-title")?.text()?.trim() 
             ?: doc.selectFirst("meta[property=og:title]")?.attr("content") ?: "Unknown"
         
-        val poster = doc.selectFirst(".film-poster img, .movie-info img")?.attr("src")
-        val plot = doc.selectFirst(".film-content, #film-content")?.text()?.trim()
+        val poster = normalizeUrl(doc.selectFirst(".film-poster img, .movie-info img, .poster img")?.attr("src"))
+        val plot = doc.selectFirst(".film-content, #film-content, .description")?.text()?.trim()
         val year = doc.selectFirst(".year, .release-year")?.text()?.filter { it.isDigit() }?.toIntOrNull()
 
         val episodes = mutableListOf<Episode>()
-        // Tìm link xem phim hoặc danh sách tập
-        doc.select(".list-episode a, #list_episodes a, a[href*='-tap-']").forEach {
+        // Cải tiến lấy tập phim từ nhiều server
+        doc.select(".list-episode a, #list_episodes a, a[href*='-tap-'], .episode a").forEach {
             val epHref = normalizeUrl(it.attr("href")) ?: return@forEach
             val epName = it.text().trim()
-            episodes.add(newEpisode(epHref) {
-                this.name = if (epName.contains("Tập")) epName else "Tập $epName"
-                this.episode = epName.filter { c -> c.isDigit() }.toIntOrNull()
-            })
+            if (episodes.none { ep -> ep.data == epHref }) {
+                episodes.add(newEpisode(epHref) {
+                    this.name = if (epName.contains("Tập")) epName else "Tập $epName"
+                    this.episode = epName.filter { c -> c.isDigit() }.toIntOrNull()
+                })
+            }
         }
 
-        // Nếu là phim lẻ không thấy danh sách tập, lấy nút "Xem phim"
         if (episodes.isEmpty()) {
-            val watchUrl = doc.selectFirst("a.btn-watch, .btn-see")?.attr("href")?.let { normalizeUrl(it) } ?: url
+            val watchUrl = doc.selectFirst("a.btn-watch, .btn-see, a[href*='/xem-phim/']")?.attr("href")?.let { normalizeUrl(it) } ?: url
             episodes.add(newEpisode(watchUrl) { this.name = "Full Movie" })
         }
 
@@ -149,19 +140,25 @@ class PhimMoiChillProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val html = app.get(data, headers = defaultHeaders).text
-        
-        // Cách 1: Tìm trong iframe
         val doc = org.jsoup.Jsoup.parse(html)
+        
+        // 1. Quét Iframe (Thường chứa Player của bên thứ 3)
         doc.select("iframe[src]").forEach {
             val src = normalizeUrl(it.attr("src")) ?: return@forEach
             loadExtractor(src, data, subtitleCallback, callback)
         }
 
-        // Cách 2: Quét link m3u8 ẩn trong Script (PhimMoi hay dùng cách này)
-        val regex = Regex("""(https?://[^\s"'<>]+(\.m3u8|\.mp4)[^\s"'<>]*)""")
-        regex.findAll(html).forEach { match ->
+        // 2. Quét Script để tìm link m3u8/mp4 "nằm vùng"
+        val scriptContent = doc.select("script").joinToString("\n") { it.data() }
+        val videoRegex = Regex("""(https?://[^\s"'<>]+(\.m3u8|\.mp4)[^\s"'<>]*)""")
+        
+        videoRegex.findAll(scriptContent + html).forEach { match ->
             val videoUrl = match.value.replace("\\/", "/")
-            M3u8Helper.generateM3u8(name, videoUrl, data).forEach(callback)
+            if (videoUrl.contains(".m3u8")) {
+                M3u8Helper.generateM3u8(name, videoUrl, data, headers = defaultHeaders).forEach(callback)
+            } else {
+                callback(newExtractorLink(name, "Hệ thống $name", videoUrl, data, Qualities.Unknown.value))
+            }
         }
 
         return true

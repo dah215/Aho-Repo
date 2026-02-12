@@ -8,7 +8,6 @@ import org.jsoup.nodes.Element
 import java.net.URLEncoder
 
 class PhimMoiChillProvider : MainAPI() {
-    // Tự động cập nhật domain nếu cần, hiện tại .net đang ổn định nhất
     override var mainUrl = "https://phimmoichill.net" 
     override var name    = "PhimMoiChill"
     override val hasMainPage        = true
@@ -29,7 +28,6 @@ class PhimMoiChillProvider : MainAPI() {
         "list/phim-moi" to "Phim Mới Cập Nhật",
         "list/phim-le"  to "Phim Lẻ",
         "list/phim-bo"  to "Phim Bộ",
-        "the-loai/phim-chieu-rap" to "Phim Chiếu Rạp"
     )
 
     private fun normalizeUrl(url: String?): String? {
@@ -45,25 +43,21 @@ class PhimMoiChillProvider : MainAPI() {
         val doc = org.jsoup.Jsoup.parse(html)
         val items = mutableListOf<SearchResponse>()
         val seenUrls = mutableSetOf<String>()
-
-        // Selector bao quát các phiên bản web khác nhau
         val containers = doc.select(".block-body li, .list-film li, .movies-list .ml-item, .item, .flw-item")
         
         for (el in containers) {
             val a = el.selectFirst("a") ?: continue
             val href = normalizeUrl(a.attr("href")) ?: continue
-            if (href.contains("/the-loai/") || href.contains("/quoc-gia/") || !seenUrls.add(href)) continue
+            if (href.contains("/the-loai/") || !seenUrls.add(href)) continue
 
             val title = el.selectFirst("h2, .title, .name, .movie-title")?.text()?.trim() 
                 ?: a.attr("title").takeIf { it.isNotBlank() } ?: a.text().trim()
             if (title.isBlank()) continue
 
             val img = el.selectFirst("img")
-            val poster = normalizeUrl(
-                img?.attr("data-src") ?: img?.attr("data-original") ?: img?.attr("src")
-            )
+            val poster = normalizeUrl(img?.attr("data-src") ?: img?.attr("data-original") ?: img?.attr("src"))
 
-            val isSeries = el.select(".label, .ep, .status, .mli-eps").text().lowercase().let {
+            val isSeries = el.select(".label, .ep, .status").text().lowercase().let {
                 it.contains("tập") || it.contains("/") || it.contains("full")
             }
 
@@ -93,15 +87,14 @@ class PhimMoiChillProvider : MainAPI() {
         val html = app.get(url, headers = defaultHeaders).text
         val doc = org.jsoup.Jsoup.parse(html)
 
-        val title = doc.selectFirst("h1.title, .movie-info h1, .entry-title")?.text()?.trim() 
+        val title = doc.selectFirst("h1.title, .movie-info h1")?.text()?.trim() 
             ?: doc.selectFirst("meta[property=og:title]")?.attr("content") ?: "Unknown"
         
         val poster = normalizeUrl(doc.selectFirst(".film-poster img, .movie-info img, .poster img")?.attr("src"))
-        val plot = doc.selectFirst(".film-content, #film-content, .description")?.text()?.trim()
+        val plot = doc.selectFirst(".film-content, #film-content")?.text()?.trim()
         val year = doc.selectFirst(".year, .release-year")?.text()?.filter { it.isDigit() }?.toIntOrNull()
 
         val episodes = mutableListOf<Episode>()
-        // Cải tiến lấy tập phim từ nhiều server
         doc.select(".list-episode a, #list_episodes a, a[href*='-tap-'], .episode a").forEach {
             val epHref = normalizeUrl(it.attr("href")) ?: return@forEach
             val epName = it.text().trim()
@@ -114,7 +107,7 @@ class PhimMoiChillProvider : MainAPI() {
         }
 
         if (episodes.isEmpty()) {
-            val watchUrl = doc.selectFirst("a.btn-watch, .btn-see, a[href*='/xem-phim/']")?.attr("href")?.let { normalizeUrl(it) } ?: url
+            val watchUrl = doc.selectFirst("a.btn-watch, .btn-see")?.attr("href")?.let { normalizeUrl(it) } ?: url
             episodes.add(newEpisode(watchUrl) { this.name = "Full Movie" })
         }
 
@@ -140,27 +133,39 @@ class PhimMoiChillProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val html = app.get(data, headers = defaultHeaders).text
-        val doc = org.jsoup.Jsoup.parse(html)
         
-        // 1. Quét Iframe (Thường chứa Player của bên thứ 3)
-        doc.select("iframe[src]").forEach {
+        // 1. Quét Iframe
+        org.jsoup.Jsoup.parse(html).select("iframe[src]").forEach {
             val src = normalizeUrl(it.attr("src")) ?: return@forEach
             loadExtractor(src, data, subtitleCallback, callback)
         }
 
-        // 2. Quét Script để tìm link m3u8/mp4 "nằm vùng"
-        val scriptContent = doc.select("script").joinToString("\n") { it.data() }
+        // 2. Quét link Video trực tiếp (Fix triệt để lỗi Type Mismatch ở đây) 
         val videoRegex = Regex("""(https?://[^\s"'<>]+(\.m3u8|\.mp4)[^\s"'<>]*)""")
-        
-        videoRegex.findAll(scriptContent + html).forEach { match ->
+        videoRegex.findAll(html).forEach { match ->
             val videoUrl = match.value.replace("\\/", "/")
+            
             if (videoUrl.contains(".m3u8")) {
-                M3u8Helper.generateM3u8(name, videoUrl, data, headers = defaultHeaders).forEach(callback)
+                M3u8Helper.generateM3u8(
+                    source = name,
+                    streamUrl = videoUrl,
+                    referer = data,
+                    headers = defaultHeaders
+                ).forEach(callback)
             } else {
-                callback(newExtractorLink(name, "Hệ thống $name", videoUrl, data, Qualities.Unknown.value))
+                // ✅ Sử dụng Named Arguments để tránh nhầm lẫn vị trí tham số 
+                callback(
+                    newExtractorLink(
+                        source = name,
+                        name = "$name Player",
+                        url = videoUrl,
+                        referer = data,
+                        quality = Qualities.Unknown.value,
+                        type = ExtractorLinkType.VIDEO
+                    )
+                )
             }
         }
-
         return true
     }
 }

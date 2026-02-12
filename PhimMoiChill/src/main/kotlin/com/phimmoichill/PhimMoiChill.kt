@@ -26,6 +26,8 @@ class PhimMoiChillProvider : MainAPI() {
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
         "Accept" to "application/json, text/javascript, */*; q=0.01",
         "X-Requested-With" to "XMLHttpRequest",
+        "Cache-Control" to "no-cache",
+        "Pragma" to "no-cache",
         "Origin" to "https://phimmoichill.now"
     )
 
@@ -89,6 +91,7 @@ class PhimMoiChillProvider : MainAPI() {
         val html = pageResponse.text
         val cookies = pageResponse.cookies
 
+        // Lấy ID chuẩn từ biến toàn cục trong HTML (filmInfo.episodeID)
         val episodeId = Regex("""episodeID"\s*:\s*"(\d+)"""").find(html)?.groupValues?.get(1)
             ?: Regex("""data-id="(\d+)"""").find(html)?.groupValues?.get(1)
             ?: return false
@@ -104,15 +107,19 @@ class PhimMoiChillProvider : MainAPI() {
             val cleanRes = res.replace("\\/", "/")
             var found = false
             
-            // 1. Quét link từ domain mới bạn vừa tìm thấy (sotrim)
-            val sotrimRegex = Regex("""https?://sotrim\.topphimmoi\.org/[^\s"']*""")
-            sotrimRegex.findAll(cleanRes).forEach {
+            // 1. Xử lý link Manifest (Cực kỳ quan trọng từ manh mối của bạn)
+            val manifestRegex = Regex("""https?://sotrim\.topphimmoi\.org/manifest/[a-zA-Z0-9]+""")
+            manifestRegex.findAll(cleanRes).forEach {
+                val link = it.value
+                // Thêm thủ công hậu tố .m3u8 nếu server yêu cầu hoặc để player nhận diện
+                val streamUrl = if (link.endsWith(".m3u8")) link else "$link/index.m3u8"
+                
                 callback(
                     newExtractorLink(
-                        source = "Sotrim",
-                        name = "ChillPlayer (VIP)",
-                        url = it.value,
-                        type = if (it.value.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                        source = "ChillPlayer",
+                        name = "HLS Stream",
+                        url = streamUrl,
+                        type = ExtractorLinkType.M3U8
                     ) {
                         this.referer = "https://phimmoichill.now/"
                         this.quality = Qualities.P1080.value
@@ -121,26 +128,22 @@ class PhimMoiChillProvider : MainAPI() {
                 found = true
             }
 
-            // 2. Quét link M3U8 thông thường
-            val m3u8Regex = Regex("""https?://[\w\.\-/]+\.m3u8[^\s"']*""")
-            m3u8Regex.findAll(cleanRes).forEach {
-                M3u8Helper.generateM3u8(name, it.value, data).forEach { m3u8 ->
-                    callback(m3u8)
-                    found = true
+            // 2. Quét m3u8 thông thường
+            if (!found) {
+                Regex("""https?://[\w\.\-/]+\.m3u8[^\s"']*""").findAll(cleanRes).forEach {
+                    M3u8Helper.generateM3u8(name, it.value, data).forEach { m3u8 ->
+                        callback(m3u8)
+                        found = true
+                    }
                 }
             }
             
-            // 3. Quét link MP4 trực tiếp
+            // 3. Quét MP4 hoặc Iframe Embed
             if (!found) {
                 val mp4Regex = Regex("""https?://[\w\.\-/]+\.mp4[^\s"']*""")
                 mp4Regex.findAll(cleanRes).forEach {
                     callback(
-                        newExtractorLink(
-                            source = name,
-                            name = name,
-                            url = it.value,
-                            type = null
-                        ) {
+                        newExtractorLink(name, name, it.value, null) {
                             this.referer = data
                             this.quality = Qualities.P1080.value
                         }

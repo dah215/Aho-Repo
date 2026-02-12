@@ -27,10 +27,9 @@ class PhimMoiChillProvider : MainAPI() {
     )
 
     override val mainPage = mainPageOf(
-        "phim-le/page/" to "Phim Lẻ",
-        "phim-bo/page/" to "Phim Bộ",
-        "hoat-hinh/page/" to "Hoạt Hình",
-        "tv-shows/page/" to "TV Shows"
+        "list/phim-moi" to "Phim Mới",
+        "list/phim-le" to "Phim Lẻ",
+        "list/phim-bo" to "Phim Bộ"
     )
 
     private fun requestHeaders(referer: String? = null, extra: Map<String, String> = emptyMap()): Map<String, String> {

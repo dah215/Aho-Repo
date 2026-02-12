@@ -58,9 +58,9 @@ class PhimMoiChillProvider : MainAPI() {
     // Helper function để lấy SearchQuality từ string
     private fun getSearchQuality(quality: String?): SearchQuality? {
         return when (quality?.uppercase()?.trim()) {
-            "4K", "2160P" -> SearchQuality.Q2160p
+            "4K", "2160P", "UHD" -> SearchQuality.UHD
             "HD", "720P" -> SearchQuality.HD
-            "FULL HD", "FHD", "1080P" -> SearchQuality.FHD
+            "FULL HD", "FHD", "1080P" -> SearchQuality.HD
             "SD", "480P" -> SearchQuality.SD
             else -> null
         }

@@ -54,11 +54,9 @@ class PhimMoiChillProvider : MainAPI() {
         val poster = doc.selectFirst(".film-poster img")?.attr("src")
         val description = doc.selectFirst("#film-content, .entry-content")?.text()?.trim()
         
-        // Xác định Phụ đề/Thuyết minh từ tiêu đề
         val isSub = title.contains("Vietsub", true) || html.contains("Vietsub", true)
         val isDub = title.contains("Thuyết Minh", true) || html.contains("Thuyết Minh", true)
 
-        // Lấy danh sách tập phim và đánh số để hiện ở Tab
         val episodes = doc.select("ul.list-episode li a, a[href*='/xem/']").mapIndexed { index, it ->
             val epName = it.text().trim()
             newEpisode(it.attr("href")) {
@@ -113,16 +111,17 @@ class PhimMoiChillProvider : MainAPI() {
             )
 
             serverList.forEach { (link, serverName) ->
-                // SỬ DỤNG newExtractorLink ĐỂ HẾT LỖI DEPRECATED VÀ KHÔNG HIỆN CODE TRÊN VIDEO
+                // SỬA LỖI: Đưa referer và quality vào trong khối lambda { }
                 callback(
                     newExtractorLink(
                         source = this.name,
                         name = serverName,
                         url = link,
-                        referer = "$mainUrl/",
-                        quality = Qualities.P1080.value,
                         type = ExtractorLinkType.M3U8
-                    )
+                    ) {
+                        this.referer = "$mainUrl/"
+                        this.quality = Qualities.P1080.value
+                    }
                 )
             }
             true

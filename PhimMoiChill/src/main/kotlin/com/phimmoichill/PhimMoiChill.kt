@@ -67,6 +67,7 @@ class PhimMoiChillProvider : MainAPI() {
         val title = doc.selectFirst("h1.entry-title, .caption")?.text()?.trim() ?: "Phim"
         val poster = doc.selectFirst(".film-poster img")?.attr("src")
         
+        // Lấy danh sách tập phim từ trang xem
         val episodes = doc.select("ul.list-episode li a, a[href*='/xem/']").map {
             newEpisode(it.attr("href")) {
                 this.name = it.text().trim()
@@ -84,44 +85,52 @@ class PhimMoiChillProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        // 1. Lấy trang và Cookie
         val pageResponse = app.get(data, headers = defaultHeaders)
         val html = pageResponse.text
         val cookies = pageResponse.cookies
 
-        val episodeId = Regex(""""episodeID":\s*"?(\d+)"?""").find(html)?.groupValues?.get(1)
-                        ?: Regex("""data-id="(\d+)"""").find(html)?.groupValues?.get(1)
-
-        if (episodeId == null) return false
+        // 2. Trích xuất episodeID từ filmInfo trong HTML
+        val episodeId = Regex("""episodeID"\s*:\s*"(\d+)"""").find(html)?.groupValues?.get(1)
+            ?: Regex("""data-id="(\d+)"""").find(html)?.groupValues?.get(1)
+            ?: return false
 
         return try {
+            // 3. Gọi API chillsplayer.php để lấy nguồn video
             val res = app.post(
                 "$mainUrl/chillsplayer.php",
                 data = mapOf("qcao" to episodeId),
-                headers = defaultHeaders.plus("Referer" to data),
+                headers = mapOf(
+                    "Referer" to data,
+                    "X-Requested-With" to "XMLHttpRequest",
+                    "Content-Type" to "application/x-www-form-urlencoded"
+                ),
                 cookies = cookies
             ).text
 
             val cleanRes = res.replace("\\/", "/")
             var found = false
             
-            // Xử lý link m3u8
-            Regex("""https?://[^"'<>\s]+?\.m3u8[^"'<>\s]*""").findAll(cleanRes).forEach {
+            // 4. Tìm link M3U8
+            val m3u8Regex = Regex("""https?://[\w\.\-/]+\.m3u8[^\s"']*""")
+            m3u8Regex.findAll(cleanRes).forEach {
                 M3u8Helper.generateM3u8(name, it.value, data).forEach { m3u8 ->
                     callback(m3u8)
                     found = true
                 }
             }
             
-            // Xử lý link mp4 - FIX CHÍNH XÁC THEO THÔNG BÁO LỖI
+            // 5. Tìm link MP4 (Sử dụng cú pháp newExtractorLink chuẩn SDK mới)
             if (!found) {
-                Regex("""https?://[^"'<>\s]+?\.mp4[^"'<>\s]*""").findAll(cleanRes).forEach {
+                val mp4Regex = Regex("""https?://[\w\.\-/]+\.mp4[^\s"']*""")
+                mp4Regex.findAll(cleanRes).forEach {
                     callback(
                         newExtractorLink(
                             source = name,
                             name = name,
                             url = it.value,
-                            type = null // Tham số thứ 4: ExtractorLinkType?
-                        ) { // Tham số thứ 5: Khối Lambda gán giá trị
+                            type = null // Tự động nhận diện kiểu link
+                        ) {
                             this.referer = data
                             this.quality = Qualities.P1080.value
                         }
@@ -129,7 +138,19 @@ class PhimMoiChillProvider : MainAPI() {
                     found = true
                 }
             }
+            
+            // 6. Nếu là link nhúng (Embed) thì dùng Extractor mặc định
+            if (!found && cleanRes.contains("iframe")) {
+                val embedUrl = Regex("""src="([^"]+)"""").find(cleanRes)?.groupValues?.get(1)
+                if (embedUrl != null) {
+                    loadExtractor(embedUrl, data, subtitleCallback, callback)
+                    found = true
+                }
+            }
+
             found
-        } catch (e: Exception) { false }
+        } catch (e: Exception) {
+            false
+        }
     }
 }

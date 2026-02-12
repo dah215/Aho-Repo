@@ -1,13 +1,13 @@
 {
-  "name": "BocTem",
-  "pluginClassName": "com.boctem.BocTem",
+  "name": "PhimMoiChill",
+  "pluginClassName": "com.phimmoichill.PhimMoiChill",
   "version": 1,
   "requiresResources": false,
   "description": "Vietnamese anime streaming site",
   "authors": ["BocTem"],
   "repositoryUrl": "https://github.com/dah215/Aho-Repo",
   "status": 1,
-  "tvTypes": ["Anime", "AnimeMovie"],
+  "tvTypes": ["Movie"],
   "language": "vi",
-  "iconUrl": "https://boctem.com/favicon.ico"
+  "iconUrl": "https://phimmoichill.now/favicon.ico"
 }

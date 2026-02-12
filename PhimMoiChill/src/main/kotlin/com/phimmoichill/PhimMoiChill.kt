@@ -25,10 +25,7 @@ class PhimMoiChillProvider : MainAPI() {
     private val defaultHeaders = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
         "Accept" to "application/json, text/javascript, */*; q=0.01",
-        "X-Requested-With" to "XMLHttpRequest",
-        "Cache-Control" to "no-cache",
-        "Pragma" to "no-cache",
-        "Origin" to "https://phimmoichill.now"
+        "X-Requested-With" to "XMLHttpRequest"
     )
 
     override val mainPage = mainPageOf(
@@ -91,64 +88,59 @@ class PhimMoiChillProvider : MainAPI() {
         val html = pageResponse.text
         val cookies = pageResponse.cookies
 
-        // Lấy ID chuẩn từ biến toàn cục trong HTML (filmInfo.episodeID)
+        // Lấy ID tập phim
         val episodeId = Regex("""episodeID"\s*:\s*"(\d+)"""").find(html)?.groupValues?.get(1)
             ?: Regex("""data-id="(\d+)"""").find(html)?.groupValues?.get(1)
             ?: return false
 
         return try {
-            val res = app.post(
+            // Bước 1: Lấy Key từ chillsplayer
+            val responseText = app.post(
                 "$mainUrl/chillsplayer.php",
-                data = mapOf("qcao" to episodeId),
+                data = mapOf("qcao" to episodeId, "sv" to "0"),
                 headers = defaultHeaders.plus("Referer" to data),
                 cookies = cookies
             ).text
 
-            val cleanRes = res.replace("\\/", "/")
+            // Bước 2: Giải mã Key (Dựa theo logic file cũ bạn gửi)
+            // Thường nó nằm sau cụm iniPlayers(" hoặc trong một chuỗi JSON
+            val key = Regex("""iniPlayers\("([^"]+)""").find(responseText)?.groupValues?.get(1)
+                ?: responseText.substringAfterLast("iniPlayers(\"").substringBefore("\",")
+                ?: responseText.filter { it.isLetterOrDigit() } // Fallback nếu nó trả về mỗi cái Key
+
+            if (key.length < 5) return false
+
+            // Bước 3: Ghép Key vào các Server vệ tinh (Tổng hợp từ file cũ và link sotrim bạn tìm được)
+            val serverList = listOf(
+                Pair("https://sotrim.topphimmoi.org/manifest/$key/index.m3u8", "Chill-VIP"),
+                Pair("https://sotrim.topphimmoi.org/raw/$key/index.m3u8", "Sotrim-Raw"),
+                Pair("https://dash.megacdn.xyz/raw/$key/index.m3u8", "Mega-HLS"),
+                Pair("https://dash.megacdn.xyz/dast/$key/index.m3u8", "Mega-BK")
+            )
+
             var found = false
-            
-            // 1. Xử lý link Manifest (Cực kỳ quan trọng từ manh mối của bạn)
-            val manifestRegex = Regex("""https?://sotrim\.topphimmoi\.org/manifest/[a-zA-Z0-9]+""")
-            manifestRegex.findAll(cleanRes).forEach {
-                val link = it.value
-                // Thêm thủ công hậu tố .m3u8 nếu server yêu cầu hoặc để player nhận diện
-                val streamUrl = if (link.endsWith(".m3u8")) link else "$link/index.m3u8"
-                
+            serverList.forEach { (link, serverName) ->
                 callback(
                     newExtractorLink(
-                        source = "ChillPlayer",
-                        name = "HLS Stream",
-                        url = streamUrl,
+                        source = serverName,
+                        name = serverName,
+                        url = link,
                         type = ExtractorLinkType.M3U8
                     ) {
-                        this.referer = "https://phimmoichill.now/"
+                        this.referer = "$mainUrl/"
                         this.quality = Qualities.P1080.value
                     }
                 )
                 found = true
             }
 
-            // 2. Quét m3u8 thông thường
+            // Bước 4: Nếu các link ghép không chạy, thử tìm link trực tiếp trong response
             if (!found) {
-                Regex("""https?://[\w\.\-/]+\.m3u8[^\s"']*""").findAll(cleanRes).forEach {
+                Regex("""https?://[^\s"']+\.m3u8[^\s"']*""").findAll(responseText).forEach {
                     M3u8Helper.generateM3u8(name, it.value, data).forEach { m3u8 ->
                         callback(m3u8)
                         found = true
                     }
-                }
-            }
-            
-            // 3. Quét MP4 hoặc Iframe Embed
-            if (!found) {
-                val mp4Regex = Regex("""https?://[\w\.\-/]+\.mp4[^\s"']*""")
-                mp4Regex.findAll(cleanRes).forEach {
-                    callback(
-                        newExtractorLink(name, name, it.value, null) {
-                            this.referer = data
-                            this.quality = Qualities.P1080.value
-                        }
-                    )
-                    found = true
                 }
             }
 

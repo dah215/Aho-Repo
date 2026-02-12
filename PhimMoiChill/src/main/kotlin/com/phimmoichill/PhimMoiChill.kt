@@ -24,6 +24,7 @@ class PhimMoiChillProvider : MainAPI() {
 
     private val defaultHeaders = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "Accept" to "application/json, text/javascript, */*; q=0.01",
         "X-Requested-With" to "XMLHttpRequest"
     )
 
@@ -47,36 +48,33 @@ class PhimMoiChillProvider : MainAPI() {
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
 
+    override suspend fun search(query: String): List<SearchResponse> {
+        val url = "$mainUrl/tim-kiem/${URLEncoder.encode(query, "utf-8")}"
+        val html = app.get(url, headers = defaultHeaders).text
+        return Jsoup.parse(html).select(".list-film .item").mapNotNull { el ->
+            val a = el.selectFirst("a") ?: return@mapNotNull null
+            val title = el.selectFirst("p")?.text()?.trim() ?: a.attr("title")
+            val poster = el.selectFirst("img")?.attr("data-src") ?: el.selectFirst("img")?.attr("src")
+            newMovieSearchResponse(title, a.attr("href"), TvType.Movie) {
+                this.posterUrl = poster
+            }
+        }
+    }
+
     override suspend fun load(url: String): LoadResponse {
         val html = app.get(url, headers = defaultHeaders).text
         val doc = Jsoup.parse(html)
         val title = doc.selectFirst("h1.entry-title, .caption")?.text()?.trim() ?: "Phim"
         val poster = doc.selectFirst(".film-poster img")?.attr("src")
-        val description = doc.selectFirst("#film-content, .entry-content")?.text()?.trim()
         
-        val isSub = title.contains("Vietsub", true) || html.contains("Vietsub", true)
-        val isDub = title.contains("Thuyết Minh", true) || html.contains("Thuyết Minh", true)
-
-        val episodes = doc.select("ul.list-episode li a, a[href*='/xem/']").mapIndexed { index, it ->
-            val epName = it.text().trim()
+        val episodes = doc.select("ul.list-episode li a, a[href*='/xem/']").map {
             newEpisode(it.attr("href")) {
-                this.name = if (epName.contains("Tập")) epName else "Tập ${index + 1}: $epName"
-                this.episode = index + 1
+                this.name = it.text().trim()
             }
         }.distinctBy { it.data }
 
-        return if (episodes.size > 1 || url.contains("/phim-bo/")) {
-            newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
-                this.posterUrl = poster
-                this.plot = description
-                this.tags = listOfNotNull(if (isSub) "Vietsub" else null, if (isDub) "Thuyết Minh" else null)
-            }
-        } else {
-            newMovieLoadResponse(title, url, TvType.Movie, episodes.firstOrNull()?.data ?: url) {
-                this.posterUrl = poster
-                this.plot = description
-                this.tags = listOfNotNull(if (isSub) "Vietsub" else null, if (isDub) "Thuyết Minh" else null)
-            }
+        return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
+            this.posterUrl = poster
         }
     }
 
@@ -88,33 +86,43 @@ class PhimMoiChillProvider : MainAPI() {
     ): Boolean {
         val pageResponse = app.get(data, headers = defaultHeaders)
         val html = pageResponse.text
-        
+        val cookies = pageResponse.cookies
+
+        // Lấy ID tập phim
         val episodeId = Regex("""episodeID"\s*:\s*"(\d+)"""").find(html)?.groupValues?.get(1)
+            ?: Regex("""data-id="(\d+)"""").find(html)?.groupValues?.get(1)
             ?: return false
 
         return try {
+            // Bước 1: Lấy Key từ chillsplayer
             val responseText = app.post(
                 "$mainUrl/chillsplayer.php",
                 data = mapOf("qcao" to episodeId, "sv" to "0"),
                 headers = defaultHeaders.plus("Referer" to data),
-                cookies = pageResponse.cookies
+                cookies = cookies
             ).text
 
+            // Bước 2: Giải mã Key (Dựa theo logic file cũ bạn gửi)
+            // Thường nó nằm sau cụm iniPlayers(" hoặc trong một chuỗi JSON
             val key = Regex("""iniPlayers\("([^"]+)""").find(responseText)?.groupValues?.get(1)
-                ?: responseText.substringAfter("iniPlayers(\"").substringBefore("\"")
-            
+                ?: responseText.substringAfterLast("iniPlayers(\"").substringBefore("\",")
+                ?: responseText.filter { it.isLetterOrDigit() } // Fallback nếu nó trả về mỗi cái Key
+
             if (key.length < 5) return false
 
+            // Bước 3: Ghép Key vào các Server vệ tinh (Tổng hợp từ file cũ và link sotrim bạn tìm được)
             val serverList = listOf(
-                "https://sotrim.topphimmoi.org/manifest/$key/index.m3u8" to "Chill VIP",
-                "https://dash.megacdn.xyz/raw/$key/index.m3u8" to "DASH Fast"
+                Pair("https://sotrim.topphimmoi.org/manifest/$key/index.m3u8", "Chill-VIP"),
+                Pair("https://sotrim.topphimmoi.org/raw/$key/index.m3u8", "Sotrim-Raw"),
+                Pair("https://dash.megacdn.xyz/raw/$key/index.m3u8", "Mega-HLS"),
+                Pair("https://dash.megacdn.xyz/dast/$key/index.m3u8", "Mega-BK")
             )
 
+            var found = false
             serverList.forEach { (link, serverName) ->
-                // SỬA LỖI: Đưa referer và quality vào trong khối lambda { }
                 callback(
                     newExtractorLink(
-                        source = this.name,
+                        source = serverName,
                         name = serverName,
                         url = link,
                         type = ExtractorLinkType.M3U8
@@ -123,8 +131,22 @@ class PhimMoiChillProvider : MainAPI() {
                         this.quality = Qualities.P1080.value
                     }
                 )
+                found = true
             }
-            true
-        } catch (e: Exception) { false }
+
+            // Bước 4: Nếu các link ghép không chạy, thử tìm link trực tiếp trong response
+            if (!found) {
+                Regex("""https?://[^\s"']+\.m3u8[^\s"']*""").findAll(responseText).forEach {
+                    M3u8Helper.generateM3u8(name, it.value, data).forEach { m3u8 ->
+                        callback(m3u8)
+                        found = true
+                    }
+                }
+            }
+
+            found
+        } catch (e: Exception) {
+            false
+        }
     }
 }

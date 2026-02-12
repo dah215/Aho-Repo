@@ -25,7 +25,8 @@ class PhimMoiChillProvider : MainAPI() {
     private val defaultHeaders = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
         "Accept" to "application/json, text/javascript, */*; q=0.01",
-        "X-Requested-With" to "XMLHttpRequest"
+        "X-Requested-With" to "XMLHttpRequest",
+        "Origin" to "https://phimmoichill.now"
     )
 
     override val mainPage = mainPageOf(
@@ -67,7 +68,6 @@ class PhimMoiChillProvider : MainAPI() {
         val title = doc.selectFirst("h1.entry-title, .caption")?.text()?.trim() ?: "Phim"
         val poster = doc.selectFirst(".film-poster img")?.attr("src")
         
-        // Lấy danh sách tập phim từ trang xem
         val episodes = doc.select("ul.list-episode li a, a[href*='/xem/']").map {
             newEpisode(it.attr("href")) {
                 this.name = it.text().trim()
@@ -85,33 +85,30 @@ class PhimMoiChillProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // 1. Lấy trang và Cookie
+        // Lấy trang xem để lấy Cookie và EpisodeID
         val pageResponse = app.get(data, headers = defaultHeaders)
         val html = pageResponse.text
         val cookies = pageResponse.cookies
 
-        // 2. Trích xuất episodeID từ filmInfo trong HTML
+        // Tìm ID tập phim qua nhiều phương thức Regex để tránh sai sót
         val episodeId = Regex("""episodeID"\s*:\s*"(\d+)"""").find(html)?.groupValues?.get(1)
             ?: Regex("""data-id="(\d+)"""").find(html)?.groupValues?.get(1)
+            ?: Regex("""pm-player"\s*data-id="(\d+)"""").find(html)?.groupValues?.get(1)
             ?: return false
 
         return try {
-            // 3. Gọi API chillsplayer.php để lấy nguồn video
+            // Gửi POST request lấy link video
             val res = app.post(
                 "$mainUrl/chillsplayer.php",
                 data = mapOf("qcao" to episodeId),
-                headers = mapOf(
-                    "Referer" to data,
-                    "X-Requested-With" to "XMLHttpRequest",
-                    "Content-Type" to "application/x-www-form-urlencoded"
-                ),
+                headers = defaultHeaders.plus("Referer" to data),
                 cookies = cookies
             ).text
 
             val cleanRes = res.replace("\\/", "/")
             var found = false
             
-            // 4. Tìm link M3U8
+            // 1. Quét link M3U8
             val m3u8Regex = Regex("""https?://[\w\.\-/]+\.m3u8[^\s"']*""")
             m3u8Regex.findAll(cleanRes).forEach {
                 M3u8Helper.generateM3u8(name, it.value, data).forEach { m3u8 ->
@@ -120,7 +117,7 @@ class PhimMoiChillProvider : MainAPI() {
                 }
             }
             
-            // 5. Tìm link MP4 (Sử dụng cú pháp newExtractorLink chuẩn SDK mới)
+            // 2. Quét link MP4 trực tiếp
             if (!found) {
                 val mp4Regex = Regex("""https?://[\w\.\-/]+\.mp4[^\s"']*""")
                 mp4Regex.findAll(cleanRes).forEach {
@@ -129,7 +126,7 @@ class PhimMoiChillProvider : MainAPI() {
                             source = name,
                             name = name,
                             url = it.value,
-                            type = null // Tự động nhận diện kiểu link
+                            type = null
                         ) {
                             this.referer = data
                             this.quality = Qualities.P1080.value
@@ -139,10 +136,11 @@ class PhimMoiChillProvider : MainAPI() {
                 }
             }
             
-            // 6. Nếu là link nhúng (Embed) thì dùng Extractor mặc định
-            if (!found && cleanRes.contains("iframe")) {
-                val embedUrl = Regex("""src="([^"]+)"""").find(cleanRes)?.groupValues?.get(1)
-                if (embedUrl != null) {
+            // 3. Nếu là link Embed (Iframe)
+            if (!found) {
+                val embedRegex = Regex("""(?:iframe|source|file|url)["']?\s*[:=]\s*["']([^"']+)""").find(cleanRes)
+                val embedUrl = embedRegex?.groupValues?.get(1)
+                if (embedUrl != null && embedUrl.startsWith("http")) {
                     loadExtractor(embedUrl, data, subtitleCallback, callback)
                     found = true
                 }

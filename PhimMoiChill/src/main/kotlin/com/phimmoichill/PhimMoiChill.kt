@@ -55,6 +55,17 @@ class PhimMoiChillProvider : MainAPI() {
         return null
     }
 
+    // Helper function để lấy SearchQuality từ string
+    private fun getSearchQuality(quality: String?): SearchQuality? {
+        return when (quality?.uppercase()?.trim()) {
+            "4K", "2160P" -> SearchQuality.Q2160p
+            "HD", "720P" -> SearchQuality.HD
+            "FULL HD", "FHD", "1080P" -> SearchQuality.FHD
+            "SD", "480P" -> SearchQuality.SD
+            else -> null
+        }
+    }
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page <= 1) "$mainUrl/${request.data}" else "$mainUrl/${request.data}?page=$page"
         
@@ -78,7 +89,7 @@ class PhimMoiChillProvider : MainAPI() {
                 // Lấy thông tin bổ sung
                 val episodeInfo = el.selectFirst(".episode, .tap, .current")?.text()?.trim()
                 val year = el.selectFirst(".year, .release-year")?.text()?.trim()
-                val quality = el.selectFirst(".quality, .hd, .resolution")?.text()?.trim()
+                val qualityText = el.selectFirst(".quality, .hd, .resolution")?.text()?.trim()
                 
                 // Kiểm tra xem là phim bộ hay phim lẻ
                 val href = a.attr("href") ?: return@mapNotNull null
@@ -88,14 +99,12 @@ class PhimMoiChillProvider : MainAPI() {
                     newTvSeriesSearchResponse(title, fixPosterUrl(href) ?: href, TvType.TvSeries) {
                         this.posterUrl = poster
                         this.year = year?.toIntOrNull()
-                        // Hiển thị thông tin tập hiện tại
-                        episodeInfo?.let { this.episodes = listOf(it) }
                     }
                 } else {
                     newMovieSearchResponse(title, fixPosterUrl(href) ?: href, TvType.Movie) {
                         this.posterUrl = poster
                         this.year = year?.toIntOrNull()
-                        this.quality = getQuality(quality)
+                        this.quality = getSearchQuality(qualityText)
                     }
                 }
             }.filter { it.name.isNotBlank() }
@@ -105,16 +114,6 @@ class PhimMoiChillProvider : MainAPI() {
             // Log error nhưng không crash
             logError("Error loading main page: ${e.message}")
             newHomePageResponse(request.name, emptyList(), hasNext = false)
-        }
-    }
-
-    private fun getQuality(quality: String?): Int? {
-        return when (quality?.uppercase()) {
-            "4K", "2160P" -> Qualities.P2160.value
-            "HD", "720P" -> Qualities.P720.value
-            "FULL HD", "FHD", "1080P" -> Qualities.P1080.value
-            "SD", "480P" -> Qualities.P480.value
-            else -> null
         }
     }
 
@@ -189,6 +188,11 @@ class PhimMoiChillProvider : MainAPI() {
                 }
             }.distinctBy { it.data }
             
+            // Build tags với thông tin phụ đề/thuyết minh
+            val tags = genres.toMutableList()
+            if (hasSubtitle) tags.add("Phụ đề")
+            if (hasDubbing) tags.add("Thuyết minh")
+            
             // Xác định loại phim
             val isTvSeries = episodes.size > 1 || html.contains("phim-bo") || url.contains("phim-bo")
             
@@ -197,10 +201,7 @@ class PhimMoiChillProvider : MainAPI() {
                     this.posterUrl = poster
                     this.plot = description
                     this.year = year
-                    this.tags = genres
-                    // Thêm tags cho phụ đề/thuyết minh
-                    if (hasSubtitle) this.tags = (this.tags ?: emptyList()) + "Phụ đề"
-                    if (hasDubbing) this.tags = (this.tags ?: emptyList()) + "Thuyết minh"
+                    this.tags = tags
                 }
             } else if (episodes.size == 1) {
                 // Phim lẻ có 1 tập
@@ -208,9 +209,7 @@ class PhimMoiChillProvider : MainAPI() {
                     this.posterUrl = poster
                     this.plot = description
                     this.year = year
-                    this.tags = genres
-                    if (hasSubtitle) this.tags = (this.tags ?: emptyList()) + "Phụ đề"
-                    if (hasDubbing) this.tags = (this.tags ?: emptyList()) + "Thuyết minh"
+                    this.tags = tags
                 }
             } else {
                 // Không có episode info, coi như phim lẻ với URL hiện tại
@@ -218,9 +217,7 @@ class PhimMoiChillProvider : MainAPI() {
                     this.posterUrl = poster
                     this.plot = description
                     this.year = year
-                    this.tags = genres
-                    if (hasSubtitle) this.tags = (this.tags ?: emptyList()) + "Phụ đề"
-                    if (hasDubbing) this.tags = (this.tags ?: emptyList()) + "Thuyết minh"
+                    this.tags = tags
                 }
             }
         } catch (e: Exception) {
@@ -372,7 +369,8 @@ class PhimMoiChillProvider : MainAPI() {
         return null
     }
 
-    private fun extractDirectLinks(html: String, referer: String, callback: (ExtractorLink) -> Unit): Boolean {
+    // Đổi thành suspend function vì newExtractorLink là suspend
+    private suspend fun extractDirectLinks(html: String, referer: String, callback: (ExtractorLink) -> Unit): Boolean {
         var found = false
         
         // Tìm M3U8 links

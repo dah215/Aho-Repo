@@ -25,7 +25,8 @@ class PhimMoiChillProvider : MainAPI() {
     private val defaultHeaders = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         "Accept" to "*/*",
-        "X-Requested-With" to "XMLHttpRequest"
+        "X-Requested-With" to "XMLHttpRequest",
+        "Origin" to mainUrl
     )
 
     private fun normalizeUrl(url: String?): String? {
@@ -59,7 +60,7 @@ class PhimMoiChillProvider : MainAPI() {
         val html = app.get(url, headers = defaultHeaders).text
         val doc = Jsoup.parse(html)
         val title = doc.selectFirst("h1.title")?.text()?.trim() ?: "Unknown"
-        val episodes = doc.select(".list-episode a").map {
+        val episodes = doc.select(".list-episode a, #list_episodes a").map {
             newEpisode(normalizeUrl(it.attr("href"))!!) { this.name = it.text().trim() }
         }.distinctBy { it.data }
 
@@ -78,7 +79,7 @@ class PhimMoiChillProvider : MainAPI() {
         val episodeId = Regex("""pm(\d+)""").find(data)?.groupValues?.get(1)
 
         if (episodeId != null) {
-            // 1. Tấn công trực tiếp vào trang xử lý quảng cáo mà bạn đã tìm thấy
+            // Bước 1: Gọi chillsplayer.php để lấy cấu hình Player
             try {
                 val playerRes = app.post(
                     "$mainUrl/chillsplayer.php",
@@ -86,11 +87,12 @@ class PhimMoiChillProvider : MainAPI() {
                     headers = defaultHeaders.plus("Referer" to data)
                 ).text
 
-                // 2. Lọc link m3u8 (loại bỏ link quảng cáo 1s thường chứa từ 'ads')
+                // Bước 2: Tìm link m3u8 thực sự trong Player (Bỏ qua link rác)
                 val m3u8Regex = Regex("""https?[:\\]+[^\s"'<>]+?\.m3u8[^\s"'<>]*""")
                 m3u8Regex.findAll(playerRes.replace("\\/", "/")).forEach { match ->
                     val link = match.value
-                    if (!link.contains("ads", ignoreCase = true)) {
+                    // Loại bỏ các link chứa 'ads' hoặc 'pre-roll'
+                    if (!link.contains("ads") && !link.contains("qcao")) {
                         M3u8Helper.generateM3u8(name, link, data).forEach { 
                             callback(it)
                             hasLinks = true 
@@ -100,7 +102,7 @@ class PhimMoiChillProvider : MainAPI() {
             } catch (e: Exception) {}
         }
 
-        // 3. Nếu chillsplayer thất bại, dùng API lấy link tập phim
+        // Bước 3: Nếu vẫn không có link, thử phương thức dự phòng qua AJAX endpoint
         if (!hasLinks && episodeId != null) {
             try {
                 val ajaxRes = app.post(
@@ -109,11 +111,11 @@ class PhimMoiChillProvider : MainAPI() {
                     headers = defaultHeaders.plus("Referer" to data)
                 ).text
                 
-                // Trích xuất link từ JSON trả về
                 Regex("""https?[:\\]+[^\s"'<>]+?\.m3u8[^\s"'<>]*""").findAll(ajaxRes.replace("\\/", "/")).forEach {
-                    if (!it.value.contains("ads", ignoreCase = true)) {
-                        M3u8Helper.generateM3u8(name, it.value, data).forEach { link ->
-                            callback(link)
+                    val link = it.value
+                    if (!link.contains("ads")) {
+                        M3u8Helper.generateM3u8(name, link, data).forEach { m3u8 ->
+                            callback(m3u8)
                             hasLinks = true
                         }
                     }

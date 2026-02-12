@@ -22,10 +22,10 @@ class PhimMoiChillProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
-    // Header copy y hệt từ tab Network bạn chụp
+    // Header chuẩn từ file JS và Screenshot của bạn
     private val defaultHeaders = mapOf(
         "User-Agent" to "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
-        "Accept" to "text/javascript, application/javascript, */*; q=0.01",
+        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "X-Requested-With" to "XMLHttpRequest",
         "Referer" to "$mainUrl/"
     )
@@ -37,19 +37,20 @@ class PhimMoiChillProvider : MainAPI() {
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val timestamp = System.currentTimeMillis() // Giống tham số _= trong sotrim.js bạn tìm thấy
-        val url = if (page <= 1) "$mainUrl/${request.data}?_=$timestamp" else "$mainUrl/${request.data}?page=$page&_=$timestamp"
+        val url = if (page <= 1) "$mainUrl/${request.data}" else "$mainUrl/${request.data}?page=$page"
         
         return try {
             val html = app.get(url, headers = defaultHeaders).text
             val doc = Jsoup.parse(html)
             
-            // Sử dụng selector chuẩn từ file JSON bạn gửi
+            // Selector chính xác từ phimmoichill_main.json: .list-film .item
             val items = doc.select(".list-film .item").mapNotNull { el ->
                 val a = el.selectFirst("a") ?: return@mapNotNull null
                 val title = el.selectFirst("p")?.text()?.trim() ?: a.attr("title")
-                // Ưu tiên data-src để fix lỗi Unknown/Crash
-                val poster = el.selectFirst("img")?.let { it.attr("data-src").ifBlank { it.attr("src") } }
+                
+                // Lấy poster từ data-src (Lazyload) để tránh lỗi Unknown/Crash
+                val img = el.selectFirst("img")
+                val poster = img?.attr("data-src")?.takeIf { it.isNotBlank() } ?: img?.attr("src")
                 
                 newMovieSearchResponse(title, a.attr("href"), TvType.Movie) {
                     this.posterUrl = poster
@@ -61,6 +62,35 @@ class PhimMoiChillProvider : MainAPI() {
         }
     }
 
+    override suspend fun load(url: String): LoadResponse {
+        val html = app.get(url, headers = defaultHeaders).text
+        val doc = Jsoup.parse(html)
+        
+        // Lấy thông tin từ phimmoichill_movie.json
+        val title = doc.selectFirst("h1.entry-title, h1.caption")?.text()?.trim() ?: "Phim"
+        val poster = doc.selectFirst(".film-poster img")?.attr("src")
+        val desc = doc.selectFirst(".film-content")?.text()?.trim()
+
+        // Danh sách tập phim từ watch_page.html
+        val episodes = doc.select("ul.list-episode li a, a[href*='/xem/']").map {
+            newEpisode(it.attr("href")) {
+                this.name = it.text().trim().replace("Tập ", "")
+            }
+        }.distinctBy { it.data }
+
+        return if (episodes.size > 1) {
+            newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
+                this.posterUrl = poster
+                this.plot = desc
+            }
+        } else {
+            newMovieLoadResponse(title, url, TvType.Movie, episodes.firstOrNull()?.data ?: url) {
+                this.posterUrl = poster
+                this.plot = desc
+            }
+        }
+    }
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -69,19 +99,18 @@ class PhimMoiChillProvider : MainAPI() {
     ): Boolean {
         var hasLinks = false
         val episodeId = Regex("""pm(\d+)""").find(data)?.groupValues?.get(1) ?: return false
-        val timestamp = System.currentTimeMillis()
 
-        // 1. Tấn công qua chillsplayer (Cổng chính bạn tìm thấy)
         try {
-            val playerRes = app.post(
-                "$mainUrl/chillsplayer.php?_=$timestamp",
+            // Tấn công vào chillsplayer.php (Logic từ phimchill.public.js)
+            val res = app.post(
+                "$mainUrl/chillsplayer.php",
                 data = mapOf("qcao" to episodeId),
                 headers = defaultHeaders.plus("Referer" to data)
             ).text
 
-            // Chỉ lấy m3u8 sạch, bỏ qua link ads gây lỗi 1s
+            // Lọc link m3u8 sạch (Bỏ qua ads/skipintro từ skipintro.js)
             val m3u8Regex = Regex("""https?[:\\]+[^"'<>\s]+?\.m3u8[^"'<>\s]*""")
-            m3u8Regex.findAll(playerRes.replace("\\/", "/")).forEach { match ->
+            m3u8Regex.findAll(res.replace("\\/", "/")).forEach { match ->
                 val link = match.value
                 if (!link.contains("ads") && !link.contains("skipintro")) {
                     M3u8Helper.generateM3u8(name, link, data).forEach { 
@@ -91,19 +120,6 @@ class PhimMoiChillProvider : MainAPI() {
                 }
             }
         } catch (e: Exception) {}
-
-        // 2. Dự phòng qua api.phimmoi.mx (Phát hiện từ file JSON)
-        if (!hasLinks) {
-            try {
-                val apiRes = app.get("https://api.phimmoi.mx/api/episode/$episodeId", headers = defaultHeaders).text
-                Regex("""https?[:\\]+[^"'<>\s]+?\.m3u8[^"'<>\s]*""").findAll(apiRes).forEach {
-                    M3u8Helper.generateM3u8(name, it.value.replace("\\/", "/"), data).forEach { link ->
-                        callback(link)
-                        hasLinks = true
-                    }
-                }
-            } catch (e: Exception) {}
-        }
 
         return hasLinks
     }

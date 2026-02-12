@@ -74,7 +74,11 @@ data class Category(
 
 // ── Main provider ─────────────────────────────────────────────────────────────
 class PhimMoiChillProvider : MainAPI() {
-    override var mainUrl = "https://phimmoichill.now"
+    // ✅ THAY ĐỔI: Thử các domain khác nhau nếu domain chính không hoạt động
+    override var mainUrl = "https://phimmoichill.net"  // Thử .net thay vì .now
+    // override var mainUrl = "https://phimmoichill.site"  // Hoặc .site
+    // override var mainUrl = "https://phimmoichill.org"  // Hoặc .org
+    
     override var name    = "PhimMoiChill"
     override val hasMainPage        = true
     override var lang               = "vi"
@@ -94,10 +98,11 @@ class PhimMoiChillProvider : MainAPI() {
         "Upgrade-Insecure-Requests" to "1"
     )
 
+    // ✅ THAY ĐỔI: Sửa lại path để không bị duplicate dấu /
     override val mainPage = mainPageOf(
-        "list/phim-moi?page="       to "Phim Mới",
-        "list/phim-le?page="        to "Phim Lẻ",
-        "list/phim-bo?page="        to "Phim Bộ"
+        "/list/phim-moi?page="       to "Phim Mới",  // ✅ Thêm "/" ở đầu
+        "/list/phim-le?page="        to "Phim Lẻ",   // ✅ Thêm "/" ở đầu
+        "/list/phim-bo?page="        to "Phim Bộ"    // ✅ Thêm "/" ở đầu
     )
 
     private fun requestHeaders(
@@ -158,16 +163,19 @@ class PhimMoiChillProvider : MainAPI() {
 
     // ── Thử API JSON trực tiếp ────────────────────────────────────────────────
     private suspend fun tryApiEndpoint(path: String, page: Int): List<MovieItem> {
-        val slug = path.removePrefix("list/").substringBefore("?")
+        // ✅ THAY ĐỔI: Sửa lại cách extract slug
+        val slug = path.removePrefix("/").removePrefix("list/").substringBefore("?")
         val candidates = listOf(
             "$mainUrl/api/$slug?page=$page",
             "$mainUrl/api/list/$slug?page=$page",
-            "$mainUrl/api/phim?type=$slug&page=$page"
+            "$mainUrl/api/phim?type=$slug&page=$page",
+            "$mainUrl/api/movies?type=$slug&page=$page",  // ✅ Thêm endpoint mới
+            "$mainUrl/api/v1/movies?category=$slug&page=$page"  // ✅ Thêm endpoint mới
         )
         val jsonHeaders = requestHeaders(mainUrl, mapOf("Accept" to "application/json"))
         for (url in candidates) {
             val text = runCatching {
-                app.get(url, headers = jsonHeaders).text
+                app.get(url, headers = jsonHeaders, timeout = 30).text
             }.getOrNull() ?: continue
             if (!text.trimStart().startsWith("{") && !text.trimStart().startsWith("[")) continue
 
@@ -176,9 +184,18 @@ class PhimMoiChillProvider : MainAPI() {
                     mapper.readValue(text, mapper.typeFactory.constructCollectionType(List::class.java, MovieItem::class.java))
                 } else {
                     val node = mapper.readTree(text)
-                    val arr  = node["items"] ?: node["movies"] ?: node["films"]
-                        ?: node["data"]?.get("items") ?: node["data"]?.get("movies")
-                        ?: node["data"] ?: return@runCatching emptyList<MovieItem>()
+                    // ✅ THAY ĐỔI: Thêm nhiều trường hợp parse JSON hơn
+                    val arr  = node["items"] 
+                        ?: node["movies"] 
+                        ?: node["films"]
+                        ?: node["data"]?.get("items") 
+                        ?: node["data"]?.get("movies")
+                        ?: node["data"]?.get("films")
+                        ?: node["data"]?.get("list")
+                        ?: node["result"]?.get("items")
+                        ?: node["results"]
+                        ?: node["data"] 
+                        ?: return@runCatching emptyList<MovieItem>()
                     mapper.convertValue(arr, mapper.typeFactory.constructCollectionType(List::class.java, MovieItem::class.java))
                 }
             }.getOrElse { emptyList() }
@@ -235,8 +252,22 @@ class PhimMoiChillProvider : MainAPI() {
     private fun parseHtmlPage(html: String): List<SearchResponse> {
         val doc = org.jsoup.Jsoup.parse(html)
         val selectors = listOf(
-            ".items .item", ".list-film .item", ".film_list-wrap .flw-item",
-            ".movie-list .item", ".halim_box", ".item.thumb", "article.item", "article"
+            ".items .item", 
+            ".list-film .item", 
+            ".film_list-wrap .flw-item",
+            ".movie-list .item", 
+            ".halim_box", 
+            ".item.thumb", 
+            "article.item", 
+            "article",
+            // ✅ THAY ĐỔI: Thêm các selector phổ biến cho website phim mới
+            ".film-item",
+            ".movie-item",
+            ".post-item",
+            ".card",
+            ".film-poster",
+            "[class*='movie']",
+            "[class*='film']"
         )
         for (sel in selectors) {
             val found = doc.select(sel).mapNotNull { parseHtmlCard(it) }.distinctBy { it.url }
@@ -264,8 +295,20 @@ class PhimMoiChillProvider : MainAPI() {
 
     // ─────────────────────────────────────────────────────────────────────────
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url  = "$mainUrl/${request.data}$page"
-        val html = app.get(url, headers = requestHeaders(mainUrl)).text
+        // ✅ THAY ĐỔI: Sửa lại cách build URL để tránh duplicate /
+        val url = if (request.data.startsWith("/")) {
+            "$mainUrl${request.data}$page"
+        } else {
+            "$mainUrl/${request.data}$page"
+        }
+        
+        val html = runCatching {
+            app.get(url, headers = requestHeaders(mainUrl), timeout = 30).text
+        }.getOrElse { 
+            // ✅ THAY ĐỔI: Thử với www nếu không có www bị lỗi
+            val altUrl = url.replace("://", "://www.")
+            app.get(altUrl, headers = requestHeaders(mainUrl), timeout = 30).text
+        }
 
         // 1) Next.js __NEXT_DATA__
         var items = extractNextData(html).mapNotNull { it.toSearchResponse() }
@@ -282,7 +325,7 @@ class PhimMoiChillProvider : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val encoded = URLEncoder.encode(query, "UTF-8")
-        val html    = app.get("$mainUrl/?s=$encoded", headers = requestHeaders(mainUrl)).text
+        val html    = app.get("$mainUrl/?s=$encoded", headers = requestHeaders(mainUrl), timeout = 30).text
 
         var items = extractNextData(html).mapNotNull { it.toSearchResponse() }
         if (items.isEmpty()) items = parseHtmlPage(html)
@@ -292,7 +335,7 @@ class PhimMoiChillProvider : MainAPI() {
     // ── Load chi tiết phim ────────────────────────────────────────────────────
     override suspend fun load(url: String): LoadResponse? {
         val fixedUrl = normalizeUrl(url) ?: return null
-        val html     = app.get(fixedUrl, headers = requestHeaders(fixedUrl)).text
+        val html     = app.get(fixedUrl, headers = requestHeaders(fixedUrl), timeout = 30).text
         val doc      = org.jsoup.Jsoup.parse(html)
 
         val nextJson = Regex("""<script[^>]+id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)</script>""")
@@ -410,7 +453,7 @@ class PhimMoiChillProvider : MainAPI() {
     ): Boolean {
         return runCatching {
             val dataUrl  = normalizeUrl(data) ?: return false
-            val html     = app.get(dataUrl, headers = requestHeaders(dataUrl)).text
+            val html     = app.get(dataUrl, headers = requestHeaders(dataUrl), timeout = 30).text
             val document = org.jsoup.Jsoup.parse(html)
 
             var hasLinks = false

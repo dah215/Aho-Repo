@@ -110,26 +110,35 @@ class PhimMoiChillProvider : MainAPI() {
     ): Boolean {
         val html = app.get(data, headers = defaultHeaders).text
         
-        // 1. Quét Iframe ẩn
-        org.jsoup.Jsoup.parse(html).select("iframe[src], embed[src]").forEach {
+        // 1. Quét Iframe
+        org.jsoup.Jsoup.parse(html).select("iframe[src]").forEach {
             val src = normalizeUrl(it.attr("src")) ?: return@forEach
             loadExtractor(src, data, subtitleCallback, callback)
         }
 
-        // 2. Bộ quét link nâng cao cho m3u8 và mp4
+        // 2. Quét link Video (Sửa lỗi Type Mismatch triệt để)
         val videoRegex = Regex("""(https?://[^\s"'<>]+(\.m3u8|\.mp4)[^\s"'<>]*)""")
         videoRegex.findAll(html).forEach { match ->
             val videoUrl = match.value.replace("\\/", "/")
             if (videoUrl.contains(".m3u8")) {
                 M3u8Helper.generateM3u8(name, videoUrl, data).forEach(callback)
             } else {
+                // ✅ SỬA LỖI: Chuyển ExtractorLinkType lên vị trí thứ 4 theo đúng log lỗi
                 callback(
-                    newExtractorLink(name, "$name Video", videoUrl, data, Qualities.Unknown.value)
+                    newExtractorLink(
+                        source = name,
+                        name = "$name Video",
+                        url = videoUrl,
+                        type = ExtractorLinkType.VIDEO
+                    ) {
+                        this.quality = Qualities.Unknown.value
+                        this.referer = data
+                    }
                 )
             }
         }
         
-        // 3. Quét link từ thuộc tính data (thường dùng cho các server dự phòng)
+        // 3. Quét data attributes
         org.jsoup.Jsoup.parse(html).select("[data-src], [data-link], [data-url]").forEach {
             val src = it.attr("data-src").ifBlank { it.attr("data-link") }.ifBlank { it.attr("data-url") }
             val normalized = normalizeUrl(src) ?: return@forEach

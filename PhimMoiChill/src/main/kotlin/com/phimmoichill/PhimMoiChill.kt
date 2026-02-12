@@ -43,8 +43,7 @@ class PhimMoiChillProvider : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page <= 1) "$mainUrl/${request.data}" else "$mainUrl/${request.data}?page=$page"
         val html = app.get(url, headers = defaultHeaders).text
-        val doc = org.jsoup.Jsoup.parse(html)
-        val items = doc.select(".movies-list .ml-item, .list-film li, .item").mapNotNull { el ->
+        val items = org.jsoup.Jsoup.parse(html).select(".movies-list .ml-item, .list-film li").mapNotNull { el ->
             val a = el.selectFirst("a") ?: return@mapNotNull null
             val href = normalizeUrl(a.attr("href")) ?: return@mapNotNull null
             val title = el.selectFirst("h2, .title, .name")?.text()?.trim() ?: a.text().trim()
@@ -102,36 +101,37 @@ class PhimMoiChillProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val res = app.get(data, headers = defaultHeaders)
-        val html = res.text
+        val html = app.get(data, headers = defaultHeaders).text
         
-        // 1. Quét link m3u8 ẩn sâu trong các script (Sửa lỗi "Không tìm thấy link")
+        // 1. Quét link m3u8 ẩn (Sửa lỗi tải phim)
         val m3u8Regex = Regex("""["'](https?://[^\s"'<>]+?\.m3u8[^\s"'<>]*?)["']""")
         m3u8Regex.findAll(html).forEach { match ->
             val videoUrl = match.groupValues[1].replace("\\/", "/")
             M3u8Helper.generateM3u8(name, videoUrl, data).forEach(callback)
         }
 
-        // 2. Quét Iframe server (Dùng cho Player ngoài)
+        // 2. Quét Iframe server Player
         org.jsoup.Jsoup.parse(html).select("iframe[src]").forEach {
             val src = normalizeUrl(it.attr("src")) ?: return@forEach
             loadExtractor(src, data, subtitleCallback, callback)
         }
 
-        // 3. Quét link MP4 trực tiếp (Sửa lỗi Build)
+        // 3. Quét link MP4 trực tiếp (Sửa lỗi Build bằng cú pháp newExtractorLink chuẩn nhất)
         val mp4Regex = Regex("""["'](https?://[^\s"'<>]+?\.mp4[^\s"'<>]*?)["']""")
         mp4Regex.findAll(html).forEach { match ->
             val videoUrl = match.groupValues[1].replace("\\/", "/")
-            // ✅ SỬA LỖI BIÊN DỊCH: Sử dụng constructor trực tiếp để khớp với thư viện của bạn
+            
+            // ✅ SỬA LỖI BIÊN DỊCH: Sử dụng newExtractorLink với ExtractorLinkType ở vị trí thứ 4
             callback(
-                ExtractorLink(
+                newExtractorLink(
                     name,
                     "$name Video",
                     videoUrl,
-                    data,
-                    Qualities.Unknown.value,
-                    false // isM3u8
-                )
+                    ExtractorLinkType.VIDEO
+                ) {
+                    this.quality = Qualities.Unknown.value
+                    this.referer = data
+                }
             )
         }
 

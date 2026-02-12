@@ -22,36 +22,28 @@ class PhimMoiChillProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
-    // Header chuẩn từ file JS và Screenshot của bạn
     private val defaultHeaders = mapOf(
         "User-Agent" to "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
-        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept" to "*/*",
         "X-Requested-With" to "XMLHttpRequest",
         "Referer" to "$mainUrl/"
     )
 
     override val mainPage = mainPageOf(
-        "list/phim-moi" to "Phim Mới Cập Nhật",
+        "list/phim-moi" to "Phim Mới",
         "list/phim-le" to "Phim Lẻ",
         "list/phim-bo" to "Phim Bộ"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page <= 1) "$mainUrl/${request.data}" else "$mainUrl/${request.data}?page=$page"
-        
         return try {
             val html = app.get(url, headers = defaultHeaders).text
             val doc = Jsoup.parse(html)
-            
-            // Selector chính xác từ phimmoichill_main.json: .list-film .item
             val items = doc.select(".list-film .item").mapNotNull { el ->
                 val a = el.selectFirst("a") ?: return@mapNotNull null
                 val title = el.selectFirst("p")?.text()?.trim() ?: a.attr("title")
-                
-                // Lấy poster từ data-src (Lazyload) để tránh lỗi Unknown/Crash
-                val img = el.selectFirst("img")
-                val poster = img?.attr("data-src")?.takeIf { it.isNotBlank() } ?: img?.attr("src")
-                
+                val poster = el.selectFirst("img")?.attr("data-src") ?: el.selectFirst("img")?.attr("src")
                 newMovieSearchResponse(title, a.attr("href"), TvType.Movie) {
                     this.posterUrl = poster
                 }
@@ -65,29 +57,21 @@ class PhimMoiChillProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         val html = app.get(url, headers = defaultHeaders).text
         val doc = Jsoup.parse(html)
-        
-        // Lấy thông tin từ phimmoichill_movie.json
-        val title = doc.selectFirst("h1.entry-title, h1.caption")?.text()?.trim() ?: "Phim"
+        val title = doc.selectFirst("h1.entry-title, .caption")?.text()?.trim() ?: "Phim"
         val poster = doc.selectFirst(".film-poster img")?.attr("src")
-        val desc = doc.selectFirst(".film-content")?.text()?.trim()
-
-        // Danh sách tập phim từ watch_page.html
-        val episodes = doc.select("ul.list-episode li a, a[href*='/xem/']").map {
-            newEpisode(it.attr("href")) {
-                this.name = it.text().trim().replace("Tập ", "")
+        
+        // Tìm danh sách tập phim và lấy Numeric ID (data-id)
+        val episodes = doc.select("ul.list-episode li a, .list-episodes a").map {
+            val href = it.attr("href")
+            val id = it.attr("data-id") // Đây là Numeric ID quan trọng
+            newEpisode(href) {
+                this.name = it.text().trim()
+                this.description = id // Lưu ID vào description để dùng ở loadLinks
             }
         }.distinctBy { it.data }
 
-        return if (episodes.size > 1) {
-            newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
-                this.posterUrl = poster
-                this.plot = desc
-            }
-        } else {
-            newMovieLoadResponse(title, url, TvType.Movie, episodes.firstOrNull()?.data ?: url) {
-                this.posterUrl = poster
-                this.plot = desc
-            }
+        return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
+            this.posterUrl = poster
         }
     }
 
@@ -97,30 +81,43 @@ class PhimMoiChillProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        var hasLinks = false
-        val episodeId = Regex("""pm(\d+)""").find(data)?.groupValues?.get(1) ?: return false
+        // Lấy ID từ trang xem phim nếu description rỗng
+        val html = app.get(data, headers = defaultHeaders).text
+        val doc = Jsoup.parse(html)
+        
+        // Tìm ID tập phim từ Script (Biến filmInfo trong watch_page.html)
+        val episodeId = Regex(""""episodeID":\s*"(\d+)"""").find(html)?.groupValues?.get(1)
+                        ?: Regex("""data-id="(\d+)"""").find(html)?.groupValues?.get(1)
+        
+        // Tìm Nonce (khóa bảo mật) nếu có
+        val nonce = Regex(""""nonce":\s*"([^"]+)"""").find(html)?.groupValues?.get(1)
 
-        try {
-            // Tấn công vào chillsplayer.php (Logic từ phimchill.public.js)
+        if (episodeId == null) return false
+
+        return try {
+            // Gọi API chillsplayer.php với ID số thực tế
+            val timestamp = System.currentTimeMillis()
             val res = app.post(
-                "$mainUrl/chillsplayer.php",
-                data = mapOf("qcao" to episodeId),
+                "$mainUrl/chillsplayer.php?_=$timestamp",
+                data = mapOf(
+                    "qcao" to episodeId,
+                    "nonce" to (nonce ?: "")
+                ),
                 headers = defaultHeaders.plus("Referer" to data)
             ).text
 
-            // Lọc link m3u8 sạch (Bỏ qua ads/skipintro từ skipintro.js)
-            val m3u8Regex = Regex("""https?[:\\]+[^"'<>\s]+?\.m3u8[^"'<>\s]*""")
-            m3u8Regex.findAll(res.replace("\\/", "/")).forEach { match ->
-                val link = match.value
+            var found = false
+            // Quét link m3u8 và loại bỏ rác
+            Regex("""https?[:\\]+[^"'<>\s]+?\.m3u8[^"'<>\s]*""").findAll(res.replace("\\/", "/")).forEach {
+                val link = it.value
                 if (!link.contains("ads") && !link.contains("skipintro")) {
-                    M3u8Helper.generateM3u8(name, link, data).forEach { 
-                        callback(it)
-                        hasLinks = true 
+                    M3u8Helper.generateM3u8(name, link, data).forEach { m3u8 ->
+                        callback(m3u8)
+                        found = true
                     }
                 }
             }
-        } catch (e: Exception) {}
-
-        return hasLinks
+            found
+        } catch (e: Exception) { false }
     }
 }

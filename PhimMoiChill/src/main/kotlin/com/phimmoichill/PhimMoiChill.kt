@@ -8,7 +8,7 @@ import org.jsoup.nodes.Element
 import java.net.URLEncoder
 
 class PhimMoiChillProvider : MainAPI() {
-    override var mainUrl = "https://phimmoichill.net" 
+    override var mainUrl = "https://phimmoichill.now" 
     override var name    = "PhimMoiChill"
     override val hasMainPage        = true
     override var lang               = "vi"
@@ -43,29 +43,21 @@ class PhimMoiChillProvider : MainAPI() {
         val doc = org.jsoup.Jsoup.parse(html)
         val items = mutableListOf<SearchResponse>()
         val seenUrls = mutableSetOf<String>()
-        val containers = doc.select(".block-body li, .list-film li, .movies-list .ml-item, .item, .flw-item")
+        val containers = doc.select(".movies-list .ml-item, .list-film li, .item, .flw-item")
         
         for (el in containers) {
             val a = el.selectFirst("a") ?: continue
             val href = normalizeUrl(a.attr("href")) ?: continue
             if (href.contains("/the-loai/") || !seenUrls.add(href)) continue
 
-            val title = el.selectFirst("h2, .title, .name, .movie-title")?.text()?.trim() 
+            val title = el.selectFirst("h2, .title, .name")?.text()?.trim() 
                 ?: a.attr("title").takeIf { it.isNotBlank() } ?: a.text().trim()
             if (title.isBlank()) continue
 
             val img = el.selectFirst("img")
-            val poster = normalizeUrl(img?.attr("data-src") ?: img?.attr("data-original") ?: img?.attr("src"))
+            val poster = normalizeUrl(img?.attr("data-original") ?: img?.attr("data-src") ?: img?.attr("src"))
 
-            val isSeries = el.select(".label, .ep, .status").text().lowercase().let {
-                it.contains("tập") || it.contains("/") || it.contains("full")
-            }
-
-            if (isSeries) {
-                items.add(newTvSeriesSearchResponse(title, href, TvType.TvSeries) { this.posterUrl = poster })
-            } else {
-                items.add(newMovieSearchResponse(title, href, TvType.Movie) { this.posterUrl = poster })
-            }
+            items.add(newTvSeriesSearchResponse(title, href, TvType.TvSeries) { this.posterUrl = poster })
         }
         return items
     }
@@ -87,42 +79,26 @@ class PhimMoiChillProvider : MainAPI() {
         val html = app.get(url, headers = defaultHeaders).text
         val doc = org.jsoup.Jsoup.parse(html)
 
-        val title = doc.selectFirst("h1.title, .movie-info h1")?.text()?.trim() 
-            ?: doc.selectFirst("meta[property=og:title]")?.attr("content") ?: "Unknown"
-        
+        val title = doc.selectFirst("h1.title, .movie-info h1, .entry-title")?.text()?.trim() ?: "Unknown"
         val poster = normalizeUrl(doc.selectFirst(".film-poster img, .movie-info img, .poster img")?.attr("src"))
         val plot = doc.selectFirst(".film-content, #film-content")?.text()?.trim()
-        val year = doc.selectFirst(".year, .release-year")?.text()?.filter { it.isDigit() }?.toIntOrNull()
 
         val episodes = mutableListOf<Episode>()
-        doc.select(".list-episode a, #list_episodes a, a[href*='-tap-'], .episode a").forEach {
+        doc.select(".list-episode a, #list_episodes a, a[href*='/xem/']").forEach {
             val epHref = normalizeUrl(it.attr("href")) ?: return@forEach
             val epName = it.text().trim()
             if (episodes.none { ep -> ep.data == epHref }) {
                 episodes.add(newEpisode(epHref) {
                     this.name = if (epName.contains("Tập")) epName else "Tập $epName"
-                    this.episode = epName.filter { c -> c.isDigit() }.toIntOrNull()
                 })
             }
         }
 
-        if (episodes.isEmpty()) {
-            val watchUrl = doc.selectFirst("a.btn-watch, .btn-see")?.attr("href")?.let { normalizeUrl(it) } ?: url
-            episodes.add(newEpisode(watchUrl) { this.name = "Full Movie" })
-        }
+        if (episodes.isEmpty()) episodes.add(newEpisode(url) { this.name = "Full Movie" })
 
-        return if (episodes.size > 1) {
-            newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
-                this.posterUrl = poster
-                this.plot = plot
-                this.year = year
-            }
-        } else {
-            newMovieLoadResponse(title, url, TvType.Movie, episodes.first().data) {
-                this.posterUrl = poster
-                this.plot = plot
-                this.year = year
-            }
+        return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
+            this.posterUrl = poster
+            this.plot = plot
         }
     }
 
@@ -134,35 +110,34 @@ class PhimMoiChillProvider : MainAPI() {
     ): Boolean {
         val html = app.get(data, headers = defaultHeaders).text
         
-        // 1. Quét Iframe
-        org.jsoup.Jsoup.parse(html).select("iframe[src]").forEach {
+        // 1. Quét Iframe ẩn
+        org.jsoup.Jsoup.parse(html).select("iframe[src], embed[src]").forEach {
             val src = normalizeUrl(it.attr("src")) ?: return@forEach
             loadExtractor(src, data, subtitleCallback, callback)
         }
 
-        // 2. Quét link Video trực tiếp
+        // 2. Bộ quét link nâng cao cho m3u8 và mp4
         val videoRegex = Regex("""(https?://[^\s"'<>]+(\.m3u8|\.mp4)[^\s"'<>]*)""")
         videoRegex.findAll(html).forEach { match ->
             val videoUrl = match.value.replace("\\/", "/")
-            
             if (videoUrl.contains(".m3u8")) {
-                // ✅ FIX: generateM3u8 trong bản mới chỉ nhận 3 tham số String, Map truyền vào chỗ Int là lỗi
                 M3u8Helper.generateM3u8(name, videoUrl, data).forEach(callback)
             } else {
-                // ✅ FIX: newExtractorLink theo cấu trúc: source, name, url, type, initializer
                 callback(
-                    newExtractorLink(
-                        name,
-                        "$name Player",
-                        videoUrl,
-                        ExtractorLinkType.VIDEO
-                    ) {
-                        this.referer = data
-                        this.quality = Qualities.Unknown.value
-                    }
+                    newExtractorLink(name, "$name Video", videoUrl, data, Qualities.Unknown.value)
                 )
             }
         }
+        
+        // 3. Quét link từ thuộc tính data (thường dùng cho các server dự phòng)
+        org.jsoup.Jsoup.parse(html).select("[data-src], [data-link], [data-url]").forEach {
+            val src = it.attr("data-src").ifBlank { it.attr("data-link") }.ifBlank { it.attr("data-url") }
+            val normalized = normalizeUrl(src) ?: return@forEach
+            if (normalized.contains("http")) {
+                loadExtractor(normalized, data, subtitleCallback, callback)
+            }
+        }
+
         return true
     }
 }

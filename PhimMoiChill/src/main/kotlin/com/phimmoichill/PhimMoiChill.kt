@@ -26,7 +26,6 @@ class PhimMoiChillProvider : MainAPI() {
 
     // Bypass CloudFlare bằng WebView
     override val usesWebView = true
-    override val useWebViewForLinks = true
 
     private val headers = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
@@ -138,8 +137,8 @@ class PhimMoiChillProvider : MainAPI() {
             }
         } catch (e: Exception) {
             Log.e("PhimMoiChill", "Error parsing item: ${e.message}")
-            null
         }
+        return null
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -162,7 +161,6 @@ class PhimMoiChillProvider : MainAPI() {
             val seen = mutableSetOf<String>()
 
             // Parse từ carousel (Phim Đề Cử) - dùng selector chính xác với cấu trúc owl-carousel
-            // Cấu trúc: <ul id="film-hot"><div class="owl-wrapper-outer"><div class="owl-wrapper"><div class="owl-item"><li class="item">...
             doc.select("#film-hot .item, #film-hot li.item").forEach { el ->
                 val item = el.toSearchResult()
                 if (item != null && seen.add(item.url)) {
@@ -258,10 +256,6 @@ class PhimMoiChillProvider : MainAPI() {
             val tags = doc.select("ul.entry-meta.block-film li:nth-child(4) a, a[href*='/genre/']")
                 .map { it.text().substringAfter("Phim") }
 
-            // Lấy rating
-            val rating = doc.select("ul.entry-meta.block-film li span, .rating-value")
-                .firstOrNull()?.text()?.toRatingInt()
-
             // Lấy actors
             val actors = doc.select("ul.entry-meta.block-film li:last-child a, .actor-name")
                 .map { it.text() }
@@ -305,7 +299,6 @@ class PhimMoiChillProvider : MainAPI() {
                     this.year = year
                     this.plot = desc
                     this.tags = tags
-                    this.rating = rating
                     addActors(actors)
                     this.recommendations = recommendations
                     addTrailer(trailer)
@@ -316,7 +309,6 @@ class PhimMoiChillProvider : MainAPI() {
                     this.year = year
                     this.plot = desc
                     this.tags = tags
-                    this.rating = rating
                     addActors(actors)
                     this.recommendations = recommendations
                     addTrailer(trailer)
@@ -373,14 +365,10 @@ class PhimMoiChillProvider : MainAPI() {
                     Pair("https://dash.megacdn.xyz/dast/$key/index.m3u8", "PMBK")
                 ).forEach { (link, source) ->
                     callback(
-                        ExtractorLink(
-                            source,
-                            source,
-                            link,
-                            referer = "$baseUrl/",
-                            quality = Qualities.P1080.value,
-                            type = INFER_TYPE
-                        )
+                        newExtractorLink(source, source, link) {
+                            this.referer = "$baseUrl/"
+                            this.quality = Qualities.P1080.value
+                        }
                     )
                     hasLinks = true
                 }

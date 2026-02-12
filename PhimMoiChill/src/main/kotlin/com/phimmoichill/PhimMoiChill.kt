@@ -75,7 +75,7 @@ data class Category(
 // ── Main provider ─────────────────────────────────────────────────────────────
 class PhimMoiChillProvider : MainAPI() {
     // ✅ THAY ĐỔI: Thử các domain khác nhau nếu domain chính không hoạt động
-    override var mainUrl = "https://phimmoichill.net"  // Thử .net thay vì .now
+    override var mainUrl = "https://phimmoichill.now"  // Thử .net thay vì .now
     // override var mainUrl = "https://phimmoichill.site"  // Hoặc .site
     // override var mainUrl = "https://phimmoichill.org"  // Hoặc .org
     

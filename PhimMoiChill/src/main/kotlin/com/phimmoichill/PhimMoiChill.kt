@@ -80,17 +80,21 @@ class PhimMoiChillProvider : MainAPI() {
         val anchor = article.selectFirst("a[href]") ?: return null
         val href = normalizeUrl(anchor.attr("href")) ?: return null
 
-        val title = article.selectFirst(".entry-title, .halim-post-title, .film-title")?.text()?.trim()
+        val image = article.selectFirst("img")
+
+        val title = article.selectFirst(".entry-title, .halim-post-title, .film-title, h3, h2")?.text()?.trim().takeUnless { it.isNullOrBlank() }
+            ?: image?.attr("alt")?.trim().takeUnless { it.isNullOrBlank() }
             ?: anchor.attr("title").trim().ifEmpty { null }
+            ?: anchor.text().trim().ifEmpty { null }
             ?: return null
 
-        val image = article.selectFirst("img")
         val poster = normalizeUrl(
             image?.attr("data-src")?.takeIf { it.isNotBlank() }
+                ?: image?.attr("data-original")?.takeIf { it.isNotBlank() }
                 ?: image?.attr("src")
         )
 
-        val typeText = article.attr("class") + " " + article.text()
+        val typeText = (article.attr("class") + " " + article.text() + " " + href).lowercase()
         val type = toType(typeText)
 
         return newTvSeriesSearchResponse(title, href, type) {
@@ -102,7 +106,25 @@ class PhimMoiChillProvider : MainAPI() {
         val url = "$mainUrl/${request.data}$page"
         val document = app.get(url, headers = requestHeaders(mainUrl)).document
 
-        val items = document.select("article, .item, .movie-item, .halim-item").mapNotNull { parseCard(it) }
+        val cardSelectors = listOf(
+            "article",
+            ".item",
+            ".movie-item",
+            ".halim-item",
+            ".halim_box",
+            ".film_list-wrap .flw-item",
+            ".list-film .item"
+        )
+
+        val items = cardSelectors
+            .flatMap { selector -> document.select(selector) }
+            .mapNotNull { parseCard(it) }
+            .distinctBy { it.url }
+            .ifEmpty {
+                document.select("a[href*=/phim], a[href*=/xem-phim], a[href*=/series], a[href*=/movie]")
+                    .mapNotNull { a -> parseCard(a.parent() ?: a) }
+                    .distinctBy { it.url }
+            }
 
         return newHomePageResponse(
             HomePageList(
@@ -117,7 +139,25 @@ class PhimMoiChillProvider : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         val encoded = URLEncoder.encode(query, "UTF-8")
         val document = app.get("$mainUrl/?s=$encoded", headers = requestHeaders(mainUrl)).document
-        return document.select("article, .item, .movie-item, .halim-item").mapNotNull { parseCard(it) }
+        val cardSelectors = listOf(
+            "article",
+            ".item",
+            ".movie-item",
+            ".halim-item",
+            ".halim_box",
+            ".film_list-wrap .flw-item",
+            ".list-film .item"
+        )
+
+        return cardSelectors
+            .flatMap { selector -> document.select(selector) }
+            .mapNotNull { parseCard(it) }
+            .distinctBy { it.url }
+            .ifEmpty {
+                document.select("a[href*=/phim], a[href*=/xem-phim], a[href*=/series], a[href*=/movie]")
+                    .mapNotNull { a -> parseCard(a.parent() ?: a) }
+                    .distinctBy { it.url }
+            }
     }
 
     override suspend fun load(url: String): LoadResponse? {

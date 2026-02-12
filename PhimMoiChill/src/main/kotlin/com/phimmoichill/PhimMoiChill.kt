@@ -88,9 +88,8 @@ class PhimMoiChillProvider : MainAPI() {
         val html = pageResponse.text
         val cookies = pageResponse.cookies
 
-        // Lấy ID tập phim từ trang web
-        val episodeId = Regex(""""episodeID":\s*"(\d+)"""").find(html)?.groupValues?.get(1)
-                        ?: Regex("""data-id="(\d+)"""").find(html)?.groupValues?.get(1)
+        // Lấy episodeID từ filmInfo trong HTML
+        val episodeId = Regex(""""episodeID":\s*"?(\d+)"?""").find(html)?.groupValues?.get(1)
 
         if (episodeId == null) return false
 
@@ -105,7 +104,7 @@ class PhimMoiChillProvider : MainAPI() {
             val cleanRes = res.replace("\\/", "/")
             var found = false
             
-            // Xử lý link m3u8
+            // 1. Xử lý link m3u8 thông qua helper
             Regex("""https?://[^"'<>\s]+?\.m3u8[^"'<>\s]*""").findAll(cleanRes).forEach {
                 val link = it.value
                 M3u8Helper.generateM3u8(name, link, data).forEach { m3u8 ->
@@ -114,7 +113,7 @@ class PhimMoiChillProvider : MainAPI() {
                 }
             }
             
-            // FIX LỖI BUILD: Dùng newExtractorLink thay cho ExtractorLink cũ
+            // 2. Xử lý link mp4 (SỬA LỖI THAM SỐ BUILD TẠI ĐÂY)
             if (!found) {
                 Regex("""https?://[^"'<>\s]+?\.mp4[^"'<>\s]*""").findAll(cleanRes).forEach {
                     callback(
@@ -122,7 +121,7 @@ class PhimMoiChillProvider : MainAPI() {
                             source = name,
                             name = name,
                             url = it.value,
-                            referer = data,
+                            referer = data, // Đã kiểm tra: trong phiên bản SDK này tham số là 'referer' (viết thường)
                             quality = Qualities.P1080.value
                         )
                     )

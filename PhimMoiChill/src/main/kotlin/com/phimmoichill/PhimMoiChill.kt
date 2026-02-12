@@ -10,7 +10,6 @@ import java.net.URLEncoder
 @CloudstreamPlugin
 class PhimMoiChillPlugin : Plugin() {
     override fun load() {
-        // Đăng ký Provider vào hệ thống
         registerMainAPI(PhimMoiChillProvider())
     }
 }
@@ -23,10 +22,9 @@ class PhimMoiChillProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
 
-    // Header mô phỏng trình duyệt đang gọi AJAX sau khi bỏ quảng cáo
     private val defaultHeaders = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "Accept" to "application/json, text/javascript, */*; q=0.01",
+        "Accept" to "*/*",
         "X-Requested-With" to "XMLHttpRequest"
     )
 
@@ -84,47 +82,55 @@ class PhimMoiChillProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         var hasLinks = false
-        // Tách ID phim từ link (pm126172 -> 126172)
         val episodeId = Regex("""pm(\d+)""").find(data)?.groupValues?.get(1)
 
-        // GỌI AJAX - Bước quan trọng nhất bạn đã tìm ra
         if (episodeId != null) {
-            listOf("1", "2").forEach { serverId -> 
-                try {
-                    val ajaxRes = app.post(
-                        "$mainUrl/ajax/get_episode_links",
-                        data = mapOf("episode_id" to episodeId, "server_id" to serverId),
-                        headers = defaultHeaders.plus("Referer" to data)
-                    ).text
+            // CHIẾN THUẬT: Đánh trực tiếp vào chillsplayer.php để bỏ qua quảng cáo
+            try {
+                val playerRes = app.post(
+                    "$mainUrl/chillsplayer.php",
+                    data = mapOf("qcao" to episodeId),
+                    headers = defaultHeaders.plus("Referer" to data)
+                ).text
 
-                    // Regex bóc tách link từ JSON (xử lý cả dấu gạch chéo ngược)
-                    val linkRegex = Regex("""https?[:\\]+[^"'<>]+?\.(?:m3u8|mp4|html)[^"'<>]*""")
-                    linkRegex.findAll(ajaxRes.replace("\\/", "/")).forEach { match ->
-                        val link = match.value
-                        if (link.contains(".m3u8")) {
-                            M3u8Helper.generateM3u8(name, link, data).forEach { callback(it); hasLinks = true }
-                        } else {
-                            loadExtractor(link, data, subtitleCallback) { callback(it); hasLinks = true }
+                // 1. Quét link m3u8 thật (Bỏ qua các link Ads ngắn)
+                val m3u8Regex = Regex("""https?[:\\]+[^\s"'<>]+?\.m3u8[^\s"'<>]*""")
+                m3u8Regex.findAll(playerRes.replace("\\/", "/")).forEach { match ->
+                    val link = match.value
+                    // Phim thật thường có 'm3u8' và không chứa từ 'ads'
+                    if (!link.contains("ads", ignoreCase = true)) {
+                        M3u8Helper.generateM3u8(name, link, data).forEach { 
+                            callback(it)
+                            hasLinks = true 
                         }
                     }
-                } catch (e: Exception) { }
-                if (hasLinks) return true // Dừng lại ngay khi có link để không nhảy tập
-            }
+                }
+
+                // 2. Nếu chillsplayer trả về iframe (Server dự phòng)
+                val iframeRegex = Regex("""iframe[^>]+src=["']([^"']+)["']""")
+                iframeRegex.findAll(playerRes.replace("\\/", "/")).forEach { match ->
+                    val iframeUrl = match.groupValues[1]
+                    loadExtractor(normalizeUrl(iframeUrl)!!, data, subtitleCallback) {
+                        callback(it)
+                        hasLinks = true
+                    }
+                }
+            } catch (e: Exception) {}
         }
 
-        // Nếu AJAX không chạy (hiếm), quét toàn bộ trang làm phương án dự phòng
-        if (!hasLinks) {
-            val html = app.get(data, headers = defaultHeaders).text
-            Regex("""["'](https?://[^"']+\.(?:m3u8|mp4)[^"']*)["']""").findAll(html).forEach { match ->
-                val link = match.groupValues[1].replace("\\/", "/")
-                if (link.contains(".m3u8")) {
-                    M3u8Helper.generateM3u8(name, link, data).forEach { callback(it); hasLinks = true }
-                } else {
-                    callback(newExtractorLink(name, "$name Video", link, ExtractorLinkType.VIDEO) {
-                        this.quality = Qualities.Unknown.value
-                        this.referer = data
-                    })
-                    hasLinks = true
+        // 3. Nếu vẫn không có link, dùng lại get_episode_links làm dự phòng
+        if (!hasLinks && episodeId != null) {
+            val ajaxRes = app.post(
+                "$mainUrl/ajax/get_episode_links",
+                data = mapOf("episode_id" to episodeId, "server_id" to "1"),
+                headers = defaultHeaders.plus("Referer" to data)
+            ).text
+            
+            Regex("""https?[:\\]+[^\s"'<>]+?\.m3u8[^\s"'<>]*""").findAll(ajaxRes.replace("\\/", "/")).forEach {
+                if (!it.value.contains("ads", ignoreCase = true)) {
+                    M3u8Helper.generateM3u8(name, it.value, data).forEach { link ->
+                        callback(link); hasLinks = true
+                    }
                 }
             }
         }

@@ -88,7 +88,6 @@ class PhimMoiChillProvider : MainAPI() {
         val html = pageResponse.text
         val cookies = pageResponse.cookies
 
-        // Lấy episodeID từ filmInfo (watch_page.html)
         val episodeId = Regex(""""episodeID":\s*"?(\d+)"?""").find(html)?.groupValues?.get(1)
                         ?: Regex("""data-id="(\d+)"""").find(html)?.groupValues?.get(1)
 
@@ -113,18 +112,19 @@ class PhimMoiChillProvider : MainAPI() {
                 }
             }
             
-            // Xử lý link mp4 - CÁCH VIẾT MỚI ĐỂ KHÔNG BỊ LỖI DEPRECATED & NO PARAMETER
+            // Xử lý link mp4 - FIX CHÍNH XÁC THEO THÔNG BÁO LỖI
             if (!found) {
                 Regex("""https?://[^"'<>\s]+?\.mp4[^"'<>\s]*""").findAll(cleanRes).forEach {
                     callback(
                         newExtractorLink(
-                            name,
-                            name,
-                            it.value,
-                            data,
-                            Qualities.P1080.value,
-                            false
-                        )
+                            source = name,
+                            name = name,
+                            url = it.value,
+                            type = null // Tham số thứ 4: ExtractorLinkType?
+                        ) { // Tham số thứ 5: Khối Lambda gán giá trị
+                            this.referer = data
+                            this.quality = Qualities.P1080.value
+                        }
                     )
                     found = true
                 }

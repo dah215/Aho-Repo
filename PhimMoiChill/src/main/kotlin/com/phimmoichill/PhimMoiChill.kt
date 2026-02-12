@@ -16,23 +16,8 @@ private val mapper = jacksonObjectMapper().apply {
     configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
 }
 
-// ── Data classes ──────────────────────────────────────────────────────────────
-@JsonIgnoreProperties(ignoreUnknown = true)
-data class ApiMovieItem(
-    @JsonProperty("name")       val name: String?      = null,
-    @JsonProperty("title")      val title: String?     = null,
-    @JsonProperty("slug")       val slug: String?      = null,
-    @JsonProperty("_id")        val id: String?        = null,
-    @JsonProperty("thumb_url")  val thumbUrl: String?  = null,
-    @JsonProperty("poster_url") val posterUrl: String? = null,
-    @JsonProperty("thumbnail")  val thumbnail: String? = null,
-    @JsonProperty("image")      val image: String?     = null,
-    @JsonProperty("type")       val type: String?      = null
-)
-
 // ── Main provider ─────────────────────────────────────────────────────────────
 class PhimMoiChillProvider : MainAPI() {
-    // ✅ FIX 1: Cập nhật domain sống mới nhất (phimmoichill.net / .aa / .tv)
     override var mainUrl = "https://phimmoichill.net" 
     override var name    = "PhimMoiChill"
     override val hasMainPage        = true
@@ -43,17 +28,14 @@ class PhimMoiChillProvider : MainAPI() {
         TvType.Movie, TvType.TvSeries, TvType.Anime, TvType.AnimeMovie
     )
 
-    // ✅ FIX 2: Headers tối ưu để bypass Cloudflare (Bỏ bớt các Sec-Fetch cứng nhắc)
     private val defaultHeaders = mapOf(
         "User-Agent"                to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
         "Accept"                    to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language"           to "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
-        "DNT"                       to "1",
         "Upgrade-Insecure-Requests" to "1",
         "Connection"                to "keep-alive"
     )
 
-    // ✅ FIX 3: Cập nhật path trang chủ đúng chuẩn domain mới
     override val mainPage = mainPageOf(
         "list/phim-moi" to "Phim Mới",
         "list/phim-le"  to "Phim Lẻ",
@@ -84,12 +66,6 @@ class PhimMoiChillProvider : MainAPI() {
         text.replace(Regex("""\\u([0-9a-fA-F]{4})""")) {
             it.groupValues[1].toInt(16).toChar().toString()
         }
-
-    private fun cleanStreamUrl(raw: String) =
-        decodeUnicode(raw).trim().trim('"', '\'')
-            .replace("\\/", "/")
-            .replace("\\u0026", "&").replace("&amp;", "&")
-            .replace("\\n", "").replace("\\t", "").replace("\\", "")
 
     private fun toType(value: String): TvType {
         val lower = value.lowercase()
@@ -124,10 +100,7 @@ class PhimMoiChillProvider : MainAPI() {
                 ?: img?.attr("src")?.takeIf { it.isNotBlank() && "placeholder" !in it }
         )
 
-        val label = el.selectFirst(".label, span.label")?.text()?.trim() ?: ""
-        val typeStr = "$href $label"
-        
-        return newTvSeriesSearchResponse(title, href, toType(typeStr)) {
+        return newTvSeriesSearchResponse(title, href, toType(href)) {
             this.posterUrl = poster
         }
     }
@@ -139,11 +112,10 @@ class PhimMoiChillProvider : MainAPI() {
         val items = mutableListOf<SearchResponse>()
         val seen = mutableSetOf<String>()
 
-        // ✅ FIX 4: Thêm selectors mạnh mẽ hơn cho layout mới
         val selectors = listOf(
-            ".block-body li.item",      // Layout mới phổ biến
-            "ul.list-movie li.item",    // Layout danh sách chuẩn
-            ".movies-list .ml-item",    // Layout cũ
+            ".block-body li.item",
+            "ul.list-movie li.item", 
+            ".movies-list .ml-item",
             ".list-film .item",
             "#film-hot .item",
             ".items .item",
@@ -159,11 +131,10 @@ class PhimMoiChillProvider : MainAPI() {
                         items.add(result)
                     }
                 }
-                if (items.size > 2) break // Nếu tìm thấy > 2 phim thì tin tưởng selector này
+                if (items.size > 2) break 
             }
         }
         
-        // Fallback nếu không tìm thấy item nào theo cấu trúc chuẩn
         if (items.isEmpty()) {
              doc.select("a[href*='-tap-'], a[href*='/xem/']").forEach { anchor ->
                 val href = normalizeUrl(anchor.attr("href")) ?: return@forEach
@@ -184,23 +155,17 @@ class PhimMoiChillProvider : MainAPI() {
 
     // ─────────────────────────────────────────────────────────────────────────
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        // ✅ FIX 5: Xử lý URL phân trang đúng chuẩn "?page=" hoặc "/page/"
         val url = if (request.data.startsWith("http")) {
-             // Nếu đã là link full (ít gặp)
              val separator = if (request.data.contains("?")) "&page=" else "?page="
              "${request.data}$separator$page"
         } else {
-            // Chuẩn hóa path tránh trùng lặp dấu /
             val cleanPath = request.data.removePrefix("/")
             "$mainUrl/$cleanPath?page=$page"
         }
 
         val html = runCatching {
             app.get(url, headers = requestHeaders(mainUrl)).text
-        }.getOrElse { 
-            // Thử fallback nếu lỗi
-            "" 
-        }
+        }.getOrElse { "" }
 
         val items = parseHtmlPage(html)
         return newHomePageResponse(
@@ -211,13 +176,11 @@ class PhimMoiChillProvider : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val encoded = URLEncoder.encode(query, "UTF-8")
-        // ✅ FIX 6: Sửa lại link search
         val searchUrl = "$mainUrl/tim-kiem/$encoded"
         
         val html = runCatching {
             app.get(searchUrl, headers = requestHeaders(mainUrl)).text
         }.getOrElse { 
-            // Fallback search kiểu cũ
             runCatching {
                 app.get("$mainUrl/tim-kiem/?keyword=$encoded", headers = requestHeaders(mainUrl)).text
             }.getOrElse { "" }
@@ -228,7 +191,6 @@ class PhimMoiChillProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse? {
         val fixedUrl = normalizeUrl(url) ?: return null
         
-        // Thêm cơ chế retry cho load
         val html = runCatching {
              app.get(fixedUrl, headers = requestHeaders(fixedUrl)).text
         }.getOrElse { return null }
@@ -251,20 +213,17 @@ class PhimMoiChillProvider : MainAPI() {
         val tags = doc.select(".category a, .genres a").map { it.text() }
         val year = doc.selectFirst(".year, .release-year")?.text()?.filter { it.isDigit() }?.toIntOrNull()
 
-        // Phân loại
         val typeLabel = doc.selectFirst(".label, .film-type")?.text()?.lowercase() ?: ""
         val type = toType("$fixedUrl $typeLabel ${tags.joinToString(" ")}")
 
         val episodes = mutableListOf<Episode>()
         val seen = mutableSetOf<String>()
 
-        // ✅ FIX 7: Selector tập phim bao quát hơn
         doc.select("a[href*='-tap-'], .episode a, .list-episode a").forEach { link ->
             val epUrl = normalizeUrl(link.attr("href")) ?: return@forEach
             if (!seen.add(epUrl)) return@forEach
 
             val epName = link.text().trim()
-            // Regex lấy số tập
             val epNum = Regex("""(\d+)""").find(epName)?.value?.toIntOrNull()
 
             episodes.add(newEpisode(epUrl) {
@@ -273,7 +232,6 @@ class PhimMoiChillProvider : MainAPI() {
             })
         }
 
-        // Nếu không tìm thấy tập, có thể là phim lẻ (link watch trực tiếp)
         if (episodes.isEmpty()) {
              val watchLink = doc.selectFirst("a.btn-watch, a.btn-see")?.attr("href") 
                  ?: doc.selectFirst("a[href*='/xem-phim/']")?.attr("href")
@@ -301,6 +259,7 @@ class PhimMoiChillProvider : MainAPI() {
         }
     }
 
+    // ── Load Links (Đã sửa lỗi Argument mismatch) ─────────────────────────────────
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -313,7 +272,6 @@ class PhimMoiChillProvider : MainAPI() {
              app.get(dataUrl, headers = requestHeaders(dataUrl)).text
         }.getOrElse { return false }
         
-        // Logic extract link giữ nguyên nhưng thêm check null an toàn
         val doc = org.jsoup.Jsoup.parse(html)
         
         // 1. Tìm iframe/embed trực tiếp
@@ -324,11 +282,10 @@ class PhimMoiChillProvider : MainAPI() {
             }
         }
         
-        // 2. Quét script tìm link m3u8/mp4 ẩn (quan trọng với phimmoi)
+        // 2. Quét script tìm link m3u8/mp4 ẩn
         val scriptContent = doc.select("script").joinToString("\n") { it.data() }
-        
-        // Regex tìm link ẩn
         val regex = Regex("""(https?://[^"']+\.(m3u8|mp4)[^"']*)""")
+        
         regex.findAll(scriptContent).forEach { match ->
             val url = match.groupValues[1].replace("\\/", "/")
             
@@ -337,7 +294,13 @@ class PhimMoiChillProvider : MainAPI() {
                     name, url, dataUrl, headers = requestHeaders(dataUrl)
                 ).forEach(callback)
             } else {
-                callback(newExtractorLink(name, "Direct", url, ExtractorLinkType.VIDEO, Qualities.Unknown.value))
+                // ✅ FIX: Dùng cú pháp Builder để tránh lỗi type mismatch (Int vs Lambda)
+                callback(
+                    newExtractorLink(name, "Direct", url, ExtractorLinkType.VIDEO) {
+                        this.referer = dataUrl
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
             }
         }
 

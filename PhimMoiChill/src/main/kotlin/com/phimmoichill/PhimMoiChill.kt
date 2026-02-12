@@ -40,11 +40,8 @@ class PhimMoiChillProvider : MainAPI() {
             val a = el.selectFirst("a") ?: return@mapNotNull null
             val title = el.selectFirst("p")?.text()?.trim() ?: a.attr("title")
             val poster = el.selectFirst("img")?.attr("data-src") ?: el.selectFirst("img")?.attr("src")
-            // Thêm label (Vietsub/Thuyết minh) nếu có trên poster
-            val label = el.selectFirst(".label")?.text()?.trim()
             newMovieSearchResponse(title, a.attr("href"), TvType.Movie) {
                 this.posterUrl = poster
-                this.quality = getQualityFromString(label)
             }
         }
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
@@ -57,29 +54,30 @@ class PhimMoiChillProvider : MainAPI() {
         val poster = doc.selectFirst(".film-poster img")?.attr("src")
         val description = doc.selectFirst("#film-content, .entry-content")?.text()?.trim()
         
-        // Trích xuất thông tin Phụ đề/Thuyết minh từ tiêu đề hoặc badge
+        // Xác định Phụ đề/Thuyết minh từ tiêu đề
         val isSub = title.contains("Vietsub", true) || html.contains("Vietsub", true)
         val isDub = title.contains("Thuyết Minh", true) || html.contains("Thuyết Minh", true)
 
+        // Lấy danh sách tập phim và đánh số để hiện ở Tab
         val episodes = doc.select("ul.list-episode li a, a[href*='/xem/']").mapIndexed { index, it ->
             val epName = it.text().trim()
             newEpisode(it.attr("href")) {
-                this.name = epName
-                this.episode = index + 1 // Đánh số tập để hiện ở tab
+                this.name = if (epName.contains("Tập")) epName else "Tập ${index + 1}: $epName"
+                this.episode = index + 1
             }
         }.distinctBy { it.data }
 
-        return if (episodes.size > 1) {
+        return if (episodes.size > 1 || url.contains("/phim-bo/")) {
             newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
                 this.posterUrl = poster
                 this.plot = description
-                // Hiển thị loại hình nội dung
                 this.tags = listOfNotNull(if (isSub) "Vietsub" else null, if (isDub) "Thuyết Minh" else null)
             }
         } else {
             newMovieLoadResponse(title, url, TvType.Movie, episodes.firstOrNull()?.data ?: url) {
                 this.posterUrl = poster
                 this.plot = description
+                this.tags = listOfNotNull(if (isSub) "Vietsub" else null, if (isDub) "Thuyết Minh" else null)
             }
         }
     }
@@ -104,28 +102,26 @@ class PhimMoiChillProvider : MainAPI() {
                 cookies = pageResponse.cookies
             ).text
 
-            // TRÍCH XUẤT KEY CHUẨN ĐỂ KHÔNG HIỆN CODE LỖI
             val key = Regex("""iniPlayers\("([^"]+)""").find(responseText)?.groupValues?.get(1)
                 ?: responseText.substringAfter("iniPlayers(\"").substringBefore("\"")
             
             if (key.length < 5) return false
 
-            // Danh sách server sạch
             val serverList = listOf(
                 "https://sotrim.topphimmoi.org/manifest/$key/index.m3u8" to "Chill VIP",
                 "https://dash.megacdn.xyz/raw/$key/index.m3u8" to "DASH Fast"
             )
 
             serverList.forEach { (link, serverName) ->
-                // SỬ DỤNG HÀM CALLBACK CHUẨN ĐỂ TRÁNH HIỆN CHỮ "newExtractorLink" TRÊN VIDEO
+                // SỬ DỤNG newExtractorLink ĐỂ HẾT LỖI DEPRECATED VÀ KHÔNG HIỆN CODE TRÊN VIDEO
                 callback(
-                    ExtractorLink(
+                    newExtractorLink(
                         source = this.name,
                         name = serverName,
                         url = link,
                         referer = "$mainUrl/",
                         quality = Qualities.P1080.value,
-                        isM3u8 = true
+                        type = ExtractorLinkType.M3U8
                     )
                 )
             }

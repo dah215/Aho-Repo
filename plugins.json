@@ -18,5 +18,24 @@
         "description": "Vietnamese anime streaming site",
         "url": "https://raw.githubusercontent.com/dah215/Aho-Repo/builds/Boctem.cs3",
         "name": "Boctem"
+    },
+    {
+        "iconUrl": "https://phimmoichill.now/favicon.ico",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/dah215/Aho-Repo",
+        "status": 1,
+        "language": "vi",
+        "authors": [
+            "PhimMoiChill"
+        ],
+        "tvTypes": [
+            "Anime",
+            "AnimeMovie"
+        ],
+        "version": 1,
+        "internalName": "PhimMoiChill",
+        "description": "Vietnamese anime streaming site",
+        "url": "https://raw.githubusercontent.com/dah215/Aho-Repo/builds/PhimMoiChill.cs3",
+        "name": "PhimMoiChill"
     }
 ]

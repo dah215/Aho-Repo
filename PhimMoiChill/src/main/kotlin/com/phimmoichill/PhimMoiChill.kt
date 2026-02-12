@@ -140,26 +140,26 @@ class PhimMoiChillProvider : MainAPI() {
             loadExtractor(src, data, subtitleCallback, callback)
         }
 
-        // 2. Quét link Video trực tiếp - Fix triệt để bằng cách không dùng named arguments
+        // 2. Quét link Video trực tiếp
         val videoRegex = Regex("""(https?://[^\s"'<>]+(\.m3u8|\.mp4)[^\s"'<>]*)""")
         videoRegex.findAll(html).forEach { match ->
             val videoUrl = match.value.replace("\\/", "/")
             
             if (videoUrl.contains(".m3u8")) {
-                // Sử dụng positional arguments cho M3u8Helper
-                M3u8Helper.generateM3u8(name, videoUrl, data, defaultHeaders).forEach(callback)
+                // ✅ FIX: generateM3u8 trong bản mới chỉ nhận 3 tham số String, Map truyền vào chỗ Int là lỗi
+                M3u8Helper.generateM3u8(name, videoUrl, data).forEach(callback)
             } else {
-                // ✅ SỬA LỖI: Sử dụng constructor chuẩn theo vị trí, không dùng tên 'referer' hay 'quality'
-                // Tham số: source, name, url, referer, quality, type
+                // ✅ FIX: newExtractorLink theo cấu trúc: source, name, url, type, initializer
                 callback(
                     newExtractorLink(
                         name,
                         "$name Player",
                         videoUrl,
-                        data,
-                        Qualities.Unknown.value,
                         ExtractorLinkType.VIDEO
-                    )
+                    ) {
+                        this.referer = data
+                        this.quality = Qualities.Unknown.value
+                    }
                 )
             }
         }

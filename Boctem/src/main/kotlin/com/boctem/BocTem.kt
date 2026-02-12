@@ -25,7 +25,6 @@ class BocTemProvider : MainAPI() {
 
     private fun normalizeUrl(url: String?): String? {
         if (url.isNullOrBlank()) return null
-
         return when {
             url.startsWith("http://") || url.startsWith("https://") -> url
             url.startsWith("//") -> "https:$url"
@@ -44,8 +43,7 @@ class BocTemProvider : MainAPI() {
 
         val image = article.selectFirst("img")
         val poster = normalizeUrl(
-            image?.attr("data-src")?.takeIf { it.isNotBlank() }
-                ?: image?.attr("src")
+            image?.attr("data-src")?.takeIf { it.isNotBlank() } ?: image?.attr("src")
         )
 
         val statusText = article.selectFirst(".status")?.text().orEmpty()
@@ -60,10 +58,7 @@ class BocTemProvider : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = "$mainUrl/${request.data}$page"
         val document = app.get(url).document
-
-        val items = document
-            .select("article.thumb.grid-item")
-            .mapNotNull { parseCard(it) }
+        val items = document.select("article.thumb.grid-item").mapNotNull { parseCard(it) }
 
         return newHomePageResponse(
             HomePageList(
@@ -77,12 +72,8 @@ class BocTemProvider : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val encodedQuery = URLEncoder.encode(query, "UTF-8")
-        val url = "$mainUrl/?s=$encodedQuery"
-        val document = app.get(url).document
-
-        return document
-            .select("article.thumb.grid-item")
-            .mapNotNull { parseCard(it) }
+        val document = app.get("$mainUrl/?s=$encodedQuery").document
+        return document.select("article.thumb.grid-item").mapNotNull { parseCard(it) }
     }
 
     override suspend fun load(url: String): LoadResponse? {
@@ -103,23 +94,20 @@ class BocTemProvider : MainAPI() {
             ?: document.selectFirst("meta[property=og:description]")?.attr("content")
 
         val seen = HashSet<String>()
-        val episodes = document
-            .select("a[href*=/xem-phim/]")
-            .mapNotNull { link ->
-                val epUrl = normalizeUrl(link.attr("href")) ?: return@mapNotNull null
-                if (!epUrl.contains("-tap-")) return@mapNotNull null
-                if (!seen.add(epUrl)) return@mapNotNull null
+        val episodes = document.select("a[href*=/xem-phim/]").mapNotNull { link ->
+            val epUrl = normalizeUrl(link.attr("href")) ?: return@mapNotNull null
+            if (!epUrl.contains("-tap-")) return@mapNotNull null
+            if (!seen.add(epUrl)) return@mapNotNull null
 
-                val epName = link.text().trim().ifBlank { null }
-                val epNum = Regex("""tap-(\d+)""").find(epUrl)?.groupValues?.get(1)?.toIntOrNull()
+            val epName = link.text().trim().ifBlank { null }
+            val epNum = Regex("""tap-(\d+)""").find(epUrl)?.groupValues?.get(1)?.toIntOrNull()
 
-                newEpisode(epUrl) {
-                    this.name = epName
-                    this.episode = epNum
-                    this.posterUrl = poster
-                }
+            newEpisode(epUrl) {
+                this.name = epName
+                this.episode = epNum
+                this.posterUrl = poster
             }
-            .sortedBy { it.episode ?: Int.MAX_VALUE }
+        }.sortedBy { it.episode ?: Int.MAX_VALUE }
 
         val tags = document.select(".halim-movie-genres a, .post-category a").map { it.text() }
         val year = Regex("""/release/(\d+)/""").find(fixedUrl)?.groupValues?.get(1)?.toIntOrNull()
@@ -144,6 +132,12 @@ class BocTemProvider : MainAPI() {
             val dataUrl = normalizeUrl(data) ?: return false
             val document = app.get(dataUrl).document
 
+            var hasLinks = false
+            val linkCallback: (ExtractorLink) -> Unit = {
+                hasLinks = true
+                callback(it)
+            }
+
             fun cleanStreamUrl(raw: String): String {
                 return raw
                     .trim()
@@ -156,9 +150,18 @@ class BocTemProvider : MainAPI() {
             fun extractIframeUrlsFromText(text: String?): List<String> {
                 if (text.isNullOrBlank()) return emptyList()
 
-                val regex = Regex("""(?:src|file|link|embed_url|iframe)["']?\s*[:=]\s*["'](https?://[^"'<>\s]+)["']""")
-                return regex.findAll(text)
-                    .mapNotNull { normalizeUrl(cleanStreamUrl(it.groupValues[1])) }
+                val keyBased = Regex("""(?:src|file|link|embed_url|iframe|player|url)["']?\s*[:=]\s*["']((?:https?:)?//[^"'<>\s]+)["']""")
+                    .findAll(text)
+                    .map { it.groupValues[1] }
+
+                val rawBased = Regex("""(?:https?:)?//[^"'<>\s]+(?:embed|player|stream|video|watch)[^"'<>\s]*""")
+                    .findAll(text)
+                    .map { it.value }
+
+                return (keyBased + rawBased)
+                    .map { cleanStreamUrl(it) }
+                    .mapNotNull { normalizeUrl(it) }
+                    .filter { !it.endsWith(".jpg") && !it.endsWith(".png") && !it.endsWith(".webp") }
                     .distinct()
                     .toList()
             }
@@ -170,7 +173,7 @@ class BocTemProvider : MainAPI() {
                     .find(text)
                     ?.groupValues
                     ?.get(1)
-                    ?: Regex("""https?://[^"'<>\s]+\.m3u8[^"'<>\s]*""")
+                    ?: Regex("""(?:https?:)?//[^"'<>\s]+\.m3u8[^"'<>\s]*""")
                         .find(text)
                         ?.value
 
@@ -183,8 +186,8 @@ class BocTemProvider : MainAPI() {
                         source = name,
                         streamUrl = cleanM3u8,
                         referer = dataUrl
-                    ).forEach(callback)
-                    return true
+                    ).forEach(linkCallback)
+                    return hasLinks
                 }
 
                 val directVideo = Regex("""(?:file|src|link)["']?\s*[:=]\s*["']([^"']+\.(?:mp4|mkv|webm)(?:\?[^"']*)?)["']""")
@@ -200,7 +203,7 @@ class BocTemProvider : MainAPI() {
                     ?.let { normalizeUrl(it) ?: it }
 
                 if (!cleanDirectVideo.isNullOrBlank()) {
-                    callback(
+                    linkCallback(
                         newExtractorLink(
                             source = name,
                             name = "$name Direct",
@@ -211,7 +214,7 @@ class BocTemProvider : MainAPI() {
                             this.quality = Qualities.Unknown.value
                         }
                     )
-                    return true
+                    return hasLinks
                 }
 
                 return false
@@ -219,11 +222,10 @@ class BocTemProvider : MainAPI() {
 
             if (tryM3u8FromText(document.html())) return true
 
-            val inlineIframe = document.selectFirst("iframe[src]")?.attr("src")
-            val inlineIframeUrl = normalizeUrl(inlineIframe)
+            val inlineIframeUrl = normalizeUrl(document.selectFirst("iframe[src]")?.attr("src"))
             if (!inlineIframeUrl.isNullOrBlank()) {
-                loadExtractor(inlineIframeUrl, dataUrl, subtitleCallback, callback)
-                return true
+                loadExtractor(inlineIframeUrl, dataUrl, subtitleCallback, linkCallback)
+                if (hasLinks) return true
             }
 
             for (script in document.select("script")) {
@@ -232,18 +234,15 @@ class BocTemProvider : MainAPI() {
 
                 val embeddedUrls = extractIframeUrlsFromText(scriptText)
                 if (embeddedUrls.isNotEmpty()) {
-                    embeddedUrls.forEach { loadExtractor(it, dataUrl, subtitleCallback, callback) }
-                    return true
+                    embeddedUrls.forEach { loadExtractor(it, dataUrl, subtitleCallback, linkCallback) }
+                    if (hasLinks) return true
                 }
             }
 
             val bodyClass = document.selectFirst("body")?.attr("class").orEmpty()
             val postId = Regex("""postid-(\d+)""").find(bodyClass)?.groupValues?.get(1)
                 ?: Regex("""post-(\d+)""").find(bodyClass)?.groupValues?.get(1)
-                ?: Regex("""post-(\d+)""")
-                    .find(document.selectFirst("article")?.attr("id").orEmpty())
-                    ?.groupValues
-                    ?.get(1)
+                ?: Regex("""post-(\d+)""").find(document.selectFirst("article")?.attr("id").orEmpty())?.groupValues?.get(1)
 
             val episode = Regex("""tap-(\d+)""").find(dataUrl)?.groupValues?.get(1)
                 ?: Regex("""episode=(\d+)""").find(dataUrl)?.groupValues?.get(1)
@@ -254,9 +253,7 @@ class BocTemProvider : MainAPI() {
                 val content = script.data() + "\n" + script.html()
                 if (content.contains("ajax_player") || content.contains("nonce")) {
                     nonce = Regex("""nonce["']?\s*[:=]\s*["']([^"']+)["']""")
-                        .find(content)
-                        ?.groupValues
-                        ?.get(1)
+                        .find(content)?.groupValues?.get(1)
                     if (!nonce.isNullOrBlank()) break
                 }
             }
@@ -290,10 +287,8 @@ class BocTemProvider : MainAPI() {
                             headers = mapOf("X-Requested-With" to "XMLHttpRequest")
                         ).text
                     }.getOrNull()
-
                     if (!response.isNullOrBlank()) return response
                 }
-
                 return null
             }
 
@@ -302,38 +297,41 @@ class BocTemProvider : MainAPI() {
 
                 if (tryM3u8FromText(ajaxResponse)) return true
 
-                val iframe = Regex("""iframe[^>]+src=["']([^"']+)["']""")
-                    .find(ajaxResponse)
-                    ?.groupValues
-                    ?.get(1)
+                val iframe = Regex("""iframe[^>]+src=["']([^"']+)["']""").find(ajaxResponse)?.groupValues?.get(1)
                     ?: Regex("""(?:src|embed_url|link)["']?\s*:\s*["']([^"']+)["']""")
-                        .find(ajaxResponse)
-                        ?.groupValues
-                        ?.get(1)
+                        .find(ajaxResponse)?.groupValues?.get(1)
 
                 val iframeUrl = normalizeUrl(iframe?.replace("\\/", "/"))
                 if (!iframeUrl.isNullOrBlank()) {
-                    loadExtractor(iframeUrl, dataUrl, subtitleCallback, callback)
-                    return true
+                    loadExtractor(iframeUrl, dataUrl, subtitleCallback, linkCallback)
+                    if (hasLinks) return true
                 }
 
                 val embeddedUrls = extractIframeUrlsFromText(ajaxResponse)
                 if (embeddedUrls.isNotEmpty()) {
-                    embeddedUrls.forEach { loadExtractor(it, dataUrl, subtitleCallback, callback) }
-                    return true
+                    embeddedUrls.forEach { loadExtractor(it, dataUrl, subtitleCallback, linkCallback) }
+                    if (hasLinks) return true
                 }
             }
+
+            val genericCandidates = extractIframeUrlsFromText(document.html())
+            if (genericCandidates.isNotEmpty()) {
+                genericCandidates.forEach { loadExtractor(it, dataUrl, subtitleCallback, linkCallback) }
+                if (hasLinks) return true
+            }
+
+            loadExtractor(dataUrl, dataUrl, subtitleCallback, linkCallback)
+            if (hasLinks) return true
 
             val iframes = document.select("iframe[src]")
                 .mapNotNull { normalizeUrl(it.attr("src")) }
                 .distinct()
 
-            var extracted = false
             for (iframe in iframes) {
-                loadExtractor(iframe, dataUrl, subtitleCallback, callback)
-                extracted = true
+                loadExtractor(iframe, dataUrl, subtitleCallback, linkCallback)
             }
-            extracted
+
+            hasLinks
         }.getOrElse { false }
     }
 }

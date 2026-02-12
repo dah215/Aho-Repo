@@ -5,6 +5,7 @@ import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.Jsoup
+import java.net.URLEncoder
 
 @CloudstreamPlugin
 class PhimMoiChillPlugin : Plugin() {
@@ -22,7 +23,7 @@ class PhimMoiChillProvider : MainAPI() {
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
     private val defaultHeaders = mapOf(
-        "User-Agent" to "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
+        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept" to "*/*",
         "X-Requested-With" to "XMLHttpRequest",
         "Referer" to "$mainUrl/"
@@ -48,13 +49,28 @@ class PhimMoiChillProvider : MainAPI() {
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
 
+    // TÍNH NĂNG TÌM KIẾM
+    override suspend fun search(query: String): List<SearchResponse> {
+        val encodedQuery = URLEncoder.encode(query, "utf-8")
+        val url = "$mainUrl/tim-kiem/$encodedQuery"
+        val html = app.get(url, headers = defaultHeaders).text
+        return Jsoup.parse(html).select(".list-film .item").mapNotNull { el ->
+            val a = el.selectFirst("a") ?: return@mapNotNull null
+            val title = el.selectFirst("p")?.text()?.trim() ?: a.attr("title")
+            val poster = el.selectFirst("img")?.attr("data-src") ?: el.selectFirst("img")?.attr("src")
+            newMovieSearchResponse(title, a.attr("href"), TvType.Movie) {
+                this.posterUrl = poster
+            }
+        }
+    }
+
     override suspend fun load(url: String): LoadResponse {
         val html = app.get(url, headers = defaultHeaders).text
         val doc = Jsoup.parse(html)
         val title = doc.selectFirst("h1.entry-title, .caption")?.text()?.trim() ?: "Phim"
         val poster = doc.selectFirst(".film-poster img")?.attr("src")
         
-        // Lấy link tập phim: Cần lấy link có chữ "/xem/"
+        // Lấy link các tập phim
         val episodes = doc.select("ul.list-episode li a, a[href*='/xem/']").map {
             newEpisode(it.attr("href")) {
                 this.name = it.text().trim()
@@ -72,20 +88,20 @@ class PhimMoiChillProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // BƯỚC 1: Truy cập trang xem phim để lấy ID ẩn (Numeric ID)
+        // 1. Vào trang xem phim để trích xuất Numeric ID
         val html = app.get(data, headers = defaultHeaders).text
         
-        // Trích xuất ID từ biến filmInfo: "episodeID":"12345"
+        // Trích xuất "episodeID":"204125" từ script filmInfo
         val episodeId = Regex(""""episodeID":\s*"(\d+)"""").find(html)?.groupValues?.get(1)
                         ?: Regex("""data-id="(\d+)"""").find(html)?.groupValues?.get(1)
         
-        // Trích xuất Nonce (khóa bảo mật) nếu có
+        // Lấy Nonce nếu có
         val nonce = Regex(""""nonce":\s*"([^"]+)"""").find(html)?.groupValues?.get(1) ?: ""
 
         if (episodeId == null) return false
 
-        // BƯỚC 2: Gọi chillsplayer.php với ID số thực
         return try {
+            // 2. Gọi API lấy link
             val res = app.post(
                 "$mainUrl/chillsplayer.php",
                 data = mapOf(
@@ -96,27 +112,13 @@ class PhimMoiChillProvider : MainAPI() {
             ).text
 
             var found = false
-            // BƯỚC 3: Quét link m3u8 từ phản hồi của server
+            // 3. Quét tất cả link m3u8 trả về
             Regex("""https?[:\\]+[^"'<>\s]+?\.m3u8[^"'<>\s]*""").findAll(res.replace("\\/", "/")).forEach {
                 val link = it.value
-                // Loại bỏ các link quảng cáo 1 giây
                 if (!link.contains("ads") && !link.contains("skipintro")) {
                     M3u8Helper.generateM3u8(name, link, data).forEach { m3u8 ->
                         callback(m3u8)
                         found = true
-                    }
-                }
-            }
-            
-            // Nếu chillsplayer thất bại, thử quét trực tiếp trong trang (Dự phòng)
-            if (!found) {
-                Regex("""https?[:\\]+[^"'<>\s]+?\.m3u8[^"'<>\s]*""").findAll(html.replace("\\/", "/")).forEach {
-                    val link = it.value
-                    if (!link.contains("ads")) {
-                        M3u8Helper.generateM3u8(name, link, data).forEach { m3u8 ->
-                            callback(m3u8)
-                            found = true
-                        }
                     }
                 }
             }

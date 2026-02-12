@@ -22,14 +22,14 @@ class PhimMoiChillProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
+    // Sử dụng Headers từ sotrim.js mà bạn đã tìm thấy
     private val defaultHeaders = mapOf(
-        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "User-Agent" to "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
+        "Accept" to "text/javascript, application/javascript, */*; q=0.01",
         "X-Requested-With" to "XMLHttpRequest",
         "Referer" to "$mainUrl/"
     )
 
-    // Sửa lại cấu trúc MainPage để không bị lỗi "Operation not implemented"
     override val mainPage = mainPageOf(
         "list/phim-moi" to "Phim Mới",
         "list/phim-le" to "Phim Lẻ",
@@ -37,15 +37,15 @@ class PhimMoiChillProvider : MainAPI() {
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = if (page <= 1) "$mainUrl/${request.data}" else "$mainUrl/${request.data}?page=$page"
-        // Thêm try-catch để tránh văng app từ màn hình chính
+        val timestamp = System.currentTimeMillis().toString() // Tạo mã tương tự _=1770898565454
+        val url = if (page <= 1) "$mainUrl/${request.data}?_=$timestamp" else "$mainUrl/${request.data}?page=$page&_=$timestamp"
+        
         return try {
             val html = app.get(url, headers = defaultHeaders).text
             val items = Jsoup.parse(html).select(".movies-list .ml-item, .halim-item").mapNotNull { el ->
                 val a = el.selectFirst("a") ?: return@mapNotNull null
                 val title = el.selectFirst(".title, .entry-title")?.text()?.trim() ?: a.text().trim()
-                val poster = el.selectFirst("img")?.attr("data-src")?.takeIf { it.isNotBlank() } 
-                             ?: el.selectFirst("img")?.attr("src")
+                val poster = el.selectFirst("img")?.attr("data-src") ?: el.selectFirst("img")?.attr("src")
                 newMovieSearchResponse(title, if (a.attr("href").startsWith("http")) a.attr("href") else "$mainUrl${a.attr("href")}", TvType.Movie) {
                     this.posterUrl = poster
                 }
@@ -56,24 +56,6 @@ class PhimMoiChillProvider : MainAPI() {
         }
     }
 
-    override suspend fun load(url: String): LoadResponse {
-        val html = app.get(url, headers = defaultHeaders).text
-        val doc = Jsoup.parse(html)
-        // Fix lỗi "Unknown" trên tiêu đề
-        val title = doc.selectFirst("h1.entry-title, .halim-movie-title")?.text()?.trim() ?: "PhimMoiChill"
-        val poster = doc.selectFirst(".halim-movie-poster img")?.attr("src")
-        
-        val episodes = doc.select("a[href*='/xem/']").map {
-            newEpisode(it.attr("href")) {
-                this.name = it.text().trim()
-            }
-        }.distinctBy { it.data }
-
-        return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
-            this.posterUrl = poster
-        }
-    }
-
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -81,37 +63,31 @@ class PhimMoiChillProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         var hasLinks = false
-        val episodeId = Regex("""pm(\d+)""").find(data)?.groupValues?.get(1)
+        val episodeId = Regex("""pm(\d+)""").find(data)?.groupValues?.get(1) ?: return false
+        val timestamp = System.currentTimeMillis().toString()
 
-        // Tích hợp da88.xml và chillsplayer.php dựa trên Initiator của bạn
-        if (episodeId != null) {
-            val requests = listOf(
-                "$mainUrl/da88.xml",
-                "$mainUrl/chillsplayer.php?qcao=$episodeId"
-            )
+        try {
+            // Bước 1: Gọi chillsplayer kèm timestamp để bypass hệ thống kiểm tra của sotrim.js
+            val playerUrl = "$mainUrl/chillsplayer.php?_=$timestamp"
+            val response = app.post(
+                playerUrl,
+                data = mapOf("qcao" to episodeId),
+                headers = defaultHeaders.plus("Referer" to data)
+            ).text
 
-            for (reqUrl in requests) {
-                try {
-                    val res = if (reqUrl.contains("chillsplayer")) {
-                        app.post(reqUrl.split("?")[0], data = mapOf("qcao" to episodeId), headers = defaultHeaders).text
-                    } else {
-                        app.get(reqUrl, headers = defaultHeaders).text
+            // Bước 2: Truy quét link m3u8 sạch
+            val m3u8Regex = Regex("""https?[:\\]+[^"'<>\s]+?\.m3u8[^"'<>\s]*""")
+            m3u8Regex.findAll(response.replace("\\/", "/")).forEach { match ->
+                val link = match.value
+                if (!link.contains("ads") && !link.contains("skipintro")) {
+                    M3u8Helper.generateM3u8(name, link, data).forEach { 
+                        callback(it)
+                        hasLinks = true 
                     }
-
-                    // Tìm link m3u8 và loại bỏ ads
-                    Regex("""https?[:\\]+[^"'<>\s]+?\.m3u8[^"'<>\s]*""").findAll(res.replace("\\/", "/")).forEach {
-                        val link = it.value
-                        if (!link.contains("ads") && !link.contains("skipintro")) {
-                            M3u8Helper.generateM3u8(name, link, data).forEach { m3u8 ->
-                                callback(m3u8)
-                                hasLinks = true
-                            }
-                        }
-                    }
-                } catch (e: Exception) {}
-                if (hasLinks) break
+                }
             }
-        }
+        } catch (e: Exception) {}
+
         return hasLinks
     }
 }

@@ -321,7 +321,12 @@ class PhimMoiChillProvider : MainAPI() {
                 }
                 val cleanM3u8 = m3u8?.let(::cleanStreamUrl)?.let { normalizeUrl(it) ?: it }
                 if (!cleanM3u8.isNullOrBlank()) {
-                    M3u8Helper.generateM3u8(name, cleanM3u8, dataUrl, requestHeaders(dataUrl)).forEach(linkCallback)
+                    M3u8Helper.generateM3u8(
+                        source = name,
+                        streamUrl = cleanM3u8,
+                        referer = dataUrl,
+                        headers = requestHeaders(dataUrl)
+                    ).forEach(linkCallback)
                     if (hasLinks) return true
                     linkCallback(newExtractorLink(name, "$name M3U8", cleanM3u8, ExtractorLinkType.M3U8) {
                         this.referer = dataUrl; this.headers = requestHeaders(dataUrl); this.quality = Qualities.Unknown.value

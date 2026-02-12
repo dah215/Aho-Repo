@@ -108,38 +108,46 @@ class PhimMoiChillProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val html = app.get(data, headers = defaultHeaders).text
+        val res = app.get(data, headers = defaultHeaders)
+        val html = res.text
+        val document = org.jsoup.Jsoup.parse(html)
         
-        // 1. Quét Iframe
-        org.jsoup.Jsoup.parse(html).select("iframe[src]").forEach {
+        // 1. Giải quyết lỗi "Không tìm thấy link" bằng cách quét sâu vào script
+        val scriptData = document.select("script").joinToString("\n") { it.data() }
+        
+        // Tìm link m3u8 ẩn trong các biến JavaScript
+        val m3u8Regex = Regex("""["'](https?://[^\s"'<>]+?\.m3u8[^\s"'<>]*?)["']""")
+        m3u8Regex.findAll(scriptData + html).forEach { match ->
+            val videoUrl = match.groupValues[1].replace("\\/", "/")
+            M3u8Helper.generateM3u8(name, videoUrl, data).forEach(callback)
+        }
+
+        // 2. Quét Iframe (Dành cho các server Player bên thứ 3)
+        document.select("iframe[src]").forEach {
             val src = normalizeUrl(it.attr("src")) ?: return@forEach
             loadExtractor(src, data, subtitleCallback, callback)
         }
 
-        // 2. Quét link Video (Sửa lỗi Type Mismatch triệt để)
-        val videoRegex = Regex("""(https?://[^\s"'<>]+(\.m3u8|\.mp4)[^\s"'<>]*)""")
-        videoRegex.findAll(html).forEach { match ->
-            val videoUrl = match.value.replace("\\/", "/")
-            if (videoUrl.contains(".m3u8")) {
-                M3u8Helper.generateM3u8(name, videoUrl, data).forEach(callback)
-            } else {
-                // ✅ SỬA LỖI: Chuyển ExtractorLinkType lên vị trí thứ 4 theo đúng log lỗi
-                callback(
-                    newExtractorLink(
-                        source = name,
-                        name = "$name Video",
-                        url = videoUrl,
-                        type = ExtractorLinkType.VIDEO
-                    ) {
-                        this.quality = Qualities.Unknown.value
-                        this.referer = data
-                    }
-                )
-            }
+        // 3. Quét link Video MP4 trực tiếp
+        val mp4Regex = Regex("""["'](https?://[^\s"'<>]+?\.mp4[^\s"'<>]*?)["']""")
+        mp4Regex.findAll(scriptData + html).forEach { match ->
+            val videoUrl = match.groupValues[1].replace("\\/", "/")
+            // ✅ SỬA LỖI BIÊN DỊCH: Chỉ dùng 4 tham số cho hàm newExtractorLink
+            callback(
+                newExtractorLink(
+                    name, 
+                    "$name Video", 
+                    videoUrl, 
+                    ExtractorLinkType.VIDEO
+                ).apply {
+                    this.quality = Qualities.Unknown.value
+                    this.referer = data
+                }
+            )
         }
         
-        // 3. Quét data attributes
-        org.jsoup.Jsoup.parse(html).select("[data-src], [data-link], [data-url]").forEach {
+        // 4. Quét các thuộc tính data- ẩn (thường chứa link server dự phòng)
+        document.select("[data-src], [data-link], [data-url]").forEach {
             val src = it.attr("data-src").ifBlank { it.attr("data-link") }.ifBlank { it.attr("data-url") }
             val normalized = normalizeUrl(src) ?: return@forEach
             if (normalized.contains("http")) {

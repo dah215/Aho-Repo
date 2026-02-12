@@ -6,7 +6,7 @@ import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.Jsoup
 import java.net.URLEncoder
- 
+
 @CloudstreamPlugin
 class PhimMoiChillPlugin : Plugin() {
     override fun load() {
@@ -22,11 +22,15 @@ class PhimMoiChillProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
+    // Header mô phỏng trình duyệt Chrome thật sự trên Windows
     private val defaultHeaders = mapOf(
-        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept" to "*/*",
+        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "Accept" to "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
         "X-Requested-With" to "XMLHttpRequest",
-        "Referer" to "$mainUrl/"
+        "Sec-Fetch-Dest" to "empty",
+        "Sec-Fetch-Mode" to "cors",
+        "Sec-Fetch-Site" to "same-origin"
     )
 
     override val mainPage = mainPageOf(
@@ -37,7 +41,8 @@ class PhimMoiChillProvider : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page <= 1) "$mainUrl/${request.data}" else "$mainUrl/${request.data}?page=$page"
-        val html = app.get(url, headers = defaultHeaders).text
+        val res = app.get(url, headers = defaultHeaders)
+        val html = res.text
         val items = Jsoup.parse(html).select(".list-film .item").mapNotNull { el ->
             val a = el.selectFirst("a") ?: return@mapNotNull null
             val title = el.selectFirst("p")?.text()?.trim() ?: a.attr("title")
@@ -49,10 +54,8 @@ class PhimMoiChillProvider : MainAPI() {
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
 
-    // TÍNH NĂNG TÌM KIẾM
     override suspend fun search(query: String): List<SearchResponse> {
-        val encodedQuery = URLEncoder.encode(query, "utf-8")
-        val url = "$mainUrl/tim-kiem/$encodedQuery"
+        val url = "$mainUrl/tim-kiem/${URLEncoder.encode(query, "utf-8")}"
         val html = app.get(url, headers = defaultHeaders).text
         return Jsoup.parse(html).select(".list-film .item").mapNotNull { el ->
             val a = el.selectFirst("a") ?: return@mapNotNull null
@@ -70,7 +73,6 @@ class PhimMoiChillProvider : MainAPI() {
         val title = doc.selectFirst("h1.entry-title, .caption")?.text()?.trim() ?: "Phim"
         val poster = doc.selectFirst(".film-poster img")?.attr("src")
         
-        // Lấy link các tập phim
         val episodes = doc.select("ul.list-episode li a, a[href*='/xem/']").map {
             newEpisode(it.attr("href")) {
                 this.name = it.text().trim()
@@ -88,38 +90,45 @@ class PhimMoiChillProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // 1. Vào trang xem phim để trích xuất Numeric ID
-        val html = app.get(data, headers = defaultHeaders).text
-        
-        // Trích xuất "episodeID":"204125" từ script filmInfo
+        // BƯỚC 1: Lấy Cookie và ID từ trang xem phim
+        val pageResponse = app.get(data, headers = defaultHeaders)
+        val html = pageResponse.text
+        val cookies = pageResponse.cookies // Lưu lại cookie để gửi kèm request sau
+
+        // Trích xuất ID thật (ví dụ: 204125)
         val episodeId = Regex(""""episodeID":\s*"(\d+)"""").find(html)?.groupValues?.get(1)
                         ?: Regex("""data-id="(\d+)"""").find(html)?.groupValues?.get(1)
-        
-        // Lấy Nonce nếu có
-        val nonce = Regex(""""nonce":\s*"([^"]+)"""").find(html)?.groupValues?.get(1) ?: ""
 
         if (episodeId == null) return false
 
+        // BƯỚC 2: Gọi API chillsplayer.php với đầy đủ "vũ khí"
         return try {
-            // 2. Gọi API lấy link
             val res = app.post(
                 "$mainUrl/chillsplayer.php",
-                data = mapOf(
-                    "qcao" to episodeId,
-                    "nonce" to nonce
-                ),
-                headers = defaultHeaders.plus("Referer" to data)
+                data = mapOf("qcao" to episodeId),
+                headers = defaultHeaders.plus(Pair("Referer", data)),
+                cookies = cookies // Gửi kèm cookie để server tin tưởng
             ).text
 
+            // BƯỚC 3: Xử lý link m3u8 (bao gồm cả link bị escape \/)
+            val cleanRes = res.replace("\\/", "/")
             var found = false
-            // 3. Quét tất cả link m3u8 trả về
-            Regex("""https?[:\\]+[^"'<>\s]+?\.m3u8[^"'<>\s]*""").findAll(res.replace("\\/", "/")).forEach {
+            
+            Regex("""https?://[^"'<>\s]+?\.m3u8[^"'<>\s]*""").findAll(cleanRes).forEach {
                 val link = it.value
-                if (!link.contains("ads") && !link.contains("skipintro")) {
+                if (!link.contains("ads")) {
                     M3u8Helper.generateM3u8(name, link, data).forEach { m3u8 ->
                         callback(m3u8)
                         found = true
                     }
+                }
+            }
+            
+            // Dự phòng: Tìm link mp4 nếu có
+            if (!found) {
+                Regex("""https?://[^"'<>\s]+?\.mp4[^"'<>\s]*""").findAll(cleanRes).forEach {
+                    callback(ExtractorLink(name, name, it.value, data, Qualities.P1080.value, false))
+                    found = true
                 }
             }
             found

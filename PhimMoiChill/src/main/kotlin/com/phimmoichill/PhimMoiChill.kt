@@ -121,7 +121,7 @@ class PhimMoiChillProvider : MainAPI() {
             var found = false
             serverList.forEach { (link, serverName) ->
                 callback(
-                    newExtractorLink(
+                    newExtractorLink( 
                         source = serverName,
                         name = serverName,
                         url = link,

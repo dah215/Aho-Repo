@@ -85,19 +85,15 @@ class PhimMoiChillProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // Lấy trang xem để lấy Cookie và EpisodeID
         val pageResponse = app.get(data, headers = defaultHeaders)
         val html = pageResponse.text
         val cookies = pageResponse.cookies
 
-        // Tìm ID tập phim qua nhiều phương thức Regex để tránh sai sót
         val episodeId = Regex("""episodeID"\s*:\s*"(\d+)"""").find(html)?.groupValues?.get(1)
             ?: Regex("""data-id="(\d+)"""").find(html)?.groupValues?.get(1)
-            ?: Regex("""pm-player"\s*data-id="(\d+)"""").find(html)?.groupValues?.get(1)
             ?: return false
 
         return try {
-            // Gửi POST request lấy link video
             val res = app.post(
                 "$mainUrl/chillsplayer.php",
                 data = mapOf("qcao" to episodeId),
@@ -108,7 +104,24 @@ class PhimMoiChillProvider : MainAPI() {
             val cleanRes = res.replace("\\/", "/")
             var found = false
             
-            // 1. Quét link M3U8
+            // 1. Quét link từ domain mới bạn vừa tìm thấy (sotrim)
+            val sotrimRegex = Regex("""https?://sotrim\.topphimmoi\.org/[^\s"']*""")
+            sotrimRegex.findAll(cleanRes).forEach {
+                callback(
+                    newExtractorLink(
+                        source = "Sotrim",
+                        name = "ChillPlayer (VIP)",
+                        url = it.value,
+                        type = if (it.value.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                    ) {
+                        this.referer = "https://phimmoichill.now/"
+                        this.quality = Qualities.P1080.value
+                    }
+                )
+                found = true
+            }
+
+            // 2. Quét link M3U8 thông thường
             val m3u8Regex = Regex("""https?://[\w\.\-/]+\.m3u8[^\s"']*""")
             m3u8Regex.findAll(cleanRes).forEach {
                 M3u8Helper.generateM3u8(name, it.value, data).forEach { m3u8 ->
@@ -117,7 +130,7 @@ class PhimMoiChillProvider : MainAPI() {
                 }
             }
             
-            // 2. Quét link MP4 trực tiếp
+            // 3. Quét link MP4 trực tiếp
             if (!found) {
                 val mp4Regex = Regex("""https?://[\w\.\-/]+\.mp4[^\s"']*""")
                 mp4Regex.findAll(cleanRes).forEach {
@@ -132,16 +145,6 @@ class PhimMoiChillProvider : MainAPI() {
                             this.quality = Qualities.P1080.value
                         }
                     )
-                    found = true
-                }
-            }
-            
-            // 3. Nếu là link Embed (Iframe)
-            if (!found) {
-                val embedRegex = Regex("""(?:iframe|source|file|url)["']?\s*[:=]\s*["']([^"']+)""").find(cleanRes)
-                val embedUrl = embedRegex?.groupValues?.get(1)
-                if (embedUrl != null && embedUrl.startsWith("http")) {
-                    loadExtractor(embedUrl, data, subtitleCallback, callback)
                     found = true
                 }
             }

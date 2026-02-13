@@ -98,6 +98,16 @@ class PhimMoiChillProvider : MainAPI() {
                 val qualityText = el.selectFirst(".quality, .hd, .resolution, .tag-quality")?.text()?.trim()
                 val yearText = el.selectFirst(".year, .release-year")?.text()?.trim()
                 
+                // Lấy thông tin phụ đề/thuyết minh từ các tag
+                val tags = mutableListOf<String>()
+                el.select(".tag, .label, .badge").forEach { tagEl ->
+                    val tagText = tagEl.text().trim().lowercase()
+                    when {
+                        tagText.contains("vietsub") || tagText.contains("phụ đề") || tagText.contains("sub") -> tags.add("Phụ đề")
+                        tagText.contains("thuyết minh") || tagText.contains("lồng tiếng") || tagText.contains("dub") -> tags.add("Thuyết minh")
+                    }
+                }
+                
                 // Lấy href
                 val href = a.attr("href") ?: return@mapNotNull null
                 val fixedHref = fixUrl(href) ?: href
@@ -109,12 +119,16 @@ class PhimMoiChillProvider : MainAPI() {
                     newTvSeriesSearchResponse(title, fixedHref, TvType.TvSeries) {
                         this.posterUrl = poster
                         this.year = yearText?.toIntOrNull()
+                        // Hiển thị chất lượng và tags
+                        this.quality = getSearchQuality(qualityText)
+                        this.tags = if (tags.isNotEmpty()) tags else null
                     }
                 } else {
                     newMovieSearchResponse(title, fixedHref, TvType.Movie) {
                         this.posterUrl = poster
                         this.year = yearText?.toIntOrNull()
                         this.quality = getSearchQuality(qualityText)
+                        this.tags = if (tags.isNotEmpty()) tags else null
                     }
                 }
             }.filter { it.name.isNotBlank() }
@@ -141,6 +155,20 @@ class PhimMoiChillProvider : MainAPI() {
                     ?: return@mapNotNull null
                 
                 val poster = getImageUrl(el.selectFirst("img"))
+                
+                // Lấy chất lượng
+                val qualityText = el.selectFirst(".quality, .hd, .resolution")?.text()?.trim()
+                
+                // Lấy tags
+                val tags = mutableListOf<String>()
+                el.select(".tag, .label, .badge").forEach { tagEl ->
+                    val tagText = tagEl.text().trim().lowercase()
+                    when {
+                        tagText.contains("vietsub") || tagText.contains("phụ đề") || tagText.contains("sub") -> tags.add("Phụ đề")
+                        tagText.contains("thuyết minh") || tagText.contains("lồng tiếng") || tagText.contains("dub") -> tags.add("Thuyết minh")
+                    }
+                }
+                
                 val href = a.attr("href") ?: return@mapNotNull null
                 val fixedHref = fixUrl(href) ?: href
                 
@@ -149,10 +177,14 @@ class PhimMoiChillProvider : MainAPI() {
                 if (isTvSeries) {
                     newTvSeriesSearchResponse(title, fixedHref, TvType.TvSeries) {
                         this.posterUrl = poster
+                        this.quality = getSearchQuality(qualityText)
+                        this.tags = if (tags.isNotEmpty()) tags else null
                     }
                 } else {
                     newMovieSearchResponse(title, fixedHref, TvType.Movie) {
                         this.posterUrl = poster
+                        this.quality = getSearchQuality(qualityText)
+                        this.tags = if (tags.isNotEmpty()) tags else null
                     }
                 }
             }
@@ -189,6 +221,15 @@ class PhimMoiChillProvider : MainAPI() {
             // Lấy thông tin chất lượng
             val qualityText = doc.selectFirst(".quality, .hd, .resolution")?.text()?.trim()
             
+            // Lấy thông tin phụ đề/thuyết minh từ HTML
+            val tags = genres.toMutableList()
+            if (html.contains("vietsub", ignoreCase = true) || html.contains("phụ đề", ignoreCase = true)) {
+                tags.add("Phụ đề")
+            }
+            if (html.contains("thuyết minh", ignoreCase = true) || html.contains("lồng tiếng", ignoreCase = true)) {
+                tags.add("Thuyết minh")
+            }
+            
             // Lấy danh sách tập
             val episodes = doc.select("ul.list-episode li a, .episode-list a, .list-ep a, a[href*='/xem/'], a[href*='/watch/']").mapNotNull {
                 val epUrl = it.attr("href") ?: return@mapNotNull null
@@ -197,9 +238,6 @@ class PhimMoiChillProvider : MainAPI() {
                     this.name = epName
                 }
             }.distinctBy { it.data }
-            
-            // Tags với thông tin phụ đề/thuyết minh
-            val tags = genres.toMutableList()
             
             // Xác định loại phim
             val isTvSeries = episodes.size > 1 || html.contains("phim-bo") || url.contains("phim-bo")
@@ -238,60 +276,47 @@ class PhimMoiChillProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        var foundAny = false
-        
         try {
             val pageResponse = app.get(data, headers = defaultHeaders)
             val html = pageResponse.text
             val cookies = pageResponse.cookies
 
-            // Headers cho video
+            // Headers cho video request
             val videoHeaders = mapOf(
                 "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
                 "Accept" to "*/*",
                 "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
-                "Origin" to mainUrl,
                 "Referer" to "$mainUrl/"
             )
 
             // Lấy episode ID
             val episodeId = extractEpisodeId(html)
-            
-            if (episodeId == null) {
-                // Tìm link trực tiếp
-                return extractDirectLinks(html, data, callback, videoHeaders)
-            }
 
             // Lấy key từ chillsplayer
-            val responseText = try {
-                app.post(
-                    "$mainUrl/chillsplayer.php",
-                    data = mapOf("qcao" to episodeId, "sv" to "0"),
-                    headers = defaultHeaders + ("Referer" to data),
-                    cookies = cookies
-                ).text
-            } catch (e: Exception) {
-                logError("Error calling chillsplayer: ${e.message}")
-                return extractDirectLinks(html, data, callback, videoHeaders)
-            }
-
-            // Giải mã key
-            val key = extractKey(responseText)
-            
-            if (key.isNullOrEmpty() || key.length < 5) {
-                return extractDirectLinks(html, data, callback, videoHeaders)
-            }
-
-            // Danh sách server
-            val serverList = listOf(
-                "https://sotrim.topphimmoi.org/manifest/$key/index.m3u8" to "Chill-VIP",
-                "https://sotrim.topphimmoi.org/raw/$key/index.m3u8" to "Sotrim-Raw",
-                "https://dash.megacdn.xyz/raw/$key/index.m3u8" to "Mega-HLS",
-                "https://dash.megacdn.xyz/dast/$key/index.m3u8" to "Mega-BK"
-            )
-
-            serverList.forEach { (link, serverName) ->
+            val key = if (episodeId != null) {
                 try {
+                    val responseText = app.post(
+                        "$mainUrl/chillsplayer.php",
+                        data = mapOf("qcao" to episodeId, "sv" to "0"),
+                        headers = defaultHeaders + ("Referer" to data),
+                        cookies = cookies
+                    ).text
+                    extractKey(responseText)
+                } catch (e: Exception) {
+                    null
+                }
+            } else null
+
+            // Danh sách server - CHỈ add những server có key hợp lệ
+            if (!key.isNullOrEmpty() && key.length >= 5) {
+                val serverList = listOf(
+                    "https://sotrim.topphimmoi.org/manifest/$key/index.m3u8" to "Chill-VIP",
+                    "https://sotrim.topphimmoi.org/raw/$key/index.m3u8" to "Sotrim-Raw",
+                    "https://dash.megacdn.xyz/raw/$key/index.m3u8" to "Mega-HLS",
+                    "https://dash.megacdn.xyz/dast/$key/index.m3u8" to "Mega-BK"
+                )
+
+                serverList.forEach { (link, serverName) ->
                     callback(
                         newExtractorLink(
                             source = serverName,
@@ -304,28 +329,21 @@ class PhimMoiChillProvider : MainAPI() {
                             this.quality = Qualities.P1080.value
                         }
                     )
-                    foundAny = true
-                } catch (e: Exception) {
-                    logError("Failed to add server $serverName: ${e.message}")
                 }
             }
 
-            // Fallback
-            if (!foundAny) {
-                foundAny = extractDirectLinks(responseText, data, callback, videoHeaders)
-            }
-            if (!foundAny) {
-                foundAny = extractDirectLinks(html, data, callback, videoHeaders)
-            }
+            // Tìm link trực tiếp trong HTML (m3u8, mp4)
+            extractDirectLinks(html, data, callback, videoHeaders)
 
             // Tìm phụ đề
             extractSubtitles(html, subtitleCallback)
 
+            return true
+
         } catch (e: Exception) {
             logError("loadLinks error: ${e.message}")
+            return false
         }
-
-        return foundAny
     }
 
     private fun extractEpisodeId(html: String): String? {
@@ -381,59 +399,50 @@ class PhimMoiChillProvider : MainAPI() {
         referer: String, 
         callback: (ExtractorLink) -> Unit,
         videoHeaders: Map<String, String>
-    ): Boolean {
-        var found = false
-        
+    ) {
         // Tìm M3U8 links
         val m3u8Pattern = Regex("""https?://[^\s"'<>]+\.m3u8[^\s"'<>]*""")
         m3u8Pattern.findAll(html).forEach { match ->
             val url = match.value
-            try {
-                val name = when {
-                    url.contains("manifest") -> "Chill-Manifest"
-                    url.contains("raw") -> "Chill-Raw"
-                    url.contains("megacdn") -> "MegaCDN"
-                    else -> "Direct-M3U8"
+            val name = when {
+                url.contains("manifest") -> "Chill-Manifest"
+                url.contains("raw") -> "Chill-Raw"
+                url.contains("megacdn") -> "MegaCDN"
+                else -> "Direct-M3U8"
+            }
+            
+            callback(
+                newExtractorLink(
+                    source = name,
+                    name = name,
+                    url = url,
+                    type = ExtractorLinkType.M3U8
+                ) {
+                    this.referer = referer
+                    this.headers = videoHeaders
+                    this.quality = Qualities.P1080.value
                 }
-                
-                callback(
-                    newExtractorLink(
-                        source = name,
-                        name = name,
-                        url = url,
-                        type = ExtractorLinkType.M3U8
-                    ) {
-                        this.referer = referer
-                        this.headers = videoHeaders
-                        this.quality = Qualities.P1080.value
-                    }
-                )
-                found = true
-            } catch (e: Exception) { }
+            )
         }
 
         // Tìm MP4 links
         val mp4Pattern = Regex("""https?://[^\s"'<>]+\.mp4[^\s"'<>]*""")
         mp4Pattern.findAll(html).forEach { match ->
             val url = match.value
-            try {
-                callback(
-                    newExtractorLink(
-                        source = "Direct-MP4",
-                        name = "Direct-MP4",
-                        url = url,
-                        type = ExtractorLinkType.VIDEO
-                    ) {
-                        this.referer = referer
-                        this.headers = videoHeaders
-                        this.quality = Qualities.P1080.value
-                    }
-                )
-                found = true
-            } catch (e: Exception) { }
+            
+            callback(
+                newExtractorLink(
+                    source = "Direct-MP4",
+                    name = "Direct-MP4",
+                    url = url,
+                    type = ExtractorLinkType.VIDEO
+                ) {
+                    this.referer = referer
+                    this.headers = videoHeaders
+                    this.quality = Qualities.P1080.value
+                }
+            )
         }
-
-        return found
     }
 
     private fun extractSubtitles(html: String, subtitleCallback: (SubtitleFile) -> Unit) {

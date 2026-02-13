@@ -47,14 +47,29 @@ class AnimeVietSub : MainAPI() {
         "$mainUrl/anime-bo/" to "Anime Bộ"
     )
 
+    // Hàm hỗ trợ bóc tách thông tin hiển thị trên Poster
     private fun Element.toSearchResponse(): SearchResponse? {
         val title = this.selectFirst(".Title, h3")?.text()?.trim() ?: return null
         val href = this.selectFirst("a")?.attr("href") ?: return null
         val poster = this.selectFirst("img")?.let { 
             it.attr("data-src").ifEmpty { it.attr("data-original").ifEmpty { it.attr("src") } }
         }
+        
+        // Lấy thông tin số tập và chất lượng (Ví dụ: "Tập 12/12 HD")
+        val epInfo = this.selectFirst(".mli-eps, .Tag, .label")?.text()?.trim() ?: ""
+
         return newAnimeSearchResponse(title, href, TvType.Anime) {
             this.posterUrl = if (poster?.startsWith("//") == true) "https:$poster" else poster
+            
+            // HIỂN THỊ TRÊN POSTER
+            if (epInfo.isNotEmpty()) {
+                // Tách lấy số tập (Ví dụ: "12" từ "Tập 12")
+                val episodeCount = Regex("""\d+""").find(epInfo)?.value?.toIntOrNull()
+                addEpisodes(episodeCount, null) 
+                
+                // Hiển thị nhãn chất lượng/phụ đề (Ví dụ: "Full HD - Vietsub")
+                addQuality(if (epInfo.contains("HD")) "HD" else null)
+            }
         }
     }
 
@@ -74,10 +89,10 @@ class AnimeVietSub : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         var document = app.get(url, headers = defaultHeaders).document
         
-        // Theo bạn phân tích: Danh sách nằm ở li.episode a
+        // Quét danh sách tập phim theo cấu trúc bạn gửi
         var episodeElements = document.select("li.episode a")
         
-        // Nếu trang detail không có, ép buộc sang trang xem-phim
+        // Nếu không thấy (trang detail), chuyển sang trang xem-phim
         if (episodeElements.isEmpty()) {
             val watchUrl = if (url.endsWith("/")) "${url}xem-phim.html" else "$url/xem-phim.html"
             document = app.get(watchUrl, headers = defaultHeaders).document
@@ -91,7 +106,7 @@ class AnimeVietSub : MainAPI() {
             val epSource = ep.attr("data-source").ifEmpty { "du" }
             val epPlay = ep.attr("data-play").ifEmpty { "api" }
             
-            // Dữ liệu đóng gói cho loadLinks
+            // Gói dữ liệu để loadLinks bóc tách
             val data = "$url|$epHash|$epId|$epSource|$epPlay"
             
             newEpisode(data) {
@@ -104,8 +119,8 @@ class AnimeVietSub : MainAPI() {
         return newAnimeLoadResponse(title, url, TvType.Anime) {
             this.posterUrl = document.selectFirst(".Image img, .InfoImg img")?.attr("src")
             this.plot = document.selectFirst(".Description, .InfoDesc")?.text()?.trim()
+            this.tags = document.select(".InfoList a").map { it.text().trim() }
             
-            // Sử dụng mutableMapOf để tránh lỗi Assignment mismatch
             val map = mutableMapOf<DubStatus, List<Episode>>()
             if (episodesList.isNotEmpty()) {
                 map[DubStatus.Subbed] = episodesList
@@ -126,6 +141,7 @@ class AnimeVietSub : MainAPI() {
         val source = parts.getOrNull(3) ?: "du"
         val playType = parts.getOrNull(4) ?: "api"
 
+        // Cách 1: Giải mã Hash trực tiếp (Ưu tiên vì nhanh và đúng server)
         if (playType == "api" && hash.isNotEmpty()) {
             decryptHash(hash)?.let { decryptedUrl ->
                 if (decryptedUrl.contains(".m3u8")) {
@@ -137,10 +153,14 @@ class AnimeVietSub : MainAPI() {
             }
         }
 
-        // Dự phòng bằng Ajax nếu giải mã hash lỗi
+        // Cách 2: Gọi AJAX dự phòng (Nếu hash bị đổi Key hoặc hết hạn)
         val response = app.post(
             "$mainUrl$AJAX_URL",
-            data = mapOf("action" to "get_episodes_player", "episode_id" to episodeId, "server" to source),
+            data = mapOf(
+                "action" to "get_episodes_player",
+                "episode_id" to episodeId,
+                "server" to source
+            ),
             headers = defaultHeaders
         ).parsedSafe<AjaxResponse>()
 
@@ -161,7 +181,7 @@ class AnimeVietSub : MainAPI() {
             val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
             cipher.init(Cipher.DECRYPT_MODE, keySpec, ivSpec)
             
-            // Dùng URL_SAFE vì hash chứa '_' và '-'
+            // Giải mã Base64 URL Safe
             val decoded = Base64.decode(hash, Base64.URL_SAFE)
             val decrypted = cipher.doFinal(decoded)
             String(decrypted, Charsets.UTF_8)

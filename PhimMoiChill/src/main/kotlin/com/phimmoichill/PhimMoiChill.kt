@@ -98,16 +98,6 @@ class PhimMoiChillProvider : MainAPI() {
                 val qualityText = el.selectFirst(".quality, .hd, .resolution, .tag-quality")?.text()?.trim()
                 val yearText = el.selectFirst(".year, .release-year")?.text()?.trim()
                 
-                // Lấy thông tin phụ đề/thuyết minh từ các tag
-                val tags = mutableListOf<String>()
-                el.select(".tag, .label, .badge").forEach { tagEl ->
-                    val tagText = tagEl.text().trim().lowercase()
-                    when {
-                        tagText.contains("vietsub") || tagText.contains("phụ đề") || tagText.contains("sub") -> tags.add("Phụ đề")
-                        tagText.contains("thuyết minh") || tagText.contains("lồng tiếng") || tagText.contains("dub") -> tags.add("Thuyết minh")
-                    }
-                }
-                
                 // Lấy href
                 val href = a.attr("href") ?: return@mapNotNull null
                 val fixedHref = fixUrl(href) ?: href
@@ -119,16 +109,13 @@ class PhimMoiChillProvider : MainAPI() {
                     newTvSeriesSearchResponse(title, fixedHref, TvType.TvSeries) {
                         this.posterUrl = poster
                         this.year = yearText?.toIntOrNull()
-                        // Hiển thị chất lượng và tags
                         this.quality = getSearchQuality(qualityText)
-                        this.tags = if (tags.isNotEmpty()) tags else null
                     }
                 } else {
                     newMovieSearchResponse(title, fixedHref, TvType.Movie) {
                         this.posterUrl = poster
                         this.year = yearText?.toIntOrNull()
                         this.quality = getSearchQuality(qualityText)
-                        this.tags = if (tags.isNotEmpty()) tags else null
                     }
                 }
             }.filter { it.name.isNotBlank() }
@@ -159,16 +146,6 @@ class PhimMoiChillProvider : MainAPI() {
                 // Lấy chất lượng
                 val qualityText = el.selectFirst(".quality, .hd, .resolution")?.text()?.trim()
                 
-                // Lấy tags
-                val tags = mutableListOf<String>()
-                el.select(".tag, .label, .badge").forEach { tagEl ->
-                    val tagText = tagEl.text().trim().lowercase()
-                    when {
-                        tagText.contains("vietsub") || tagText.contains("phụ đề") || tagText.contains("sub") -> tags.add("Phụ đề")
-                        tagText.contains("thuyết minh") || tagText.contains("lồng tiếng") || tagText.contains("dub") -> tags.add("Thuyết minh")
-                    }
-                }
-                
                 val href = a.attr("href") ?: return@mapNotNull null
                 val fixedHref = fixUrl(href) ?: href
                 
@@ -178,13 +155,11 @@ class PhimMoiChillProvider : MainAPI() {
                     newTvSeriesSearchResponse(title, fixedHref, TvType.TvSeries) {
                         this.posterUrl = poster
                         this.quality = getSearchQuality(qualityText)
-                        this.tags = if (tags.isNotEmpty()) tags else null
                     }
                 } else {
                     newMovieSearchResponse(title, fixedHref, TvType.Movie) {
                         this.posterUrl = poster
                         this.quality = getSearchQuality(qualityText)
-                        this.tags = if (tags.isNotEmpty()) tags else null
                     }
                 }
             }

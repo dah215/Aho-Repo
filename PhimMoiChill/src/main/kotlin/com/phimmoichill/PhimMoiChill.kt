@@ -300,7 +300,6 @@ class PhimMoiChillProvider : MainAPI() {
                             type = ExtractorLinkType.M3U8
                         ) {
                             this.referer = "$mainUrl/"
-                            this.origin = mainUrl
                             this.headers = videoHeaders
                             this.quality = Qualities.P1080.value
                         }
@@ -405,7 +404,6 @@ class PhimMoiChillProvider : MainAPI() {
                         type = ExtractorLinkType.M3U8
                     ) {
                         this.referer = referer
-                        this.origin = mainUrl
                         this.headers = videoHeaders
                         this.quality = Qualities.P1080.value
                     }
@@ -427,7 +425,6 @@ class PhimMoiChillProvider : MainAPI() {
                         type = ExtractorLinkType.VIDEO
                     ) {
                         this.referer = referer
-                        this.origin = mainUrl
                         this.headers = videoHeaders
                         this.quality = Qualities.P1080.value
                     }

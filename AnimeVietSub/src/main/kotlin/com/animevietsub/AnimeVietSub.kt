@@ -54,19 +54,18 @@ class AnimeVietSub : MainAPI() {
             it.attr("data-src").ifEmpty { it.attr("data-original").ifEmpty { it.attr("src") } }
         }
         
-        // Lấy thông tin nhãn trên poster (Ví dụ: "Tập 12 Vietsub")
         val epInfo = this.selectFirst(".mli-eps, .Tag, .label")?.text()?.trim() ?: ""
 
         return newAnimeSearchResponse(title, href, TvType.Anime) {
             this.posterUrl = if (poster?.startsWith("//") == true) "https:$poster" else poster
             
-            // FIX LỖI 68 & 71: Thay thế addEpisodes/addQuality bằng thuộc tính trực tiếp
+            // FIX LỖI 66: Sử dụng hàm helper thay vì gán trực tiếp vào this.episodes
             if (epInfo.isNotEmpty()) {
-                // Hiển thị số tập lên poster (ví dụ: "12")
-                this.episodes = Regex("""\d+""").find(epInfo)?.value?.toIntOrNull()
+                val epNum = Regex("""\d+""").find(epInfo)?.value?.toIntOrNull()
+                if (epNum != null) {
+                    this.addSub(epNum) // Hàm này sẽ tự tạo Map <DubStatus.Subbed, Int> cho bạn
+                }
                 
-                // Hiển thị chất lượng/phụ đề lên poster (Ví dụ: "HD", "Vietsub")
-                // Chúng ta gán thẳng vào phẩm chất (quality)
                 if (epInfo.contains("HD", ignoreCase = true)) {
                     this.quality = SearchQuality.HD
                 }

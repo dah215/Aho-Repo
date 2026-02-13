@@ -18,7 +18,7 @@ class AnimeVietSubPlugin : Plugin() {
 class AnimeVietSub : MainAPI() {
     override var mainUrl = "https://animevietsub.ee"
     override var name = "AnimeVietSub"
-    override var lang = "vi" // FIX: Đổi từ val sang var
+    override var lang = "vi"
     override val hasMainPage = true
     override val hasChromecastSupport = true
     override val hasDownloadSupport = true
@@ -63,7 +63,10 @@ class AnimeVietSub : MainAPI() {
 
             newAnimeSearchResponse(title, href, TvType.Anime) {
                 this.posterUrl = poster
-                if (!epInfo.isNullOrEmpty()) addQuality(epInfo)
+                // Sử dụng getSearchQuality để tránh lỗi Type Mismatch
+                if (!epInfo.isNullOrEmpty()) {
+                    this.quality = getSearchQuality(epInfo)
+                }
             }
         }
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
@@ -89,10 +92,10 @@ class AnimeVietSub : MainAPI() {
         val poster = getImageUrl(document.selectFirst(".Image img, .InfoImg img"))
         val description = document.selectFirst(".Description, .InfoDesc")?.text()?.trim()
         
-        // FIX: Sử dụng score thay cho rating đã bị xóa
-        val scoreValue = document.selectFirst("#score_current")?.attr("value")?.toDoubleOrNull()
+        // FIX LỖI 108: Score nhận Int (vd: 8.5 điểm -> 85)
+        val scoreValue = document.selectFirst("#score_current")?.attr("value")
+            ?.toDoubleOrNull()?.times(10)?.toInt()
 
-        // FIX: Sử dụng newEpisode để tránh lỗi deprecated
         val episodes = document.select(".list-episode li a, #list_episodes li a").map { ep ->
             val epName = ep.text().trim()
             newEpisode(ep.attr("href")) {
@@ -101,12 +104,15 @@ class AnimeVietSub : MainAPI() {
             }
         }
 
-        // FIX: Truyền episodes vào đúng vị trí của hàm newAnimeLoadResponse
         return newAnimeLoadResponse(title, url, TvType.Anime) {
             this.posterUrl = poster
             this.plot = description
-            this.score = scoreValue?.let { Score(it, 10.0) } // Hệ thống điểm mới
-            this.episodes = episodes
+            // FIX LỖI 108: Truyền 1 tham số Int cho constructor Score
+            if (scoreValue != null) {
+                this.score = Score(scoreValue)
+            }
+            // FIX LỖI 109: Wrap list tập phim vào Map với DubStatus.Subbed
+            this.episodes = mapOf(DubStatus.Subbed to episodes)
         }
     }
 
@@ -129,7 +135,7 @@ class AnimeVietSub : MainAPI() {
                 headers = defaultHeaders.plus("X-Requested-With" to "XMLHttpRequest")
             ).text
             
-            // Tìm link m3u8 trong phản hồi
+            // Tìm link m3u8 sạch
             Regex("""https?://[^\s"']+\.m3u8""").find(res)?.value?.let { link ->
                 callback(
                     newExtractorLink(

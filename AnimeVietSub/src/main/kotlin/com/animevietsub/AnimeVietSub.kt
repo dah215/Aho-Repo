@@ -3,8 +3,6 @@ package com.animevietsub
 import android.util.Base64
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
-import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
@@ -29,9 +27,9 @@ class AnimeVietSub : MainAPI() {
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA)
 
     companion object {
-        private const val AES_KEY = "anhemlun@animevs" // 
-        private const val AES_IV = "@animevsub@anime"  // 
-        private const val AJAX_URL = "/ajax/all"       // 
+        private const val AES_KEY = "anhemlun@animevs"
+        private const val AES_IV = "@animevsub@anime"
+        private const val AJAX_URL = "/ajax/all"
     }
 
     private val defaultHeaders = mapOf(
@@ -53,11 +51,8 @@ class AnimeVietSub : MainAPI() {
         val poster = this.selectFirst("img")?.let { 
             it.attr("data-src").ifEmpty { it.attr("data-original").ifEmpty { it.attr("src") } }
         }
-        val epInfo = this.selectFirst(".mli-eps, .Tag")?.text()?.trim()
-
         return newAnimeSearchResponse(title, href, TvType.Anime) {
             this.posterUrl = if (poster?.startsWith("//") == true) "https:$poster" else poster
-            if (!epInfo.isNullOrEmpty()) addQuality(epInfo)
         }
     }
 
@@ -75,31 +70,44 @@ class AnimeVietSub : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val document = app.get(url, headers = defaultHeaders).document
-        val title = document.selectFirst("h1.Title")?.text()?.trim() ?: "Anime"
+        var document = app.get(url, headers = defaultHeaders).document
         
-        val episodesList = document.select(".list-episode li a, #list_episodes li a, .episode-link").map { ep ->
-            val epName = ep.text().trim()
-            val epId = ep.attr("data-id")     // [cite: 124]
-            val epHash = ep.attr("data-hash") // [cite: 124]
+        // BƯỚC 1: KIỂM TRA DANH SÁCH TẬP PHIM
+        // Theo file bạn gửi, Selector chuẩn là "li.episode a"
+        var episodeElements = document.select("li.episode a")
+        
+        // BƯỚC 2: NẾU TRỐNG, CHUYỂN SANG TRANG XEM-PHIM.HTML
+        if (episodeElements.isEmpty()) {
+            val watchUrl = url.trimEnd('/') + "/xem-phim.html"
+            document = app.get(watchUrl, headers = defaultHeaders).document
+            episodeElements = document.select("li.episode a")
+        }
+
+        val episodesList = episodeElements.mapNotNull { ep ->
+            val epName = ep.text().trim().ifEmpty { ep.attr("title") }
+            val epId = ep.attr("data-id")
+            val epHash = ep.attr("data-hash")
             val epSource = ep.attr("data-source").ifEmpty { "du" }
             val epPlay = ep.attr("data-play").ifEmpty { "api" }
             
-            // Định dạng dữ liệu: url|hash|id|source|playType 
+            // Đóng gói dữ liệu để loadLinks sử dụng
             val data = "$url|$epHash|$epId|$epSource|$epPlay"
             
             newEpisode(data) {
-                this.name = epName
+                this.name = "Tập $epName"
                 this.episode = epName.filter { it.isDigit() }.toIntOrNull()
             }
         }
 
+        val title = document.selectFirst("h1.Title")?.text()?.trim() ?: "Anime"
         return newAnimeLoadResponse(title, url, TvType.Anime) {
-            this.posterUrl = document.selectFirst(".Image img")?.attr("src")
-            this.plot = document.selectFirst(".Description")?.text()?.trim()
+            this.posterUrl = document.selectFirst(".Image img, .InfoImg img")?.attr("src")
+            this.plot = document.selectFirst(".Description, .InfoDesc")?.text()?.trim()
             
             val map = mutableMapOf<DubStatus, List<Episode>>()
-            map[DubStatus.Subbed] = episodesList
+            if (episodesList.isNotEmpty()) {
+                map[DubStatus.Subbed] = episodesList
+            }
             this.episodes = map
         }
     }
@@ -110,15 +118,15 @@ class AnimeVietSub : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val parts = data.split("|") // [cite: 128]
+        val parts = data.split("|")
         val hash = parts.getOrNull(1) ?: ""
         val episodeId = parts.getOrNull(2) ?: ""
         val source = parts.getOrNull(3) ?: "du"
         val playType = parts.getOrNull(4) ?: "api"
 
+        // 1. Giải mã Hash (Ưu tiên)
         if (playType == "api" && hash.isNotEmpty()) {
-            val decryptedUrl = decryptHash(hash) // [cite: 130]
-            if (!decryptedUrl.isNullOrEmpty()) {
+            decryptHash(hash)?.let { decryptedUrl ->
                 if (decryptedUrl.contains(".m3u8")) {
                     M3u8Helper.generateM3u8(this.name, decryptedUrl, mainUrl).forEach(callback)
                     return true
@@ -128,37 +136,31 @@ class AnimeVietSub : MainAPI() {
             }
         }
 
-        // Gọi AJAX dự phòng nếu không có hash hoặc giải mã lỗi [cite: 135, 136]
-        return loadAjaxLinks(episodeId, source, callback)
-    }
-
-    private suspend fun loadAjaxLinks(episodeId: String, source: String, callback: (ExtractorLink) -> Unit): Boolean {
-        if (episodeId.isEmpty()) return false
+        // 2. Dự phòng qua AJAX
         val response = app.post(
             "$mainUrl$AJAX_URL",
             data = mapOf("action" to "get_episodes_player", "episode_id" to episodeId, "server" to source),
             headers = defaultHeaders
-        ).parsedSafe<AjaxResponse>() // 
+        ).parsedSafe<AjaxResponse>()
 
         response?.data?.let { link ->
             if (link.contains(".m3u8")) {
                 M3u8Helper.generateM3u8(this.name, link, mainUrl).forEach(callback)
             } else {
-                loadExtractor(link, mainUrl, subtitleCallback = {}, callback)
+                loadExtractor(link, mainUrl, subtitleCallback, callback)
             }
-            return true
         }
-        return false
+        return true
     }
 
     private fun decryptHash(hash: String): String? {
         return try {
             val keySpec = SecretKeySpec(AES_KEY.toByteArray(), "AES")
             val ivSpec = IvParameterSpec(AES_IV.toByteArray())
-            val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding") // 
+            val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
             cipher.init(Cipher.DECRYPT_MODE, keySpec, ivSpec)
-
-            val decoded = Base64.decode(hash, Base64.DEFAULT) // 
+            // Lưu ý: Thử cả DEFAULT và URL_SAFE nếu lỗi
+            val decoded = Base64.decode(hash, Base64.DEFAULT)
             val decrypted = cipher.doFinal(decoded)
             String(decrypted, Charsets.UTF_8)
         } catch (e: Exception) {
@@ -166,10 +168,8 @@ class AnimeVietSub : MainAPI() {
         }
     }
 
-    // Model để xử lý JSON trả về từ Server 
     data class AjaxResponse(
         @JsonProperty("status") val status: Boolean?,
-        @JsonProperty("data") val data: String?,
-        @JsonProperty("message") val message: String?
+        @JsonProperty("data") val data: String?
     )
 }

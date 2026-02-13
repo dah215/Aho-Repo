@@ -3,6 +3,8 @@ package com.animevietsub
 import android.util.Base64
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.plugins.CloudstreamPlugin // Thêm dòng này
+import com.lagradost.cloudstream3.plugins.Plugin            // Thêm dòng này
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
@@ -13,6 +15,7 @@ import javax.crypto.spec.SecretKeySpec
 @CloudstreamPlugin
 class AnimeVietSubPlugin : Plugin() {
     override fun load() {
+        // Fix Unresolved reference 'registerMainAPI'
         registerMainAPI(AnimeVietSub())
     }
 }
@@ -71,26 +74,21 @@ class AnimeVietSub : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse {
         var document = app.get(url, headers = defaultHeaders).document
-        
-        // BƯỚC 1: KIỂM TRA DANH SÁCH TẬP PHIM
-        // Theo file bạn gửi, Selector chuẩn là "li.episode a"
         var episodeElements = document.select("li.episode a")
         
-        // BƯỚC 2: NẾU TRỐNG, CHUYỂN SANG TRANG XEM-PHIM.HTML
         if (episodeElements.isEmpty()) {
-            val watchUrl = url.trimEnd('/') + "/xem-phim.html"
+            val watchUrl = if (url.endsWith("/")) "${url}xem-phim.html" else "$url/xem-phim.html"
             document = app.get(watchUrl, headers = defaultHeaders).document
             episodeElements = document.select("li.episode a")
         }
 
         val episodesList = episodeElements.mapNotNull { ep ->
-            val epName = ep.text().trim().ifEmpty { ep.attr("title") }
+            val epName = ep.text().trim()
             val epId = ep.attr("data-id")
             val epHash = ep.attr("data-hash")
             val epSource = ep.attr("data-source").ifEmpty { "du" }
             val epPlay = ep.attr("data-play").ifEmpty { "api" }
             
-            // Đóng gói dữ liệu để loadLinks sử dụng
             val data = "$url|$epHash|$epId|$epSource|$epPlay"
             
             newEpisode(data) {
@@ -124,7 +122,6 @@ class AnimeVietSub : MainAPI() {
         val source = parts.getOrNull(3) ?: "du"
         val playType = parts.getOrNull(4) ?: "api"
 
-        // 1. Giải mã Hash (Ưu tiên)
         if (playType == "api" && hash.isNotEmpty()) {
             decryptHash(hash)?.let { decryptedUrl ->
                 if (decryptedUrl.contains(".m3u8")) {
@@ -136,7 +133,6 @@ class AnimeVietSub : MainAPI() {
             }
         }
 
-        // 2. Dự phòng qua AJAX
         val response = app.post(
             "$mainUrl$AJAX_URL",
             data = mapOf("action" to "get_episodes_player", "episode_id" to episodeId, "server" to source),
@@ -159,7 +155,6 @@ class AnimeVietSub : MainAPI() {
             val ivSpec = IvParameterSpec(AES_IV.toByteArray())
             val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
             cipher.init(Cipher.DECRYPT_MODE, keySpec, ivSpec)
-            // Lưu ý: Thử cả DEFAULT và URL_SAFE nếu lỗi
             val decoded = Base64.decode(hash, Base64.DEFAULT)
             val decrypted = cipher.doFinal(decoded)
             String(decrypted, Charsets.UTF_8)

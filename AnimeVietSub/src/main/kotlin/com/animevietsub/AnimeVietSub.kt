@@ -33,7 +33,6 @@ class AnimeVietSub : MainAPI() {
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA)
 
     companion object {
-        // Key giải mã được xác định từ phân tích thực tế [cite: 33]
         private const val DECODE_PASSWORD = "dm_thang_suc_vat_get_link_an_dbt" 
         private const val AJAX_URL = "/ajax/all"
     }
@@ -51,7 +50,6 @@ class AnimeVietSub : MainAPI() {
         "$mainUrl/anime-bo/" to "Anime Bộ"
     )
 
-    // --- THUẬT TOÁN GIẢI MÃ HIỆN ĐẠI ---
     private fun pakoInflateRaw(data: ByteArray): ByteArray {
         val inflater = Inflater(true)
         inflater.setInput(data)
@@ -70,17 +68,13 @@ class AnimeVietSub : MainAPI() {
             val digest = MessageDigest.getInstance("SHA-256")
             val key = digest.digest(DECODE_PASSWORD.toByteArray(StandardCharsets.UTF_8))
             val secretKey = SecretKeySpec(key, "AES")
-            
             val decodedBytes = Base64.decode(aesData, Base64.DEFAULT)
             val iv = decodedBytes.copyOfRange(0, 16)
             val ciphertext = decodedBytes.copyOfRange(16, decodedBytes.size)
-            
             val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
             cipher.init(Cipher.DECRYPT_MODE, secretKey, IvParameterSpec(iv))
-            
             val plaintextPadded = cipher.doFinal(ciphertext)
             val inflated = pakoInflateRaw(plaintextPadded)
-            
             String(inflated, StandardCharsets.UTF_8).replace("\\n", "\n").replace("\"", "")
         } catch (e: Exception) { null }
     }
@@ -125,19 +119,20 @@ class AnimeVietSub : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         var document = app.get(url, headers = defaultHeaders).document
         
-        // Flow: Tự động chuyển sang trang xem-phim để lấy danh sách tập [cite: 38, 41, 42]
-        var episodeElements = document.select("li.episode a")
-        if (episodeElements.isEmpty()) {
+        // Fix lỗi Elements mismatch: lấy danh sách thẻ 'a' thay vì Elements đơn lẻ
+        var episodesNodes = document.select("li.episode a")
+        
+        if (episodesNodes.isEmpty()) {
             val watchUrl = if (url.endsWith("/")) "${url}xem-phim.html" else "$url/xem-phim.html"
             document = app.get(watchUrl, headers = defaultHeaders).document
-            episodeElements = document.select("li.episode a") [cite: 30, 42]
+            episodesNodes = document.select("li.episode a")
         }
 
-        val episodesList = episodeElements.mapNotNull { ep ->
-            val epId = ep.attr("data-id") [cite: 32]
-            val epHash = ep.attr("data-hash") [cite: 33]
-            val epSource = ep.attr("data-source").ifEmpty { "du" } [cite: 34]
-            val epPlay = ep.attr("data-play").ifEmpty { "api" } [cite: 34]
+        val episodesList = episodesNodes.mapNotNull { ep ->
+            val epId = ep.attr("data-id")
+            val epHash = ep.attr("data-hash")
+            val epSource = ep.attr("data-source").ifEmpty { "du" }
+            val epPlay = ep.attr("data-play").ifEmpty { "api" }
             val epName = ep.text().trim()
             
             newEpisode("$url|$epHash|$epId|$epSource|$epPlay") {
@@ -151,7 +146,6 @@ class AnimeVietSub : MainAPI() {
             this.posterUrl = document.selectFirst(".Image img, .InfoImg img")?.attr("src")
             this.plot = document.selectFirst(".Description, .InfoDesc")?.text()?.trim()
             
-            // FIX LỖI BIÊN DỊCH: Sử dụng mutableMapOf thay vì mapOf 
             val episodesMap = mutableMapOf<DubStatus, List<Episode>>()
             if (episodesList.isNotEmpty()) {
                 episodesMap[DubStatus.Subbed] = episodesList
@@ -167,18 +161,19 @@ class AnimeVietSub : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val parts = data.split("|")
+        if (parts.size < 5) return false
+        
+        val referer = parts[0]
         val hash = parts[1]
         val epId = parts[2]
         val source = parts[3]
 
-        // Bước 1: Gọi Ajax lấy link đã mã hóa [cite: 1]
         val response = app.post(
             "$mainUrl$AJAX_URL",
             data = mapOf("action" to "get_episodes_player", "episode_id" to epId, "server" to source, "hash" to hash),
-            headers = mapOf("Referer" to parts[0], "X-Requested-With" to "XMLHttpRequest")
+            headers = mapOf("Referer" to referer, "X-Requested-With" to "XMLHttpRequest")
         ).parsedSafe<AjaxResponse>()
 
-        // Bước 2: Giải mã chuỗi trả về để lấy link m3u8 thực tế [cite: 33]
         response?.data?.let { encrypted ->
             decryptData(encrypted)?.let { finalLink ->
                 if (finalLink.contains(".m3u8")) {

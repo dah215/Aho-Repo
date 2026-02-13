@@ -4,7 +4,6 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
-import org.jsoup.Jsoup
 import java.net.URLEncoder
 
 @CloudstreamPlugin
@@ -20,7 +19,7 @@ class PhimMoiChillProvider : MainAPI() {
     override val hasMainPage = true
     override var lang = "vi"
     override val hasDownloadSupport = true
-    override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
+    override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
 
     private val pageHeaders = mapOf(
         "User-Agent"      to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
@@ -37,16 +36,8 @@ class PhimMoiChillProvider : MainAPI() {
     override val mainPage = mainPageOf(
         "list/phim-moi"           to "Phim Mới",
         "list/phim-le"            to "Phim Lẻ",
-        "list/phim-bo"            to "Phim Bộ",
-        "genre/phim-hanh-dong"    to "Hành Động",
-        "country/phim-han-quoc"   to "Phim Hàn",
-        "country/phim-trung-quoc" to "Phim Trung",
-        "country/phim-au-my"      to "Phim Mỹ"
+        "list/phim-bo"            to "Phim Bộ"
     )
-
-    // ─────────────────────────────────────────────────────────────────
-    // HELPERS
-    // ─────────────────────────────────────────────────────────────────
 
     private fun fixUrl(url: String): String {
         if (url.isBlank()) return url
@@ -74,86 +65,73 @@ class PhimMoiChillProvider : MainAPI() {
             ?.groupValues?.get(1)
 
     /**
-     * Parse span.label text để lấy chất lượng và loại phim.
+     * Parse card → AnimeSearchResponse (duy nhất loại hỗ trợ cả quality badge + dub/sub badge)
      *
-     * Các dạng text thực tế:
-     *   "HD - Vietsub"          → Movie, HD
-     *   "4K - Vietsub"          → Movie, UHD
-     *   "CAM - Vietsub"         → Movie, Cam
-     *   "Tập 3/12 - Vietsub"    → TvSeries, HD
-     *   "Tập 18/34"             → TvSeries, HD
-     *   "Hoàn Tất (12/12)"      → TvSeries, HD
-     *   "Hoàn Tất(13/13)"       → TvSeries, HD
+     * HTML label thực tế từ site:
+     *   "HD - Vietsub"        → Movie, HD badge + Sub badge
+     *   "4K - Vietsub"        → Movie, 4K badge + Sub badge
+     *   "CAM - Vietsub"       → Movie, CAM badge + Sub badge
+     *   "Tập 3/12 - Vietsub"  → Series, HD badge + Sub badge
+     *   "Hoàn Tất (12/12)"    → Series, HD badge (check TM badge cho Dub)
+     *   badge-tm trên card    → Cũng có Thuyết Minh → thêm Dub badge
+     *   badge-4k trên card    → UHD/4K badge
      */
-    data class LabelInfo(val quality: SearchQuality?, val isSeries: Boolean, val subInfo: String?)
-
-    private fun parseLabelText(el: org.jsoup.nodes.Element): LabelInfo {
-        // Lấy text từ span.label (kể cả nested div.status)
-        val labelEl = el.selectFirst("span.label") ?: return LabelInfo(null, false, null)
-        val text = labelEl.text().trim()
-
-        if (text.isBlank()) return LabelInfo(null, false, null)
-        val upper = text.uppercase()
-
-        // Detect series: có "Tập", "/", "Hoàn Tất", "Đang chiếu", "Tập full"
-        val isSeries = upper.contains("TẬP") || 
-                       (upper.contains("/") && !upper.startsWith("HD") && !upper.startsWith("4K")) ||
-                       upper.contains("HOÀN TẤT") || 
-                       upper.contains("HOÀN TẤT") ||
-                       upper.contains("FULL (")
-
-        // Detect quality
-        val quality = when {
-            upper.contains("4K") || upper.contains("UHD")       -> SearchQuality.UHD
-            upper.contains("FULL HD") || upper.contains("1080") -> SearchQuality.HD
-            upper.contains("HD")                                -> SearchQuality.HD
-            upper.contains("CAM")                               -> SearchQuality.Cam
-            upper.contains("SD") || upper.contains("480")       -> SearchQuality.SD
-            // Nếu là series (Tập X/Y), mặc định hiện HD
-            isSeries                                             -> SearchQuality.HD
-            else                                                 -> null
-        }
-
-        // Kiểm tra badge-4k riêng (badge thêm bên ngoài label)
-        val has4k = el.selectFirst("span.film-badge.badge-4k") != null
-        val finalQuality = if (has4k) SearchQuality.UHD else quality
-
-        // Sub/dub info từ label text
-        val subInfo = when {
-            upper.contains("VIETSUB")       -> "Vietsub"
-            upper.contains("THUYẾT MINH") || 
-            upper.contains("THUYẾT MINH")   -> "Thuyết Minh"
-            else -> null
-        }
-
-        return LabelInfo(finalQuality, isSeries, subInfo)
-    }
-
     private fun parseCard(el: org.jsoup.nodes.Element): SearchResponse? {
-        val a      = el.selectFirst("a[href*='/info/']") ?: return null
-        val href   = fixUrl(a.attr("href"))
-        val title  = a.attr("title").trim().ifEmpty {
+        val a     = el.selectFirst("a[href*='/info/']") ?: return null
+        val href  = fixUrl(a.attr("href"))
+        val title = a.attr("title").trim().ifEmpty {
             el.selectFirst("h3, p")?.text()?.trim() ?: return null
         }
         val poster = imgUrl(el.selectFirst("img"))
-        val info   = parseLabelText(el)
 
-        return if (info.isSeries) {
-            newAnimeSearchResponse(title, href, TvType.TvSeries) {
-                this.posterUrl = poster
-                this.quality   = info.quality
+        // Lấy text label + alt text
+        val labelText  = el.selectFirst("span.label")?.text()?.trim() ?: ""
+        val labelUpper = labelText.uppercase()
+        val altText    = el.selectFirst("img")?.attr("alt")?.uppercase() ?: ""
+
+        // Detect series: label có "Tập", "/" với số, "Hoàn Tất"
+        val isSeries = labelUpper.run {
+            contains("TẬP") || contains("HOÀN TẤT") || contains("FULL (") ||
+            (Regex("""\d+/\d+""").containsMatchIn(this))
+        }
+
+        // Quality: ưu tiên badge-4k > label text > alt text
+        val has4kBadge = el.selectFirst("span.film-badge.badge-4k") != null
+        val quality: SearchQuality? = when {
+            has4kBadge                                              -> SearchQuality.UHD
+            labelUpper.contains("4K") || labelUpper.contains("UHD")  -> SearchQuality.UHD
+            altText.contains("4K") || altText.contains("UHD")       -> SearchQuality.UHD
+            labelUpper.contains("FULL HD")                          -> SearchQuality.HD
+            labelUpper.contains("HD") || altText.contains(" HD ")   -> SearchQuality.HD
+            labelUpper.contains("CAM")                              -> SearchQuality.Cam
+            labelUpper.contains("SD") || labelUpper.contains("480") -> SearchQuality.SD
+            else                                                    -> SearchQuality.HD // default
+        }
+
+        // DubStatus: Subbed = Vietsub, Dubbed = Thuyết Minh
+        // badge-tm = có ít nhất 1 tập thuyết minh
+        val hasTMBadge    = el.selectFirst("span.film-badge.badge-tm") != null
+        val hasVietsub    = labelUpper.contains("VIETSUB") || altText.contains("VIETSUB")
+        val hasThuyetMinh = labelUpper.contains("THUYẾT MINH") || 
+                            labelUpper.contains("LỒNG TIẾNG") || hasTMBadge
+
+        val dubs = HashSet<DubStatus>().apply {
+            // Thêm Subbed nếu có Vietsub hoặc không rõ (mặc định site này là Vietsub)
+            if (hasVietsub || (!hasThuyetMinh && !labelUpper.contains("RAW"))) {
+                add(DubStatus.Subbed)
             }
-        } else {
-            newMovieSearchResponse(title, href, TvType.Movie) {
-                this.posterUrl = poster
-                this.quality   = info.quality
-            }
+            if (hasThuyetMinh) add(DubStatus.Dubbed)
+        }
+
+        val tvType = if (isSeries) TvType.TvSeries else TvType.Movie
+
+        // Dùng newAnimeSearchResponse để hiện ĐỒNG THỜI quality badge + Sub/Dub badge
+        return newAnimeSearchResponse(title, href, tvType) {
+            this.posterUrl = poster
+            this.quality   = quality
+            this.dubStatus = dubs
         }
     }
-
-    // ─────────────────────────────────────────────────────────────────
-    // MAIN PAGE & SEARCH
-    // ─────────────────────────────────────────────────────────────────
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url  = if (page <= 1) "$mainUrl/${request.data}"
@@ -169,10 +147,6 @@ class PhimMoiChillProvider : MainAPI() {
         return doc.select("li.item").mapNotNull { parseCard(it) }
     }
 
-    // ─────────────────────────────────────────────────────────────────
-    // LOAD (info page → episode list)
-    // ─────────────────────────────────────────────────────────────────
-
     override suspend fun load(url: String): LoadResponse {
         val doc  = app.get(url, headers = pageHeaders).document
         val html = doc.html()
@@ -182,29 +156,26 @@ class PhimMoiChillProvider : MainAPI() {
         val poster = imgUrl(
             doc.selectFirst("img[itemprop=image], img[itemprop=thumbnailUrl], .image img, .film-poster img")
         )
-        val description = doc.selectFirst("[itemprop=description], #film-content, .film-content")
-            ?.text()?.trim()
+        val description = doc.selectFirst(
+            "[itemprop=description], #film-content, .film-content, .film-info p"
+        )?.text()?.trim()
         val year = doc.selectFirst("a[href*='phim-nam-']")?.text()
             ?.let { Regex("""\b(19|20)\d{2}\b""").find(it)?.value?.toIntOrNull() }
         val genres = doc.select("a[href*='/genre/']").map { it.text().trim() }.distinct()
 
-        // Tags: Vietsub / Thuyết Minh
         val htmlLow = html.lowercase()
         val tags = genres.toMutableList().apply {
-            if (htmlLow.contains("vietsub"))                           add("Vietsub")
+            if (htmlLow.contains("vietsub"))                          add("Vietsub")
             if (htmlLow.contains("thuyết minh") || 
-                htmlLow.contains("lồng tiếng"))                       add("Thuyết Minh")
+                htmlLow.contains("lồng tiếng"))                      add("Thuyết Minh")
         }
 
-        // Link xem đầu tiên (nút "Xem phim")
         val firstWatchUrl = doc.selectFirst(
             "a.btn-see[href*='/xem/'], a[href*='/xem/'].btn-danger, a[href*='/xem/'].btn-primary"
         )?.attr("href")?.let { fixUrl(it) }
 
-        // Detect series: có link tập trong div.latest-episode
-        val hasEpisodes = doc.select("div.latest-episode a[data-id], .episode-manager a[data-id]").isNotEmpty()
+        val hasEpisodes = doc.select("div.latest-episode a[data-id]").isNotEmpty()
 
-        // ── PHIM LẺ ──────────────────────────────────────────────────
         if (!hasEpisodes) {
             val watchUrl = firstWatchUrl ?: url
             return newMovieLoadResponse(title, url, TvType.Movie, watchUrl) {
@@ -215,11 +186,9 @@ class PhimMoiChillProvider : MainAPI() {
             }
         }
 
-        // ── PHIM BỘ: load watch page lấy danh sách tập ──────────────
         val episodes = if (firstWatchUrl != null) {
             try {
                 val watchDoc = app.get(firstWatchUrl, headers = pageHeaders).document
-                // Selector chính xác: ul.episodes#list_episodes li a[data-id]
                 watchDoc.select("ul.episodes li a[data-id]").mapNotNull { a ->
                     val epUrl  = fixUrl(a.attr("href"))
                     val epName = a.text().trim()
@@ -232,7 +201,6 @@ class PhimMoiChillProvider : MainAPI() {
             } catch (_: Exception) { emptyList() }
         } else emptyList()
 
-        // Fallback nếu watch page không lấy được
         val finalEpisodes = episodes.ifEmpty {
             doc.select("div.latest-episode a[data-id]").mapNotNull { a ->
                 val epUrl  = fixUrl(a.attr("href"))
@@ -256,16 +224,6 @@ class PhimMoiChillProvider : MainAPI() {
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────
-    // LOAD LINKS (watch page → video URL)
-    //
-    // Cơ chế:
-    //   POST /chillsplayer.php  {qcao: episodeID, sv: serverIndex}
-    //   Response HTML chứa: iniPlayers("KEY")
-    //   CDN: sotrim.topphimmoi.org / dash.megacdn.xyz
-    //
-    // Chỉ dùng /raw/ và /dast/ (bỏ /manifest/ để tránh lỗi)
-    // ─────────────────────────────────────────────────────────────────
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -276,7 +234,6 @@ class PhimMoiChillProvider : MainAPI() {
         val html     = pageResp.text
         val cookies  = pageResp.cookies
 
-        // Lấy episodeID
         val episodeId =
             Regex("""filmInfo\.episodeID\s*=\s*parseInt\s*\(\s*['"](\d+)['"]\s*\)""")
                 .find(html)?.groupValues?.get(1)
@@ -290,7 +247,6 @@ class PhimMoiChillProvider : MainAPI() {
             "Origin"  to mainUrl
         )
 
-        // Lấy KEY từ server đầu tiên (sv=0), rồi dùng cho tất cả server
         var key: String? = null
         for (sv in 0..3) {
             try {
@@ -308,7 +264,6 @@ class PhimMoiChillProvider : MainAPI() {
 
                 if (!key.isNullOrEmpty()) break
 
-                // Fallback: m3u8 trực tiếp trong response
                 Regex("""https?://[^\s"'<>]+\.m3u8[^\s"'<>]*""").findAll(resp).forEach { m ->
                     callback(newExtractorLink(
                         source = "Server ${sv + 1}",
@@ -325,19 +280,11 @@ class PhimMoiChillProvider : MainAPI() {
 
         if (key.isNullOrEmpty()) return false
 
-        // 4 server với URL /raw/ hoặc /dast/ (bỏ /manifest/ gây lỗi)
-        // sv=0 PMFAST: sotrim /raw/ (dùng raw thay manifest để tránh lỗi)
-        // sv=1 PMHLS:  sotrim /raw/
-        // sv=2 PMPRO:  megacdn /raw/
-        // sv=3 PMBK:   megacdn /dast/
-        val serverUrls = listOf(
-            "PMHLS"  to "https://sotrim.topphimmoi.org/raw/$key/index.m3u8",
-            "PMPRO"  to "https://dash.megacdn.xyz/raw/$key/index.m3u8",
-            "PMBK"   to "https://dash.megacdn.xyz/dast/$key/index.m3u8"
-        )
-
-        var added = false
-        for ((serverName, m3u8Url) in serverUrls) {
+        listOf(
+            "PMHLS" to "https://sotrim.topphimmoi.org/raw/$key/index.m3u8",
+            "PMPRO" to "https://dash.megacdn.xyz/raw/$key/index.m3u8",
+            "PMBK"  to "https://dash.megacdn.xyz/dast/$key/index.m3u8"
+        ).forEach { (serverName, m3u8Url) ->
             callback(newExtractorLink(
                 source = serverName,
                 name   = serverName,
@@ -347,9 +294,8 @@ class PhimMoiChillProvider : MainAPI() {
                 this.referer = "$mainUrl/"
                 this.quality = Qualities.P1080.value
             })
-            added = true
         }
 
-        return added
+        return true
     }
 }

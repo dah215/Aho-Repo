@@ -34,44 +34,31 @@ class PhimMoiChillProvider : MainAPI() {
         "list/phim-bo" to "Phim Bộ"
     )
 
-    // Fix URL ảnh
+    // === SỬA LỖI 1: Fix URL poster ===
     private fun fixPosterUrl(url: String?): String? {
         if (url.isNullOrEmpty()) return null
-        return if (url.startsWith("http")) url else {
-            val cleanUrl = if (url.startsWith("//")) "https:$url" else if (url.startsWith("/")) url else "/$url"
-            if (cleanUrl.startsWith("http")) cleanUrl else "$mainUrl$cleanUrl"
+        return when {
+            url.startsWith("http") -> url
+            url.startsWith("//") -> "https:$url"
+            url.startsWith("/") -> "$mainUrl$url"
+            else -> "$mainUrl/$url"
         }
     }
 
-    // Lấy URL ảnh từ element
-    private fun getImageUrl(imgElement: org.jsoup.nodes.Element?): String? {
-        if (imgElement == null) return null
-        
-        val lazyAttrs = listOf("data-src", "data-original", "data-lazy-src")
-        for (attr in lazyAttrs) {
-            val url = imgElement.attr(attr)
+    // Lấy URL ảnh với lazy loading support
+    private fun getImageUrl(el: org.jsoup.nodes.Element?): String? {
+        if (el == null) return null
+        val attrs = listOf("data-src", "data-original", "src")
+        for (attr in attrs) {
+            val url = el.attr(attr)
             if (!url.isNullOrEmpty() && !url.startsWith("data:image")) {
                 return fixPosterUrl(url)
             }
         }
-        
-        val src = imgElement.attr("src")
-        if (!src.isNullOrEmpty() && !src.startsWith("data:image")) {
-            return fixPosterUrl(src)
-        }
         return null
     }
 
-    // Fix URL
-    private fun fixUrl(url: String?): String {
-        if (url.isNullOrEmpty()) return ""
-        return if (url.startsWith("http")) url else {
-            val cleanUrl = if (url.startsWith("/")) url else "/$url"
-            "$mainUrl$cleanUrl"
-        }
-    }
-
-    // Lấy SearchQuality
+    // === SỬA LỖI 2: Lấy quality ===
     private fun getSearchQuality(quality: String?): SearchQuality? {
         return when (quality?.uppercase()?.trim()) {
             "4K", "2160P", "UHD" -> SearchQuality.UHD
@@ -85,18 +72,17 @@ class PhimMoiChillProvider : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page <= 1) "$mainUrl/${request.data}" else "$mainUrl/${request.data}?page=$page"
         val html = app.get(url, headers = defaultHeaders).text
-        val doc = Jsoup.parse(html)
-        
-        val items = doc.select(".list-film .item").mapNotNull { el ->
+        val items = Jsoup.parse(html).select(".list-film .item").mapNotNull { el ->
             val a = el.selectFirst("a") ?: return@mapNotNull null
-            val title = el.selectFirst("p")?.text()?.trim() ?: a.attr("title") ?: return@mapNotNull null
+            val title = el.selectFirst("p")?.text()?.trim() ?: a.attr("title")
+            
+            // === SỬA LỖI 1: Dùng getImageUrl ===
             val poster = getImageUrl(el.selectFirst("img"))
-            val href = fixUrl(a.attr("href"))
             
-            // Lấy thêm thông tin
-            val qualityText = el.selectFirst(".quality, .hd")?.text()?.trim()
+            // === SỬA LỖI 2: Lấy thêm quality ===
+            val qualityText = el.selectFirst(".quality, .hd, .resolution")?.text()?.trim()
             
-            newMovieSearchResponse(title, href, TvType.Movie) {
+            newMovieSearchResponse(title, a.attr("href"), TvType.Movie) {
                 this.posterUrl = poster
                 this.quality = getSearchQuality(qualityText)
             }
@@ -107,16 +93,13 @@ class PhimMoiChillProvider : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/tim-kiem/${URLEncoder.encode(query, "utf-8")}"
         val html = app.get(url, headers = defaultHeaders).text
-        val doc = Jsoup.parse(html)
-        
-        return doc.select(".list-film .item").mapNotNull { el ->
+        return Jsoup.parse(html).select(".list-film .item").mapNotNull { el ->
             val a = el.selectFirst("a") ?: return@mapNotNull null
-            val title = el.selectFirst("p")?.text()?.trim() ?: a.attr("title") ?: return@mapNotNull null
+            val title = el.selectFirst("p")?.text()?.trim() ?: a.attr("title")
             val poster = getImageUrl(el.selectFirst("img"))
-            val href = fixUrl(a.attr("href"))
-            val qualityText = el.selectFirst(".quality, .hd")?.text()?.trim()
+            val qualityText = el.selectFirst(".quality, .hd, .resolution")?.text()?.trim()
             
-            newMovieSearchResponse(title, href, TvType.Movie) {
+            newMovieSearchResponse(title, a.attr("href"), TvType.Movie) {
                 this.posterUrl = poster
                 this.quality = getSearchQuality(qualityText)
             }
@@ -126,11 +109,14 @@ class PhimMoiChillProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         val html = app.get(url, headers = defaultHeaders).text
         val doc = Jsoup.parse(html)
-        
         val title = doc.selectFirst("h1.entry-title, .caption")?.text()?.trim() ?: "Phim"
+        
+        // === SỬA LỖI 1: Dùng getImageUrl ===
         val poster = getImageUrl(doc.selectFirst(".film-poster img"))
+        
+        // === SỬA LỖI 2: Lấy thêm thông tin ===
         val description = doc.selectFirst(".film-content, .description")?.text()?.trim()
-        val year = doc.selectFirst(".year, .release-year")?.text()?.trim()?.toIntOrNull()
+        val year = doc.selectFirst(".year")?.text()?.trim()?.toIntOrNull()
         val genres = doc.select(".genre a, .categories a").map { it.text() }
         
         // Tags với phụ đề/thuyết minh
@@ -142,15 +128,13 @@ class PhimMoiChillProvider : MainAPI() {
             tags.add("Thuyết minh")
         }
         
-        // Lấy danh sách tập - GIỐNG CODE GỐC
         val episodes = doc.select("ul.list-episode li a, a[href*='/xem/']").map {
-            val epHref = fixUrl(it.attr("href"))
-            newEpisode(epHref) {
+            newEpisode(it.attr("href")) {
                 this.name = it.text().trim()
             }
         }.distinctBy { it.data }
-        
-        // LUÔN DÙNG TvSeries - GIỐNG CODE GỐC
+
+        // GIỮ NGUYÊN như code gốc - luôn dùng TvSeries
         return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
             this.posterUrl = poster
             this.plot = description
@@ -159,6 +143,7 @@ class PhimMoiChillProvider : MainAPI() {
         }
     }
 
+    // === GIỮ NGUYÊN loadLinks như code gốc ===
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,

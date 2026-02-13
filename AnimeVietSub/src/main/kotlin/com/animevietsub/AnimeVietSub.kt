@@ -301,7 +301,7 @@ class AnimeVietSub : MainAPI() {
     }
 
     // Parse m3u8 text content → ExtractorLinks
-    private fun parseAndCallbackM3u8(m3u8Content: String, referer: String, callback: (ExtractorLink) -> Unit) {
+    private suspend fun parseAndCallbackM3u8(m3u8Content: String, referer: String, callback: (ExtractorLink) -> Unit) {
         val lines = m3u8Content.lines()
         var quality = Qualities.Unknown.value
 

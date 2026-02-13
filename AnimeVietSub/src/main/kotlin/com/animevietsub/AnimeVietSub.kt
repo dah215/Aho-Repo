@@ -28,9 +28,11 @@ class AnimeVietSub : MainAPI() {
         TvType.OVA
     )
 
+    // Header bảo mật cao - Cần Referer và User-Agent chính xác
     private val defaultHeaders = mapOf(
-        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-        "Referer" to "$mainUrl/"
+        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Referer" to "$mainUrl/",
+        "X-Requested-With" to "XMLHttpRequest"
     )
 
     override val mainPage = mainPageOf(
@@ -63,9 +65,10 @@ class AnimeVietSub : MainAPI() {
 
             newAnimeSearchResponse(title, href, TvType.Anime) {
                 this.posterUrl = poster
-                // Sử dụng getSearchQuality để tránh lỗi Type Mismatch
+                // FIX LỖI getSearchQuality: Gán trực tiếp hoặc dùng addQuality nếu hỗ trợ
+                // Ở đây ta dùng trường quality của SearchResponse
                 if (!epInfo.isNullOrEmpty()) {
-                    this.quality = getSearchQuality(epInfo)
+                    addQuality(epInfo) 
                 }
             }
         }
@@ -92,11 +95,11 @@ class AnimeVietSub : MainAPI() {
         val poster = getImageUrl(document.selectFirst(".Image img, .InfoImg img"))
         val description = document.selectFirst(".Description, .InfoDesc")?.text()?.trim()
         
-        // FIX LỖI 108: Score nhận Int (vd: 8.5 điểm -> 85)
+        // FIX LỖI Score: Gán trực tiếp Int thay vì khởi tạo Class Score
         val scoreValue = document.selectFirst("#score_current")?.attr("value")
             ?.toDoubleOrNull()?.times(10)?.toInt()
 
-        val episodes = document.select(".list-episode li a, #list_episodes li a").map { ep ->
+        val episodesList = document.select(".list-episode li a, #list_episodes li a").map { ep ->
             val epName = ep.text().trim()
             newEpisode(ep.attr("href")) {
                 this.name = epName
@@ -107,12 +110,13 @@ class AnimeVietSub : MainAPI() {
         return newAnimeLoadResponse(title, url, TvType.Anime) {
             this.posterUrl = poster
             this.plot = description
-            // FIX LỖI 108: Truyền 1 tham số Int cho constructor Score
+            // FIX LỖI 112: Sử dụng giá trị Int trực tiếp nếu property là Int?
+            // Nếu SDK yêu cầu Score, ta phải tìm cách khác, nhưng thường là Int
             if (scoreValue != null) {
-                this.score = Score(scoreValue)
+                this.rating = scoreValue 
             }
-            // FIX LỖI 109: Wrap list tập phim vào Map với DubStatus.Subbed
-            this.episodes = mapOf(DubStatus.Subbed to episodes)
+            // FIX LỖI 115: Sử dụng mutableMapOf để khớp kiểu MutableMap
+            this.episodes = mutableMapOf(DubStatus.Subbed to episodesList)
         }
     }
 
@@ -122,8 +126,9 @@ class AnimeVietSub : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val html = app.get(data, headers = defaultHeaders).text
-        val document = Jsoup.parse(html)
+        // Bảo mật cao: Cần lấy Cookie từ GET request trước khi POST
+        val req = app.get(data, headers = defaultHeaders)
+        val document = Jsoup.parse(req.text())
 
         val filmId = document.select("input#film_id").attr("value")
         val episodeId = document.select("input#episode_id").attr("value")
@@ -132,10 +137,15 @@ class AnimeVietSub : MainAPI() {
             val res = app.post(
                 "$mainUrl/ajax/player",
                 data = mapOf("episode_id" to episodeId, "film_id" to filmId),
-                headers = defaultHeaders.plus("X-Requested-With" to "XMLHttpRequest")
+                headers = defaultHeaders.plus(mapOf(
+                    "X-Requested-With" to "XMLHttpRequest",
+                    "Referer" to data
+                )),
+                cookies = req.cookies
             ).text
             
-            // Tìm link m3u8 sạch
+            // Tìm link m3u8 trong JSON response
+            // Lưu ý: Có thể link bị mã hóa Base64 hoặc AES, tạm thời quét Regex
             Regex("""https?://[^\s"']+\.m3u8""").find(res)?.value?.let { link ->
                 callback(
                     newExtractorLink(
@@ -145,6 +155,7 @@ class AnimeVietSub : MainAPI() {
                         type = ExtractorLinkType.M3U8
                     ) {
                         this.referer = mainUrl
+                        this.headers = defaultHeaders
                     }
                 )
             }

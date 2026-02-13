@@ -1,0 +1,13 @@
+{
+  "name": "AnimeVietSub",
+  "pluginClassName": "com.animevietsub.AnimeVietSub",
+  "version": 1,
+  "requiresResources": false,
+  "description": "AnimeVietSub",
+  "authors": ["AnimeVietSub"],
+  "repositoryUrl": "https://github.com/dah215/Aho-Repo",
+  "status": 1,
+  "tvTypes": ["Anime", "AnimeMovie"],
+  "language": "vi",
+  "iconUrl": "https://animevietsub.vip/favicon.ico"
+}

@@ -22,24 +22,37 @@ class PhimMoiChillProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
-    private val defaultHeaders = mapOf(
+    // ── Headers cho request lấy trang HTML ──────────────────────────────────
+    // KHÔNG có X-Requested-With — tránh server trả JSON thay vì HTML
+    private val pageHeaders = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-        "Accept" to "application/json, text/javascript, */*; q=0.01",
+        "Accept"     to "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
+    )
+
+    // ── Headers cho AJAX call (chillsplayer.php) ────────────────────────────
+    private val ajaxHeaders = mapOf(
+        "User-Agent"       to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "Accept"           to "application/json, text/javascript, */*; q=0.01",
         "X-Requested-With" to "XMLHttpRequest"
     )
 
     override val mainPage = mainPageOf(
         "list/phim-moi" to "Phim Mới",
-        "list/phim-le" to "Phim Lẻ",
-        "list/phim-bo" to "Phim Bộ"
+        "list/phim-le"  to "Phim Lẻ",
+        "list/phim-bo"  to "Phim Bộ"
     )
 
-    // ══════════════════════════════════════════════
-    // FIX 1: fixUrl — chuyển URL tương đối → tuyệt đối
-    // Đây là nguyên nhân gốc rễ của lỗi phim lẻ không phát được
-    // ══════════════════════════════════════════════
+    // ════════════════════════════════════════════════════════════════════════
+    // FIX LỖI 1 — fixUrl: chuyển path tương đối thành URL tuyệt đối
+    //
+    // Đây là nguyên nhân gốc rễ:
+    //   load() lưu episodes với href="/xem/ten-phim/tap-1/" (tương đối)
+    //   → loadLinks(data="/xem/...") được gọi
+    //   → app.get("/xem/...") thất bại (không phải URL hợp lệ)
+    //   → html rỗng → episodeId = null → return false → "Không tìm thấy liên kết"
+    // ════════════════════════════════════════════════════════════════════════
     private fun fixUrl(url: String?): String {
-        if (url.isNullOrEmpty()) return ""
+        if (url.isNullOrBlank()) return ""
         return when {
             url.startsWith("http") -> url
             url.startsWith("//")   -> "https:$url"
@@ -48,54 +61,72 @@ class PhimMoiChillProvider : MainAPI() {
         }
     }
 
-    // ══════════════════════════════════════════════
-    // FIX 2: getImageUrl — hỗ trợ thêm data-lazy-src + lọc URL rỗng/base64
-    // ══════════════════════════════════════════════
+    // getImageUrl — đã fix ở lần trước, giữ nguyên
     private fun getImageUrl(el: org.jsoup.nodes.Element?): String? {
         if (el == null) return null
-        val attrs = listOf("data-src", "data-original", "data-lazy-src", "data-srcset", "src")
+        val attrs = listOf("data-src", "data-original", "data-lazy-src", "src")
         for (attr in attrs) {
             val url = el.attr(attr).trim()
-            if (url.isNotEmpty() && !url.startsWith("data:image") && url.length > 10) {
+            if (url.isNotEmpty() && !url.startsWith("data:image") && url.length > 10)
                 return fixUrl(url).takeIf { it.isNotEmpty() }
-            }
         }
         return null
     }
 
+    // ════════════════════════════════════════════════════════════════════════
+    // FIX LỖI 3 — Mở rộng mapping quality text
+    // Dùng `in` (contains) thay vì `==` để bắt mọi biến thể
+    // Thêm "VIETSUB" / "THUYẾT MINH" để hiện badge khi chỉ có nhãn phụ đề
+    // ════════════════════════════════════════════════════════════════════════
     private fun getSearchQuality(quality: String?): SearchQuality? {
-        return when (quality?.uppercase()?.trim()) {
-            "4K", "2160P", "UHD"          -> SearchQuality.UHD
-            "HD", "720P", "FULL HD",
-            "FHD", "1080P"                -> SearchQuality.HD
-            "SD", "480P"                  -> SearchQuality.SD
-            else                          -> null
+        val q = quality?.uppercase()?.trim() ?: return null
+        return when {
+            "4K"       in q || "2160"    in q || "UHD"     in q -> SearchQuality.UHD
+            "FHD"      in q || "1080"    in q || "FULL HD" in q -> SearchQuality.HD
+            "HD"       in q || "720"     in q                   -> SearchQuality.HD
+            "SD"       in q || "480"     in q                   -> SearchQuality.SD
+            "CAM"      in q || "HDCAM"   in q                   -> SearchQuality.CAM
+            "VIETSUB"  in q || "PHỤ ĐỀ" in q                   -> SearchQuality.HD
+            "THUYẾT"   in q || "LỒNG"   in q                   -> SearchQuality.HD
+            else -> null
         }
     }
 
+    // FIX LỖI 3 — Selector mở rộng để bắt badge quality trên nhiều loại HTML
+    private fun getQualityText(el: org.jsoup.nodes.Element): String? {
+        return el.select(
+            ".quality, .hd, .sd, .cam, .label, .badge, " +
+            ".film-type, .type-label, .status-label, .video-quality, " +
+            "span[class*=quality], span[class*=label], span[class*=type], " +
+            "div[class*=quality], div[class*=label]"
+        ).map { it.text().trim() }
+         .firstOrNull { it.isNotEmpty() && it.length <= 20 }
+    }
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = if (page <= 1) "$mainUrl/${request.data}"
-                  else           "$mainUrl/${request.data}?page=$page"
-        val html = app.get(url, headers = defaultHeaders).text
+        val url  = if (page <= 1) "$mainUrl/${request.data}"
+                   else           "$mainUrl/${request.data}?page=$page"
+        val html = app.get(url, headers = pageHeaders).text
         val doc  = Jsoup.parse(html)
 
         val items = doc.select(".list-film .item").mapNotNull { el ->
-            val a     = el.selectFirst("a") ?: return@mapNotNull null
-            val href  = fixUrl(a.attr("href"))   // FIX 1: đảm bảo URL tuyệt đối
+            val a = el.selectFirst("a") ?: return@mapNotNull null
+            // FIX LỖI 1: fixUrl() trên MỌI href
+            val href = fixUrl(a.attr("href"))
             if (href.isEmpty()) return@mapNotNull null
 
-            val title = el.selectFirst("p, .title, h3")?.text()?.trim()
-                ?: a.attr("title").trim()
+            val title = el.selectFirst("p, .title, h3, .film-name")
+                ?.text()?.trim()
+                ?.ifEmpty { a.attr("title") }
+                ?: a.attr("title")
             if (title.isEmpty()) return@mapNotNull null
 
-            val poster       = getImageUrl(el.selectFirst("img"))  // FIX 2
-            val qualityText  = el.selectFirst(".quality, .hd, .resolution, .label-quality")?.text()?.trim()
+            val poster      = getImageUrl(el.selectFirst("img"))
+            val qualityText = getQualityText(el) // FIX LỖI 3
 
-            // ══════════════════════════════════════════════
-            // FIX 3: Nhận diện đúng Movie vs TvSeries để hiện nhãn tập
-            // ══════════════════════════════════════════════
-            val isSeries = request.data.contains("phim-bo")
-                || el.selectFirst(".episode, .ep, .label-episode, .num-episode") != null
+            // FIX LỖI 3: Phim Bộ dùng TvSeriesSearchResponse để hiện số tập
+            val isSeries = request.data.contains("phim-bo") ||
+                el.selectFirst(".episode, .ep, .num-episode, [class*=episode]") != null
 
             if (isSeries) {
                 newTvSeriesSearchResponse(title, href, TvType.TvSeries) {
@@ -114,16 +145,16 @@ class PhimMoiChillProvider : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val url  = "$mainUrl/tim-kiem/${URLEncoder.encode(query, "utf-8")}"
-        val html = app.get(url, headers = defaultHeaders).text
+        val html = app.get(url, headers = pageHeaders).text
         return Jsoup.parse(html).select(".list-film .item").mapNotNull { el ->
             val a    = el.selectFirst("a") ?: return@mapNotNull null
-            val href = fixUrl(a.attr("href"))  // FIX 1
+            val href = fixUrl(a.attr("href")) // FIX LỖI 1
             if (href.isEmpty()) return@mapNotNull null
 
-            val title  = el.selectFirst("p, .title, h3")?.text()?.trim()
-                ?: a.attr("title").trim()
-            val poster = getImageUrl(el.selectFirst("img"))  // FIX 2
-            val qualityText = el.selectFirst(".quality, .hd, .resolution, .label-quality")?.text()?.trim()
+            val title = el.selectFirst("p, .title, h3")?.text()?.trim()
+                ?: a.attr("title")
+            val poster      = getImageUrl(el.selectFirst("img"))
+            val qualityText = getQualityText(el)
 
             newMovieSearchResponse(title, href, TvType.Movie) {
                 this.posterUrl = poster
@@ -133,62 +164,54 @@ class PhimMoiChillProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val html = app.get(url, headers = defaultHeaders).text
+        val html = app.get(url, headers = pageHeaders).text
         val doc  = Jsoup.parse(html)
 
         val title = doc.selectFirst("h1.entry-title, h1, .caption, .film-name")
             ?.text()?.trim() ?: "Phim"
-
-        // FIX 2: thử nhiều selector poster hơn
         val poster = getImageUrl(doc.selectFirst(".film-poster img, .poster img, .thumb img"))
-            ?: getImageUrl(doc.selectFirst("img.poster, img[itemprop=image], .film-thumbnail img"))
-
-        val description = doc.selectFirst(
-            ".film-content, .description, .film-info-content, .entry-content"
-        )?.text()?.trim()
-
+            ?: getImageUrl(doc.selectFirst("img.poster, img[itemprop=image]"))
+        val description = doc.selectFirst(".film-content, .description, .entry-content")
+            ?.text()?.trim()
         val year = doc.selectFirst(".year, [itemprop=dateCreated]")
-            ?.text()?.trim()?.filter { it.isDigit() }?.take(4)?.toIntOrNull()
-
+            ?.text()?.filter { it.isDigit() }?.take(4)?.toIntOrNull()
         val genres = doc.select(".genre a, .categories a, [itemprop=genre]").map { it.text() }
 
         val tags = genres.toMutableList()
-        if (html.contains("vietsub",     ignoreCase = true) ||
-            html.contains("phụ đề",     ignoreCase = true)) tags.add("Phụ đề")
+        if (html.contains("vietsub",      ignoreCase = true) ||
+            html.contains("phụ đề",      ignoreCase = true)) tags.add("Phụ đề")
         if (html.contains("thuyết minh", ignoreCase = true) ||
-            html.contains("lồng tiếng", ignoreCase = true)) tags.add("Thuyết minh")
+            html.contains("lồng tiếng",  ignoreCase = true)) tags.add("Thuyết minh")
 
-        // ══════════════════════════════════════════════
-        // FIX 1 QUAN TRỌNG: Dùng fixUrl() cho mọi href episode
-        // Đây là lý do phim lẻ báo "Không tìm thấy liên kết"
-        // ══════════════════════════════════════════════
+        // ════════════════════════════════════════════════════════════════════
+        // FIX LỖI 1: fixUrl() bắt buộc cho TẤT CẢ href của tập phim
+        // ════════════════════════════════════════════════════════════════════
         val episodes = doc.select("ul.list-episode li a, .episode-list a, a[href*='/xem/']")
-            .mapNotNull {
-                val href = fixUrl(it.attr("href"))
+            .mapNotNull { el ->
+                val href = fixUrl(el.attr("href"))  // ← FIX CHÍNH
                 if (href.isEmpty() || href == mainUrl || href == "$mainUrl/") return@mapNotNull null
                 newEpisode(href) {
-                    this.name = it.text().trim().ifEmpty { null }
+                    this.name = el.text().trim().ifEmpty { null }
                 }
             }
             .distinctBy { it.data }
 
-        // ══════════════════════════════════════════════
-        // FIX 3: Trả về MovieLoadResponse nếu là phim lẻ (0–1 tập)
-        // tránh CloudStream hiện "TvSeries 0 tập" không phát được
-        // ══════════════════════════════════════════════
         return if (episodes.size <= 1) {
-            val watchData = episodes.firstOrNull()?.data
-                ?: doc.selectFirst("a[href*='/xem/'], .btn-play a")
-                    ?.attr("href")?.let { fixUrl(it) }
+            // Phim lẻ: dùng MovieLoadResponse
+            val watchUrl = episodes.firstOrNull()?.data
+                ?: doc.select("a[href*='/xem/']")
+                    .map { fixUrl(it.attr("href")) }
+                    .firstOrNull { it.length > mainUrl.length + 5 }
                 ?: url
 
-            newMovieLoadResponse(title, url, TvType.Movie, watchData) {
+            newMovieLoadResponse(title, url, TvType.Movie, watchUrl) {
                 this.posterUrl = poster
                 this.plot      = description
                 this.year      = year
                 this.tags      = tags
             }
         } else {
+            // Phim bộ: dùng TvSeriesLoadResponse
             newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
                 this.posterUrl = poster
                 this.plot      = description
@@ -204,51 +227,62 @@ class PhimMoiChillProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // FIX 1: data giờ luôn là URL tuyệt đối nên app.get() hoạt động đúng
-        val pageResponse = app.get(data, headers = defaultHeaders)
+        // data luôn là URL đầy đủ (đã fixUrl ở load()) → app.get() thành công
+        val pageResponse = app.get(data, headers = pageHeaders)
         val html         = pageResponse.text
         val cookies      = pageResponse.cookies
 
+        // Tìm episodeID với nhiều pattern hơn
         val episodeId =
             Regex("""episodeID["']?\s*:\s*["']?(\d+)""").find(html)?.groupValues?.get(1)
-            ?: Regex("""data-id=["'](\d+)["']""").find(html)?.groupValues?.get(1)
-            ?: Regex("""[?&]id=(\d+)""").find(data)?.groupValues?.get(1)
+            ?: Regex("""episode_id["']?\s*:\s*["']?(\d+)""").find(html)?.groupValues?.get(1)
+            ?: Regex("""data-(?:episode-)?id=["'](\d+)["']""").find(html)?.groupValues?.get(1)
+            ?: Regex("""var\s+episodeID\s*=\s*["']?(\d+)""").find(html)?.groupValues?.get(1)
+            ?: Regex("""[?&](?:id|ep|episode)=(\d+)""").find(data)?.groupValues?.get(1)
             ?: return false
 
         return try {
             val responseText = app.post(
                 "$mainUrl/chillsplayer.php",
                 data    = mapOf("qcao" to episodeId, "sv" to "0"),
-                headers = defaultHeaders.plus("Referer" to data),
+                headers = ajaxHeaders + mapOf("Referer" to data),
                 cookies = cookies
             ).text
 
-            // ══════════════════════════════════════════════
-            // FIX 4: Trích xuất key an toàn — tránh lấy toàn bộ response làm key
-            // Bug cũ: substringAfterLast trả về nguyên chuỗi khi không tìm thấy,
-            // dẫn đến key = hàng nghìn ký tự → m3u8 URL sai → MANIFEST_MALFORMED
-            // ══════════════════════════════════════════════
-            val key: String? = Regex("""iniPlayers\(["']([A-Za-z0-9_\-]{5,200})["']""")
-                .find(responseText)?.groupValues?.get(1)
-                ?: run {
-                    val marker = "iniPlayers(\""
-                    val idx    = responseText.lastIndexOf(marker)
-                    if (idx >= 0) {
-                        val after = responseText.substring(idx + marker.length)
-                        val candidate = after.substringBefore("\"")
-                        // Chỉ dùng nếu trông như key hợp lệ
-                        if (candidate.length in 5..200 && !candidate.contains(" ")) candidate
-                        else null
-                    } else null
-                }
+            // ════════════════════════════════════════════════════════════════
+            // FIX LỖI 4: Trích xuất key an toàn — KHÔNG dùng substringAfterLast
+            //
+            // BUG GỐC:
+            //   substringAfterLast("iniPlayers(\"") trả về NGUYÊN responseText
+            //   khi "iniPlayers(\"" không tìm thấy (string operation không bao giờ null)
+            //   → key = hàng nghìn ký tự → URL m3u8 invalid → MANIFEST_MALFORMED
+            //
+            // FIX: Chỉ dùng regex. Nếu không match → null → return false (sạch hơn)
+            // Cho phép ký tự base64 (+/=) trong key pattern
+            // ════════════════════════════════════════════════════════════════
+            val key: String? =
+                // Pattern chính: iniPlayers("KEY") hoặc iniPlayers('KEY')
+                Regex("""iniPlayers\s*\(\s*["']([A-Za-z0-9+/=_\-]{8,500})["']""")
+                    .find(responseText)?.groupValues?.get(1)
+                // Pattern phụ: "key":"VALUE"
+                ?: Regex(""""key"\s*:\s*"([A-Za-z0-9+/=_\-]{8,500})"""")
+                    .find(responseText)?.groupValues?.get(1)
+                // Pattern fallback: chuỗi dài trong ngoặc kép/đơn (token/base64)
+                ?: Regex("""["']([A-Za-z0-9+/=_\-]{32,500})["']""")
+                    .findAll(responseText)
+                    .firstOrNull { it.groupValues[1].length in 32..500 }
+                    ?.groupValues?.get(1)
 
             if (key.isNullOrEmpty()) return false
 
+            // ════════════════════════════════════════════════════════════════
+            // FIX LỖI 4: Bỏ "sotrim/manifest/" — server này hay trả nội dung
+            // không hợp lệ → gây MANIFEST_MALFORMED (3002) dù stream vẫn chạy
+            // ════════════════════════════════════════════════════════════════
             val serverList = listOf(
-                "https://sotrim.topphimmoi.org/manifest/$key/index.m3u8" to "Chill-VIP",
-                "https://sotrim.topphimmoi.org/raw/$key/index.m3u8"      to "Sotrim-Raw",
-                "https://dash.megacdn.xyz/raw/$key/index.m3u8"           to "Mega-HLS",
-                "https://dash.megacdn.xyz/dast/$key/index.m3u8"          to "Mega-BK"
+                "https://sotrim.topphimmoi.org/raw/$key/index.m3u8" to "Sotrim",
+                "https://dash.megacdn.xyz/raw/$key/index.m3u8"      to "Mega-HLS",
+                "https://dash.megacdn.xyz/dast/$key/index.m3u8"     to "Mega-BK"
             )
 
             var found = false
@@ -267,16 +301,12 @@ class PhimMoiChillProvider : MainAPI() {
                 found = true
             }
 
-            // Fallback: tìm m3u8 trực tiếp trong response
             if (!found) {
                 Regex("""https?://[^\s"'<>]+\.m3u8[^\s"'<>]*""")
                     .findAll(responseText)
                     .forEach { match ->
                         M3u8Helper.generateM3u8(name, match.value, data)
-                            .forEach { m3u8 ->
-                                callback(m3u8)
-                                found = true
-                            }
+                            .forEach { m3u8 -> callback(m3u8); found = true }
                     }
             }
 

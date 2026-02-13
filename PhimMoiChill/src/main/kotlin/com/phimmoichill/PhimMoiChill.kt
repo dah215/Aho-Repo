@@ -115,7 +115,7 @@ class PhimMoiChillProvider : MainAPI() {
         val hasThuyetMinh = labelUpper.contains("THUYẾT MINH") || 
                             labelUpper.contains("LỒNG TIẾNG") || hasTMBadge
 
-        val dubs = EnumSet<DubStatus>().apply {
+        val dubs = HashSet<DubStatus>().apply {
             // Thêm Subbed nếu có Vietsub hoặc không rõ (mặc định site này là Vietsub)
             if (hasVietsub || (!hasThuyetMinh && !labelUpper.contains("RAW"))) {
                 add(DubStatus.Subbed)

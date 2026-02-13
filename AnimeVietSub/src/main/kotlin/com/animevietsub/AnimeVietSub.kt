@@ -54,19 +54,22 @@ class AnimeVietSub : MainAPI() {
             it.attr("data-src").ifEmpty { it.attr("data-original").ifEmpty { it.attr("src") } }
         }
         
-        val epInfo = this.selectFirst(".mli-eps, .Tag, .label")?.text()?.trim() ?: ""
+        // MỞ RỘNG QUÉT NHÃN: Quét nhiều class khác nhau để lấy "Full", "HD", "Tập 12"
+        val epInfo = this.select(".mli-eps, .Tag, .label, .Status, .Quality").text().trim()
 
         return newAnimeSearchResponse(title, href, TvType.Anime) {
             this.posterUrl = if (poster?.startsWith("//") == true) "https:$poster" else poster
             
             if (epInfo.isNotEmpty()) {
-                // Sử dụng addSub thay vì gán trực tiếp để tránh lỗi Type Mismatch
+                // 1. Hiển thị số tập (dành cho Anime bộ)
                 val epNum = Regex("""\d+""").find(epInfo)?.value?.toIntOrNull()
                 if (epNum != null) {
                     this.addSub(epNum)
                 }
                 
-                if (epInfo.contains("HD", ignoreCase = true)) {
+                // 2. Hiển thị nhãn chất lượng (dành cho Anime lẻ/Movie)
+                // Nếu thấy chữ Full, HD, Vietsub thì hiện nhãn HD
+                if (epInfo.contains(Regex("Full|HD|Movie|Viet", RegexOption.IGNORE_CASE))) {
                     this.quality = SearchQuality.HD
                 }
             }
@@ -77,10 +80,10 @@ class AnimeVietSub : MainAPI() {
         val url = if (page == 1) request.data else "${request.data}trang-$page.html"
         val document = app.get(url, headers = defaultHeaders).document
         
-        // CHỐNG TRÙNG LẶP: Sử dụng distinctBy { it.url }
+        // CHỐNG TRÙNG: Làm sạch URL trước khi distinct để tránh "phim.html" và "phim.html/" coi là 2 phim
         val items = document.select(".TPostMv, .TPost")
             .mapNotNull { it.toSearchResponse() }
-            .distinctBy { it.url } 
+            .distinctBy { it.url.trimEnd('/') } 
 
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
@@ -90,7 +93,7 @@ class AnimeVietSub : MainAPI() {
         return app.get(url, headers = defaultHeaders).document
             .select(".TPostMv, .TPost")
             .mapNotNull { it.toSearchResponse() }
-            .distinctBy { it.url } // Chống trùng lặp khi tìm kiếm
+            .distinctBy { it.url.trimEnd('/') }
     }
 
     override suspend fun load(url: String): LoadResponse {
@@ -113,7 +116,7 @@ class AnimeVietSub : MainAPI() {
             val data = "$url|$epHash|$epId|$epSource|$epPlay"
             
             newEpisode(data) {
-                this.name = "Tập $epName"
+                this.name = if (epName.contains("Tập")) epName else "Tập $epName"
                 this.episode = epName.filter { it.isDigit() }.toIntOrNull()
             }
         }

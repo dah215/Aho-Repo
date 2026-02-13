@@ -3,8 +3,8 @@ package com.animevietsub
 import android.util.Base64
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.plugins.CloudstreamPlugin // Thêm dòng này
-import com.lagradost.cloudstream3.plugins.Plugin            // Thêm dòng này
+import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
+import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
@@ -15,7 +15,6 @@ import javax.crypto.spec.SecretKeySpec
 @CloudstreamPlugin
 class AnimeVietSubPlugin : Plugin() {
     override fun load() {
-        // Fix Unresolved reference 'registerMainAPI'
         registerMainAPI(AnimeVietSub())
     }
 }
@@ -74,8 +73,11 @@ class AnimeVietSub : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse {
         var document = app.get(url, headers = defaultHeaders).document
+        
+        // Theo bạn phân tích: Danh sách nằm ở li.episode a
         var episodeElements = document.select("li.episode a")
         
+        // Nếu trang detail không có, ép buộc sang trang xem-phim
         if (episodeElements.isEmpty()) {
             val watchUrl = if (url.endsWith("/")) "${url}xem-phim.html" else "$url/xem-phim.html"
             document = app.get(watchUrl, headers = defaultHeaders).document
@@ -89,6 +91,7 @@ class AnimeVietSub : MainAPI() {
             val epSource = ep.attr("data-source").ifEmpty { "du" }
             val epPlay = ep.attr("data-play").ifEmpty { "api" }
             
+            // Dữ liệu đóng gói cho loadLinks
             val data = "$url|$epHash|$epId|$epSource|$epPlay"
             
             newEpisode(data) {
@@ -102,6 +105,7 @@ class AnimeVietSub : MainAPI() {
             this.posterUrl = document.selectFirst(".Image img, .InfoImg img")?.attr("src")
             this.plot = document.selectFirst(".Description, .InfoDesc")?.text()?.trim()
             
+            // Sử dụng mutableMapOf để tránh lỗi Assignment mismatch
             val map = mutableMapOf<DubStatus, List<Episode>>()
             if (episodesList.isNotEmpty()) {
                 map[DubStatus.Subbed] = episodesList
@@ -133,6 +137,7 @@ class AnimeVietSub : MainAPI() {
             }
         }
 
+        // Dự phòng bằng Ajax nếu giải mã hash lỗi
         val response = app.post(
             "$mainUrl$AJAX_URL",
             data = mapOf("action" to "get_episodes_player", "episode_id" to episodeId, "server" to source),
@@ -155,7 +160,9 @@ class AnimeVietSub : MainAPI() {
             val ivSpec = IvParameterSpec(AES_IV.toByteArray())
             val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
             cipher.init(Cipher.DECRYPT_MODE, keySpec, ivSpec)
-            val decoded = Base64.decode(hash, Base64.DEFAULT)
+            
+            // Dùng URL_SAFE vì hash chứa '_' và '-'
+            val decoded = Base64.decode(hash, Base64.URL_SAFE)
             val decrypted = cipher.doFinal(decoded)
             String(decrypted, Charsets.UTF_8)
         } catch (e: Exception) {

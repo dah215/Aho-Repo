@@ -7,6 +7,7 @@ import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
@@ -319,8 +320,11 @@ class AnimeVietSub : MainAPI() {
                     val urlLine = lines.getOrNull(i + 1)?.trim() ?: return@forEachIndexed
                     if (urlLine.startsWith("http")) {
                         callback.invoke(
-                            ExtractorLink(name, name, urlLine, referer,
-                                quality, isM3u8 = true)
+                            newExtractorLink(name, name, urlLine) {
+                                this.referer = referer
+                                this.quality = quality
+                                this.type    = ExtractorLinkType.M3U8
+                            }
                         )
                     }
                 }
@@ -331,8 +335,11 @@ class AnimeVietSub : MainAPI() {
             val firstSegment = lines.firstOrNull { it.startsWith("http") }
             if (firstSegment != null) {
                 callback.invoke(
-                    ExtractorLink(name, name, firstSegment, referer,
-                        Qualities.Unknown.value, isM3u8 = false)
+                    newExtractorLink(name, name, firstSegment) {
+                        this.referer = referer
+                        this.quality = Qualities.Unknown.value
+                        this.type    = ExtractorLinkType.VIDEO
+                    }
                 )
             }
         }

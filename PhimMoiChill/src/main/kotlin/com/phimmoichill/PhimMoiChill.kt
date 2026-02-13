@@ -85,7 +85,6 @@ class PhimMoiChillProvider : MainAPI() {
             "FHD"      in q || "1080"    in q || "FULL HD" in q -> SearchQuality.HD
             "HD"       in q || "720"     in q                   -> SearchQuality.HD
             "SD"       in q || "480"     in q                   -> SearchQuality.SD
-            "CAM"      in q || "HDCAM"   in q                   -> SearchQuality.CAM
             "VIETSUB"  in q || "PHỤ ĐỀ" in q                   -> SearchQuality.HD
             "THUYẾT"   in q || "LỒNG"   in q                   -> SearchQuality.HD
             else -> null

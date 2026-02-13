@@ -11,6 +11,10 @@ import java.net.URLEncoder
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
+import java.security.MessageDigest
+import java.nio.charset.StandardCharsets
+import java.util.zip.Inflater
+import java.io.ByteArrayOutputStream
 
 @CloudstreamPlugin
 class AnimeVietSubPlugin : Plugin() {
@@ -29,8 +33,8 @@ class AnimeVietSub : MainAPI() {
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA)
 
     companion object {
-        private const val AES_KEY = "anhemlun@animevs"
-        private const val AES_IV = "@animevsub@anime"
+        // Password giải mã từ file Extractor bạn gửi 
+        private const val DECODE_PASSWORD = "dm_thang_suc_vat_get_link_an_dbt" 
         private const val AJAX_URL = "/ajax/all"
     }
 
@@ -47,6 +51,43 @@ class AnimeVietSub : MainAPI() {
         "$mainUrl/anime-bo/" to "Anime Bộ"
     )
 
+    // --- LOGIC GIẢI MÃ TỪ FILE BẠN CUNG CẤP  ---
+    private fun pakoInflateRaw(data: ByteArray): ByteArray {
+        val inflater = Inflater(true)
+        inflater.setInput(data)
+        val output = ByteArray(1024)
+        val outputStream = ByteArrayOutputStream()
+        while (!inflater.finished()) {
+            val count = inflater.inflate(output)
+            outputStream.write(output, 0, count)
+        }
+        inflater.end()
+        return outputStream.toByteArray()
+    }
+
+    private fun unpacked(aesData: String): String? {
+        return try {
+            val digest = MessageDigest.getInstance("SHA-256")
+            val key = digest.digest(DECODE_PASSWORD.toByteArray(StandardCharsets.UTF_8))
+            val secretKey = SecretKeySpec(key, "AES")
+            
+            val decodedBytes = Base64.decode(aesData, Base64.DEFAULT)
+            val iv = decodedBytes.copyOfRange(0, 16)
+            val ciphertext = decodedBytes.copyOfRange(16, decodedBytes.size)
+            
+            val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
+            cipher.init(Cipher.DECRYPT_MODE, secretKey, IvParameterSpec(iv))
+            
+            val plaintextPadded = cipher.doFinal(ciphertext)
+            val inflated = pakoInflateRaw(plaintextPadded)
+            
+            String(inflated, StandardCharsets.UTF_8).replace("\\n", "\n").replace("\"", "")
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    // --- CẤU TRÚC GIAO DIỆN ---
     private fun Element.toSearchResponse(): SearchResponse? {
         val title = this.selectFirst(".Title, h3")?.text()?.trim() ?: return null
         val href = this.selectFirst("a")?.attr("href") ?: return null
@@ -54,27 +95,19 @@ class AnimeVietSub : MainAPI() {
             it.attr("data-src").ifEmpty { it.attr("data-original").ifEmpty { it.attr("src") } }
         }
         
-        // GIẢI QUYẾT LỖI SỐ 1: Quét tất cả các thẻ có thể chứa nhãn (HD, Full, Vietsub, Số tập)
+        // Quét nhãn để hiển thị Full/HD/Tập phim cho cả Anime bộ và lẻ
         val epText = this.select(".mli-eps, .Tag, .label, .Status, .Quality").text().trim()
 
         return newAnimeSearchResponse(title, href, TvType.Anime) {
             this.posterUrl = if (poster?.startsWith("//") == true) "https:$poster" else poster
             
-            // GIẢI QUYẾT LỖI SỐ 3 (BUILD): 
-            // Không gán trực tiếp vào biến episodes để tránh mismatch type.
-            // Sử dụng các hàm helper an toàn của SDK.
             if (epText.isNotEmpty()) {
-                // Lấy số tập nếu có (ví dụ: "Tập 12" -> lấy 12)
                 val epMatch = Regex("""(\d+)""").find(epText)
                 if (epMatch != null) {
                     val num = epMatch.groupValues[1].toIntOrNull()
-                    if (num != null) {
-                        this.addSub(num) // Hiển thị số tập Vietsub
-                    }
+                    if (num != null) this.addSub(num) 
                 }
-
-                // Hiển thị chất lượng HD nếu là phim lẻ hoặc có nhãn HD/Full
-                if (epText.contains(Regex("Full|HD|Movie|Vietsub|Lồng Tiếng", RegexOption.IGNORE_CASE))) {
+                if (epText.contains(Regex("Full|HD|Movie|Vietsub", RegexOption.IGNORE_CASE))) {
                     this.quality = SearchQuality.HD
                 }
             }
@@ -84,27 +117,26 @@ class AnimeVietSub : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page == 1) request.data else "${request.data}trang-$page.html"
         val document = app.get(url, headers = defaultHeaders).document
-        
         val items = document.select(".TPostMv, .TPost")
             .mapNotNull { it.toSearchResponse() }
-            .distinctBy { it.url.trimEnd('/') } // Fix lỗi lặp phim (số 2)
+            .distinctBy { it.url.trimEnd('/') } // Chống trùng phim
 
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/tim-kiem/${URLEncoder.encode(query, "utf-8")}/"
-        val items = app.get(url, headers = defaultHeaders).document
+        return app.get(url, headers = defaultHeaders).document
             .select(".TPostMv, .TPost")
             .mapNotNull { it.toSearchResponse() }
             .distinctBy { it.url.trimEnd('/') }
-        return items
     }
 
     override suspend fun load(url: String): LoadResponse {
         var document = app.get(url, headers = defaultHeaders).document
-        var episodeElements = document.select("li.episode a")
         
+        // Chuyển sang trang xem-phim nếu là trang thông tin [cite: 16, 17]
+        var episodeElements = document.select("li.episode a")
         if (episodeElements.isEmpty()) {
             val watchUrl = if (url.endsWith("/")) "${url}xem-phim.html" else "$url/xem-phim.html"
             document = app.get(watchUrl, headers = defaultHeaders).document
@@ -112,12 +144,13 @@ class AnimeVietSub : MainAPI() {
         }
 
         val episodesList = episodeElements.mapNotNull { ep ->
-            val epName = ep.text().trim()
             val epId = ep.attr("data-id")
             val epHash = ep.attr("data-hash")
             val epSource = ep.attr("data-source").ifEmpty { "du" }
             val epPlay = ep.attr("data-play").ifEmpty { "api" }
+            val epName = ep.text().trim()
             
+            // Đóng gói data để loadLinks sử dụng [cite: 21, 22]
             val data = "$url|$epHash|$epId|$epSource|$epPlay"
             
             newEpisode(data) {
@@ -130,12 +163,7 @@ class AnimeVietSub : MainAPI() {
         return newAnimeLoadResponse(title, url, TvType.Anime) {
             this.posterUrl = document.selectFirst(".Image img, .InfoImg img")?.attr("src")
             this.plot = document.selectFirst(".Description, .InfoDesc")?.text()?.trim()
-            
-            val map = mutableMapOf<DubStatus, List<Episode>>()
-            if (episodesList.isNotEmpty()) {
-                map[DubStatus.Subbed] = episodesList
-            }
-            this.episodes = map
+            this.episodes = mapOf(DubStatus.Subbed to episodesList)
         }
     }
 
@@ -146,50 +174,37 @@ class AnimeVietSub : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val parts = data.split("|")
-        val hash = parts.getOrNull(1) ?: ""
-        val episodeId = parts.getOrNull(2) ?: ""
-        val source = parts.getOrNull(3) ?: "du"
-        val playType = parts.getOrNull(4) ?: "api"
+        val refererUrl = parts[0]
+        val hash = parts[1]
+        val episodeId = parts[2]
+        val source = parts[3]
 
-        if (playType == "api" && hash.isNotEmpty()) {
-            decryptHash(hash)?.let { decryptedUrl ->
-                if (decryptedUrl.contains(".m3u8")) {
-                    M3u8Helper.generateM3u8(this.name, decryptedUrl, mainUrl).forEach(callback)
-                    return true
+        // Gửi yêu cầu AJAX lấy link mã hóa [cite: 22]
+        val response = app.post(
+            "$mainUrl$AJAX_URL",
+            data = mapOf(
+                "action" to "get_episodes_player", 
+                "episode_id" to episodeId, 
+                "server" to source,
+                "hash" to hash
+            ),
+            headers = mapOf("Referer" to refererUrl, "X-Requested-With" to "XMLHttpRequest")
+        ).parsedSafe<AjaxResponse>()
+
+        val encryptedFile = response?.data
+        if (encryptedFile != null) {
+            // Giải mã link bằng thuật toán AES từ file cũ 
+            val finalLink = unpacked(encryptedFile)
+            if (finalLink != null) {
+                if (finalLink.contains(".m3u8")) {
+                    M3u8Helper.generateM3u8(this.name, finalLink, mainUrl).forEach(callback)
+                } else {
+                    loadExtractor(finalLink, mainUrl, subtitleCallback, callback)
                 }
-                loadExtractor(decryptedUrl, mainUrl, subtitleCallback, callback)
                 return true
             }
         }
-
-        val response = app.post(
-            "$mainUrl$AJAX_URL",
-            data = mapOf("action" to "get_episodes_player", "episode_id" to episodeId, "server" to source),
-            headers = defaultHeaders
-        ).parsedSafe<AjaxResponse>()
-
-        response?.data?.let { link ->
-            if (link.contains(".m3u8")) {
-                M3u8Helper.generateM3u8(this.name, link, mainUrl).forEach(callback)
-            } else {
-                loadExtractor(link, mainUrl, subtitleCallback, callback)
-            }
-        }
-        return true
-    }
-
-    private fun decryptHash(hash: String): String? {
-        return try {
-            val keySpec = SecretKeySpec(AES_KEY.toByteArray(), "AES")
-            val ivSpec = IvParameterSpec(AES_IV.toByteArray())
-            val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
-            cipher.init(Cipher.DECRYPT_MODE, keySpec, ivSpec)
-            val decoded = Base64.decode(hash, Base64.URL_SAFE)
-            val decrypted = cipher.doFinal(decoded)
-            String(decrypted, Charsets.UTF_8)
-        } catch (e: Exception) {
-            null
-        }
+        return false
     }
 
     data class AjaxResponse(

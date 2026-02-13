@@ -22,9 +22,10 @@ class PhimMoiChillProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
+    // Header chuẩn giả lập Chrome
     private val defaultHeaders = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-        "Accept" to "application/json, text/javascript, */*; q=0.01",
+        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "X-Requested-With" to "XMLHttpRequest",
         "Referer" to "$mainUrl/"
     )
@@ -35,34 +36,47 @@ class PhimMoiChillProvider : MainAPI() {
         "list/phim-bo" to "Phim Bộ"
     )
 
-    // Hàm xử lý URL ảnh (Lazy load)
-    private fun getImageUrl(el: org.jsoup.nodes.Element?): String? {
-        if (el == null) return null
-        val attrs = listOf("data-src", "data-original", "src")
-        for (attr in attrs) {
-            val url = el.attr(attr)
-            if (!url.isNullOrEmpty() && !url.startsWith("data:image")) {
-                return if (url.startsWith("//")) "https:$url" else url
-            }
+    // --- HÀM HỖ TRỢ FIX LỖI 1: Xử lý ảnh Poster ---
+    private fun getFullPosterUrl(url: String?): String? {
+        if (url.isNullOrEmpty()) return null
+        return when {
+            url.startsWith("http") -> url
+            url.startsWith("//") -> "https:$url"
+            url.startsWith("/") -> "$mainUrl$url" // Ghép domain nếu là link tương đối
+            else -> url
         }
-        return null
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page <= 1) "$mainUrl/${request.data}" else "$mainUrl/${request.data}?page=$page"
         val html = app.get(url, headers = defaultHeaders).text
-        val items = Jsoup.parse(html).select(".list-film .item").mapNotNull { el ->
+        val doc = Jsoup.parse(html)
+        
+        val items = doc.select(".list-film .item").mapNotNull { el ->
             val a = el.selectFirst("a") ?: return@mapNotNull null
-            val title = el.selectFirst("p")?.text()?.trim() ?: a.attr("title")
+            val title = el.selectFirst("p, .title, h3")?.text()?.trim() ?: a.attr("title")
             
-            // FIX LỖI 2: Hiện nhãn Tập/Vietsub trên bìa
-            // Lấy text từ .label (vd: Tập 10) hoặc .status (vd: Vietsub)
-            val label = el.selectFirst(".label, .status")?.text()?.trim()
+            // FIX LỖI 1: Lấy ảnh từ nhiều nguồn attribute và xử lý link
+            val img = el.selectFirst("img")
+            val posterRaw = img?.attr("data-src") 
+                ?: img?.attr("data-original") 
+                ?: img?.attr("src")
+            val poster = getFullPosterUrl(posterRaw)
+
+            // FIX LỖI 2: Quét toàn bộ text trong item để tìm Nhãn (Vietsub/Tập)
+            val allText = el.text()
+            // Tìm chữ "Tập X" hoặc "Vietsub/Thuyết minh"
+            val label = when {
+                allText.contains("Tập", true) -> "Tập " + Regex("Tập\\s*(\\d+)").find(allText)?.groupValues?.get(1)
+                allText.contains("Vietsub", true) -> "Vietsub"
+                allText.contains("Thuyết Minh", true) -> "Thuyết Minh"
+                else -> el.selectFirst(".label, .status")?.text()?.trim()
+            }
 
             newMovieSearchResponse(title, a.attr("href"), TvType.Movie) {
-                this.posterUrl = getImageUrl(el.selectFirst("img"))
+                this.posterUrl = poster
                 if (!label.isNullOrEmpty()) {
-                    addQuality(label) // Hiển thị thẳng text lấy được lên poster
+                    addQuality(label)
                 }
             }
         }
@@ -75,13 +89,13 @@ class PhimMoiChillProvider : MainAPI() {
         return Jsoup.parse(html).select(".list-film .item").mapNotNull { el ->
             val a = el.selectFirst("a") ?: return@mapNotNull null
             val title = el.selectFirst("p")?.text()?.trim() ?: a.attr("title")
-            val label = el.selectFirst(".label, .status")?.text()?.trim()
+            
+            val img = el.selectFirst("img")
+            val posterRaw = img?.attr("data-src") ?: img?.attr("src")
+            val poster = getFullPosterUrl(posterRaw)
             
             newMovieSearchResponse(title, a.attr("href"), TvType.Movie) {
-                this.posterUrl = getImageUrl(el.selectFirst("img"))
-                if (!label.isNullOrEmpty()) {
-                    addQuality(label)
-                }
+                this.posterUrl = poster
             }
         }
     }
@@ -89,42 +103,44 @@ class PhimMoiChillProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         val html = app.get(url, headers = defaultHeaders).text
         val doc = Jsoup.parse(html)
-        val title = doc.selectFirst("h1.entry-title, .caption")?.text()?.trim() ?: "Phim"
         
-        // FIX LỖI 1: Poster đen thui -> Dùng getImageUrl thay vì attr("src")
-        val poster = getImageUrl(doc.selectFirst(".film-poster img, .movie-l-img img"))
+        val title = doc.selectFirst("h1.entry-title, .caption, .title-film")?.text()?.trim() ?: "Phim"
         
-        val description = doc.selectFirst(".film-content, .description, #film-content")?.text()?.trim()
-        val year = doc.selectFirst(".year")?.text()?.trim()?.toIntOrNull()
+        // FIX LỖI 1: Poster ở trang chi tiết
+        val img = doc.selectFirst(".film-poster img, .movie-l-img img")
+        val posterRaw = img?.attr("data-src") ?: img?.attr("src")
+        val poster = getFullPosterUrl(posterRaw)
+
+        val description = doc.selectFirst("#film-content, .entry-content, .description")?.text()?.trim()
         
-        // Lấy Tags (Thể loại + Quốc gia)
+        // Tags
         val tags = doc.select(".entry-meta li a, .tags a").map { it.text() }
 
-        // FIX LỖI 3: Phim lẻ không phát được (không tìm thấy tập)
-        // Logic: Tìm link tập, nếu không thấy thì coi như đây là phim lẻ 1 tập
-        val episodeList = doc.select("ul.list-episode li a, #list_episodes li a, a.btn-see").mapIndexed { index, it ->
-            val link = it.attr("href")
-            val name = it.text().trim()
-            newEpisode(link) {
-                this.name = if (name.isNotEmpty()) name else "Full"
+        // FIX LỖI 3 & 4: Logic lấy tập phim
+        // Thử tìm danh sách tập
+        var episodes = doc.select("ul.list-episode li a, #list_episodes li a").mapIndexed { index, it ->
+            val epName = it.text().trim()
+            newEpisode(it.attr("href")) {
+                this.name = if (epName.isEmpty()) "Tập ${index + 1}" else epName
                 this.episode = index + 1
             }
         }.distinctBy { it.data }
 
-        // Nếu list rỗng (trường hợp web đổi giao diện hoặc phim lẻ đặc biệt), tự tạo tập mặc định
-        val finalEpisodes = if (episodeList.isEmpty()) {
-            listOf(newEpisode(url) {
-                this.name = "Xem ngay"
-                this.episode = 1
-            })
-        } else {
-            episodeList
+        // Nếu không tìm thấy tập nào (Phim Lẻ), tự tạo 1 tập từ URL hiện tại
+        if (episodes.isEmpty()) {
+            // Kiểm tra xem có nút "Xem ngay" không để lấy link chính xác
+            val watchUrl = doc.selectFirst("a.btn-see, a.btn-watch")?.attr("href") ?: url
+            episodes = listOf(
+                newEpisode(watchUrl) {
+                    this.name = "Phim Lẻ"
+                    this.episode = 1
+                }
+            )
         }
 
-        return newTvSeriesLoadResponse(title, url, TvType.TvSeries, finalEpisodes) {
+        return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
             this.posterUrl = poster
             this.plot = description
-            this.year = year
             this.tags = tags
         }
     }
@@ -138,7 +154,6 @@ class PhimMoiChillProvider : MainAPI() {
         val response = app.get(data, headers = defaultHeaders)
         val html = response.text
         
-        // Lấy ID tập phim
         val episodeId = Regex("""episodeID"\s*:\s*"(\d+)"""").find(html)?.groupValues?.get(1)
             ?: Regex("""data-id="(\d+)"""").find(html)?.groupValues?.get(1)
             ?: return false
@@ -147,7 +162,10 @@ class PhimMoiChillProvider : MainAPI() {
             val res = app.post(
                 "$mainUrl/chillsplayer.php",
                 data = mapOf("qcao" to episodeId, "sv" to "0"),
-                headers = defaultHeaders.plus(mapOf("Referer" to data, "Origin" to mainUrl)),
+                headers = defaultHeaders.plus(mapOf(
+                    "Referer" to data, // Referer phải là trang hiện tại
+                    "Origin" to mainUrl
+                )),
                 cookies = response.cookies
             ).text
 
@@ -156,30 +174,34 @@ class PhimMoiChillProvider : MainAPI() {
             
             if (key.length < 5) return false
 
-            val servers = listOf(
-                "https://sotrim.topphimmoi.org/manifest/$key/index.m3u8" to "Chill VIP",
-                "https://dash.megacdn.xyz/raw/$key/index.m3u8" to "Mega HLS"
+            val serverList = listOf(
+                Pair("https://sotrim.topphimmoi.org/manifest/$key/index.m3u8", "VIP HLS"),
+                Pair("https://dash.megacdn.xyz/raw/$key/index.m3u8", "Mega Server")
             )
 
-            servers.forEach { (link, sName) ->
+            serverList.forEach { (link, serverName) ->
                 callback(
                     newExtractorLink(
                         source = this.name,
-                        name = sName,
+                        name = serverName,
                         url = link,
                         type = ExtractorLinkType.M3U8
                     ) {
-                        // FIX LỖI 4 (3002 Malformed): Thêm Origin vào Header của luồng phát
+                        // FIX LỖI 3002: Header của luồng phát
+                        // Quan trọng: Truyền User-Agent và Origin vào player
                         this.referer = "$mainUrl/"
                         this.quality = Qualities.P1080.value
                         this.headers = mapOf(
                             "Origin" to mainUrl,
+                            "User-Agent" to defaultHeaders["User-Agent"]!!,
                             "Referer" to "$mainUrl/"
                         )
                     }
                 )
             }
             true
-        } catch (e: Exception) { false }
+        } catch (e: Exception) {
+            false
+        }
     }
 }

@@ -1,5 +1,25 @@
 [
     {
+        "iconUrl": "https://animevietsub.vip/favicon.ico",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/dah215/Aho-Repo",
+        "fileSize": 14247,
+        "status": 1,
+        "language": "vi",
+        "authors": [
+            "AnimeVietSub"
+        ],
+        "tvTypes": [
+            "Anime",
+            "AnimeMovie"
+        ],
+        "version": 1,
+        "internalName": "AnimeVietSub",
+        "description": "AnimeVietSub",
+        "url": "https://raw.githubusercontent.com/dah215/Aho-Repo/builds/AnimeVietSub.cs3",
+        "name": "AnimeVietSub"
+    },
+    {
         "iconUrl": "https://boctem.com/favicon.ico",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/dah215/Aho-Repo",

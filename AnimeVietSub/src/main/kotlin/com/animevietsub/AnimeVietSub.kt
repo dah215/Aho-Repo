@@ -38,7 +38,6 @@ class AnimeVietSub : MainAPI() {
         private const val DECODE_PASSWORD = "dm_thang_suc_vat_get_link_an_dbt"
     }
 
-    // FIX: Dung Jackson truc tiep — parseJson khong ton tai trong scope nay
     private val mapper = jacksonObjectMapper()
 
     private val defaultHeaders = mapOf(
@@ -48,13 +47,13 @@ class AnimeVietSub : MainAPI() {
     )
 
     override val mainPage = mainPageOf(
-        "$mainUrl/danh-sach/list-dang-chieu/" to "Dang Chieu",
-        "$mainUrl/danh-sach/list-tron-bo/"    to "Tron Bo",
-        "$mainUrl/anime-le/"                  to "Anime Le",
-        "$mainUrl/anime-bo/"                  to "Anime Bo"
+        "$mainUrl/danh-sach/list-dang-chieu/" to "Đang Chiếu",
+        "$mainUrl/danh-sach/list-tron-bo/"    to "Trọn Bộ",
+        "$mainUrl/anime-le/"                  to "Anime Lẻ",
+        "$mainUrl/anime-bo/"                  to "Anime Bộ"
     )
 
-    // FIX: Buffer 8192 thay 1024 — tranh loi cat du lieu khi inflate
+    // Inflate với buffer lớn, tránh lỗi cắt dữ liệu
     private fun pakoInflateRaw(data: ByteArray): ByteArray {
         val inflater = Inflater(true)
         inflater.setInput(data)
@@ -77,13 +76,12 @@ class AnimeVietSub : MainAPI() {
             val digest    = MessageDigest.getInstance("SHA-256")
             val key       = digest.digest(DECODE_PASSWORD.toByteArray(StandardCharsets.UTF_8))
             val secretKey = SecretKeySpec(key, "AES")
-            // FIX: trim() truoc decode tranh loi whitespace thua
-            val decoded    = Base64.decode(aesData.trim(), Base64.DEFAULT)
-            val iv         = decoded.copyOfRange(0, 16)
-            val ciphertext = decoded.copyOfRange(16, decoded.size)
-            val cipher     = Cipher.getInstance("AES/CBC/PKCS5Padding")
+            val decoded   = Base64.decode(aesData.trim(), Base64.DEFAULT)
+            val iv        = decoded.copyOfRange(0, 16)
+            val ct        = decoded.copyOfRange(16, decoded.size)
+            val cipher    = Cipher.getInstance("AES/CBC/PKCS5Padding")
             cipher.init(Cipher.DECRYPT_MODE, secretKey, IvParameterSpec(iv))
-            val plain = cipher.doFinal(ciphertext)
+            val plain = cipher.doFinal(ct)
             String(pakoInflateRaw(plain), StandardCharsets.UTF_8)
                 .replace("\\n", "\n")
                 .replace("\"", "")
@@ -130,35 +128,37 @@ class AnimeVietSub : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        var document = app.get(url, headers = defaultHeaders).document
+        // Lần 1: thử URL gốc (trang phim hoặc trang tập)
+        var document      = app.get(url, headers = defaultHeaders).document
+        // FIX: Selector chính xác từ HTML thực tế của site
+        // HTML: <ul class="list-episode tab-pane"><li class="episode "><a data-id="..." ...>
+        var episodesNodes = document.select("ul.list-episode li a[data-id]")
 
-        // FIX: Mo rong selector bat nhieu layout HTML hon
-        var episodesNodes = document.select(
-            "li.episode a, .list-server .server a, .listEp li a, ul.episodios li a"
-        )
-
+        // Lần 2: thử thêm /xem-phim.html nếu chưa có tập
         if (episodesNodes.isEmpty()) {
-            val watchUrl  = if (url.endsWith("/")) "${url}xem-phim.html" else "$url/xem-phim.html"
-            document      = app.get(watchUrl, headers = defaultHeaders).document
-            episodesNodes = document.select(
-                "li.episode a, .list-server .server a, .listEp li a, ul.episodios li a"
-            )
+            val watchUrl  = url.trimEnd('/') + "/xem-phim.html"
+            val doc2      = runCatching { app.get(watchUrl, headers = defaultHeaders).document }.getOrNull()
+            if (doc2 != null) {
+                episodesNodes = doc2.select("ul.list-episode li a[data-id]")
+                if (episodesNodes.isNotEmpty()) document = doc2
+            }
         }
 
         val episodesList = episodesNodes.mapNotNull { ep ->
-            val epId     = ep.attr("data-id")
-            val epHash   = ep.attr("data-hash")
-            val epSource = ep.attr("data-source").ifEmpty { "du" }
-            // FIX: Giu du 5 phan — parts[4] = play (truoc day bi bo)
-            val epPlay   = ep.attr("data-play").ifEmpty { "api" }
-            val epName   = ep.text().trim()
+            val epId   = ep.attr("data-id").trim()
+            val epHash = ep.attr("data-hash").trim()
+            // data-play = "api", data-source = "du" (từ HTML thực tế)
+            val epPlay = ep.attr("data-play").ifEmpty { "api" }
+            val epSrc  = ep.attr("data-source").ifEmpty { "du" }
+            val epName = ep.attr("title").ifEmpty { ep.text().trim() }
 
-            if (epId.isEmpty() && epHash.isEmpty()) return@mapNotNull null
+            // Bỏ qua nút không có đủ dữ liệu
+            if (epId.isEmpty() || epHash.isEmpty()) return@mapNotNull null
 
-            newEpisode("$url|$epHash|$epId|$epSource|$epPlay") {
-                this.name    = if (epName.contains("Tap") || epName.contains("tap"))
-                                    epName else "Tap $epName"
-                this.episode = epName.filter { c -> c.isDigit() }.toIntOrNull()
+            // Format: url|hash|id|source|play  (5 phần, split bằng "|")
+            newEpisode("$url|$epHash|$epId|$epSrc|$epPlay") {
+                this.name    = epName
+                this.episode = Regex("\\d+").find(epName)?.value?.toIntOrNull()
             }
         }
 
@@ -180,55 +180,48 @@ class AnimeVietSub : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        // Format được tạo trong load(): "filmUrl|hash|epId|source|play"
         val parts = data.split("|")
         if (parts.size < 5) return false
 
-        val referer = parts[0]
-        val hash    = parts[1]
-        val epId    = parts[2]
-        val source  = parts[3]
-        val play    = parts[4]  // FIX: truoc day khong dua vao POST
+        val referer = parts[0]  // URL trang phim, dùng làm Referer
+        val hash    = parts[1]  // data-hash
+        val epId    = parts[2]  // data-id (episode ID)
+        val source  = parts[3]  // data-source
+        val play    = parts[4]  // data-play
 
         val reqHeaders = mapOf(
             "Referer"           to referer,
             "X-Requested-With" to "XMLHttpRequest",
-            "User-Agent"        to "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+            "User-Agent"        to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         )
 
-        // ── Endpoint 1: /ajax/player?v=2019a (endpoint thuc su hoat dong) ──
-        // FIX: Code cu dung /ajax/all sai -> doi sang endpoint dung
-        val body1 = try {
+        // ── Endpoint 1: /ajax/player?v=2019a ─────────────────────────────────
+        // Từ reference code hoạt động: params = id, play, link
+        // id = episodeID (data-id), play = data-play ("api"), link = data-hash
+        val body1 = runCatching {
             app.post(
                 "$mainUrl/ajax/player?v=2019a",
                 data    = mapOf("id" to epId, "play" to play, "link" to hash),
                 headers = reqHeaders
             ).text
-        } catch (e: Exception) { "" }
+        }.getOrNull().orEmpty()
 
         if (body1.isNotEmpty()) {
-            // Thu parse dang {link:[{file:...}]}
-            // FIX: Dung mapper.readValue thay parseJson (parseJson khong compile duoc)
+            // Response dạng {"success":1,"link":[{"file":"<encrypted>"}]}
             val enc1 = runCatching {
-                mapper.readValue<Json2AnimeResponse>(body1)
-                    .link.firstNotNullOfOrNull { lnk -> lnk.file?.takeIf { it.isNotBlank() } }
+                mapper.readValue<PlayerResponse>(body1)
+                    .link.firstNotNullOfOrNull { it.file?.takeIf(String::isNotBlank) }
             }.getOrNull()
             if (!enc1.isNullOrBlank()) {
                 val dec = decryptData(enc1)
                 if (!dec.isNullOrBlank()) return handleLink(dec, callback, subtitleCallback)
             }
-
-            // Thu parse dang {status, data}
-            val enc2 = runCatching {
-                mapper.readValue<AjaxResponse>(body1).data
-            }.getOrNull()
-            if (!enc2.isNullOrBlank()) {
-                val dec = decryptData(enc2)
-                if (!dec.isNullOrBlank()) return handleLink(dec, callback, subtitleCallback)
-            }
         }
 
         // ── Endpoint 2: /ajax/all (fallback) ─────────────────────────────────
-        val body2 = try {
+        // action=get_episodes_player, episode_id, server, hash
+        val body2 = runCatching {
             app.post(
                 "$mainUrl/ajax/all",
                 data    = mapOf(
@@ -239,23 +232,25 @@ class AnimeVietSub : MainAPI() {
                 ),
                 headers = reqHeaders
             ).text
-        } catch (e: Exception) { "" }
+        }.getOrNull().orEmpty()
 
         if (body2.isNotEmpty()) {
-            val enc3 = runCatching {
+            // Thử parse dạng {status, data}
+            val enc2 = runCatching {
                 mapper.readValue<AjaxResponse>(body2).data
             }.getOrNull()
-            if (!enc3.isNullOrBlank()) {
-                val dec = decryptData(enc3)
+            if (!enc2.isNullOrBlank()) {
+                val dec = decryptData(enc2)
                 if (!dec.isNullOrBlank()) return handleLink(dec, callback, subtitleCallback)
             }
 
-            val enc4 = runCatching {
-                mapper.readValue<Json2AnimeResponse>(body2)
-                    .link.firstNotNullOfOrNull { lnk -> lnk.file?.takeIf { it.isNotBlank() } }
+            // Thử parse dạng {link:[{file:...}]}
+            val enc3 = runCatching {
+                mapper.readValue<PlayerResponse>(body2)
+                    .link.firstNotNullOfOrNull { it.file?.takeIf(String::isNotBlank) }
             }.getOrNull()
-            if (!enc4.isNullOrBlank()) {
-                val dec = decryptData(enc4)
+            if (!enc3.isNullOrBlank()) {
+                val dec = decryptData(enc3)
                 if (!dec.isNullOrBlank()) return handleLink(dec, callback, subtitleCallback)
             }
         }
@@ -284,16 +279,18 @@ class AnimeVietSub : MainAPI() {
 
     // ── Data classes ──────────────────────────────────────────────────────────
 
-    data class Json2AnimeResponse(
-        @JsonProperty("_fxStatus") val fxStatus: Int?        = null,
-        @JsonProperty("success")   val success: Int?         = null,
-        @JsonProperty("link")      val link: List<LinkItem>  = emptyList()
+    // Response từ /ajax/player?v=2019a: {"_fxStatus":1,"success":1,"link":[{"file":"<aes_data>"}]}
+    data class PlayerResponse(
+        @JsonProperty("_fxStatus") val fxStatus: Int?       = null,
+        @JsonProperty("success")   val success: Int?        = null,
+        @JsonProperty("link")      val link: List<LinkItem> = emptyList()
     )
 
     data class LinkItem(
         @JsonProperty("file") val file: String? = null
     )
 
+    // Response từ /ajax/all: {"status":true,"data":"<aes_data>"}
     data class AjaxResponse(
         @JsonProperty("status") val status: Boolean? = null,
         @JsonProperty("data")   val data: String?    = null

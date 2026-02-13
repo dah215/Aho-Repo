@@ -53,7 +53,6 @@ class AnimeVietSub : MainAPI() {
         "$mainUrl/anime-bo/"                  to "Anime Bộ"
     )
 
-    // Inflate với buffer lớn, tránh lỗi cắt dữ liệu
     private fun pakoInflateRaw(data: ByteArray): ByteArray {
         val inflater = Inflater(true)
         inflater.setInput(data)
@@ -128,35 +127,50 @@ class AnimeVietSub : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        // Lần 1: thử URL gốc (trang phim hoặc trang tập)
+        // Trang phim (film page) → cần lấy danh sách tập từ trang xem
+        // Thử load trực tiếp url, nếu không có tập thì thử tap-01
         var document      = app.get(url, headers = defaultHeaders).document
-        // FIX: Selector chính xác từ HTML thực tế của site
-        // HTML: <ul class="list-episode tab-pane"><li class="episode "><a data-id="..." ...>
         var episodesNodes = document.select("ul.list-episode li a[data-id]")
 
-        // Lần 2: thử thêm /xem-phim.html nếu chưa có tập
+        // Nếu film page không có list-episode → thử load trang tập đầu tiên
         if (episodesNodes.isEmpty()) {
-            val watchUrl  = url.trimEnd('/') + "/xem-phim.html"
-            val doc2      = runCatching { app.get(watchUrl, headers = defaultHeaders).document }.getOrNull()
-            if (doc2 != null) {
-                episodesNodes = doc2.select("ul.list-episode li a[data-id]")
-                if (episodesNodes.isNotEmpty()) document = doc2
+            // Lấy href của tập đầu tiên từ bất kỳ link nào trên film page
+            val firstEpHref = document.selectFirst(
+                "a[href*='/tap-'], a.btn-episode, a.episode-link"
+            )?.attr("href")?.let {
+                if (it.startsWith("http")) it else "$mainUrl$it"
+            }
+
+            if (firstEpHref != null) {
+                val doc2 = runCatching {
+                    app.get(firstEpHref, headers = defaultHeaders).document
+                }.getOrNull()
+                if (doc2 != null) {
+                    episodesNodes = doc2.select("ul.list-episode li a[data-id]")
+                    if (episodesNodes.isNotEmpty()) document = doc2
+                }
             }
         }
 
         val episodesList = episodesNodes.mapNotNull { ep ->
             val epId   = ep.attr("data-id").trim()
             val epHash = ep.attr("data-hash").trim()
-            // data-play = "api", data-source = "du" (từ HTML thực tế)
             val epPlay = ep.attr("data-play").ifEmpty { "api" }
             val epSrc  = ep.attr("data-source").ifEmpty { "du" }
             val epName = ep.attr("title").ifEmpty { ep.text().trim() }
 
-            // Bỏ qua nút không có đủ dữ liệu
-            if (epId.isEmpty() || epHash.isEmpty()) return@mapNotNull null
+            // href của tập này, VD: https://animevietsub.ee/phim/.../tap-01-111047.html
+            // *** ĐÂY LÀ FIX QUAN TRỌNG NHẤT ***
+            // Server kiểm tra Referer — phải là URL trang TẬP, không phải trang PHIM
+            val epUrl = ep.attr("href").let {
+                if (it.startsWith("http")) it else "$mainUrl$it"
+            }
 
-            // Format: url|hash|id|source|play  (5 phần, split bằng "|")
-            newEpisode("$url|$epHash|$epId|$epSrc|$epPlay") {
+            if (epId.isEmpty() || epHash.isEmpty() || epUrl.isEmpty()) return@mapNotNull null
+
+            // Format: epUrl|hash|id|source|play
+            // parts[0] = URL trang tập (dùng làm Referer cho AJAX call)
+            newEpisode("$epUrl|$epHash|$epId|$epSrc|$epPlay") {
                 this.name    = epName
                 this.episode = Regex("\\d+").find(epName)?.value?.toIntOrNull()
             }
@@ -180,25 +194,26 @@ class AnimeVietSub : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // Format được tạo trong load(): "filmUrl|hash|epId|source|play"
+        // Format: epUrl|hash|epId|source|play
         val parts = data.split("|")
         if (parts.size < 5) return false
 
-        val referer = parts[0]  // URL trang phim, dùng làm Referer
-        val hash    = parts[1]  // data-hash
-        val epId    = parts[2]  // data-id (episode ID)
-        val source  = parts[3]  // data-source
-        val play    = parts[4]  // data-play
+        // *** FIX: parts[0] là URL trang TẬP — đây là Referer server yêu cầu ***
+        // VD: https://animevietsub.ee/phim/jujutsu-kaisen-3rd-season-a5820/tap-07-111770.html
+        val epUrl   = parts[0]
+        val hash    = parts[1]
+        val epId    = parts[2]
+        val source  = parts[3]
+        val play    = parts[4]
 
         val reqHeaders = mapOf(
-            "Referer"           to referer,
+            "Referer"           to epUrl,   // ← Referer là URL tập cụ thể
             "X-Requested-With" to "XMLHttpRequest",
             "User-Agent"        to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         )
 
-        // ── Endpoint 1: /ajax/player?v=2019a ─────────────────────────────────
-        // Từ reference code hoạt động: params = id, play, link
-        // id = episodeID (data-id), play = data-play ("api"), link = data-hash
+        // Endpoint chính: /ajax/player?v=2019a
+        // Params: id=episodeID, play=data-play, link=data-hash
         val body1 = runCatching {
             app.post(
                 "$mainUrl/ajax/player?v=2019a",
@@ -208,7 +223,7 @@ class AnimeVietSub : MainAPI() {
         }.getOrNull().orEmpty()
 
         if (body1.isNotEmpty()) {
-            // Response dạng {"success":1,"link":[{"file":"<encrypted>"}]}
+            // Parse dạng {"success":1, "link":[{"file":"<aes_encrypted>"}]}
             val enc1 = runCatching {
                 mapper.readValue<PlayerResponse>(body1)
                     .link.firstNotNullOfOrNull { it.file?.takeIf(String::isNotBlank) }
@@ -219,8 +234,7 @@ class AnimeVietSub : MainAPI() {
             }
         }
 
-        // ── Endpoint 2: /ajax/all (fallback) ─────────────────────────────────
-        // action=get_episodes_player, episode_id, server, hash
+        // Fallback: /ajax/all
         val body2 = runCatching {
             app.post(
                 "$mainUrl/ajax/all",
@@ -235,7 +249,6 @@ class AnimeVietSub : MainAPI() {
         }.getOrNull().orEmpty()
 
         if (body2.isNotEmpty()) {
-            // Thử parse dạng {status, data}
             val enc2 = runCatching {
                 mapper.readValue<AjaxResponse>(body2).data
             }.getOrNull()
@@ -244,7 +257,6 @@ class AnimeVietSub : MainAPI() {
                 if (!dec.isNullOrBlank()) return handleLink(dec, callback, subtitleCallback)
             }
 
-            // Thử parse dạng {link:[{file:...}]}
             val enc3 = runCatching {
                 mapper.readValue<PlayerResponse>(body2)
                     .link.firstNotNullOfOrNull { it.file?.takeIf(String::isNotBlank) }
@@ -279,7 +291,6 @@ class AnimeVietSub : MainAPI() {
 
     // ── Data classes ──────────────────────────────────────────────────────────
 
-    // Response từ /ajax/player?v=2019a: {"_fxStatus":1,"success":1,"link":[{"file":"<aes_data>"}]}
     data class PlayerResponse(
         @JsonProperty("_fxStatus") val fxStatus: Int?       = null,
         @JsonProperty("success")   val success: Int?        = null,
@@ -290,7 +301,6 @@ class AnimeVietSub : MainAPI() {
         @JsonProperty("file") val file: String? = null
     )
 
-    // Response từ /ajax/all: {"status":true,"data":"<aes_data>"}
     data class AjaxResponse(
         @JsonProperty("status") val status: Boolean? = null,
         @JsonProperty("data")   val data: String?    = null

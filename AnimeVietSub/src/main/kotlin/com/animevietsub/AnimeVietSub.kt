@@ -59,11 +59,11 @@ class AnimeVietSub : MainAPI() {
         return newAnimeSearchResponse(title, href, TvType.Anime) {
             this.posterUrl = if (poster?.startsWith("//") == true) "https:$poster" else poster
             
-            // FIX LỖI 66: Sử dụng hàm helper thay vì gán trực tiếp vào this.episodes
             if (epInfo.isNotEmpty()) {
+                // Sử dụng addSub thay vì gán trực tiếp để tránh lỗi Type Mismatch
                 val epNum = Regex("""\d+""").find(epInfo)?.value?.toIntOrNull()
                 if (epNum != null) {
-                    this.addSub(epNum) // Hàm này sẽ tự tạo Map <DubStatus.Subbed, Int> cho bạn
+                    this.addSub(epNum)
                 }
                 
                 if (epInfo.contains("HD", ignoreCase = true)) {
@@ -76,14 +76,21 @@ class AnimeVietSub : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page == 1) request.data else "${request.data}trang-$page.html"
         val document = app.get(url, headers = defaultHeaders).document
-        val items = document.select(".TPostMv, .TPost").mapNotNull { it.toSearchResponse() }
+        
+        // CHỐNG TRÙNG LẶP: Sử dụng distinctBy { it.url }
+        val items = document.select(".TPostMv, .TPost")
+            .mapNotNull { it.toSearchResponse() }
+            .distinctBy { it.url } 
+
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/tim-kiem/${URLEncoder.encode(query, "utf-8")}/"
         return app.get(url, headers = defaultHeaders).document
-            .select(".TPostMv, .TPost").mapNotNull { it.toSearchResponse() }
+            .select(".TPostMv, .TPost")
+            .mapNotNull { it.toSearchResponse() }
+            .distinctBy { it.url } // Chống trùng lặp khi tìm kiếm
     }
 
     override suspend fun load(url: String): LoadResponse {

@@ -5,6 +5,7 @@ import com.fasterxml.jackson.annotation.JsonProperty
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
@@ -38,12 +39,15 @@ class AnimeVietSub : MainAPI() {
         private const val DECODE_PASSWORD = "dm_thang_suc_vat_get_link_an_dbt"
     }
 
+    // *** FIX CHÍNH: CloudflareKiller để bypass Cloudflare protection ***
+    // Không có cái này, POST /ajax/player trả về trang CF challenge thay vì JSON
+    private val cfKiller = CloudflareKiller()
+
     private val mapper = jacksonObjectMapper()
 
     private val defaultHeaders = mapOf(
-        "User-Agent"        to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Referer"           to "$mainUrl/",
-        "X-Requested-With" to "XMLHttpRequest"
+        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Referer"    to "$mainUrl/"
     )
 
     override val mainPage = mainPageOf(
@@ -111,7 +115,7 @@ class AnimeVietSub : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url   = if (page == 1) request.data else "${request.data}trang-$page.html"
-        val doc   = app.get(url, headers = defaultHeaders).document
+        val doc   = app.get(url, interceptor = cfKiller, headers = defaultHeaders).document
         val items = doc.select(".TPostMv, .TPost")
             .mapNotNull { it.toSearchResponse() }
             .distinctBy { it.url.trimEnd('/') }
@@ -120,30 +124,23 @@ class AnimeVietSub : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/tim-kiem/${URLEncoder.encode(query, "utf-8")}/"
-        return app.get(url, headers = defaultHeaders).document
+        return app.get(url, interceptor = cfKiller, headers = defaultHeaders).document
             .select(".TPostMv, .TPost")
             .mapNotNull { it.toSearchResponse() }
             .distinctBy { it.url.trimEnd('/') }
     }
 
     override suspend fun load(url: String): LoadResponse {
-        // Trang phim (film page) → cần lấy danh sách tập từ trang xem
-        // Thử load trực tiếp url, nếu không có tập thì thử tap-01
-        var document      = app.get(url, headers = defaultHeaders).document
+        var document      = app.get(url, interceptor = cfKiller, headers = defaultHeaders).document
         var episodesNodes = document.select("ul.list-episode li a[data-id]")
 
-        // Nếu film page không có list-episode → thử load trang tập đầu tiên
         if (episodesNodes.isEmpty()) {
-            // Lấy href của tập đầu tiên từ bất kỳ link nào trên film page
-            val firstEpHref = document.selectFirst(
-                "a[href*='/tap-'], a.btn-episode, a.episode-link"
-            )?.attr("href")?.let {
-                if (it.startsWith("http")) it else "$mainUrl$it"
-            }
+            val firstEpHref = document.selectFirst("a[href*='/tap-'], a.btn-episode, a.episode-link")
+                ?.attr("href")?.let { if (it.startsWith("http")) it else "$mainUrl$it" }
 
             if (firstEpHref != null) {
                 val doc2 = runCatching {
-                    app.get(firstEpHref, headers = defaultHeaders).document
+                    app.get(firstEpHref, interceptor = cfKiller, headers = defaultHeaders).document
                 }.getOrNull()
                 if (doc2 != null) {
                     episodesNodes = doc2.select("ul.list-episode li a[data-id]")
@@ -158,18 +155,13 @@ class AnimeVietSub : MainAPI() {
             val epPlay = ep.attr("data-play").ifEmpty { "api" }
             val epSrc  = ep.attr("data-source").ifEmpty { "du" }
             val epName = ep.attr("title").ifEmpty { ep.text().trim() }
-
-            // href của tập này, VD: https://animevietsub.ee/phim/.../tap-01-111047.html
-            // *** ĐÂY LÀ FIX QUAN TRỌNG NHẤT ***
-            // Server kiểm tra Referer — phải là URL trang TẬP, không phải trang PHIM
-            val epUrl = ep.attr("href").let {
+            val epUrl  = ep.attr("href").let {
                 if (it.startsWith("http")) it else "$mainUrl$it"
             }
 
             if (epId.isEmpty() || epHash.isEmpty() || epUrl.isEmpty()) return@mapNotNull null
 
             // Format: epUrl|hash|id|source|play
-            // parts[0] = URL trang tập (dùng làm Referer cho AJAX call)
             newEpisode("$epUrl|$epHash|$epId|$epSrc|$epPlay") {
                 this.name    = epName
                 this.episode = Regex("\\d+").find(epName)?.value?.toIntOrNull()
@@ -194,36 +186,44 @@ class AnimeVietSub : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // Format: epUrl|hash|epId|source|play
         val parts = data.split("|")
         if (parts.size < 5) return false
 
-        // *** FIX: parts[0] là URL trang TẬP — đây là Referer server yêu cầu ***
-        // VD: https://animevietsub.ee/phim/jujutsu-kaisen-3rd-season-a5820/tap-07-111770.html
-        val epUrl   = parts[0]
-        val hash    = parts[1]
-        val epId    = parts[2]
-        val source  = parts[3]
-        val play    = parts[4]
+        val epUrl  = parts[0]  // URL trang tập — làm Referer
+        val hash   = parts[1]  // data-hash
+        val epId   = parts[2]  // data-id
+        val source = parts[3]  // data-source
+        val play   = parts[4]  // data-play
 
-        val reqHeaders = mapOf(
-            "Referer"           to epUrl,   // ← Referer là URL tập cụ thể
-            "X-Requested-With" to "XMLHttpRequest",
-            "User-Agent"        to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        // *** BƯỚC 1: GET trang tập trước để CF cookies được set ***
+        // Không có bước này, POST tiếp theo sẽ bị CF chặn
+        runCatching {
+            app.get(
+                epUrl,
+                interceptor = cfKiller,
+                headers     = defaultHeaders
+            )
+        }
+
+        // *** BƯỚC 2: POST /ajax/player?v=2019a với CF cookies vừa lấy ***
+        // Đây là endpoint thực tế từ avs.watch.js
+        // Params: id=episodeID, play=data-play, link=data-hash
+        val ajaxHeaders = mapOf(
+            "User-Agent"        to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "X-Requested-With" to "XMLHttpRequest"
         )
 
-        // Endpoint chính: /ajax/player?v=2019a
-        // Params: id=episodeID, play=data-play, link=data-hash
         val body1 = runCatching {
             app.post(
                 "$mainUrl/ajax/player?v=2019a",
-                data    = mapOf("id" to epId, "play" to play, "link" to hash),
-                headers = reqHeaders
+                data        = mapOf("id" to epId, "play" to play, "link" to hash),
+                interceptor = cfKiller,
+                referer     = epUrl,
+                headers     = ajaxHeaders
             ).text
         }.getOrNull().orEmpty()
 
-        if (body1.isNotEmpty()) {
-            // Parse dạng {"success":1, "link":[{"file":"<aes_encrypted>"}]}
+        if (body1.isNotEmpty() && !body1.startsWith("<")) {
             val enc1 = runCatching {
                 mapper.readValue<PlayerResponse>(body1)
                     .link.firstNotNullOfOrNull { it.file?.takeIf(String::isNotBlank) }
@@ -234,21 +234,23 @@ class AnimeVietSub : MainAPI() {
             }
         }
 
-        // Fallback: /ajax/all
+        // *** BƯỚC 3: Fallback /ajax/all ***
         val body2 = runCatching {
             app.post(
                 "$mainUrl/ajax/all",
-                data    = mapOf(
+                data        = mapOf(
                     "action"     to "get_episodes_player",
                     "episode_id" to epId,
                     "server"     to source,
                     "hash"       to hash
                 ),
-                headers = reqHeaders
+                interceptor = cfKiller,
+                referer     = epUrl,
+                headers     = ajaxHeaders
             ).text
         }.getOrNull().orEmpty()
 
-        if (body2.isNotEmpty()) {
+        if (body2.isNotEmpty() && !body2.startsWith("<")) {
             val enc2 = runCatching {
                 mapper.readValue<AjaxResponse>(body2).data
             }.getOrNull()

@@ -278,7 +278,6 @@ class AnimeVietSub : MainAPI() {
         val aH = ajaxH(epUrl)
         val cookies = mutableMapOf<String, String>()
 
-        // CRITICAL: Pre-fetch main page to get fresh cookies/tokens
         try {
             val mainRes = app.get(mainUrl, interceptor = cfKiller, headers = baseHeaders)
             cookies.putAll(mainRes.cookies)
@@ -317,12 +316,12 @@ class AnimeVietSub : MainAPI() {
             rssStrategy(filmId, candidates, aH, cookies, vH, subtitleCallback, callback)
         } ?: false
 
-        // STRATEGY B: Official AJAX API
+        // STRATEGY B: Official AJAX API with user-provided payload logic
         if (!found) found = withTimeoutOrNull(15_000L) {
             ajaxStrategy(epUrl, filmId, candidates, cookies, aH, vH, subtitleCallback, callback)
         } ?: false
         
-        // STRATEGY C: Page scraping
+        // STRATEGY C: Page scraping for embedded players
         if (!found) found = withTimeoutOrNull(8_000L) {
             pageStrategy(pageBody, epUrl, vH, subtitleCallback, callback)
         } ?: false
@@ -365,33 +364,20 @@ class AnimeVietSub : MainAPI() {
     ): Boolean {
         for (epId in candidates) {
             try {
-                val r1 = app.post("$mainUrl/ajax/player",
-                    data = mapOf("episodeId" to epId, "backup" to "1"),
-                    headers = aH, cookies = cookies, interceptor = cfKiller)
-                cookies.putAll(r1.cookies)
-                val raw1 = r1.text ?: continue
-
-                val html = try {
-                    @Suppress("UNCHECKED_CAST")
-                    (mapper.readValue(raw1, Map::class.java) as Map<String, Any?>)["html"]?.toString()
-                } catch (_: Exception) { null } ?: raw1
-
-                val doc = Jsoup.parse(html)
+                // Try multiple parameter combinations including the new 'link' payload found by user
+                val doc = Jsoup.parse(app.get(epUrl, headers = baseHeaders, cookies = cookies, interceptor = cfKiller).text ?: "")
                 val btns = doc.select("a.btn3dsv,a[data-href],a[data-play],.server-item a,.btn-server,li[data-id] a,button[data-href],a[data-link]")
-
-                if (btns.isEmpty()) {
-                    if (processPlayerResponse(raw1, epUrl, vH, sub, cb)) return true
-                }
 
                 for (btn in btns) {
                     val hash = (btn.attr("data-href").ifBlank { btn.attr("data-link").ifBlank { btn.attr("href") } }).trim()
                     val play = btn.attr("data-play").trim()
                     val btnId = btn.attr("data-id").trim().ifBlank { epId }
-                    if (hash.isBlank()) continue
+                    if (hash.isBlank() || hash == "#") continue
 
                     if (hash.startsWith("http")) { if (emit(hash, vH, sub, cb)) return true; continue }
 
                     val paramSets = listOf(
+                        mapOf("link" to hash, "id" to filmId), // User's found payload
                         mapOf("link" to hash, "id" to btnId, "play" to play),
                         mapOf("link" to hash, "id" to epId, "play" to play),
                         mapOf("link" to hash, "episodeId" to epId)
@@ -476,7 +462,12 @@ class AnimeVietSub : MainAPI() {
         val ref = headers["Referer"] ?: mainUrl
         log("EMIT", clean)
         
-        // CRITICAL: Ensure headers are sent with the stream request to bypass server checks
+        // CRITICAL: Bypass Google Storage Chunks if they are causing load issues
+        if (clean.contains("storage.googleapiscdn.com") && clean.contains("video")) {
+            log("EMIT", "Skipping potential broken Google chunk link")
+            return false
+        }
+
         val streamHeaders = headers.toMutableMap().apply {
             put("Referer", ref)
             put("Origin", mainUrl)
@@ -488,7 +479,7 @@ class AnimeVietSub : MainAPI() {
 
         return try {
             when {
-                clean.contains(".m3u8") || clean.contains("storage.googleapiscdn.com") -> {
+                clean.contains(".m3u8") -> {
                     cb(newExtractorLink(name, name, clean) {
                         this.referer = ref; this.quality = Qualities.Unknown.value
                         this.type = ExtractorLinkType.M3U8; this.headers = streamHeaders

@@ -36,12 +36,10 @@ class AnimeVietSub : MainAPI() {
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA)
 
     companion object {
-        // Mật khẩu giải mã (có thể thay đổi theo thời gian)
         private const val DECODE_PASSWORD = "dm_thang_suc_vat_get_link_an_dbt"
     }
 
     private val cfKiller = CloudflareKiller()
-    // Cập nhật User-Agent mới hơn
     private val ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
     private val defaultHeaders = mapOf(
@@ -50,21 +48,12 @@ class AnimeVietSub : MainAPI() {
         "Accept-Language" to "vi-VN,vi;q=0.9,en;q=0.8"
     )
 
-    override val mainPage = mainPageOf(
-        "$mainUrl/danh-sach/list-dang-chieu/" to "Đang Chiếu",
-        "$mainUrl/danh-sach/list-tron-bo/"    to "Trọn Bộ",
-        "$mainUrl/anime-le/"                  to "Anime Lẻ",
-        "$mainUrl/anime-bo/"                  to "Anime Bộ"
-    )
-
     // ─────────────────────────────────────────────────────────────────────────
-    // DECRYPT: AES-256-CBC + pako.inflateRaw
+    // DECRYPT
     // ─────────────────────────────────────────────────────────────────────────
     private fun decryptLink(aes: String): String? {
         return try {
-            // Nếu chuỗi bắt đầu bằng http, có thể nó không bị mã hóa
             if (aes.startsWith("http")) return aes
-
             val cleaned = aes.replace(Regex("\\s"), "")
             val key     = MessageDigest.getInstance("SHA-256")
                             .digest(DECODE_PASSWORD.toByteArray(StandardCharsets.UTF_8))
@@ -77,10 +66,7 @@ class AnimeVietSub : MainAPI() {
             val plain  = cipher.doFinal(ct)
             String(pakoInflateRaw(plain), StandardCharsets.UTF_8)
                 .replace("\\n", "\n").replace("\"", "").trim()
-        } catch (e: Exception) { 
-            // e.printStackTrace() 
-            null 
-        }
+        } catch (e: Exception) { null }
     }
 
     private fun pakoInflateRaw(data: ByteArray): ByteArray {
@@ -94,8 +80,8 @@ class AnimeVietSub : MainAPI() {
                 if (n == 0) break
                 out.write(buf, 0, n)
             }
-        } catch (e: Exception) {
-            // Ignore inflate errors
+        } catch (e: Exception) { 
+            // Ignore
         } finally { inflater.end() }
         return out.toByteArray()
     }
@@ -171,7 +157,7 @@ class AnimeVietSub : MainAPI() {
         }
     }
 
-    // ── Load Links (FIXED) ────────────────────────────────────────────────────
+    // ── Load Links (FIXED & ROBUST) ───────────────────────────────────────────
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -184,7 +170,6 @@ class AnimeVietSub : MainAPI() {
         val filmId    = parts[1]
         val episodeId = parts[2]
 
-        // Warm CF cookies
         runCatching { app.get(epUrl, interceptor = cfKiller, headers = defaultHeaders) }
 
         val ajaxHeaders = mapOf(
@@ -195,7 +180,7 @@ class AnimeVietSub : MainAPI() {
             "User-Agent"       to ua
         )
 
-        // BƯỚC 1: Lấy FRESH hash
+        // BƯỚC 1: Lấy FRESH hash (Luôn dùng episodeId)
         val step1 = runCatching {
             app.post(
                 "$mainUrl/ajax/player",
@@ -208,8 +193,6 @@ class AnimeVietSub : MainAPI() {
 
         val serverHtml = step1?.html ?: return false
         val serverDoc  = Jsoup.parse(serverHtml)
-
-        // Ưu tiên server "api" (DU)
         val prefServer = serverDoc.selectFirst("a.btn3dsv[data-play=api]")
             ?: serverDoc.selectFirst("a.btn3dsv")
             ?: return false
@@ -218,43 +201,34 @@ class AnimeVietSub : MainAPI() {
         val serverPlay = prefServer.attr("data-play").trim().ifEmpty { "api" }
         val serverBtnId = prefServer.attr("data-id").trim()
 
-        // BƯỚC 2: Lấy link (FIX: Thử dùng episodeId hoặc serverBtnId thay vì filmId)
-        // Nhiều site đã đổi logic: api cần episodeId hoặc serverBtnId
-        val step2Params = when (serverPlay) {
-            "api"  -> mapOf("link" to freshHash, "id" to episodeId) // FIX: Dùng episodeId thay vì filmId
-            else   -> mapOf("link" to freshHash, "play" to serverPlay, "id" to serverBtnId, "backuplinks" to "1")
+        // BƯỚC 2: Lấy link (Thử filmId trước, nếu lỗi thì thử episodeId)
+        suspend fun fetchLink(idToUse: String): PlayerResp? {
+            val params = when (serverPlay) {
+                "api"  -> mapOf("link" to freshHash, "id" to idToUse)
+                else   -> mapOf("link" to freshHash, "play" to serverPlay, "id" to serverBtnId, "backuplinks" to "1")
+            }
+            return runCatching {
+                app.post("$mainUrl/ajax/player", data = params, interceptor = cfKiller, referer = epUrl, headers = ajaxHeaders)
+                    .parsedSafe<PlayerResp>()
+            }.getOrNull()
         }
 
-        val step2Resp = runCatching {
-            app.post(
-                "$mainUrl/ajax/player",
-                data        = step2Params,
-                interceptor = cfKiller,
-                referer     = epUrl,
-                headers     = ajaxHeaders
-            )
-        }.getOrNull() ?: return false
-
-        val body = step2Resp.text.trim()
-        if (body.isBlank() || body.startsWith("<")) return false
-
-        val parsed = step2Resp.parsedSafe<PlayerResp>() ?: return false
+        // Thử lần 1 với filmId (Logic chuẩn cũ)
+        var parsed = fetchLink(filmId)
         
-        // Kiểm tra cả fxStatus và success
-        if (parsed.fxStatus != 1 && parsed.success != 1) return false
+        // Nếu thất bại, thử lần 2 với episodeId (Logic mới/fallback)
+        if (parsed == null || (parsed.fxStatus != 1 && parsed.success != 1)) {
+            parsed = fetchLink(episodeId)
+        }
+
+        if (parsed == null || (parsed.fxStatus != 1 && parsed.success != 1)) return false
 
         return when (serverPlay) {
             "api" -> {
                 val enc = parsed.linkArray?.firstNotNullOfOrNull { it.file?.takeIf(String::isNotBlank) }
                     ?: return false
-                
-                // FIX: Kiểm tra nếu link không bị mã hóa (bắt đầu bằng http)
-                if (enc.startsWith("http")) {
-                    handleDecrypted(enc, epUrl, callback, subtitleCallback)
-                } else {
-                    val dec = decryptLink(enc) ?: return false
-                    handleDecrypted(dec, epUrl, callback, subtitleCallback)
-                }
+                val dec = decryptLink(enc) ?: return false
+                handleDecrypted(dec, epUrl, callback, subtitleCallback)
             }
             else -> {
                 val direct = parsed.linkString?.takeIf { it.startsWith("http") } ?: return false
@@ -271,31 +245,45 @@ class AnimeVietSub : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit
     ): Boolean {
         val link = dec.trim()
+        // Headers quan trọng để tránh lỗi Malformed Manifest
+        val videoHeaders = mapOf(
+            "User-Agent" to ua,
+            "Referer"    to "$mainUrl/",
+            "Origin"     to mainUrl
+        )
+
         return when {
             link.startsWith("http") && link.contains(".m3u8") -> {
-                M3u8Helper.generateM3u8(name, link, referer).forEach(callback); true
+                // Thử parse bằng M3u8Helper và gán headers
+                val links = M3u8Helper.generateM3u8(name, link, "$mainUrl/")
+                if (links.isNotEmpty()) {
+                    links.forEach { 
+                        it.headers = videoHeaders
+                        callback(it) 
+                    }
+                } else {
+                    // Fallback: Nếu parse thất bại, add link trực tiếp
+                    callback(newExtractorLink(name, name, link) {
+                        this.headers = videoHeaders
+                        this.type = ExtractorLinkType.M3U8
+                    })
+                }
+                true
             }
             link.startsWith("#EXTM3U") -> {
-                // Xử lý nội dung M3U8 raw
-                var lastUrl: String? = null
                 link.lines().forEach { line ->
                     if (line.startsWith("http")) {
-                        lastUrl = line.trim()
-                        callback(newExtractorLink(name, name, lastUrl!!) {
-                            this.referer = referer
+                        callback(newExtractorLink(name, name, line.trim()) {
+                            this.headers = videoHeaders
                             this.type = ExtractorLinkType.M3U8
                         })
                     }
                 }
-                lastUrl != null
-            }
-            link.startsWith("http") -> { loadExtractor(link, referer, subtitleCallback, callback); true }
-            link.contains("\n") -> {
-                link.lines().filter { it.startsWith("http") }.forEach { u ->
-                    if (u.contains(".m3u8")) M3u8Helper.generateM3u8(name, u, referer).forEach(callback)
-                    else loadExtractor(u, referer, subtitleCallback, callback)
-                }
                 true
+            }
+            link.startsWith("http") -> { 
+                loadExtractor(link, referer, subtitleCallback, callback)
+                true 
             }
             else -> false
         }

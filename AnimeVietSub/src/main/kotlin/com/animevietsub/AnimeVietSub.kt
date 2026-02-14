@@ -129,9 +129,9 @@ class AnimeVietSub : MainAPI() {
         if (parts.size < 3) return false
         val (epUrl, filmId, episodeId) = parts
 
-        // 1. Khởi tạo Session (Lấy Cookie)
+        // 1. Khởi tạo Session (Lấy Cookie ban đầu)
         val pageReq = app.get(epUrl, interceptor = cfKiller, headers = defaultHeaders)
-        val cookies = pageReq.cookies
+        var cookies = pageReq.cookies
 
         val ajaxHeaders = mapOf(
             "X-Requested-With" to "XMLHttpRequest",
@@ -142,9 +142,11 @@ class AnimeVietSub : MainAPI() {
             "Accept"           to "application/json, text/javascript, */*; q=0.01"
         )
 
-        // 2. Bước 1: Lấy Hash
-        val step1 = app.post("$mainUrl/ajax/player", data = mapOf("episodeId" to episodeId, "backup" to "1"), 
-                             headers = ajaxHeaders, cookies = cookies, interceptor = cfKiller).parsedSafe<ServerSelectionResp>() ?: return false
+        // 2. Bước 1: Lấy Hash (player request 1)
+        val step1Req = app.post("$mainUrl/ajax/player", data = mapOf("episodeId" to episodeId, "backup" to "1"), 
+                             headers = ajaxHeaders, cookies = cookies, interceptor = cfKiller)
+        cookies = cookies + step1Req.cookies // Cập nhật cookie
+        val step1 = step1Req.parsedSafe<ServerSelectionResp>() ?: return false
 
         val serverDoc = Jsoup.parse(step1.html ?: "")
         val btn = serverDoc.selectFirst("a.btn3dsv[data-play=api]") ?: serverDoc.selectFirst("a.btn3dsv") ?: return false
@@ -153,10 +155,12 @@ class AnimeVietSub : MainAPI() {
         val btnId = btn.attr("data-id")
 
         // 3. Bước 2: Kích hoạt Session (get_episode - CỰC KỲ QUAN TRỌNG)
-        app.get("$mainUrl/ajax/get_episode?filmId=$filmId&episodeId=$episodeId", 
+        // Đây là bước "Hack" để server tin rằng bạn là người dùng thật
+        val activeReq = app.get("$mainUrl/ajax/get_episode?filmId=$filmId&episodeId=$episodeId", 
                 headers = ajaxHeaders, cookies = cookies, interceptor = cfKiller)
+        cookies = cookies + activeReq.cookies
 
-        // 4. Bước 3: Lấy Link mã hóa (Thử cả filmId và episodeId)
+        // 4. Bước 3: Lấy Link mã hóa (player request 2 - Thử cả filmId và episodeId)
         val idsToTry = listOf(filmId, episodeId)
         var finalDecrypted: String? = null
 
@@ -164,14 +168,17 @@ class AnimeVietSub : MainAPI() {
             val params = if (play == "api") mapOf("link" to hash, "id" to id)
                          else mapOf("link" to hash, "play" to play, "id" to btnId, "backuplinks" to "1")
             
-            val step2 = app.post("$mainUrl/ajax/player", data = params, headers = ajaxHeaders, cookies = cookies, interceptor = cfKiller)
-            val parsed = step2.parsedSafe<PlayerResp>()
+            val step2Req = app.post("$mainUrl/ajax/player", data = params, headers = ajaxHeaders, cookies = cookies, interceptor = cfKiller)
+            val parsed = step2Req.parsedSafe<PlayerResp>()
             
             if (play == "api") {
                 val enc = parsed?.linkArray?.firstOrNull()?.file
                 if (enc != null) {
                     finalDecrypted = decryptLink(enc)
-                    if (finalDecrypted != null && finalDecrypted.startsWith("http")) break
+                    if (finalDecrypted != null && finalDecrypted.startsWith("http")) {
+                        cookies = cookies + step2Req.cookies
+                        break
+                    }
                 }
             } else {
                 val direct = parsed?.linkString
@@ -196,15 +203,14 @@ class AnimeVietSub : MainAPI() {
         var realUrl = decrypted
         if (decrypted.startsWith("http") && !decrypted.contains(".m3u8")) {
             runCatching {
-                // Thực hiện tối đa 5 lần redirect để tìm link m3u8
                 var currentUrl = decrypted
-                for (i in 1..5) {
+                for (i in 1..5) { // Thử tối đa 5 lần redirect
                     val res = app.get(currentUrl, headers = videoHeaders, cookies = cookies, interceptor = cfKiller)
-                    currentUrl = res.url
-                    if (currentUrl.contains(".m3u8")) {
-                        realUrl = currentUrl
+                    if (res.url.contains(".m3u8")) {
+                        realUrl = res.url
                         break
                     }
+                    currentUrl = res.url
                 }
             }
         }

@@ -143,8 +143,7 @@ class AnimeVietSub : MainAPI() {
         "Accept-Language" to "vi-VN,vi;q=0.9,en;q=0.8",
         "Sec-Fetch-Dest" to "document",
         "Sec-Fetch-Mode" to "navigate",
-        "Sec-Fetch-Site" to "none",
-        "Priority" to "u=0, i"
+        "Sec-Fetch-Site" to "none"
     )
 
     private fun ajaxH(ref: String) = mapOf(
@@ -297,24 +296,50 @@ class AnimeVietSub : MainAPI() {
 
         var found = false
 
-        // STRATEGY A: Official AJAX API with NEW logic
-        found = withTimeoutOrNull(25_000L) {
+        // STRATEGY A: RSS/XML get_episode API (NEW DEFINITIVE FIX)
+        found = withTimeoutOrNull(20_000L) {
+            rssStrategy(filmId, candidates, aH, cookies, vH, subtitleCallback, callback)
+        } ?: false
+
+        // STRATEGY B: Official AJAX API
+        if (!found) found = withTimeoutOrNull(15_000L) {
             ajaxStrategy(epUrl, filmId, candidates, cookies, aH, vH, subtitleCallback, callback)
         } ?: false
         
-        if (!found) found = withTimeoutOrNull(10_000L) {
+        if (!found) found = withTimeoutOrNull(8_000L) {
             pageStrategy(pageBody, epUrl, vH, subtitleCallback, callback)
         } ?: false
 
-        if (!found) found = withTimeoutOrNull(8_000L) {
-            jsStrategy(pageBody, epUrl, vH, subtitleCallback, callback)
-        } ?: false
-
-        if (!found) found = withTimeoutOrNull(10_000L) {
-            mineStrategy(pageBody, epUrl, vH, subtitleCallback, callback)
-        } ?: false
-
         return found
+    }
+
+    private suspend fun rssStrategy(
+        filmId: String, candidates: List<String>,
+        aH: Map<String, String>, cookies: Map<String, String>,
+        vH: Map<String, String>, sub: (SubtitleFile) -> Unit, cb: (ExtractorLink) -> Unit
+    ): Boolean {
+        for (epId in candidates) {
+            log("RSS", "Trying epId=$epId")
+            try {
+                val res = app.get("$mainUrl/ajax/get_episode?filmId=$filmId&episodeId=$epId",
+                    headers = aH, cookies = cookies, interceptor = cfKiller).text ?: continue
+                
+                if (res.contains("<file>")) {
+                    val encrypted = res.substringAfter("<file>").substringBefore("</file>")
+                    if (encrypted.isNotBlank()) {
+                        log("RSS", "Found encrypted file in RSS")
+                        val decrypted = Crypto.decrypt(encrypted)
+                        if (decrypted != null && emit(decrypted, vH, sub, cb)) return true
+                    }
+                }
+                
+                // Also check for direct links in RSS
+                Regex("""<file><!\[CDATA\[(https?://[^\]]+)\]\]></file>""").find(res)?.groupValues?.get(1)?.let {
+                    if (emit(it, vH, sub, cb)) return true
+                }
+            } catch (e: Exception) { log("RSS", "Error: ${e.message}") }
+        }
+        return false
     }
 
     private suspend fun ajaxStrategy(
@@ -324,16 +349,7 @@ class AnimeVietSub : MainAPI() {
         sub: (SubtitleFile) -> Unit, cb: (ExtractorLink) -> Unit
     ): Boolean {
         for (epId in candidates) {
-            log("AJAX", "Trying epId=$epId")
             try {
-                // Pre-fetch get_episode to set session
-                runCatching {
-                    app.get("$mainUrl/ajax/get_episode?filmId=$filmId&episodeId=$epId",
-                        headers = aH, cookies = cookies, interceptor = cfKiller)
-                        .also { cookies.putAll(it.cookies) }
-                }
-
-                // Step 1: Get player HTML
                 val r1 = app.post("$mainUrl/ajax/player",
                     data = mapOf("episodeId" to epId, "backup" to "1"),
                     headers = aH, cookies = cookies, interceptor = cfKiller)
@@ -350,7 +366,6 @@ class AnimeVietSub : MainAPI() {
 
                 if (btns.isEmpty()) {
                     if (processPlayerResponse(raw1, epUrl, vH, sub, cb)) return true
-                    if (tryUrlsFrom(html, epUrl, vH, sub, cb)) return true
                 }
 
                 for (btn in btns) {
@@ -361,12 +376,9 @@ class AnimeVietSub : MainAPI() {
 
                     if (hash.startsWith("http")) { if (emit(hash, vH, sub, cb)) return true; continue }
 
-                    // Try multiple parameter combinations for the new API
                     val paramSets = listOf(
                         mapOf("link" to hash, "id" to btnId, "play" to play),
                         mapOf("link" to hash, "id" to epId, "play" to play),
-                        mapOf("link" to hash, "id" to filmId, "play" to play),
-                        mapOf("link" to hash, "id" to btnId),
                         mapOf("link" to hash, "episodeId" to epId)
                     )
 
@@ -378,7 +390,7 @@ class AnimeVietSub : MainAPI() {
                         } catch (_: Exception) {}
                     }
                 }
-            } catch (e: Exception) { log("AJAX", "Error: ${e.message}") }
+            } catch (_: Exception) {}
         }
         return false
     }
@@ -391,28 +403,14 @@ class AnimeVietSub : MainAPI() {
         try {
             @Suppress("UNCHECKED_CAST")
             val j = mapper.readValue(raw, Map::class.java) as Map<String, Any?>
-            
             val lnk = j["link"] ?: j["url"] ?: j["stream"] ?: j["file"]
             if (lnk is String && lnk.isNotBlank()) {
                 if (lnk.startsWith("http") && emit(lnk, vH, sub, cb)) return true
                 Crypto.decrypt(lnk)?.let { if (emit(it, vH, sub, cb)) return true }
             }
-
-            if (lnk is List<*>) {
-                for (item in lnk.filterIsInstance<Map<String, Any?>>()) {
-                    val file = (item["file"] ?: item["src"] ?: item["url"])?.toString() ?: continue
-                    if (file.startsWith("http")) { if (emit(file, vH, sub, cb)) return true; continue }
-                    Crypto.decrypt(file)?.let { if (emit(it, vH, sub, cb)) return true }
-                }
-            }
         } catch (_: Exception) {}
 
         if (tryUrlsFrom(raw, epUrl, vH, sub, cb)) return true
-        
-        val trimmed = raw.trim()
-        if (!trimmed.startsWith("{") && !trimmed.startsWith("[") && !trimmed.startsWith("<")) {
-            Crypto.decrypt(trimmed)?.let { if (emit(it, vH, sub, cb)) return true }
-        }
         return false
     }
 
@@ -425,41 +423,11 @@ class AnimeVietSub : MainAPI() {
             val src = fixUrl(el.attr("src").ifBlank { el.attr("data-src") }) ?: continue
             try { loadExtractor(src, epUrl, sub, cb); return true } catch (_: Exception) {}
         }
-        for (el in doc.select("video source[src],video[src]")) {
-            val s = fixUrl(el.attr("src")) ?: continue
-            if (emit(s, vH, sub, cb)) return true
-        }
         for (el in doc.select("[data-file],[data-url],[data-source],[data-stream]")) {
             val raw = listOf("data-file","data-url","data-source","data-stream")
                 .firstNotNullOfOrNull { a -> el.attr(a).takeIf { it.isNotBlank() } } ?: continue
             if (raw.startsWith("http") && emit(raw, vH, sub, cb)) return true
             Crypto.decrypt(raw)?.let { if (emit(it, vH, sub, cb)) return true }
-        }
-        return false
-    }
-
-    private suspend fun jsStrategy(
-        body: String, epUrl: String, vH: Map<String, String>,
-        sub: (SubtitleFile) -> Unit, cb: (ExtractorLink) -> Unit
-    ): Boolean {
-        val doc = try { Jsoup.parse(body) } catch (_: Exception) { return false }
-        for (script in doc.select("script:not([src])").map { it.html() }.filter { it.length > 30 }) {
-            val up = unpackJS(script)
-            if (tryUrlsFrom(up, epUrl, vH, sub, cb)) return true
-            for (m in Regex("""["']([A-Za-z0-9+/]{40,}={0,2})["']""").findAll(up)) {
-                Crypto.decrypt(m.groupValues[1])?.let { if (emit(it, vH, sub, cb)) return true }
-            }
-        }
-        return false
-    }
-
-    private suspend fun mineStrategy(
-        body: String, epUrl: String, vH: Map<String, String>,
-        sub: (SubtitleFile) -> Unit, cb: (ExtractorLink) -> Unit
-    ): Boolean {
-        if (tryUrlsFrom(body, epUrl, vH, sub, cb)) return true
-        for (m in Regex("""(?:file|link|source|url|enc)\s*[:=]\s*["']([A-Za-z0-9+/]{24,}={0,2})["']""").findAll(body)) {
-            Crypto.decrypt(m.groupValues[1])?.let { if (emit(it, vH, sub, cb)) return true }
         }
         return false
     }
@@ -482,24 +450,6 @@ class AnimeVietSub : MainAPI() {
         if (url.startsWith("http")) return url
         if (url.startsWith("//")) return "https:$url"
         return try { URL(URL(base), url).toString() } catch (_: Exception) { url }
-    }
-
-    private fun unpackJS(js: String): String {
-        var r = js
-        repeat(3) {
-            Regex("""\}\s*\(\s*['"]([^'"]+)['"]\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*['"]([^'"]+)['"]\s*,""")
-                .find(r)?.let { m ->
-                    try {
-                        val p = m.groupValues[1]; val a = m.groupValues[2].toInt()
-                        val c = m.groupValues[3].toInt(); val k = m.groupValues[4].split("|")
-                        var res = p
-                        for (i in c - 1 downTo 0) if (i < k.size && k[i].isNotEmpty())
-                            res = res.replace(Regex("\\b${i.toString(a)}\\b"), k[i])
-                        r = res; return@repeat
-                    } catch (_: Exception) {}
-                }
-        }
-        return r
     }
 
     private suspend fun emit(

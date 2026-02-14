@@ -140,7 +140,7 @@ class AnimeVietSub : MainAPI() {
         if (parts.size < 3) return false
         val (epUrl, filmId, episodeId) = parts
 
-        // 1. Khởi tạo Session và lấy Cookie
+        // 1. Lấy Cookie phiên làm việc
         val pageReq = app.get(epUrl, interceptor = cfKiller, headers = defaultHeaders)
         val cookies = pageReq.cookies
 
@@ -150,16 +150,10 @@ class AnimeVietSub : MainAPI() {
             "Referer"          to epUrl,
             "Origin"           to mainUrl,
             "User-Agent"       to ua,
-            "Accept"           to "application/json, text/javascript, */*; q=0.01",
-            "Sec-Fetch-Mode"   to "cors",
-            "Sec-Fetch-Site"   to "same-origin"
+            "Accept"           to "application/json, text/javascript, */*; q=0.01"
         )
 
-        // 2. Gọi get_episode (Dựa trên log của bạn - Rất quan trọng để tránh lỗi 2001)
-        app.get("$mainUrl/ajax/get_episode?filmId=$filmId&episodeId=$episodeId", 
-                headers = ajaxHeaders, cookies = cookies, interceptor = cfKiller)
-
-        // 3. Bước 1: Lấy Hash
+        // 2. Bước 1: Lấy Hash (player request đầu tiên)
         val step1 = app.post(
             "$mainUrl/ajax/player",
             data = mapOf("episodeId" to episodeId, "backup" to "1"),
@@ -174,7 +168,11 @@ class AnimeVietSub : MainAPI() {
         val play = btn.attr("data-play")
         val btnId = btn.attr("data-id")
 
-        // 4. Bước 2: Lấy Link mã hóa
+        // 3. Kích hoạt tập phim (Dựa trên log get_episode của bạn)
+        app.get("$mainUrl/ajax/get_episode?filmId=$filmId&episodeId=$episodeId", 
+                headers = ajaxHeaders, cookies = cookies, interceptor = cfKiller)
+
+        // 4. Bước 2: Lấy Link mã hóa (player request thứ hai)
         val params = if (play == "api") mapOf("link" to hash, "id" to filmId)
                      else mapOf("link" to hash, "play" to play, "id" to btnId, "backuplinks" to "1")
         
@@ -192,10 +190,9 @@ class AnimeVietSub : MainAPI() {
             val enc = parsed.linkArray?.firstOrNull()?.file ?: return false
             val dec = decryptLink(enc) ?: return false
             
-            // 5. Xử lý Redirect (Dựa trên log video0.html, video1.html... trả về 302)
-            // Chúng ta sẽ tự follow redirect để lấy link m3u8 cuối cùng
-            val finalUrl = if (dec.startsWith("http")) {
-                val res = app.get(dec, headers = videoHeaders, cookies = cookies, interceptor = cfKiller, followRedirects = true)
+            // 5. Xử lý Redirect (Tự động follow để lấy link cuối cùng)
+            val finalUrl = if (dec.startsWith("http") && !dec.contains(".m3u8")) {
+                val res = app.get(dec, headers = videoHeaders, cookies = cookies, interceptor = cfKiller)
                 res.url
             } else dec
 

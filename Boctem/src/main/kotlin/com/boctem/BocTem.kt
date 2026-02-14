@@ -1031,12 +1031,14 @@ class MultiDepthProviderCrawler(
         queue.add(startUrl to 0)
         
         val allCandidates = mutableListOf<StreamCandidate>()
-        
-        while (queue.isNotEmpty() && context.depth < context.maxDepth) {
+        // BUG FIX: use local depth tracking (context.depth never incremented → infinite loop)
+        val maxDepth = 3 // Reduced from 10 to prevent hanging
+
+        while (queue.isNotEmpty()) {
             val (currentUrl, currentDepth) = queue.removeFirst()
             
             if (currentUrl in context.visitedUrls) continue
-            if (currentDepth > context.maxDepth) continue
+            if (currentDepth >= maxDepth) continue  // BUG FIX: was comparing wrong variable
             
             context.visitedUrls.add(currentUrl)
             
@@ -1076,12 +1078,18 @@ class MultiDepthProviderCrawler(
                 }
                 
                 allCandidates.addAll(candidates)
-                
-                candidates.filter { it.confidence < 0.9 }.forEach { candidate ->
-                    if (candidate.url !in context.visitedUrls) {
-                        queue.add(candidate.url to currentDepth + 1)
+
+                // BUG FIX: only queue genuinely promising URLs, and cap the queue size
+                if (queue.size < 20) {
+                    candidates.filter { it.confidence < 0.9 }.take(5).forEach { candidate ->
+                        if (candidate.url !in context.visitedUrls) {
+                            queue.add(candidate.url to currentDepth + 1)
+                        }
                     }
                 }
+                
+                // Early exit if we already have high-confidence candidates
+                if (allCandidates.any { it.confidence >= 0.9 }) return@withContext allCandidates.distinctBy { it.url }
                 
             } catch (e: Exception) {
                 context.forensicLog.add(ForensicTrace(
@@ -1477,39 +1485,109 @@ class AdaptiveDecisionEngine(
         context: ResolutionContext
     ): List<ExtractorLink> {
         val validLinks = mutableListOf<ExtractorLink>()
-        
-        candidates.sortedByDescending { it.confidence }.take(10).forEach { candidate ->
-            val validation = validator.validate(candidate, networkEngine, context)
-            
-            if (validation.isValid) {
-                val link = when (validation.type) {
+
+        // BUG FIX: Don't do HEAD/GET validation per candidate – this caused infinite loading.
+        // Instead trust URL heuristics (extension, confidence) for high-confidence candidates,
+        // and only network-validate the top unknown candidate as a last resort.
+        val sorted = candidates.sortedByDescending { it.confidence }
+
+        for (candidate in sorted.take(10)) {
+            val url = candidate.url
+
+            // Determine type by URL extension first (fast, no network call)
+            val quickType = when {
+                url.contains(".m3u8", ignoreCase = true) -> StreamAuthenticityValidator.StreamType.M3U8
+                url.contains(".mp4", ignoreCase = true) -> StreamAuthenticityValidator.StreamType.MP4
+                url.contains(".mkv", ignoreCase = true) -> StreamAuthenticityValidator.StreamType.MKV
+                url.contains(".webm", ignoreCase = true) -> StreamAuthenticityValidator.StreamType.WEBM
+                url.contains("mpd") || url.contains("dash") -> StreamAuthenticityValidator.StreamType.DASH
+                else -> StreamAuthenticityValidator.StreamType.UNKNOWN
+            }
+
+            val headers = mapOf(
+                "Referer" to candidate.source,
+                "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept" to "*/*",
+                "Origin" to "https://boctem.com"
+            )
+
+            if (quickType != StreamAuthenticityValidator.StreamType.UNKNOWN) {
+                // High-confidence: build link directly without network call
+                val link = when (quickType) {
                     StreamAuthenticityValidator.StreamType.M3U8 -> {
                         M3u8Helper.generateM3u8(
                             source = "BocTem",
-                            streamUrl = candidate.url,
+                            streamUrl = url,
                             referer = candidate.source,
-                            headers = validation.headers
+                            headers = headers
                         ).firstOrNull()
                     }
                     else -> {
+                        val quality = inferQualityFromUrl(url)
                         newExtractorLink(
                             source = "BocTem",
-                            name = "BocTem ${validation.quality ?: "Auto"}",
-                            url = candidate.url,
+                            name = "BocTem ${quality ?: "Auto"}",
+                            url = url,
                             type = ExtractorLinkType.VIDEO
                         ) {
                             this.referer = candidate.source
-                            this.quality = validation.quality?.removeSuffix("p")?.toIntOrNull() ?: Qualities.Unknown.value
-                            this.headers = validation.headers
+                            this.quality = quality?.removeSuffix("p")?.toIntOrNull() ?: Qualities.Unknown.value
+                            this.headers = headers
                         }
                     }
                 }
-                
                 link?.let { validLinks.add(it) }
+                if (validLinks.size >= 3) break // Enough links, stop early
+            } else if (candidate.confidence >= 0.8 && validLinks.isEmpty()) {
+                // Only network-validate a single UNKNOWN candidate as last resort
+                try {
+                    val validation = validator.validate(candidate, networkEngine, context)
+                    if (validation.isValid) {
+                        val link = when (validation.type) {
+                            StreamAuthenticityValidator.StreamType.M3U8 -> {
+                                M3u8Helper.generateM3u8(
+                                    source = "BocTem",
+                                    streamUrl = url,
+                                    referer = candidate.source,
+                                    headers = validation.headers
+                                ).firstOrNull()
+                            }
+                            else -> {
+                                newExtractorLink(
+                                    source = "BocTem",
+                                    name = "BocTem ${validation.quality ?: "Auto"}",
+                                    url = url,
+                                    type = ExtractorLinkType.VIDEO
+                                ) {
+                                    this.referer = candidate.source
+                                    this.quality = validation.quality?.removeSuffix("p")?.toIntOrNull() ?: Qualities.Unknown.value
+                                    this.headers = validation.headers
+                                }
+                            }
+                        }
+                        link?.let { validLinks.add(it) }
+                    }
+                } catch (_: Exception) {}
             }
         }
-        
+
         return validLinks
+    }
+
+    private fun inferQualityFromUrl(url: String): String? {
+        val patterns = listOf(
+            Regex("""(\d{3,4})p"""),
+            Regex("""[/_](1080|720|480|360|240)[/_]"""),
+            Regex("""(\d{3,4})[xX](\d{3,4})""")
+        )
+        for (p in patterns) {
+            val m = p.find(url) ?: continue
+            return when (p.pattern) {
+                patterns[2].pattern -> m.groupValues[2] + "p"
+                else -> m.groupValues[1] + "p"
+            }
+        }
+        return null
     }
     
     private fun extractPostId(url: String, context: ResolutionContext): String? {
@@ -1733,24 +1811,118 @@ class BocTemProvider : MainAPI() {
         val description = document.selectFirst(".entry-content")?.text()?.trim()
             ?: document.selectFirst("meta[property=og:description]")?.attr("content")
         
+        // ── BUG FIX: Episode list ────────────────────────────────────────────
+        // Halim theme renders episodes in specific containers.
+        // Strategy 1: Try common Halim selectors first (server-side rendered).
+        // Strategy 2: Fallback to AJAX episode list if HTML has none.
         val seen = HashSet<String>()
-        val episodes = document
-            .select("a[href*=/xem-phim/]")
-            .mapNotNull { link ->
-                val epUrl = normalizeUrl(link.attr("href")) ?: return@mapNotNull null
-                if (!epUrl.contains("-tap-")) return@mapNotNull null
+
+        fun parseEpisodeLinks(scope: org.jsoup.nodes.Element): List<Episode> {
+            // Halim wraps each ep in <a> inside .list-episode, .halim-list-episode, etc.
+            val selectors = listOf(
+                ".list-episode a",
+                ".halim-list-episode a",
+                ".ep_link a",
+                "ul.list-ep li a",
+                ".film-list a",
+                ".episodelist a",
+                "div[id^='eps'] a",
+                // broad fallback – any anchor whose href contains the series slug
+                "a[href]"
+            )
+            for (sel in selectors) {
+                val links = scope.select(sel)
+                    .filter { el ->
+                        val href = el.attr("href")
+                        href.contains("/xem-phim/") || href.contains("-tap-") || href.contains("episode") || href.contains("ep-")
+                    }
+                if (links.isNotEmpty()) {
+                    return links.mapNotNull { link ->
+                        val epUrl = normalizeUrl(link.attr("href")) ?: return@mapNotNull null
+                        // Must look like an episode URL, not the series overview page
+                        val isEpUrl = epUrl.contains("-tap-") || epUrl.contains("/tap-") ||
+                            epUrl.contains("-episode-") || epUrl.contains("/episode-") ||
+                            epUrl.contains("-ep-") || epUrl.contains("/ep-")
+                        if (!isEpUrl) return@mapNotNull null
+                        if (!seen.add(epUrl)) return@mapNotNull null
+
+                        val epText = link.text().trim()
+                        val epNum = Regex("""(?:tap|ep(?:isode)?)[- _](\d+)""", RegexOption.IGNORE_CASE)
+                            .find(epUrl)?.groupValues?.get(1)?.toIntOrNull()
+                            ?: Regex("""(\d+)$""").find(epUrl.trimEnd('/'))?.groupValues?.get(1)?.toIntOrNull()
+
+                        newEpisode(epUrl) {
+                            this.name = epText.ifBlank { "Tập $epNum" }
+                            this.episode = epNum
+                            this.posterUrl = poster
+                        }
+                    }
+                }
+            }
+            return emptyList()
+        }
+
+        var episodes = parseEpisodeLinks(document)
+
+        // Strategy 2: AJAX fallback – Halim provides episode list via admin-ajax.php
+        if (episodes.isEmpty()) {
+            try {
+                // Extract post ID from page body
+                val html = document.outerHtml()
+                val postId = listOf(
+                    Regex("""class="[^"]*\bpostid-(\d+)\b"""),
+                    Regex("""post_id["']?\s*[:=]\s*["']?(\d+)"""),
+                    Regex("""data-postid=["'](\d+)["']""")
+                ).firstNotNullOfOrNull { it.find(html)?.groupValues?.get(1) }
+
+                val nonce = listOf(
+                    Regex(""""nonce"\s*:\s*"([a-f0-9]+)""""),
+                    Regex("""data-nonce=["']([^"']+)["']"""),
+                    Regex("""var\s+halim_nonce\s*=\s*["']([^"']+)["']"""),
+                    Regex("""nonce\s*=\s*["']([a-f0-9]{5,20})["']""")
+                ).firstNotNullOfOrNull { it.find(html)?.groupValues?.get(1) }
+
+                if (postId != null && nonce != null) {
+                    val ajaxResponse = app.post(
+                        "$mainUrl/wp-admin/admin-ajax.php",
+                        data = mapOf(
+                            "action" to "halim_ajax_episode_list",
+                            "nonce" to nonce,
+                            "postid" to postId
+                        ),
+                        headers = requestHeaders(fixedUrl)
+                    ).text
+
+                    if (ajaxResponse.isNotBlank() && ajaxResponse != "0") {
+                        val ajaxDoc = Jsoup.parse(ajaxResponse)
+                        val ajaxEpisodes = parseEpisodeLinks(ajaxDoc)
+                        if (ajaxEpisodes.isNotEmpty()) episodes = ajaxEpisodes
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+
+        // Ultimate fallback: any link on the page whose href looks like an episode
+        if (episodes.isEmpty()) {
+            episodes = document.select("a[href]").mapNotNull { link ->
+                val href = link.attr("href")
+                val epUrl = normalizeUrl(href) ?: return@mapNotNull null
+                val isEp = epUrl.contains("-tap-") || epUrl.contains("/tap-") ||
+                    (epUrl.contains("xem-phim") && epUrl != fixedUrl)
+                if (!isEp) return@mapNotNull null
                 if (!seen.add(epUrl)) return@mapNotNull null
-                
-                val epName = link.text().trim().ifBlank { null }
-                val epNum = Regex("""tap-(\d+)""").find(epUrl)?.groupValues?.get(1)?.toIntOrNull()
-                
+                val epNum = Regex("""(?:tap|ep)[- _]?(\d+)""", RegexOption.IGNORE_CASE)
+                    .find(epUrl)?.groupValues?.get(1)?.toIntOrNull()
                 newEpisode(epUrl) {
-                    this.name = epName
+                    this.name = link.text().trim().ifBlank { "Tập $epNum" }
                     this.episode = epNum
                     this.posterUrl = poster
                 }
             }
-            .sortedBy { it.episode ?: Int.MAX_VALUE }
+        }
+
+        episodes = episodes.sortedBy { it.episode ?: Int.MAX_VALUE }
+        // ────────────────────────────────────────────────────────────────────
         
         val tags = document.select(".halim-movie-genres a, .post-category a").map { it.text() }
         val year = Regex("""/release/(\d+)/""").find(fixedUrl)?.groupValues?.get(1)?.toIntOrNull()
@@ -1782,7 +1954,10 @@ class BocTemProvider : MainAPI() {
         ))
         
         return try {
-            val success = decisionEngine.resolve(data, context, subtitleCallback, callback, mainUrl)
+            // BUG FIX: Add 25s hard timeout to prevent infinite loading
+            val success = withTimeoutOrNull(25_000L) {
+                decisionEngine.resolve(data, context, subtitleCallback, callback, mainUrl)
+            } ?: false
             
             if (!success) {
                 println("=== FORENSIC TRACE ===")

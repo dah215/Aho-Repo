@@ -27,8 +27,8 @@ class BocTemProvider : MainAPI() {
     )
 
     override val mainPage = mainPageOf(
-        "$mainUrl/page/" to "Anime Mới",
-        "$mainUrl/release/2026/page/" to "Anime 2026"
+        "/page/" to "Anime Mới",
+        "/release/2026/page/" to "Anime 2026"
     )
 
     private fun requestHeaders(referer: String? = null, extra: Map<String, String> = emptyMap()): Map<String, String> {

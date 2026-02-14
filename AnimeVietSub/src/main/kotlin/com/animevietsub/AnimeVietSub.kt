@@ -1,7 +1,6 @@
 package com.animevietsub
 
 import android.util.Base64
-import com.fasterxml.jackson.annotation.JsonProperty
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.network.CloudflareKiller
@@ -11,12 +10,12 @@ import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.withTimeoutOrNull
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
-import java.net.URLEncoder
-import java.net.URL
-import java.security.MessageDigest
-import java.nio.charset.StandardCharsets
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.net.URL
+import java.net.URLEncoder
+import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
 import java.util.zip.GZIPInputStream
 import java.util.zip.Inflater
 import javax.crypto.Cipher
@@ -29,82 +28,136 @@ class AnimeVietSubPlugin : Plugin() {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// ENCRYPTION BREAKER  –  fast-path first, brute-force last
+// ENCRYPTION BREAKER
+// Critical fix: CryptoJS uses OpenSSL EVP_BytesToKey(MD5, 1 iter, salt),
+// NOT raw MD5(password) as key. This is the #1 reason decryption was failing.
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 object EncryptionBreaker {
 
-    // The site's confirmed key – tried FIRST at O(1) cost
-    private const val KNOWN_PASS = "dm_thang_suc_vat_get_link_an_dbt"
-
-    // Short fallback list, ordered by likelihood
-    private val FALLBACK_PASSES = listOf(
-        "animevietsub", "animevsub", "VSub@2025", "VSub@2024",
-        "video_decrypt_key", "streaming_key", "player_key", ""
+    private val PASSWORDS = listOf(
+        "dm_thang_suc_vat_get_link_an_dbt",   // confirmed key for this site
+        "animevietsub", "animevsub",
+        "VSub@2025", "VSub@2024",
+        "streaming_key", "player_key", ""
     )
 
-    // Only the 6 most common combos (hash × ivStrategy), both with CBC/PKCS5
-    private val FAST_COMBOS = listOf(
-        Triple("MD5",    "AES/CBC/PKCS5Padding", "prefix"),
-        Triple("SHA-256","AES/CBC/PKCS5Padding", "prefix"),
-        Triple("MD5",    "AES/CBC/PKCS5Padding", "zero"),
-        Triple("SHA-256","AES/CBC/PKCS5Padding", "zero"),
-        Triple("MD5",    "AES/CBC/PKCS5Padding", "fromKey"),
-        Triple("SHA-256","AES/CBC/PKCS5Padding", "fromKey")
+    // OpenSSL "Salted__" magic header
+    private val SALTED_MAGIC = byteArrayOf(
+        0x53, 0x61, 0x6c, 0x74, 0x65, 0x64, 0x5f, 0x5f  // "Salted__"
     )
 
+    // ── Public entry ─────────────────────────────────────────────────────────
     fun autoBreak(encrypted: String?): String? {
         if (encrypted.isNullOrBlank()) return null
-        val c = encrypted.trim().replace("\\s".toRegex(), "")
+        val c = encrypted.trim().replace("\\s+".toRegex(), "")
 
-        // 1. Plain Base64 → URL?
+        // 0. Already a URL?
+        if (isValidUrl(c)) return c
+
+        // 1. Plain Base64 → try as URL
         try {
             val raw = String(Base64.decode(c, Base64.DEFAULT), StandardCharsets.UTF_8)
             if (isValidUrl(raw)) return raw
         } catch (_: Exception) {}
 
-        // 2. Known password × fast combos
-        for ((hash, mode, iv) in FAST_COMBOS) {
-            decrypt(c, KNOWN_PASS, hash, mode, iv)?.let { if (isValidUrl(it)) return it }
+        // 2. CryptoJS / OpenSSL format (MAIN strategy – tries each password once)
+        for (pass in PASSWORDS) {
+            val r = decryptCryptoJS(c, pass)
+            if (r != null && isValidUrl(r)) return r
         }
 
-        // 3. Fallback passwords × fast combos
-        for (pass in FALLBACK_PASSES) {
-            for ((hash, mode, iv) in FAST_COMBOS) {
-                decrypt(c, pass, hash, mode, iv)?.let { if (isValidUrl(it)) return it }
+        // 3. Raw AES fallback (key = MD5/SHA256 of password, IV from prefix/zero)
+        for (pass in PASSWORDS) {
+            for (algo in listOf("MD5", "SHA-256")) {
+                for (ivStrat in listOf("prefix", "zero")) {
+                    val r = decryptRaw(c, pass, algo, ivStrat) ?: continue
+                    if (isValidUrl(r)) return r
+                }
             }
         }
+
         return null
     }
 
-    private fun decrypt(enc: String, password: String, hashAlgo: String,
-                        mode: String, ivStrat: String): String? {
-        val decoded = try { Base64.decode(enc, Base64.DEFAULT) } catch (_: Exception) { return null }
-        if (decoded.size < 17) return null
-        val key = when (hashAlgo) {
-            "MD5"    -> md5(password)
-            "SHA-256"-> sha256(password)
-            "SHA-1"  -> sha1_16(password)
-            else     -> return null
+    // ── CryptoJS / OpenSSL EVP_BytesToKey decryption ─────────────────────────
+    //
+    // This matches exactly what JavaScript's CryptoJS.AES.decrypt(enc, "password") does:
+    //   1. Base64-decode the ciphertext
+    //   2. Strip the 8-byte "Salted__" header (if present)
+    //   3. Read 8-byte salt from bytes 8-16
+    //   4. Derive 32-byte key + 16-byte IV via evpKDF(MD5, password, salt)
+    //   5. Decrypt with AES-256-CBC / PKCS7
+    //
+    private fun decryptCryptoJS(enc: String, password: String): String? {
+        val raw = try { Base64.decode(enc, Base64.DEFAULT) } catch (_: Exception) { return null }
+        if (raw.size < 16) return null
+
+        val hasSalt = raw.size >= 16 && raw.copyOfRange(0, 8).contentEquals(SALTED_MAGIC)
+
+        val (salt, ct) = if (hasSalt) {
+            raw.copyOfRange(8, 16) to raw.copyOfRange(16, raw.size)
+        } else {
+            // No salt – try with null salt (less common but possible)
+            null to raw
         }
-        val (iv, ct) = when (ivStrat) {
-            "prefix" -> decoded.copyOfRange(0, 16) to decoded.copyOfRange(16, decoded.size)
-            "zero"   -> ByteArray(16) to decoded
-            "fromKey"-> key.copyOfRange(0, 16) to decoded
-            else     -> return null
-        }
-        if (ct.isEmpty()) return null
+
+        val (key, iv) = evpBytesToKey(password.toByteArray(StandardCharsets.UTF_8), salt, 32, 16)
+
         return try {
-            val cipher = Cipher.getInstance(mode)
+            val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
             cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
             val plain = cipher.doFinal(ct)
             tryDecompress(plain) ?: String(plain, StandardCharsets.UTF_8)
         } catch (_: Exception) { null }
     }
 
-    private fun md5(s: String)     = MessageDigest.getInstance("MD5")   .digest(s.toByteArray())
-    private fun sha256(s: String)  = MessageDigest.getInstance("SHA-256").digest(s.toByteArray())
-    private fun sha1_16(s: String) = MessageDigest.getInstance("SHA-1") .digest(s.toByteArray()).copyOf(16)
+    // ── OpenSSL EVP_BytesToKey with MD5, 1 iteration ─────────────────────────
+    // Produces `keyLen + ivLen` bytes from password + optional salt.
+    private fun evpBytesToKey(
+        password: ByteArray, salt: ByteArray?,
+        keyLen: Int, ivLen: Int
+    ): Pair<ByteArray, ByteArray> {
+        val md = MessageDigest.getInstance("MD5")
+        val out = ByteArrayOutputStream()
+        var prev = ByteArray(0)
+        while (out.size() < keyLen + ivLen) {
+            md.reset()
+            md.update(prev)
+            md.update(password)
+            if (salt != null) md.update(salt)
+            prev = md.digest()
+            out.write(prev)
+        }
+        val b = out.toByteArray()
+        return b.copyOfRange(0, keyLen) to b.copyOfRange(keyLen, keyLen + ivLen)
+    }
 
+    // ── Raw AES fallback (key = Hash(password), IV from prefix or zeros) ─────
+    private fun decryptRaw(enc: String, password: String, hashAlgo: String, ivStrat: String): String? {
+        val decoded = try { Base64.decode(enc, Base64.DEFAULT) } catch (_: Exception) { return null }
+        if (decoded.size < 17) return null
+
+        val key = when (hashAlgo) {
+            "MD5"    -> MessageDigest.getInstance("MD5")   .digest(password.toByteArray())
+            "SHA-256"-> MessageDigest.getInstance("SHA-256").digest(password.toByteArray())
+            else     -> return null
+        }
+        val (iv, ct) = when (ivStrat) {
+            "prefix" -> decoded.copyOfRange(0, 16) to decoded.copyOfRange(16, decoded.size)
+            "zero"   -> ByteArray(16) to decoded
+            else     -> return null
+        }
+        if (ct.isEmpty()) return null
+
+        return try {
+            val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
+            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
+            val plain = cipher.doFinal(ct)
+            tryDecompress(plain) ?: String(plain, StandardCharsets.UTF_8)
+        } catch (_: Exception) { null }
+    }
+
+    // ── Decompression ─────────────────────────────────────────────────────────
     private fun tryDecompress(data: ByteArray): String? {
         try {
             val gz = GZIPInputStream(ByteArrayInputStream(data))
@@ -121,16 +174,15 @@ object EncryptionBreaker {
         return null
     }
 
-    fun isValidUrl(s: String?) = s != null &&
+    fun isValidUrl(s: String?) = s != null && s.length > 8 &&
         (s.startsWith("http://") || s.startsWith("https://") || s.startsWith("//") ||
          s.contains(".m3u8") || s.contains(".mp4") || s.contains(".mpd"))
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// URL / RESPONSE HELPERS
+// HELPERS
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 object ResponseAnalyzer {
-
     fun extractUrls(body: String, base: String): List<String> {
         val urls = mutableListOf<String>()
         Regex("""["'](https?://[^"']+\.(?:m3u8|mp4|mpd)[^"']*)["']""")
@@ -142,39 +194,37 @@ object ResponseAnalyzer {
         if (body.contains("<")) {
             try {
                 val doc = Jsoup.parse(body)
-                listOf("data-src","data-url","data-href","data-file","data-link","data-source").forEach { attr ->
-                    doc.select("[$attr]").forEach { el -> el.attr(attr).takeIf { it.isNotBlank() }?.let { urls.add(it) } }
+                listOf("data-src","data-url","data-href","data-file","data-link","data-source").forEach { a ->
+                    doc.select("[$a]").forEach { el -> el.attr(a).takeIf { it.isNotBlank() }?.let { urls.add(it) } }
                 }
-                doc.select("source[src],video[src],iframe[src]").forEach { urls.add(it.attr("src")) }
+                doc.select("source[src],video[src],iframe[src]").forEach { el ->
+                    el.attr("src").takeIf { it.isNotBlank() }?.let { urls.add(it) }
+                }
             } catch (_: Exception) {}
         }
-        return urls.map { absolute(it, base) }.distinct().filter { it.startsWith("http") }
+        return urls.map { abs(it, base) }.distinct().filter { it.startsWith("http") }
     }
-
-    private fun absolute(url: String, base: String): String {
+    private fun abs(url: String, base: String): String {
         if (url.startsWith("http")) return url
         if (url.startsWith("//")) return "https:$url"
         return try { URL(URL(base), url).toString() } catch (_: Exception) { url }
     }
-
     fun isStream(url: String) = url.contains(".m3u8") || url.contains(".mp4") ||
-                                url.contains(".mpd")  || url.contains("/stream/")
+                                url.contains(".mpd") || url.contains("/stream/")
 }
 
 object DataMiner {
-    private val ENC_PAT = Regex(
+    private val ENC = Regex(
         """(?:file|link|source|url|enc|stream|video)\s*[:=]\s*["']([A-Za-z0-9+/]{24,}={0,2})["']"""
     )
-
     fun mineEncrypted(body: String): List<String> {
         val out = mutableListOf<String>()
-        ENC_PAT.findAll(body).forEach { out.add(it.groupValues[1]) }
+        ENC.findAll(body).forEach { out.add(it.groupValues[1]) }
         Regex("""["']([A-Za-z0-9+/]{40,}={0,2})["']""").findAll(body).forEach {
             val v = it.groupValues[1]; if (entropy(v) > 4.0) out.add(v)
         }
         return out.distinct()
     }
-
     private fun entropy(s: String): Double {
         val f = mutableMapOf<Char, Int>()
         s.forEach { f[it] = (f[it] ?: 0) + 1 }
@@ -187,10 +237,9 @@ object DataMiner {
 object JSReverse {
     fun unpack(js: String): String {
         var r = js
-        repeat(5) { val next = unpackOne(r); if (next == r) return r; r = next }
+        repeat(5) { val n = unpackOne(r); if (n == r) return r; r = n }
         return r
     }
-
     private fun unpackOne(js: String): String {
         Regex("""\}\s*\(\s*['"]([^'"]+)['"]\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*['"]([^'"]+)['"]\s*,""")
             .find(js)?.let { m ->
@@ -204,27 +253,18 @@ object JSReverse {
                 } catch (_: Exception) {}
             }
         Regex("""atob\s*\(\s*['"]([A-Za-z0-9+/=]+)['"]\s*\)""").find(js)?.let { m ->
-            try {
-                val d = String(Base64.decode(m.groupValues[1], Base64.DEFAULT))
-                return js.replace(m.value, "'$d'")
-            } catch (_: Exception) {}
-        }
-        Regex("""String\.fromCharCode\s*\(([\d\s,]+)\)""").find(js)?.let { m ->
-            try {
-                val d = m.groupValues[1].split(",").map { it.trim().toInt() }.map { it.toChar() }.joinToString("")
-                return js.replace(m.value, "'$d'")
-            } catch (_: Exception) {}
+            try { return js.replace(m.value, "'${String(Base64.decode(m.groupValues[1], Base64.DEFAULT))}'") }
+            catch (_: Exception) {}
         }
         return js
     }
-
     fun extractUrls(js: String): List<String> {
         val urls = mutableListOf<String>()
         listOf(
             Regex("""['"]https?://[^'"]+\.m3u8[^'"]*['"]"""),
             Regex("""['"]https?://[^'"]+\.mp4[^'"]*['"]"""),
-            Regex("""['"]https?://[^'"]*(?:stream|hls|video|cdn|play)[^'"]*['"]""")
-        ).forEach { pat -> pat.findAll(js).forEach { urls.add(it.value.trim('\'', '"')) } }
+            Regex("""['"]https?://[^'"]*(?:stream|hls|video|cdn)[^'"]*['"]""")
+        ).forEach { p -> p.findAll(js).forEach { urls.add(it.value.trim('\'', '"')) } }
         return urls.distinct()
     }
 }
@@ -233,7 +273,6 @@ object JSReverse {
 // MAIN PLUGIN
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class AnimeVietSub : MainAPI() {
-
     override var mainUrl = "https://animevietsub.ee"
     override var name    = "AnimeVietSub"
     override var lang    = "vi"
@@ -245,38 +284,23 @@ class AnimeVietSub : MainAPI() {
     private val debugMode = true
     private val cfKiller  = CloudflareKiller()
     private val mapper    = jacksonObjectMapper()
-    private val ua        = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-                            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    private val ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
     private val defaultHeaders = mapOf(
-        "User-Agent"      to ua,
-        "Accept"          to "text/html,application/xhtml+xml,*/*;q=0.8",
+        "User-Agent" to ua, "Accept" to "text/html,*/*;q=0.8",
         "Accept-Language" to "vi-VN,vi;q=0.9,en;q=0.8",
-        "Sec-Fetch-Dest"  to "document",
-        "Sec-Fetch-Mode"  to "navigate",
-        "Sec-Fetch-Site"  to "none"
+        "Sec-Fetch-Dest" to "document", "Sec-Fetch-Mode" to "navigate", "Sec-Fetch-Site" to "none"
     )
-
-    private fun ajaxHeaders(ref: String) = defaultHeaders + mapOf(
+    private fun ajaxH(ref: String) = defaultHeaders + mapOf(
         "X-Requested-With" to "XMLHttpRequest",
-        "Content-Type"     to "application/x-www-form-urlencoded; charset=UTF-8",
-        "Referer"          to ref,
-        "Origin"           to mainUrl,
-        "Accept"           to "application/json, text/javascript, */*; q=0.01",
-        "Sec-Fetch-Dest"   to "empty",
-        "Sec-Fetch-Mode"   to "cors",
-        "Sec-Fetch-Site"   to "same-origin"
+        "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
+        "Referer" to ref, "Origin" to mainUrl,
+        "Accept" to "application/json, text/javascript, */*; q=0.01",
+        "Sec-Fetch-Dest" to "empty", "Sec-Fetch-Mode" to "cors", "Sec-Fetch-Site" to "same-origin"
     )
-
-    private fun videoHeaders(ref: String) = mapOf(
-        "User-Agent" to ua,
-        "Referer"    to ref,
-        "Origin"     to mainUrl,
-        "Accept"     to "*/*"
-    )
+    private fun vidH(ref: String) = mapOf("User-Agent" to ua, "Referer" to ref, "Origin" to mainUrl, "Accept" to "*/*")
 
     // ── Utils ─────────────────────────────────────────────────────────────────
-
     private fun fixUrl(u: String?): String? {
         if (u.isNullOrBlank() || u.startsWith("javascript") || u == "#") return null
         val t = u.trim()
@@ -305,15 +329,13 @@ class AnimeVietSub : MainAPI() {
     private fun log(tag: String, msg: String) { if (debugMode) println("AVS[$tag] $msg") }
 
     // ── Pages ─────────────────────────────────────────────────────────────────
-
     override val mainPage = mainPageOf(
-        "$mainUrl/"                           to "Trang Chủ",
+        "$mainUrl/" to "Trang Chủ",
         "$mainUrl/danh-sach/list-dang-chieu/" to "Đang Chiếu",
-        "$mainUrl/danh-sach/list-tron-bo/"    to "Trọn Bộ",
-        "$mainUrl/anime-le/"                  to "Anime Lẻ",
-        "$mainUrl/anime-bo/"                  to "Anime Bộ"
+        "$mainUrl/danh-sach/list-tron-bo/" to "Trọn Bộ",
+        "$mainUrl/anime-le/" to "Anime Lẻ",
+        "$mainUrl/anime-bo/" to "Anime Bộ"
     )
-
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val base = request.data.ifBlank { mainUrl }
         val url  = if (page == 1) base else "${base.removeSuffix("/")}/trang-$page.html"
@@ -322,7 +344,6 @@ class AnimeVietSub : MainAPI() {
             .mapNotNull { it.toSearchResponse() }.distinctBy { it.url }
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
-
     private fun Element.toSearchResponse(): SearchResponse? {
         val a     = selectFirst("a") ?: return null
         val href  = fixUrl(a.attr("href")) ?: return null
@@ -332,7 +353,6 @@ class AnimeVietSub : MainAPI() {
         val poster = fixUrl(img?.attr("data-src")?.takeIf { it.isNotBlank() } ?: img?.attr("src"))
         return newAnimeSearchResponse(title, href, TvType.Anime) { posterUrl = poster }
     }
-
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/tim-kiem/${URLEncoder.encode(query, "utf-8")}/"
         return app.get(url, interceptor = cfKiller, headers = defaultHeaders).document
@@ -340,14 +360,13 @@ class AnimeVietSub : MainAPI() {
             .mapNotNull { it.toSearchResponse() }.distinctBy { it.url }
     }
 
+    // ── Load ──────────────────────────────────────────────────────────────────
     override suspend fun load(url: String): LoadResponse {
         val fixedUrl = fixUrl(url) ?: throw ErrorLoadingException("Invalid URL")
         var doc = app.get(fixedUrl, interceptor = cfKiller, headers = defaultHeaders).document
 
-        val sel = "ul.list-episode li a, .list-eps a, .server-list a, " +
-                  ".list-episode a, .episodes a, #list_episodes a"
+        val sel = "ul.list-episode li a, .list-eps a, .server-list a, .list-episode a, .episodes a, #list_episodes a"
         var epNodes = doc.select(sel)
-
         if (epNodes.isEmpty()) {
             val watchUrl = doc.selectFirst(
                 "a.btn-see, a[href*='/tap-'], a[href*='/episode-'], .btn-watch a, a.watch_button, a.xem-phim"
@@ -359,11 +378,19 @@ class AnimeVietSub : MainAPI() {
         }
 
         val filmId = filmIdFromUrl(fixedUrl)
+
         val episodes = epNodes.mapNotNull { ep ->
             val href   = fixUrl(ep.attr("href")) ?: return@mapNotNull null
-            val dataId = ep.attr("data-id").trim().ifBlank { ep.attr("data-episodeid").trim() }
+            // Check both the <a> itself and its parent <li> for data-id
+            val dataId = ep.attr("data-id").trim()
+                .ifBlank { ep.attr("data-episodeid").trim() }
+                .ifBlank { ep.parent()?.attr("data-id")?.trim() ?: "" }
+                .ifBlank { ep.parent()?.attr("data-episodeid")?.trim() ?: "" }
             val hrefId = epIdFromHref(href)
             val name   = ep.text().trim().ifBlank { ep.attr("title").trim() }
+
+            log("LOAD", "ep: href=$href dataId='$dataId' hrefId='$hrefId'")
+
             newEpisode("$href@@$filmId@@$dataId@@$hrefId") {
                 this.name    = name
                 this.episode = Regex("\\d+").find(name)?.value?.toIntOrNull() ?: hrefId.toIntOrNull()
@@ -374,10 +401,9 @@ class AnimeVietSub : MainAPI() {
         val poster = doc.selectFirst(".Image img, .InfoImg img, img[itemprop=image]")?.let {
             fixUrl(it.attr("data-src").ifBlank { it.attr("src") })
         }
-
         return newAnimeLoadResponse(title, fixedUrl, TvType.Anime) {
-            posterUrl    = poster
-            plot         = doc.selectFirst(".Description, .InfoDesc, #film-content")?.text()?.trim()
+            posterUrl     = poster
+            plot          = doc.selectFirst(".Description, .InfoDesc, #film-content")?.text()?.trim()
             this.episodes = mutableMapOf(DubStatus.Subbed to episodes)
         }
     }
@@ -386,10 +412,8 @@ class AnimeVietSub : MainAPI() {
     // LOAD LINKS
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     override suspend fun loadLinks(
-        data: String,
-        isCasting: Boolean,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
+        data: String, isCasting: Boolean,
+        subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ): Boolean {
         val parts  = data.split("@@")
         val epUrl  = parts.getOrNull(0)?.takeIf { it.isNotBlank() } ?: return false
@@ -399,253 +423,248 @@ class AnimeVietSub : MainAPI() {
 
         log("LINKS", "epUrl=$epUrl filmId='$filmId' dataId='$dataId' hrefId='$hrefId'")
 
-        val vHeaders = videoHeaders(epUrl)
-        val aHeaders = ajaxHeaders(epUrl)
-        val cookies  = mutableMapOf<String, String>()
+        val vH = vidH(epUrl)
+        val aH = ajaxH(epUrl)
+        val cookies = mutableMapOf<String, String>()
         var pageBody = ""
 
-        // ── Fetch page ONCE – cache body ──────────────────────────────────────
+        // Fetch page ONCE and cache
         try {
             val res = app.get(epUrl, interceptor = cfKiller, headers = defaultHeaders)
             cookies.putAll(res.cookies)
             pageBody = res.text ?: ""
-            log("LINKS", "Page cached, body=${pageBody.length}b cookies=${cookies.keys}")
-        } catch (e: Exception) {
-            log("LINKS", "Page fetch failed: ${e.message}")
-            return false
-        }
+            log("LINKS", "Page cached ${pageBody.length}b")
+        } catch (e: Exception) { log("LINKS", "Page fetch failed: ${e.message}"); return false }
 
         var found = false
 
-        // ── A: AJAX API (15 s timeout) ────────────────────────────────────────
+        // ── A: AJAX (15s) ────────────────────────────────────────────────────
         if (!found) found = withTimeoutOrNull(15_000L) {
-            strategyAjax(epUrl, filmId, dataId, hrefId, cookies, aHeaders, vHeaders, subtitleCallback, callback)
+            strategyAjax(epUrl, filmId, dataId, hrefId, cookies, aH, vH, subtitleCallback, callback)
         } ?: false
-        log("LINKS", "After A: found=$found")
+        log("LINKS", "A=$found")
 
-        // ── B: Scrape cached page (8 s timeout) ───────────────────────────────
+        // ── B: Page scrape (8s) ──────────────────────────────────────────────
         if (!found) found = withTimeoutOrNull(8_000L) {
-            strategyPageScrape(pageBody, epUrl, vHeaders, subtitleCallback, callback)
+            strategyPageScrape(pageBody, epUrl, vH, subtitleCallback, callback)
         } ?: false
-        log("LINKS", "After B: found=$found")
+        log("LINKS", "B=$found")
 
-        // ── C: JS reverse (5 s timeout) ───────────────────────────────────────
+        // ── C: JS reverse (5s) ───────────────────────────────────────────────
         if (!found) found = withTimeoutOrNull(5_000L) {
-            strategyJSReverse(pageBody, epUrl, vHeaders, subtitleCallback, callback)
+            strategyJS(pageBody, epUrl, vH, subtitleCallback, callback)
         } ?: false
-        log("LINKS", "After C: found=$found")
+        log("LINKS", "C=$found")
 
-        // ── D: Data mine (8 s timeout) ────────────────────────────────────────
+        // ── D: Data mine + decrypt (8s) ──────────────────────────────────────
         if (!found) found = withTimeoutOrNull(8_000L) {
-            strategyDataMine(pageBody, epUrl, vHeaders, subtitleCallback, callback)
+            strategyMine(pageBody, epUrl, vH, subtitleCallback, callback)
         } ?: false
-        log("LINKS", "After D: found=$found")
+        log("LINKS", "D=$found")
 
-        // ── E: Alt endpoints (10 s timeout) ──────────────────────────────────
+        // ── E: Alt endpoints (10s) ───────────────────────────────────────────
         if (!found) found = withTimeoutOrNull(10_000L) {
-            strategyAltEndpoints(epUrl, filmId, dataId, hrefId, vHeaders, subtitleCallback, callback)
+            strategyAlt(epUrl, filmId, dataId, hrefId, vH, subtitleCallback, callback)
         } ?: false
-        log("LINKS", "Final: found=$found")
+        log("LINKS", "Final=$found")
 
         return found
     }
 
-    // ── Strategy A ────────────────────────────────────────────────────────────
+    // ── Strategy A: AJAX player API ───────────────────────────────────────────
     private suspend fun strategyAjax(
         epUrl: String, filmId: String, dataId: String, hrefId: String,
         cookies: MutableMap<String, String>,
-        aHeaders: Map<String, String>, vHeaders: Map<String, String>,
-        subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
+        aH: Map<String, String>, vH: Map<String, String>,
+        sub: (SubtitleFile) -> Unit, cb: (ExtractorLink) -> Unit
     ): Boolean {
+        // Try dataId first (database ID), then hrefId (sequential), then filmId
         val candidates = listOf(dataId, hrefId, filmId).filter { it.isNotBlank() }.distinct()
-        for (episodeId in candidates) {
-            log("LINKS", "AJAX episodeId='$episodeId'")
+        log("LINKS", "AJAX candidates: $candidates")
+
+        for (epId in candidates) {
             try {
+                // Step 1: get server list HTML
                 val r1 = app.post("$mainUrl/ajax/player",
-                    data = mapOf("episodeId" to episodeId, "backup" to "1"),
-                    headers = aHeaders, cookies = cookies, interceptor = cfKiller)
+                    data = mapOf("episodeId" to epId, "backup" to "1"),
+                    headers = aH, cookies = cookies, interceptor = cfKiller)
                 cookies.putAll(r1.cookies)
-                val body1 = r1.text ?: continue
+                val raw1 = r1.text ?: continue
+                log("LINKS", "Step1 epId=$epId raw: ${raw1.take(200)}")
 
                 val htmlContent = try {
-                    (mapper.readValue(body1, Map::class.java) as? Map<*, *>)
-                        ?.get("html")?.toString() ?: body1
-                } catch (_: Exception) { body1 }
+                    @Suppress("UNCHECKED_CAST")
+                    (mapper.readValue(raw1, Map::class.java) as Map<String, Any?>)["html"]?.toString() ?: raw1
+                } catch (_: Exception) { raw1 }
 
                 val btns = Jsoup.parse(htmlContent).select(
-                    "a.btn3dsv, a[data-href], a[data-play], " +
-                    ".server-item a, .btn-server, li[data-id] a, .episodes-btn a"
+                    "a.btn3dsv, a[data-href], a[data-play], .server-item a, .btn-server, li[data-id] a"
                 )
-                log("LINKS", "Server buttons: ${btns.size}")
+                log("LINKS", "Buttons found: ${btns.size} for epId=$epId")
 
                 if (btns.isEmpty()) {
+                    // No buttons → try direct URL extraction
                     for (u in ResponseAnalyzer.extractUrls(htmlContent, epUrl))
-                        if (ResponseAnalyzer.isStream(u) && emitStream(u, vHeaders, subtitleCallback, callback)) return true
+                        if (ResponseAnalyzer.isStream(u) && emit(u, vH, sub, cb)) return true
                     continue
                 }
 
                 for (btn in btns) {
                     val hash  = btn.attr("data-href").ifBlank { btn.attr("href") }.trim()
                     val play  = btn.attr("data-play").trim()
-                    val btnId = btn.attr("data-id").trim().ifBlank { episodeId }
+                    val btnId = btn.attr("data-id").trim().ifBlank { epId }
                     if (hash.isBlank()) continue
+                    log("LINKS", "Btn: play='$play' hash='${hash.take(60)}'")
 
-                    if (hash.startsWith("http")) {
-                        if (emitStream(hash, vHeaders, subtitleCallback, callback)) return true
-                        continue
-                    }
+                    if (hash.startsWith("http")) { if (emit(hash, vH, sub, cb)) return true; continue }
 
+                    // Optional: activate session
                     runCatching {
-                        app.get("$mainUrl/ajax/get_episode?filmId=$filmId&episodeId=$episodeId",
-                            headers = aHeaders, cookies = cookies, interceptor = cfKiller)
+                        app.get("$mainUrl/ajax/get_episode?filmId=$filmId&episodeId=$epId",
+                            headers = aH, cookies = cookies, interceptor = cfKiller)
                             .also { cookies.putAll(it.cookies) }
                     }
 
-                    val paramSets = mutableListOf<Map<String, String>>()
-                    if (play == "api" || play.isBlank()) {
-                        paramSets += mapOf("link" to hash, "id" to episodeId)
-                        paramSets += mapOf("link" to hash, "id" to btnId)
-                        if (filmId.isNotBlank()) paramSets += mapOf("link" to hash, "id" to filmId)
-                    } else {
-                        paramSets += mapOf("link" to hash, "play" to play, "id" to btnId, "backuplinks" to "1")
-                        paramSets += mapOf("link" to hash, "play" to play, "id" to episodeId)
+                    // Build param combinations
+                    val paramSets = buildList {
+                        if (play == "api" || play.isBlank()) {
+                            add(mapOf("link" to hash, "id" to epId))
+                            add(mapOf("link" to hash, "id" to btnId))
+                            if (filmId.isNotBlank()) add(mapOf("link" to hash, "id" to filmId))
+                        } else {
+                            add(mapOf("link" to hash, "play" to play, "id" to btnId, "backuplinks" to "1"))
+                            add(mapOf("link" to hash, "play" to play, "id" to epId))
+                        }
                     }
 
                     for (params in paramSets) {
                         try {
                             val r2 = app.post("$mainUrl/ajax/player",
-                                data = params, headers = aHeaders,
-                                cookies = cookies, interceptor = cfKiller)
+                                data = params, headers = aH, cookies = cookies, interceptor = cfKiller)
                             cookies.putAll(r2.cookies)
-                            val body2 = r2.text ?: continue
-                            log("LINKS", "Step2: ${body2.take(120)}")
-                            if (processPlayerBody(body2, epUrl, vHeaders, subtitleCallback, callback)) return true
+                            val raw2 = r2.text ?: continue
+                            log("LINKS", "Step2: ${raw2.take(200)}")
+                            if (processBody(raw2, epUrl, vH, sub, cb)) return true
                         } catch (e: Exception) { log("LINKS", "Step2 err: ${e.message}") }
                     }
                 }
-            } catch (e: Exception) { log("LINKS", "AJAX err: ${e.message}") }
+            } catch (e: Exception) { log("LINKS", "AJAX err epId=$epId: ${e.message}") }
         }
         return false
     }
 
-    private suspend fun processPlayerBody(
-        body: String, epUrl: String, vHeaders: Map<String, String>,
-        subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
+    // ── Parse and handle a player AJAX response body ──────────────────────────
+    private suspend fun processBody(
+        body: String, epUrl: String, vH: Map<String, String>,
+        sub: (SubtitleFile) -> Unit, cb: (ExtractorLink) -> Unit
     ): Boolean {
         if (body.isBlank()) return false
 
-        val (directLink, encFiles) = try {
+        // Parse JSON: link = String | [{file: ...}]
+        val (direct, files) = try {
             @Suppress("UNCHECKED_CAST")
-            val json = mapper.readValue(body, Map::class.java) as Map<String, Any?>
-            when (val lnk = json["link"]) {
-                is String  -> lnk.takeIf { it.isNotBlank() } to emptyList()
+            val j = mapper.readValue(body, Map::class.java) as Map<String, Any?>
+            when (val lnk = j["link"]) {
+                is String  -> lnk.takeIf { it.isNotBlank() } to emptyList<String>()
                 is List<*> -> null to lnk.filterIsInstance<Map<String, Any?>>()
-                                         .mapNotNull { it["file"] as? String }
+                                         .mapNotNull { (it["file"] ?: it["src"] ?: it["url"]) as? String }
                                          .filter { it.isNotBlank() }
-                else       -> (json["url"] as? String) to emptyList<String>()
+                else       -> (j["url"] as? String ?: j["stream"] as? String) to emptyList<String>()
             }
         } catch (_: Exception) { null to emptyList<String>() }
 
-        if (!directLink.isNullOrBlank() && directLink.startsWith("http"))
-            if (emitStream(directLink, vHeaders, subtitleCallback, callback)) return true
+        log("LINKS", "processBody: direct=$direct files=${files.size}")
 
-        for (enc in encFiles) {
-            if (enc.startsWith("http")) {
-                if (emitStream(enc, vHeaders, subtitleCallback, callback)) return true
-                continue
-            }
-            val dec = EncryptionBreaker.autoBreak(enc) ?: continue
+        // Case 1: direct URL
+        if (!direct.isNullOrBlank() && direct.startsWith("http"))
+            if (emit(direct, vH, sub, cb)) return true
+
+        // Case 2: encrypted file list – THIS is where CryptoJS decrypt is critical
+        for (enc in files) {
+            if (enc.startsWith("http")) { if (emit(enc, vH, sub, cb)) return true; continue }
+            log("LINKS", "Decrypting: ${enc.take(80)}...")
+            val dec = EncryptionBreaker.autoBreak(enc)
             log("LINKS", "Decrypted → $dec")
-            if (emitStream(dec, vHeaders, subtitleCallback, callback)) return true
+            if (dec != null && emit(dec, vH, sub, cb)) return true
         }
 
+        // Case 3: mine URLs from raw body
         for (u in ResponseAnalyzer.extractUrls(body, epUrl))
-            if (ResponseAnalyzer.isStream(u) && emitStream(u, vHeaders, subtitleCallback, callback)) return true
+            if (ResponseAnalyzer.isStream(u) && emit(u, vH, sub, cb)) return true
 
-        if (!body.trimStart().startsWith("{") && !body.trimStart().startsWith("[") &&
-            !body.trimStart().startsWith("<")) {
+        // Case 4: entire body might be encrypted
+        if (!body.trimStart().run { startsWith("{") || startsWith("[") || startsWith("<") }) {
             val dec = EncryptionBreaker.autoBreak(body.trim())
-            if (dec != null && EncryptionBreaker.isValidUrl(dec))
-                if (emitStream(dec, vHeaders, subtitleCallback, callback)) return true
+            if (dec != null && EncryptionBreaker.isValidUrl(dec) && emit(dec, vH, sub, cb)) return true
         }
-
         return false
     }
 
-    // ── Strategy B ────────────────────────────────────────────────────────────
+    // ── Strategy B: Scrape cached page ───────────────────────────────────────
     private suspend fun strategyPageScrape(
-        body: String, epUrl: String, vHeaders: Map<String, String>,
-        subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
+        body: String, epUrl: String, vH: Map<String, String>,
+        sub: (SubtitleFile) -> Unit, cb: (ExtractorLink) -> Unit
     ): Boolean {
         if (body.isBlank()) return false
         val doc = try { Jsoup.parse(body) } catch (_: Exception) { return false }
 
         for (el in doc.select("iframe[src],iframe[data-src]")) {
             val src = fixUrl(el.attr("src").ifBlank { el.attr("data-src") }) ?: continue
-            log("LINKS", "iframe → $src")
-            try { loadExtractor(src, epUrl, subtitleCallback, callback); return true } catch (_: Exception) {}
+            log("LINKS", "iframe $src")
+            try { loadExtractor(src, epUrl, sub, cb); return true } catch (_: Exception) {}
             try {
-                val iBody = app.get(src, headers = vHeaders, interceptor = cfKiller).text ?: continue
+                val iBody = app.get(src, headers = vH, interceptor = cfKiller).text ?: continue
                 for (u in ResponseAnalyzer.extractUrls(iBody, src))
-                    if (ResponseAnalyzer.isStream(u) && emitStream(u, vHeaders, subtitleCallback, callback)) return true
+                    if (ResponseAnalyzer.isStream(u) && emit(u, vH, sub, cb)) return true
             } catch (_: Exception) {}
         }
-
         for (el in doc.select("video source[src],video[src]")) {
             val src = fixUrl(el.attr("src")) ?: continue
-            if (emitStream(src, vHeaders, subtitleCallback, callback)) return true
+            if (emit(src, vH, sub, cb)) return true
         }
-
         for (el in doc.select("[data-file],[data-url],[data-source],[data-stream]")) {
             val raw = listOf("data-file","data-url","data-source","data-stream")
-                .firstNotNullOfOrNull { attr -> el.attr(attr).takeIf { it.isNotBlank() } } ?: continue
-            val src = fixUrl(raw)
-            if (src != null && ResponseAnalyzer.isStream(src)) {
-                if (emitStream(src, vHeaders, subtitleCallback, callback)) return true
-            } else {
-                val dec = EncryptionBreaker.autoBreak(raw)
-                if (dec != null && emitStream(dec, vHeaders, subtitleCallback, callback)) return true
-            }
+                .firstNotNullOfOrNull { a -> el.attr(a).takeIf { it.isNotBlank() } } ?: continue
+            fixUrl(raw)?.takeIf { ResponseAnalyzer.isStream(it) }?.let { if (emit(it, vH, sub, cb)) return true }
+            EncryptionBreaker.autoBreak(raw)?.let { if (emit(it, vH, sub, cb)) return true }
         }
         return false
     }
 
-    // ── Strategy C ────────────────────────────────────────────────────────────
-    private suspend fun strategyJSReverse(
-        body: String, epUrl: String, vHeaders: Map<String, String>,
-        subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
+    // ── Strategy C: JS unpack ────────────────────────────────────────────────
+    private suspend fun strategyJS(
+        body: String, epUrl: String, vH: Map<String, String>,
+        sub: (SubtitleFile) -> Unit, cb: (ExtractorLink) -> Unit
     ): Boolean {
         val doc = try { Jsoup.parse(body) } catch (_: Exception) { return false }
         for (script in doc.select("script:not([src])").map { it.html() }.filter { it.length > 50 }) {
-            val unpacked = JSReverse.unpack(script)
-            for (u in (JSReverse.extractUrls(unpacked) + ResponseAnalyzer.extractUrls(unpacked, epUrl)).distinct())
-                if (ResponseAnalyzer.isStream(u) && emitStream(u, vHeaders, subtitleCallback, callback)) return true
+            val u = JSReverse.unpack(script)
+            for (url in (JSReverse.extractUrls(u) + ResponseAnalyzer.extractUrls(u, epUrl)).distinct())
+                if (ResponseAnalyzer.isStream(url) && emit(url, vH, sub, cb)) return true
         }
         return false
     }
 
-    // ── Strategy D ────────────────────────────────────────────────────────────
-    private suspend fun strategyDataMine(
-        body: String, epUrl: String, vHeaders: Map<String, String>,
-        subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
+    // ── Strategy D: Data mine ─────────────────────────────────────────────────
+    private suspend fun strategyMine(
+        body: String, epUrl: String, vH: Map<String, String>,
+        sub: (SubtitleFile) -> Unit, cb: (ExtractorLink) -> Unit
     ): Boolean {
         for (u in ResponseAnalyzer.extractUrls(body, epUrl))
-            if (ResponseAnalyzer.isStream(u) && emitStream(u, vHeaders, subtitleCallback, callback)) return true
+            if (ResponseAnalyzer.isStream(u) && emit(u, vH, sub, cb)) return true
         for (enc in DataMiner.mineEncrypted(body)) {
-            if (enc.startsWith("http")) {
-                if (emitStream(enc, vHeaders, subtitleCallback, callback)) return true; continue
-            }
+            if (enc.startsWith("http")) { if (emit(enc, vH, sub, cb)) return true; continue }
             val dec = EncryptionBreaker.autoBreak(enc) ?: continue
-            if (emitStream(dec, vHeaders, subtitleCallback, callback)) return true
+            log("LINKS", "Mine dec $dec")
+            if (emit(dec, vH, sub, cb)) return true
         }
         return false
     }
 
-    // ── Strategy E ────────────────────────────────────────────────────────────
-    private suspend fun strategyAltEndpoints(
+    // ── Strategy E: Alt AJAX endpoints ────────────────────────────────────────
+    private suspend fun strategyAlt(
         epUrl: String, filmId: String, dataId: String, hrefId: String,
-        vHeaders: Map<String, String>,
-        subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
+        vH: Map<String, String>, sub: (SubtitleFile) -> Unit, cb: (ExtractorLink) -> Unit
     ): Boolean {
         val ids = listOf(dataId, hrefId, filmId).filter { it.isNotBlank() }.distinct()
         for (id in ids) {
@@ -653,57 +672,47 @@ class AnimeVietSub : MainAPI() {
                 "$mainUrl/ajax/player?episodeId=$id",
                 "$mainUrl/ajax/getLink?filmId=$filmId&episodeId=$id",
                 "$mainUrl/ajax/stream/$id",
-                "$mainUrl/ajax/player?id=$id",
-                "$mainUrl/api/get_link/$id"
+                "$mainUrl/ajax/player?id=$id"
             )) {
                 try {
-                    val body = app.get(ep, headers = defaultHeaders, interceptor = cfKiller).text ?: continue
-                    if (processPlayerBody(body, epUrl, vHeaders, subtitleCallback, callback)) return true
+                    val b = app.get(ep, headers = defaultHeaders, interceptor = cfKiller).text ?: continue
+                    if (processBody(b, epUrl, vH, sub, cb)) return true
                 } catch (_: Exception) {}
             }
         }
         return false
     }
 
-    // ── Emit stream (NO blocking M3u8Helper call) ─────────────────────────────
-    private suspend fun emitStream(
+    // ── Emit a stream URL ─────────────────────────────────────────────────────
+    private suspend fun emit(
         url: String, headers: Map<String, String>,
-        subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
+        sub: (SubtitleFile) -> Unit, cb: (ExtractorLink) -> Unit
     ): Boolean {
         val clean = url.trim()
         if (!clean.startsWith("http")) return false
-        val referer = headers["Referer"] ?: mainUrl
+        val ref = headers["Referer"] ?: mainUrl
         log("EMIT", clean)
         return try {
             when {
                 clean.contains(".m3u8") -> {
-                    callback(newExtractorLink(name, name, clean) {
-                        this.referer = referer
-                        this.quality = Qualities.Unknown.value
-                        this.type    = ExtractorLinkType.M3U8
-                        this.headers = headers
-                    })
-                    true
+                    cb(newExtractorLink(name, name, clean) {
+                        this.referer = ref; this.quality = Qualities.Unknown.value
+                        this.type = ExtractorLinkType.M3U8; this.headers = headers
+                    }); true
                 }
                 clean.contains(".mp4") || clean.contains(".mkv") || clean.contains(".webm") -> {
-                    callback(newExtractorLink(name, name, clean) {
-                        this.referer = referer
-                        this.quality = Qualities.Unknown.value
-                        this.type    = ExtractorLinkType.VIDEO
-                        this.headers = headers
-                    })
-                    true
+                    cb(newExtractorLink(name, name, clean) {
+                        this.referer = ref; this.quality = Qualities.Unknown.value
+                        this.type = ExtractorLinkType.VIDEO; this.headers = headers
+                    }); true
                 }
                 else -> try {
-                    loadExtractor(clean, referer, subtitleCallback, callback); true
+                    loadExtractor(clean, ref, sub, cb); true
                 } catch (_: Exception) {
-                    callback(newExtractorLink(name, name, clean) {
-                        this.referer = referer
-                        this.quality = Qualities.Unknown.value
-                        this.type    = ExtractorLinkType.VIDEO
-                        this.headers = headers
-                    })
-                    true
+                    cb(newExtractorLink(name, name, clean) {
+                        this.referer = ref; this.quality = Qualities.Unknown.value
+                        this.type = ExtractorLinkType.VIDEO; this.headers = headers
+                    }); true
                 }
             }
         } catch (e: Exception) { log("EMIT", "err: ${e.message}"); false }

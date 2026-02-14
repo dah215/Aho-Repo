@@ -45,12 +45,21 @@ class AnimeVietSub : MainAPI() {
         "User-Agent" to ua,
         "Accept"     to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "Accept-Language" to "vi-VN,vi;q=0.9,en;q=0.8",
-        "Priority"   to "u=0, i",
-        "Sec-Ch-Ua"  to "\"Not/A)Brand\";v=\"8\", \"Chromium\";v=\"126\", \"Google Chrome\";v=\"126\"",
+        "Cache-Control" to "no-cache",
+        "Pragma" to "no-cache",
+        "Priority" to "u=0, i",
+        "Sec-Ch-Ua" to "\"Not/A)Brand\";v=\"8\", \"Chromium\";v=\"126\", \"Google Chrome\";v=\"126\"",
         "Sec-Fetch-Dest" to "document",
         "Sec-Fetch-Mode" to "navigate",
         "Sec-Fetch-Site" to "none",
         "Sec-Fetch-User" to "?1"
+    )
+
+    override val mainPage = mainPageOf(
+        "$mainUrl/danh-sach/list-dang-chieu/" to "Đang Chiếu",
+        "$mainUrl/danh-sach/list-tron-bo/"    to "Trọn Bộ",
+        "$mainUrl/anime-le/"                  to "Anime Lẻ",
+        "$mainUrl/anime-bo/"                  to "Anime Bộ"
     )
 
     private fun fixUrl(url: String?): String? {
@@ -59,30 +68,46 @@ class AnimeVietSub : MainAPI() {
         return when {
             trimmed.startsWith("http") -> trimmed
             trimmed.startsWith("//") -> "https:$trimmed"
-            else -> "$mainUrl/${trimmed.removePrefix("/")}"
+            trimmed.startsWith("/") -> "$mainUrl$trimmed"
+            else -> "$mainUrl/$trimmed"
         }
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val data = request.data.ifBlank { return newHomePageResponse(request.name, emptyList(), false) }
+        val data = request.data
         val url = if (page == 1) data else "${data.removeSuffix("/")}/trang-$page.html"
-        val fixedUrl = fixUrl(url) ?: return newHomePageResponse(request.name, emptyList(), false)
-        val doc = app.get(fixedUrl, interceptor = cfKiller, headers = defaultHeaders).document
-        val items = doc.select("article.TPostMv, article.TPost, .TPostMv").mapNotNull { it.toSearchResponse() }
+        
+        val res = app.get(url, interceptor = cfKiller, headers = defaultHeaders)
+        val doc = res.document
+        
+        // Sử dụng Selector rộng hơn để tránh màn hình đen
+        val items = doc.select("article, .TPostMv, .item, .list-film li, .TPost").mapNotNull { 
+            it.toSearchResponse() 
+        }.distinctBy { it.url }
+        
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
 
     private fun Element.toSearchResponse(): SearchResponse? {
-        val title = selectFirst(".Title, h3, h2")?.text()?.trim() ?: return null
-        val href  = fixUrl(selectFirst("a")?.attr("href")) ?: return null
-        val poster = selectFirst("img")?.let { fixUrl(it.attr("data-src").ifEmpty { it.attr("src") }) }
-        return newAnimeSearchResponse(title, href, TvType.Anime) { posterUrl = poster }
+        val title = selectFirst(".Title, h3, h2, .title")?.text()?.trim() ?: return null
+        val a = selectFirst("a") ?: return null
+        val href = fixUrl(a.attr("href")) ?: return null
+        
+        val img = selectFirst("img")
+        val poster = fixUrl(img?.attr("data-src")?.takeIf { it.isNotBlank() } 
+                     ?: img?.attr("data-original")?.takeIf { it.isNotBlank() }
+                     ?: img?.attr("src"))
+        
+        return newAnimeSearchResponse(title, href, TvType.Anime) { 
+            posterUrl = poster 
+        }
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/tim-kiem/${URLEncoder.encode(query, "utf-8")}/"
         return app.get(url, interceptor = cfKiller, headers = defaultHeaders).document
-            .select("article.TPostMv, article.TPost").mapNotNull { it.toSearchResponse() }
+            .select("article, .TPostMv, .item, .list-film li").mapNotNull { it.toSearchResponse() }
+            .distinctBy { it.url }
     }
 
     override suspend fun load(url: String): LoadResponse {
@@ -109,8 +134,13 @@ class AnimeVietSub : MainAPI() {
             }
         }
 
-        return newAnimeLoadResponse(doc.selectFirst("h1.Title, .Title, h1")?.text()?.trim() ?: "Anime", fixedUrl, TvType.Anime) {
-            this.posterUrl = doc.selectFirst(".Image img, .InfoImg img, img[itemprop=image]")?.let { fixUrl(it.attr("data-src").ifEmpty { it.attr("src") }) }
+        val title = doc.selectFirst("h1.Title, .Title, h1")?.text()?.trim() ?: "Anime"
+        val poster = doc.selectFirst(".Image img, .InfoImg img, img[itemprop=image]")?.let { 
+            fixUrl(it.attr("data-src").ifEmpty { it.attr("src") }) 
+        }
+
+        return newAnimeLoadResponse(title, fixedUrl, TvType.Anime) {
+            this.posterUrl = poster
             this.plot = doc.selectFirst(".Description, .InfoDesc, #film-content")?.text()?.trim()
             this.episodes = mutableMapOf(DubStatus.Subbed to episodes)
         }
@@ -126,7 +156,6 @@ class AnimeVietSub : MainAPI() {
         if (parts.size < 3) return false
         val (epUrl, filmId, episodeId) = parts
 
-        // 1. Khởi tạo Session
         val pageReq = app.get(epUrl, interceptor = cfKiller, headers = defaultHeaders)
         val cookies = pageReq.cookies
 
@@ -139,7 +168,6 @@ class AnimeVietSub : MainAPI() {
             "Accept"           to "application/json, text/javascript, */*; q=0.01"
         )
 
-        // 2. Bước 1: Lấy Hash
         val step1 = app.post(
             "$mainUrl/ajax/player",
             data = mapOf("episodeId" to episodeId, "backup" to "1"),
@@ -154,11 +182,9 @@ class AnimeVietSub : MainAPI() {
         val play = btn.attr("data-play")
         val btnId = btn.attr("data-id")
 
-        // 3. Bước 2: Kích hoạt Session tập phim (get_episode)
         app.get("$mainUrl/ajax/get_episode?filmId=$filmId&episodeId=$episodeId", 
                 headers = ajaxHeaders, cookies = cookies, interceptor = cfKiller)
 
-        // 4. Bước 3: Lấy Link mã hóa (Thử cả filmId và episodeId)
         val idsToTry = listOf(filmId, episodeId)
         var finalDecrypted: String? = null
 
@@ -184,10 +210,8 @@ class AnimeVietSub : MainAPI() {
             }
         }
 
-        // Fix lỗi biên dịch: Sử dụng biến cục bộ không null
         val decrypted = finalDecrypted ?: return false
 
-        // 5. Bước 4: Xuyên thấu Redirect
         val videoHeaders = mapOf(
             "User-Agent" to ua, 
             "Referer"    to epUrl, 

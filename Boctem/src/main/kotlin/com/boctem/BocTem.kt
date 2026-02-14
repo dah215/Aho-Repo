@@ -27,7 +27,7 @@ class BocTemProvider : MainAPI() {
     )
 
     override val mainPage = mainPageOf(
-        "anime-moi/page/" to "Anime Mới",
+        "/" to "Anime Mới",
         "release/2026/page/" to "Anime 2026"
     )
 

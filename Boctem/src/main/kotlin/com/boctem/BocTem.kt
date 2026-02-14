@@ -26,97 +26,54 @@ class BocTemProvider : MainAPI() {
         "Upgrade-Insecure-Requests" to "1"
     )
 
-    override val mainPage = mainPageOf(
-        "/" to "Anime Mới",
-        "release/2026/page/" to "Anime 2026"
-    )
-
-    private fun requestHeaders(referer: String? = null, extra: Map<String, String> = emptyMap()): Map<String, String> {
-        val headers = defaultHeaders.toMutableMap()
-        val ref = referer ?: mainUrl
-        headers["Referer"] = ref
-        headers.putAll(extra)
-        return headers
+    private fun requestHeaders(referer: String? = null, extra: Map<String, String>? = null): Map<String, String> {
+        return defaultHeaders.toMutableMap().apply {
+            referer?.let { put("Referer", it) }
+            extra?.let { putAll(it) }
+        }
     }
 
     private fun normalizeUrl(url: String?): String? {
         if (url.isNullOrBlank()) return null
-
-        return when {
-            url.startsWith("http://") || url.startsWith("https://") -> url
-            url.startsWith("//") -> "https:$url"
-            url.startsWith("/") -> "$mainUrl$url"
-            else -> "$mainUrl/$url"
-        }
+        if (url.startsWith("//")) return "https:$url"
+        if (url.startsWith("/")) return "$mainUrl$url"
+        return url
     }
 
-    private fun decodeUnicode(text: String): String {
-        return text.replace(Regex("""\\u([0-9a-fA-F]{4})""")) { match ->
-            match.groupValues[1].toInt(16).toChar().toString()
-        }
+    private fun cleanStreamUrl(url: String?): String? {
+        return url?.replace("\\/", "/")?.replace("\"", "")?.replace("'", "")?.trim()
     }
 
-    private fun cleanStreamUrl(raw: String): String {
-        return decodeUnicode(raw)
-            .trim()
-            .trim('"', '\'')
-            .replace("\\/", "/")
-            .replace("\\u0026", "&")
-            .replace("&amp;", "&")
-            .replace("\\n", "")
-            .replace("\\t", "")
-            .replace("\\", "")
-    }
-
-    private fun parseCard(article: Element): SearchResponse? {
-        val anchor = article.selectFirst("a") ?: return null
-        val href = normalizeUrl(anchor.attr("href")) ?: return null
-
-        val title = article.selectFirst(".entry-title")?.text()?.trim().orEmpty()
-            .ifEmpty { anchor.attr("title").trim() }
-            .ifEmpty { return null }
-
-        val image = article.selectFirst("img")
-        val poster = normalizeUrl(
-            image?.attr("data-src")?.takeIf { it.isNotBlank() }
-                ?: image?.attr("src")
-        )
-
-        val statusText = article.selectFirst(".status")?.text().orEmpty()
-        val episodeNumber = Regex("""(\d+)""").find(statusText)?.groupValues?.get(1)?.toIntOrNull()
-
-        return newAnimeSearchResponse(title, href, TvType.Anime) {
-            this.posterUrl = poster
-            addSub(episodeNumber)
-        }
-    }
+    override val mainPage = mainPageOf(
+        "$mainUrl/danh-sach/phim-moi/page/" to "Phim Mới Cập Nhật",
+        "$mainUrl/danh-sach/anime-bo/page/" to "Anime Bộ",
+        "$mainUrl/danh-sach/anime-le/page/" to "Anime Lẻ",
+        "$mainUrl/the-loai/hoc-duong/page/" to "Học Đường",
+    )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = "$mainUrl/${request.data}$page"
-        val document = app.get(url, headers = requestHeaders(mainUrl)).document
+        val document = app.get("${request.data}$page/", headers = requestHeaders(mainUrl)).document
+        val home = document.select(".halim-item").mapNotNull { it.toSearchResult() }
+        return newHomePageResponse(request.name, home)
+    }
 
-        val items = document
-            .select("article.thumb.grid-item")
-            .mapNotNull { parseCard(it) }
-
-        return newHomePageResponse(
-            HomePageList(
-                name = request.name,
-                list = items,
-                isHorizontalImages = false
-            ),
-            hasNext = items.isNotEmpty()
+    private fun Element.toSearchResult(): SearchResponse? {
+        val title = selectFirst(".entry-title")?.text()?.trim() ?: return null
+        val href = normalizeUrl(selectFirst("a")?.attr("href")) ?: return null
+        val posterUrl = normalizeUrl(
+            selectFirst("img")?.attr("data-src")?.takeIf { it.isNotBlank() }
+                ?: selectFirst("img")?.attr("src")
         )
+
+        return newAnimeSearchResponse(title, href, TvType.Anime) {
+            this.posterUrl = posterUrl
+        }
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val encodedQuery = URLEncoder.encode(query, "UTF-8")
-        val url = "$mainUrl/?s=$encodedQuery"
-        val document = app.get(url, headers = requestHeaders(mainUrl)).document
-
-        return document
-            .select("article.thumb.grid-item")
-            .mapNotNull { parseCard(it) }
+        val searchUrl = "$mainUrl/?s=${URLEncoder.encode(query, "utf-8")}"
+        val document = app.get(searchUrl, headers = requestHeaders(mainUrl)).document
+        return document.select(".halim-item").mapNotNull { it.toSearchResult() }
     }
 
     override suspend fun load(url: String): LoadResponse? {
@@ -137,8 +94,10 @@ class BocTemProvider : MainAPI() {
             ?: document.selectFirst("meta[property=og:description]")?.attr("content")
 
         val seen = HashSet<String>()
+        
+        // SỬA LỖI TẬP PHIM: Chỉ quét link trong class list-episode để tránh lấy nhầm điểm đánh giá ở sidebar
         val episodes = document
-            .select("a[href*=/xem-phim/]")
+            .select(".list-episode a[href*=/xem-phim/], .halim-list-eps a[href*=/xem-phim/]")
             .mapNotNull { link ->
                 val epUrl = normalizeUrl(link.attr("href")) ?: return@mapNotNull null
                 if (!epUrl.contains("-tap-")) return@mapNotNull null
@@ -186,13 +145,12 @@ class BocTemProvider : MainAPI() {
 
             fun extractIframeUrlsFromText(text: String?): List<String> {
                 if (text.isNullOrBlank()) return emptyList()
-
+                val cleanText = text.replace("\\/", "/")
                 val keyBased = Regex("""(?:src|file|link|embed_url|iframe|player|url)["']?\s*[:=]\s*["']((?:https?:)?//[^"'<>\s]+)["']""")
-                    .findAll(text)
+                    .findAll(cleanText)
                     .map { it.groupValues[1] }
-
                 val rawBased = Regex("""(?:https?:)?//[^"'<>\s]+(?:embed|player|stream|video|watch)[^"'<>\s]*""")
-                    .findAll(text)
+                    .findAll(cleanText)
                     .map { it.value }
 
                 return (keyBased + rawBased)
@@ -205,7 +163,7 @@ class BocTemProvider : MainAPI() {
 
             suspend fun tryM3u8FromText(text: String?): Boolean {
                 if (text.isNullOrBlank()) return false
-
+                val cleanText = text.replace("\\/", "/")
                 val m3u8Patterns = listOf(
                     Regex("""(?:file|src|link|playlist)["']?\s*[:=]\s*["']([^"']+\.m3u8[^"']*)["']"""),
                     Regex("""(?:https?:)?//[^"'<>\s]+\.m3u8[^"'<>\s]*"""),
@@ -213,13 +171,11 @@ class BocTemProvider : MainAPI() {
                 )
 
                 val m3u8 = m3u8Patterns.firstNotNullOfOrNull { pattern ->
-                    val match = pattern.find(text) ?: return@firstNotNullOfOrNull null
+                    val match = pattern.find(cleanText) ?: return@firstNotNullOfOrNull null
                     if (match.groupValues.size > 1) match.groupValues[1] else match.value
                 }
 
-                val cleanM3u8 = m3u8
-                    ?.let(::cleanStreamUrl)
-                    ?.let { normalizeUrl(it) ?: it }
+                val cleanM3u8 = m3u8?.let(::cleanStreamUrl)?.let { normalizeUrl(it) ?: it }
 
                 if (!cleanM3u8.isNullOrBlank()) {
                     M3u8Helper.generateM3u8(
@@ -228,178 +184,58 @@ class BocTemProvider : MainAPI() {
                         referer = dataUrl,
                         headers = requestHeaders(dataUrl)
                     ).forEach(linkCallback)
-                    if (hasLinks) return true
-
-                    linkCallback(
-                        newExtractorLink(
-                            source = name,
-                            name = "$name M3U8",
-                            url = cleanM3u8,
-                            type = ExtractorLinkType.M3U8
-                        ) {
-                            this.referer = dataUrl
-                            this.quality = Qualities.Unknown.value
-                            this.headers = requestHeaders(dataUrl)
-                        }
-                    )
-                    return hasLinks
+                    return true
                 }
-
-                val directVideo = Regex("""(?:file|src|link)["']?\s*[:=]\s*["']([^"']+\.(?:mp4|mkv|webm)(?:\?[^"']*)?)["']""")
-                    .find(text)
-                    ?.groupValues
-                    ?.get(1)
-                    ?: Regex("""https?://[^"'<>\s]+\.(?:mp4|mkv|webm)(?:\?[^"'<>\s]*)?""")
-                        .find(text)
-                        ?.value
-
-                val cleanDirectVideo = directVideo
-                    ?.let(::cleanStreamUrl)
-                    ?.let { normalizeUrl(it) ?: it }
-
-                if (!cleanDirectVideo.isNullOrBlank()) {
-                    linkCallback(
-                        newExtractorLink(
-                            source = name,
-                            name = "$name Direct",
-                            url = cleanDirectVideo,
-                            type = ExtractorLinkType.VIDEO
-                        ) {
-                            this.referer = dataUrl
-                            this.quality = Qualities.Unknown.value
-                            this.headers = requestHeaders(dataUrl)
-                        }
-                    )
-                    return hasLinks
-                }
-
                 return false
             }
 
-            if (tryM3u8FromText(document.html())) return true
+            // 1. Quét HTML tĩnh trước
+            tryM3u8FromText(document.html())
 
-            val inlineIframeUrl = normalizeUrl(document.selectFirst("iframe[src]")?.attr("src"))
-            if (!inlineIframeUrl.isNullOrBlank()) {
-                loadExtractor(inlineIframeUrl, dataUrl, subtitleCallback, linkCallback)
-                if (hasLinks) return true
-            }
-
-            for (script in document.select("script")) {
-                val scriptText = script.data() + "\n" + script.html()
-                if (tryM3u8FromText(scriptText)) return true
-
-                val embeddedUrls = extractIframeUrlsFromText(scriptText)
-                if (embeddedUrls.isNotEmpty()) {
-                    embeddedUrls.forEach { loadExtractor(it, dataUrl, subtitleCallback, linkCallback) }
-                    if (hasLinks) return true
-                }
-            }
-
+            // 2. Tìm thông tin AJAX
             val bodyClass = document.selectFirst("body")?.attr("class").orEmpty()
             val postId = Regex("""postid-(\d+)""").find(bodyClass)?.groupValues?.get(1)
                 ?: Regex("""post-(\d+)""").find(bodyClass)?.groupValues?.get(1)
-                ?: Regex("""post-(\d+)""").find(document.selectFirst("article")?.attr("id").orEmpty())?.groupValues?.get(1)
 
-            val episode = Regex("""tap-(\d+)""").find(dataUrl)?.groupValues?.get(1)
-                ?: Regex("""episode=(\d+)""").find(dataUrl)?.groupValues?.get(1)
-                ?: "1"
+            val episode = Regex("""tap-(\d+)""").find(dataUrl)?.groupValues?.get(1) ?: "1"
 
             var nonce: String? = null
             for (script in document.select("script")) {
-                val content = script.data() + "\n" + script.html()
-                if (content.contains("ajax_player") || content.contains("nonce")) {
-                    nonce = Regex("""nonce["']?\s*[:=]\s*["']([^"']+)["']""")
-                        .find(content)
-                        ?.groupValues
-                        ?.get(1)
+                val content = script.data()
+                if (content.contains("nonce")) {
+                    nonce = Regex("""nonce["']?\s*[:=]\s*["']([^"']+)["']""").find(content)?.groupValues?.get(1)
                     if (!nonce.isNullOrBlank()) break
                 }
             }
 
-            suspend fun requestAjax(server: String): String? {
-                if (postId.isNullOrBlank() || nonce.isNullOrBlank()) return null
-
-                val payloads = listOf(
-                    mapOf(
-                        "action" to "halim_ajax_player",
-                        "nonce" to nonce,
-                        "postid" to postId,
-                        "episode" to episode,
-                        "server" to server
-                    ),
-                    mapOf(
-                        "action" to "ajax_player",
-                        "nonce" to nonce,
-                        "postid" to postId,
-                        "episode" to episode,
-                        "server" to server
-                    )
-                )
-
-                for (payload in payloads) {
-                    val response = runCatching {
-                        app.post(
-                            "$mainUrl/wp-admin/admin-ajax.php",
-                            data = payload,
-                            referer = dataUrl,
-                            headers = requestHeaders(
-                                dataUrl,
-                                mapOf(
-                                    "Origin" to mainUrl,
-                                    "X-Requested-With" to "XMLHttpRequest"
-                                )
-                            )
-                        ).text
-                    }.getOrNull()
-
-                    if (!response.isNullOrBlank()) return response
-                }
-
-                return null
-            }
-
+            // SỬA LỖI 3001: Lặp qua tất cả server, không return ngay lập tức
             for (server in listOf("1", "2", "3", "4", "5")) {
-                val ajaxResponse = requestAjax(server) ?: continue
+                if (postId.isNullOrBlank() || nonce.isNullOrBlank()) continue
+                
+                val ajaxResponse = runCatching {
+                    app.post(
+                        "$mainUrl/wp-admin/admin-ajax.php",
+                        data = mapOf(
+                            "action" to "halim_ajax_player",
+                            "nonce" to nonce,
+                            "postid" to postId,
+                            "episode" to episode,
+                            "server" to server
+                        ),
+                        referer = dataUrl,
+                        headers = requestHeaders(dataUrl, mapOf("X-Requested-With" to "XMLHttpRequest"))
+                    ).text
+                }.getOrNull() ?: continue
 
-                if (tryM3u8FromText(ajaxResponse)) return true
-
-                val iframe = Regex("""iframe[^>]+src=["']([^"']+)["']""")
-                    .find(ajaxResponse)
-                    ?.groupValues
-                    ?.get(1)
-                    ?: Regex("""(?:src|embed_url|link)["']?\s*:\s*["']([^"']+)["']""")
-                        .find(ajaxResponse)
-                        ?.groupValues
-                        ?.get(1)
-
-                val iframeUrl = normalizeUrl(iframe?.replace("\\/", "/"))
-                if (!iframeUrl.isNullOrBlank()) {
-                    loadExtractor(iframeUrl, dataUrl, subtitleCallback, linkCallback)
-                    if (hasLinks) return true
-                }
-
+                tryM3u8FromText(ajaxResponse)
+                
                 val embeddedUrls = extractIframeUrlsFromText(ajaxResponse)
-                if (embeddedUrls.isNotEmpty()) {
-                    embeddedUrls.forEach { loadExtractor(it, dataUrl, subtitleCallback, linkCallback) }
-                    if (hasLinks) return true
-                }
+                embeddedUrls.forEach { loadExtractor(it, dataUrl, subtitleCallback, linkCallback) }
             }
 
-            val genericCandidates = extractIframeUrlsFromText(document.html())
-            if (genericCandidates.isNotEmpty()) {
-                genericCandidates.forEach { loadExtractor(it, dataUrl, subtitleCallback, linkCallback) }
-                if (hasLinks) return true
-            }
-
-            loadExtractor(dataUrl, dataUrl, subtitleCallback, linkCallback)
-            if (hasLinks) return true
-
-            val iframes = document.select("iframe[src]")
-                .mapNotNull { normalizeUrl(it.attr("src")) }
-                .distinct()
-
-            for (iframe in iframes) {
-                loadExtractor(iframe, dataUrl, subtitleCallback, linkCallback)
+            // Fallback: Quét toàn bộ iframe còn lại
+            document.select("iframe[src]").mapNotNull { normalizeUrl(it.attr("src")) }.forEach {
+                loadExtractor(it, dataUrl, subtitleCallback, linkCallback)
             }
 
             hasLinks

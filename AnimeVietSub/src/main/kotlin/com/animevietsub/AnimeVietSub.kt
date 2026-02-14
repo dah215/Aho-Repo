@@ -126,7 +126,7 @@ class AnimeVietSub : MainAPI() {
         if (parts.size < 3) return false
         val (epUrl, filmId, episodeId) = parts
 
-        // 1. Khởi tạo Session (Warming up)
+        // 1. Khởi tạo Session
         val pageReq = app.get(epUrl, interceptor = cfKiller, headers = defaultHeaders)
         val cookies = pageReq.cookies
 
@@ -136,12 +136,10 @@ class AnimeVietSub : MainAPI() {
             "Referer"          to epUrl,
             "Origin"           to mainUrl,
             "User-Agent"       to ua,
-            "Accept"           to "application/json, text/javascript, */*; q=0.01",
-            "Sec-Fetch-Mode"   to "cors",
-            "Sec-Fetch-Site"   to "same-origin"
+            "Accept"           to "application/json, text/javascript, */*; q=0.01"
         )
 
-        // 2. Bước 1: Lấy Hash (Player Step 1)
+        // 2. Bước 1: Lấy Hash
         val step1 = app.post(
             "$mainUrl/ajax/player",
             data = mapOf("episodeId" to episodeId, "backup" to "1"),
@@ -156,11 +154,11 @@ class AnimeVietSub : MainAPI() {
         val play = btn.attr("data-play")
         val btnId = btn.attr("data-id")
 
-        // 3. Bước 2: Kích hoạt Session tập phim (Dựa trên log get_episode - CỰC KỲ QUAN TRỌNG)
+        // 3. Bước 2: Kích hoạt Session tập phim (get_episode)
         app.get("$mainUrl/ajax/get_episode?filmId=$filmId&episodeId=$episodeId", 
                 headers = ajaxHeaders, cookies = cookies, interceptor = cfKiller)
 
-        // 4. Bước 3: Lấy Link mã hóa (Player Step 2 - Thử cả filmId và episodeId)
+        // 4. Bước 3: Lấy Link mã hóa (Thử cả filmId và episodeId)
         val idsToTry = listOf(filmId, episodeId)
         var finalDecrypted: String? = null
 
@@ -186,9 +184,10 @@ class AnimeVietSub : MainAPI() {
             }
         }
 
-        if (finalDecrypted == null) return false
+        // Fix lỗi biên dịch: Sử dụng biến cục bộ không null
+        val decrypted = finalDecrypted ?: return false
 
-        // 5. Bước 4: Xuyên thấu Redirect (Sửa lỗi 2001/1002 triệt để)
+        // 5. Bước 4: Xuyên thấu Redirect
         val videoHeaders = mapOf(
             "User-Agent" to ua, 
             "Referer"    to epUrl, 
@@ -196,11 +195,10 @@ class AnimeVietSub : MainAPI() {
             "Accept"     to "*/*"
         )
 
-        var realUrl = finalDecrypted
-        if (finalDecrypted.startsWith("http") && (finalDecrypted.contains(".html") || !finalDecrypted.contains(".m3u8"))) {
+        var realUrl = decrypted
+        if (decrypted.startsWith("http") && (decrypted.contains(".html") || !decrypted.contains(".m3u8"))) {
             runCatching {
-                // Tự mình đi xuyên qua các trang redirect trung gian
-                val res = app.get(finalDecrypted, headers = videoHeaders, cookies = cookies, interceptor = cfKiller)
+                val res = app.get(decrypted, headers = videoHeaders, cookies = cookies, interceptor = cfKiller)
                 realUrl = res.url
             }
         }
@@ -230,43 +228,4 @@ class AnimeVietSub : MainAPI() {
             val decoded = Base64.decode(aes.replace("\\s".toRegex(), ""), Base64.DEFAULT)
             if (decoded.size < 17) return null
             
-            val iv = decoded.copyOfRange(0, 16)
-            val ct = decoded.copyOfRange(16, decoded.size)
-            
-            val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
-            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
-            val plain = cipher.doFinal(ct)
-            
-            try {
-                val inflater = Inflater(true).apply { setInput(plain) }
-                val out = ByteArrayOutputStream()
-                val buf = ByteArray(8192)
-                while (!inflater.finished()) {
-                    val n = inflater.inflate(buf)
-                    if (n == 0) break
-                    out.write(buf, 0, n)
-                }
-                inflater.end()
-                String(out.toByteArray(), StandardCharsets.UTF_8).replace("\"", "").trim()
-            } catch (e: Exception) {
-                String(plain, StandardCharsets.UTF_8).replace("\"", "").trim()
-            }
-        } catch (e: Exception) { null }
-    }
-
-    data class ServerSelectionResp(@JsonProperty("html") val html: String? = null)
-    
-    data class PlayerResp(
-        @JsonProperty("link") val linkRaw: Any? = null,
-        @JsonProperty("success") val success: Int? = null
-    ) {
-        @Suppress("UNCHECKED_CAST")
-        val linkArray: List<LinkFile>? 
-            get() = (linkRaw as? List<*>)?.filterIsInstance<Map<String, Any?>>()?.map { 
-                LinkFile(it["file"] as? String) 
-            }
-        val linkString: String? get() = linkRaw as? String
-    }
-
-    data class LinkFile(@JsonProperty("file") val file: String? = null)
-}
+            val iv = decoded

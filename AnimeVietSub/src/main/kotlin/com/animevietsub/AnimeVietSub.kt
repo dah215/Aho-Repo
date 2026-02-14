@@ -85,7 +85,6 @@ class AnimeVietSub : MainAPI() {
         val fixedUrl = fixUrl(url)!!
         var doc = app.get(fixedUrl, interceptor = cfKiller, headers = defaultHeaders).document
         
-        // Nếu không thấy danh sách tập, thử tìm nút "Xem phim" hoặc link tập đầu tiên
         if (doc.select("ul.list-episode li a").isEmpty()) {
             val watchUrl = doc.selectFirst("a.btn-see, a[href*='/tap-'], .btn-watch a")?.attr("href")?.let { fixUrl(it) }
             if (watchUrl != null) {
@@ -125,7 +124,9 @@ class AnimeVietSub : MainAPI() {
     ): Boolean {
         val parts = data.split("@@")
         if (parts.size < 3) return false
-        val (epUrl, filmId, episodeId) = parts
+        val epUrl     = parts[0]
+        val filmId    = parts[1]
+        val episodeId = parts[2]
 
         val pageReq = app.get(epUrl, interceptor = cfKiller, headers = defaultHeaders)
         val cookies = pageReq.cookies
@@ -195,4 +196,24 @@ class AnimeVietSub : MainAPI() {
             }
             inflater.end()
             String(out.toByteArray(), StandardCharsets.UTF_8).replace("\"", "").trim()
-        } catch
+        } catch (e: Exception) { null }
+    }
+
+    // Các lớp dữ liệu phải nằm trong class AnimeVietSub hoặc ở cấp độ package nhưng phải đúng cú pháp
+    data class ServerSelectionResp(@JsonProperty("html") val html: String? = null)
+    
+    data class PlayerResp(
+        @JsonProperty("link") val linkRaw: Any? = null,
+        @JsonProperty("success") val success: Int? = null,
+        @JsonProperty("_fxStatus") val fxStatus: Int? = null
+    ) {
+        @Suppress("UNCHECKED_CAST")
+        val linkArray: List<LinkFile>? 
+            get() = (linkRaw as? List<*>)?.filterIsInstance<Map<String, Any?>>()?.map { 
+                LinkFile(it["file"] as? String) 
+            }
+        val linkString: String? get() = linkRaw as? String
+    }
+
+    data class LinkFile(@JsonProperty("file") val file: String? = null)
+}

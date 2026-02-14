@@ -5,7 +5,6 @@ import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.*
-import okhttp3.Response
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
@@ -121,91 +120,87 @@ fun normalizeUrl(url: String?, mainUrl: String = "https://boctem.com"): String? 
 // ============================================================================
 
 class NetworkReconstructionEngine(private val provider: BocTemProvider) {
-    
+
     suspend fun executeWithTracing(
         url: String,
-        headers: Map<String, String> = emptyMap(),
+        reqHeaders: Map<String, String> = emptyMap(),
         method: String = "GET",
         body: Map<String, String>? = null,
         context: ResolutionContext
     ): NetworkSnapshot = withContext(Dispatchers.IO) {
-        val redirectChain = mutableListOf<String>()
-        var currentUrl = url
-        var finalResponse: Response? = null
-        val cookiesMap = mutableMapOf<String, String>()
-        
-        // Follow redirects manually to capture chain
-        var redirectCount = 0
-        while (redirectCount < 5) {
-            val requestHeaders = provider.requestHeaders(currentUrl, headers)
-            
+        val mergedHeaders = provider.requestHeaders(url, reqHeaders)
+        try {
             val response = if (method == "POST" && body != null) {
-                provider.app.post(currentUrl, data = body, headers = requestHeaders, referer = currentUrl)
+                app.post(url, data = body, headers = mergedHeaders, referer = url)
             } else {
-                provider.app.get(currentUrl, headers = requestHeaders)
+                app.get(url, headers = mergedHeaders)
             }
-            
-            // Capture cookies
-            response.headers.values("Set-Cookie").forEach { cookie ->
+
+            // Capture cookies from Set-Cookie headers
+            val cookiesMap = mutableMapOf<String, String>()
+            response.headers.values("Set-Cookie").forEach { cookie: String ->
                 cookie.split(";").firstOrNull()?.let { kv ->
                     val parts = kv.split("=", limit = 2)
                     if (parts.size == 2) cookiesMap[parts[0].trim()] = parts[1].trim()
                 }
             }
-            
-            if (response.isSuccessful && response.headers["Location"] != null) {
-                redirectChain.add(currentUrl)
-                currentUrl = normalizeUrl(response.headers["Location"], provider.mainUrl) ?: currentUrl
-                if (redirectChain.contains(currentUrl)) break // Circular redirect
-                redirectCount++
-            } else {
-                finalResponse = response
-                break
-            }
-        }
-        
-        val snapshot = NetworkSnapshot(
-            url = url,
-            method = method,
-            headers = headers.mapValues { listOf(it.value) },
-            requestBody = body?.toString(),
-            responseCode = finalResponse?.code ?: 0,
-            responseHeaders = finalResponse?.headers?.toMultimap() ?: emptyMap(),
-            responseBody = finalResponse?.text,
-            redirectChain = redirectChain,
-            cookies = cookiesMap.toMap()
-        )
-        
-        context.networkSnapshots.add(snapshot)
-        context.forensicLog.add(ForensicTrace(
-            phase = "NETWORK",
-            action = "REQUEST_CHAIN_CAPTURED",
-            data = mapOf(
-                "originalUrl" to url,
-                "finalUrl" to currentUrl,
-                "redirectCount" to redirectChain.size,
-                "statusCode" to snapshot.responseCode
+
+            val snapshot = NetworkSnapshot(
+                url = url,
+                method = method,
+                headers = mergedHeaders.mapValues { listOf(it.value) },
+                requestBody = body?.toString(),
+                responseCode = response.code,
+                responseHeaders = response.headers.toMultimap(),
+                responseBody = response.text,
+                redirectChain = emptyList(),
+                cookies = cookiesMap.toMap()
             )
-        ))
-        
-        snapshot
+
+            context.networkSnapshots.add(snapshot)
+            context.forensicLog.add(ForensicTrace(
+                phase = "NETWORK",
+                action = "REQUEST_CAPTURED",
+                data = mapOf("url" to url, "statusCode" to snapshot.responseCode)
+            ))
+            snapshot
+        } catch (e: Exception) {
+            context.forensicLog.add(ForensicTrace(
+                phase = "NETWORK",
+                action = "REQUEST_ERROR",
+                data = mapOf("url" to url, "error" to (e.message ?: "unknown"))
+            ))
+            val empty = NetworkSnapshot(
+                url = url,
+                method = method,
+                headers = mergedHeaders.mapValues { listOf(it.value) },
+                requestBody = body?.toString(),
+                responseCode = 0,
+                responseHeaders = emptyMap(),
+                responseBody = null
+            )
+            context.networkSnapshots.add(empty)
+            empty
+        }
     }
-    
+
     suspend fun replayFlow(snapshot: NetworkSnapshot, mainUrl: String): NetworkSnapshot {
         return executeWithTracing(
-            snapshot.url,
-            snapshot.headers.mapValues { it.value.firstOrNull() ?: "" },
-            snapshot.method,
-            snapshot.requestBody?.let { parseBody(it) },
-            ResolutionContext(snapshot.url)
+            url = snapshot.url,
+            reqHeaders = snapshot.headers.mapValues { it.value.firstOrNull() ?: "" },
+            method = snapshot.method,
+            body = snapshot.requestBody?.let { parseBody(it) },
+            context = ResolutionContext(snapshot.url)
         )
     }
-    
+
     private fun parseBody(bodyStr: String): Map<String, String> {
-        return bodyStr.removeSurrounding("{", "}").split(",").associate {
-            val (k, v) = it.split("=", limit = 2)
-            k.trim() to v.trim().removeSurrounding("\"")
-        }
+        return try {
+            bodyStr.removeSurrounding("{", "}").split(",").associate {
+                val parts = it.split("=", limit = 2)
+                parts[0].trim() to (parts.getOrNull(1)?.trim()?.removeSurrounding("\"") ?: "")
+            }
+        } catch (_: Exception) { emptyMap() }
     }
 }
 
@@ -616,36 +611,36 @@ class JSStaticReverseEngine {
             data = mapOf("inputLength" to content.length)
         ))
         
-        repeat(maxIterations) { iteration ->
+        for (iteration in 0 until maxIterations) {
             var modified = false
-            
+
             for (unpacker in unpackers) {
                 val result = unpacker(currentJS)
                 if (result != null && result != currentJS) {
                     currentJS = result
                     modified = true
-                    
+
                     context.forensicLog.add(ForensicTrace(
                         phase = "JS_REVERSE",
                         action = "UNPACK_SUCCESS",
                         data = mapOf("iteration" to iteration, "unpacker" to unpacker.toString())
                     ))
-                    
-                    extractUrlsFromJS(currentJS, extractedUrls)
+
+                    collectUrlsFromJS(currentJS, extractedUrls)
                 }
             }
-            
+
             val resolved = resolveVariableGraph(currentJS)
             if (resolved != currentJS) {
                 currentJS = resolved
                 modified = true
-                extractUrlsFromJS(currentJS, extractedUrls)
+                collectUrlsFromJS(currentJS, extractedUrls)
             }
-            
+
             if (!modified) break
         }
-        
-        extractUrlsFromJS(currentJS, extractedUrls)
+
+        collectUrlsFromJS(currentJS, extractedUrls)
         
         return extractedUrls.distinct()
     }
@@ -700,7 +695,7 @@ class JSStaticReverseEngine {
             .map { it.trim().removeSurrounding("\"") }
         
         var result = js
-        val lookupPattern = Regex("""$varName\[(\d+)\]""")
+        val lookupPattern = Regex("${Regex.escape(varName)}\\[(\\d+)\\]")
         lookupPattern.findAll(js).forEach { lookup ->
             val index = lookup.groupValues[1].toIntOrNull()
             if (index != null && index < arrayContent.size) {
@@ -719,13 +714,13 @@ class JSStaticReverseEngine {
         
         var result = js
         variables.forEach { (name, value) ->
-            result = result.replace(Regex("""\b$name\b"), "\"$value\"")
+            result = result.replace(Regex("\\b${Regex.escape(name)}\\b"), "\"${value}\"")
         }
         
         return result
     }
     
-    private fun extractUrlsFromJS(js: String, output: MutableList<String>) {
+    private fun collectUrlsFromJS(js: String, output: MutableList<String>) {
         val patterns = listOf(
             Regex("""(https?://[^\s\"'<>]+)"""),
             Regex("""["']([^\"']*(?:m3u8|mp4|stream)[^\"']*)["']""")
@@ -947,7 +942,7 @@ class StreamAuthenticityValidator {
             if (type == StreamType.UNKNOWN) {
                 val getSnapshot = networkEngine.executeWithTracing(
                     candidate.url,
-                    headers = mapOf("Range" to "bytes=0-1024"),
+                    reqHeaders = mapOf("Range" to "bytes=0-1024"),
                     context = context
                 )
                 
@@ -1181,7 +1176,8 @@ class AdaptiveDecisionEngine(
         mainUrl: String = "https://boctem.com"
     ): Boolean = withContext(Dispatchers.IO) {
         
-        val strategies = listOf<(String, ResolutionContext, (SubtitleFile) -> Unit, (ExtractorLink) -> Unit, String) -> Decision>(
+        val strategyNames = listOf("Direct", "Ajax", "DeepCrawl", "BruteForce", "Encrypted", "ObfuscatedJS")
+        val strategyFns: List<suspend (String, ResolutionContext, (SubtitleFile) -> Unit, (ExtractorLink) -> Unit, String) -> Decision> = listOf(
             ::strategyDirectExtraction,
             ::strategyAjaxExtraction,
             ::strategyDeepCrawl,
@@ -1189,10 +1185,10 @@ class AdaptiveDecisionEngine(
             ::strategyEncryptedPayload,
             ::strategyObfuscatedJS
         )
-        
-        for ((index, strategy) in strategies.withIndex()) {
-            context.strategyHistory.add("Strategy_$index")
-            
+
+        for ((index, strategy) in strategyFns.withIndex()) {
+            context.strategyHistory.add("Strategy_${strategyNames[index]}")
+
             val result = strategy(data, context, subtitleCallback, linkCallback, mainUrl)
             
             when (result) {
@@ -1256,7 +1252,7 @@ class AdaptiveDecisionEngine(
         )
         val directLinks = mutableListOf<ExtractorLink>()
         for (pattern in directPatterns) {
-            pattern.findAll(content).forEach { match ->
+            for (match in pattern.findAll(content)) {
                 val url = match.groupValues[1].replace("\\/", "/")
                 val candidate = StreamCandidate(url, data, "direct_pattern", 0.9)
                 directLinks.addAll(validateAndConvert(listOf(candidate), context))
@@ -1321,28 +1317,29 @@ class AdaptiveDecisionEngine(
                     }
 
                     // Case 2: Response is HTML with iframe (embedded player)
-                    if (response.contains("<iframe", ignoreCase = true) ||
-                        response.contains("<iframe", ignoreCase = true)) {
+                    if (response.contains("<iframe", ignoreCase = true)) {
                         val iframePattern = Regex("""iframe[^>]+src=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
-                        iframePattern.findAll(response).forEach { match ->
-                            val iframeUrl = normalizeUrl(match.groupValues[1], mainUrl) ?: return@forEach
+                        val iframeLinks = mutableListOf<ExtractorLink>()
+                        for (match in iframePattern.findAll(response)) {
+                            val iframeUrl = normalizeUrl(match.groupValues[1], mainUrl) ?: continue
                             val iframeSnapshot = networkEngine.executeWithTracing(iframeUrl, context = context)
                             val iframeCandidates = miningEngine.deepScan(iframeSnapshot.responseBody, context, mainUrl)
-                            val iframeLinks = validateAndConvert(iframeCandidates, context)
-                            if (iframeLinks.isNotEmpty()) return Decision.Success(iframeLinks)
+                            iframeLinks.addAll(validateAndConvert(iframeCandidates, context))
                         }
+                        if (iframeLinks.isNotEmpty()) return Decision.Success(iframeLinks)
                     }
 
                     // Case 3: Response is JSON with an embedded iframe/player URL field
-                    val urlFields = Regex(""""(?:link|url|src|file|stream|embed)"\s*:\s*"([^"]+)"""")
-                    urlFields.findAll(response).forEach { match ->
+                    val urlFieldPattern = Regex(""""(?:link|url|src|file|stream|embed)"\s*:\s*"([^"]+)"""")
+                    val embeddedLinks = mutableListOf<ExtractorLink>()
+                    for (match in urlFieldPattern.findAll(response)) {
                         val rawUrl = match.groupValues[1].replace("\\/", "/")
-                        val normalised = normalizeUrl(rawUrl, mainUrl) ?: return@forEach
+                        val normalised = normalizeUrl(rawUrl, mainUrl) ?: continue
                         val embSnap = networkEngine.executeWithTracing(normalised, context = context)
                         val embCandidates = miningEngine.deepScan(embSnap.responseBody, context, mainUrl)
-                        val embLinks = validateAndConvert(embCandidates, context)
-                        if (embLinks.isNotEmpty()) return Decision.Success(embLinks)
+                        embeddedLinks.addAll(validateAndConvert(embCandidates, context))
                     }
+                    if (embeddedLinks.isNotEmpty()) return Decision.Success(embeddedLinks)
 
                     // Case 4: Encrypted response
                     if (response.length > 100 && !response.contains("<")) {

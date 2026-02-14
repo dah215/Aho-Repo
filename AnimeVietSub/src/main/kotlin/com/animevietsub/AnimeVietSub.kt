@@ -394,7 +394,7 @@ class AnimeVietSub : MainAPI() {
                 true
             }
             link.startsWith("#EXTM3U") -> {
-                parseM3u8Content(link, referer, callback, serverName)
+                parseM3u8ContentSuspend(link, referer, callback, serverName)
                 true
             }
             link.startsWith("http") -> {
@@ -414,7 +414,7 @@ class AnimeVietSub : MainAPI() {
         }
     }
 
-    private fun parseM3u8Content(
+    private suspend fun parseM3u8ContentSuspend(
         content: String, 
         referer: String, 
         callback: (ExtractorLink) -> Unit,
@@ -434,11 +434,7 @@ class AnimeVietSub : MainAPI() {
                     }
                     val urlLine = lines.getOrNull(i + 1)?.trim() ?: return@forEachIndexed
                     if (urlLine.startsWith("http")) {
-                        callback.invoke(newExtractorLink(name, "$name - $serverName", urlLine) {
-                            this.referer = referer
-                            this.quality = q
-                            this.type    = ExtractorLinkType.M3U8
-                        })
+                        M3u8Helper.generateM3u8("$name - $serverName", urlLine, referer).forEach(callback)
                     }
                 }
             }
@@ -480,10 +476,14 @@ class AnimeVietSub : MainAPI() {
                         if (location.contains(".m3u8")) {
                             M3u8Helper.generateM3u8("$name - $serverName", location, "https://abysscdn.com/").forEach(callback)
                         } else {
-                            callback.invoke(newExtractorLink(name, "$name - $serverName", location) {
-                                this.referer = "https://abysscdn.com/"
-                                this.type = ExtractorLinkType.VIDEO
-                            })
+                            callback(ExtractorLink(
+                                source = name,
+                                name = "$name - $serverName",
+                                url = location,
+                                referer = "https://abysscdn.com/",
+                                quality = Qualities.Unknown.value,
+                                type = ExtractorLinkType.VIDEO
+                            ))
                         }
                         return true
                     }
@@ -497,10 +497,14 @@ class AnimeVietSub : MainAPI() {
                         if (videoUrl.contains(".m3u8")) {
                             M3u8Helper.generateM3u8("$name - $serverName", videoUrl, currentUrl).forEach(callback)
                         } else {
-                            callback.invoke(newExtractorLink(name, "$name - $serverName", videoUrl) {
-                                this.referer = currentUrl
-                                this.type = ExtractorLinkType.VIDEO
-                            })
+                            callback(ExtractorLink(
+                                source = name,
+                                name = "$name - $serverName",
+                                url = videoUrl,
+                                referer = currentUrl,
+                                quality = Qualities.Unknown.value,
+                                type = ExtractorLinkType.VIDEO
+                            ))
                         }
                         return true
                     }

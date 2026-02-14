@@ -6,13 +6,13 @@ import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.*
 import okhttp3.Response
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URL
 import java.net.URLDecoder
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
-import java.security.MessageDigest
 import java.util.*
 import java.util.regex.Pattern
 import javax.crypto.Cipher
@@ -21,12 +21,9 @@ import javax.crypto.spec.SecretKeySpec
 import kotlin.math.abs
 
 // ============================================================================
-// CORE ARCHITECTURE: AUTONOMOUS STREAM EXTRACTION SYSTEM
+// GLOBAL DATA CLASSES & ENUMS (Outside Provider)
 // ============================================================================
 
-/**
- * Forensic trace entry for full debugging capability
- */
 data class ForensicTrace(
     val timestamp: Long = System.currentTimeMillis(),
     val phase: String,
@@ -35,9 +32,6 @@ data class ForensicTrace(
     val rawContent: String? = null
 )
 
-/**
- * Network snapshot for request chain reconstruction
- */
 data class NetworkSnapshot(
     val url: String,
     val method: String,
@@ -50,9 +44,6 @@ data class NetworkSnapshot(
     val cookies: Map<String, String> = emptyMap()
 )
 
-/**
- * Extracted candidate link with metadata
- */
 data class StreamCandidate(
     val url: String,
     val source: String,
@@ -64,14 +55,11 @@ data class StreamCandidate(
 
 enum class ValidationStatus { UNTESTED, VALID, INVALID, TIMEOUT }
 
-/**
- * Adaptive decision context
- */
 data class ResolutionContext(
     val originalUrl: String,
     val depth: Int = 0,
     val maxDepth: Int = 10,
-    val visitedUrls: Set<String> = emptySet(),
+    val visitedUrls: MutableSet<String> = mutableSetOf(),
     val extractedCandidates: MutableList<StreamCandidate> = mutableListOf(),
     val forensicLog: MutableList<ForensicTrace> = mutableListOf(),
     val networkSnapshots: MutableList<NetworkSnapshot> = mutableListOf(),
@@ -85,6 +73,48 @@ data class DecryptionAttempt(
     val output: String?,
     val success: Boolean
 )
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+fun calculateEntropy(input: String): Double {
+    if (input.isEmpty()) return 0.0
+    val freq = input.groupingBy { it }.eachCount()
+    val len = input.length.toDouble()
+    return -freq.values.sumOf { count ->
+        val p = count / len
+        p * kotlin.math.log2(p)
+    }
+}
+
+fun normalizeUrl(url: String?, mainUrl: String = "https://boctem.com"): String? {
+    if (url.isNullOrBlank()) return null
+    
+    var normalized = url.trim()
+        .replace("\\/", "/")
+        .replace(Regex("[\\x00-\\x1F\\x7F]"), "")
+    
+    // Decode URL encoding
+    try {
+        normalized = URLDecoder.decode(normalized, "UTF-8")
+    } catch (_: Exception) {}
+    
+    // Add protocol if missing
+    when {
+        normalized.startsWith("http://") || normalized.startsWith("https://") -> {}
+        normalized.startsWith("//") -> normalized = "https:$normalized"
+        normalized.startsWith("/") -> normalized = "$mainUrl$normalized"
+        else -> normalized = "https://$normalized"
+    }
+    
+    // Validate URL structure
+    return try {
+        URL(normalized).toString()
+    } catch (_: Exception) {
+        null
+    }
+}
 
 // ============================================================================
 // MODULE 1: NETWORK RECONSTRUCTION ENGINE
@@ -105,7 +135,8 @@ class NetworkReconstructionEngine(private val provider: BocTemProvider) {
         val cookiesMap = mutableMapOf<String, String>()
         
         // Follow redirects manually to capture chain
-        repeat(5) { redirectCount ->
+        var redirectCount = 0
+        while (redirectCount < 5) {
             val requestHeaders = provider.requestHeaders(currentUrl, headers)
             
             val response = if (method == "POST" && body != null) {
@@ -124,11 +155,12 @@ class NetworkReconstructionEngine(private val provider: BocTemProvider) {
             
             if (response.isSuccessful && response.headers["Location"] != null) {
                 redirectChain.add(currentUrl)
-                currentUrl = provider.normalizeUrl(response.headers["Location"]) ?: currentUrl
+                currentUrl = normalizeUrl(response.headers["Location"], provider.mainUrl) ?: currentUrl
                 if (redirectChain.contains(currentUrl)) break // Circular redirect
+                redirectCount++
             } else {
                 finalResponse = response
-                return@repeat
+                break
             }
         }
         
@@ -159,8 +191,7 @@ class NetworkReconstructionEngine(private val provider: BocTemProvider) {
         snapshot
     }
     
-    suspend fun replayFlow(snapshot: NetworkSnapshot): NetworkSnapshot {
-        // Capability to replay exact network flow
+    suspend fun replayFlow(snapshot: NetworkSnapshot, mainUrl: String): NetworkSnapshot {
         return executeWithTracing(
             snapshot.url,
             snapshot.headers.mapValues { it.value.firstOrNull() ?: "" },
@@ -285,16 +316,6 @@ class ResponseIntelligenceAnalyzer {
             })
         }
     }
-    
-    private fun calculateEntropy(input: String): Double {
-        if (input.isEmpty()) return 0.0
-        val freq = input.groupingBy { it }.eachCount()
-        val len = input.length.toDouble()
-        return -freq.values.sumOf { count ->
-            val p = count / len
-            p * kotlin.math.log2(p)
-        }
-    }
 }
 
 // ============================================================================
@@ -304,21 +325,13 @@ class ResponseIntelligenceAnalyzer {
 class UniversalDataMiningEngine {
     
     private val urlPatterns = listOf(
-        // Standard URLs
         Regex("""(https?://[^\s\"'<>]+)"""),
-        // Protocol-relative
         Regex("""(//[^\s\"'<>]+)"""),
-        // Obfuscated hex escape
         Regex("""\\x([0-9a-fA-F]{2})"""),
-        // Unicode escape
         Regex("""\\u([0-9a-fA-F]{4})"""),
-        // Base64-like strings that might be URLs
         Regex("""([A-Za-z0-9+/]{50,}={0,2})"""),
-        // Data URI
         Regex("""(data:[^\s\"'<>]+)"""),
-        // Custom scheme
         Regex("""(magnet:[^\s\"'<>]+)"""),
-        // IP-based URLs
         Regex("""(https?://\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}[^\s\"'<>]*)""")
     )
     
@@ -328,7 +341,7 @@ class UniversalDataMiningEngine {
         "master", "index", "init", "hls", "dash", "cdn"
     )
     
-    fun deepScan(content: String?, context: ResolutionContext): List<StreamCandidate> {
+    fun deepScan(content: String?, context: ResolutionContext, mainUrl: String = "https://boctem.com"): List<StreamCandidate> {
         if (content.isNullOrBlank()) return emptyList()
         
         val candidates = mutableListOf<StreamCandidate>()
@@ -340,31 +353,31 @@ class UniversalDataMiningEngine {
                 val raw = match.value
                 val decoded = decodeEscapes(raw)
                 
-                normalizeAndAdd(decoded, "regex_pattern_$index", candidates, seenUrls, context)
+                normalizeAndAdd(decoded, "regex_pattern_$index", candidates, seenUrls, context, mainUrl)
                 
                 // Try base64 decode if looks like it
                 if (raw.matches(Regex("[A-Za-z0-9+/]{40,}={0,2}"))) {
-                    tryBase64Decode(raw, candidates, seenUrls, context)
+                    tryBase64Decode(raw, candidates, seenUrls, context, mainUrl)
                 }
             }
         }
         
         // Layer 2: DOM traversal if HTML
         if (content.contains("<")) {
-            extractFromDOM(content, candidates, seenUrls, context)
+            extractFromDOM(content, candidates, seenUrls, context, mainUrl)
         }
         
         // Layer 3: Script token scanning
-        extractScriptTokens(content, candidates, seenUrls, context)
+        extractScriptTokens(content, candidates, seenUrls, context, mainUrl)
         
         // Layer 4: Inline JSON recovery
-        extractJsonFields(content, candidates, seenUrls, context)
+        extractJsonFields(content, candidates, seenUrls, context, mainUrl)
         
         // Layer 5: Entropy-based hidden data detection
-        extractHighEntropyBlocks(content, candidates, seenUrls, context)
+        extractHighEntropyBlocks(content, candidates, seenUrls, context, mainUrl)
         
         // Layer 6: Concatenated string reconstruction
-        reconstructConcatenatedStrings(content, candidates, seenUrls, context)
+        reconstructConcatenatedStrings(content, candidates, seenUrls, context, mainUrl)
         
         context.forensicLog.add(ForensicTrace(
             phase = "MINING",
@@ -380,11 +393,12 @@ class UniversalDataMiningEngine {
         method: String,
         candidates: MutableList<StreamCandidate>,
         seen: MutableSet<String>,
-        context: ResolutionContext
+        context: ResolutionContext,
+        mainUrl: String
     ) {
-        val normalized = normalizeUrl(url) ?: return
+        val normalized = normalizeUrl(url, mainUrl) ?: return
         if (normalized in seen) return
-        if (normalized.length < 10) return // Too short to be valid
+        if (normalized.length < 10) return
         
         seen.add(normalized)
         
@@ -401,24 +415,20 @@ class UniversalDataMiningEngine {
     private fun calculateConfidence(url: String, context: ResolutionContext): Double {
         var score = 0.5
         
-        // Stream indicators
         streamIndicators.forEach { indicator ->
             if (url.contains(Regex(indicator, RegexOption.IGNORE_CASE))) {
                 score += 0.1
             }
         }
         
-        // Direct video file extensions
         if (url.matches(Regex(".*\\.(m3u8|mp4|mkv|webm|ts)(\\?.*)?$", RegexOption.IGNORE_CASE))) {
             score += 0.3
         }
         
-        // CDN indicators
         if (url.contains(Regex("(cdn|cloudfront|fastly|akamai)", RegexOption.IGNORE_CASE))) {
             score += 0.1
         }
         
-        // Length heuristic (very long URLs often obfuscated)
         if (url.length > 500) score -= 0.1
         
         return score.coerceIn(0.0, 1.0)
@@ -442,11 +452,12 @@ class UniversalDataMiningEngine {
         input: String,
         candidates: MutableList<StreamCandidate>,
         seen: MutableSet<String>,
-        context: ResolutionContext
+        context: ResolutionContext,
+        mainUrl: String
     ) {
         val variants = listOf(
             input,
-            input.replace("-", "+").replace("_", "/"), // URL-safe base64
+            input.replace("-", "+").replace("_", "/"),
             input.padEnd(input.length + (4 - input.length % 4) % 4, '=')
         )
         
@@ -454,7 +465,7 @@ class UniversalDataMiningEngine {
             try {
                 val decoded = String(Base64.getDecoder().decode(variant), StandardCharsets.UTF_8)
                 if (decoded.length > 10 && (decoded.contains("http") || decoded.contains(".m3u8"))) {
-                    normalizeAndAdd(decoded, "base64_decode", candidates, seen, context)
+                    normalizeAndAdd(decoded, "base64_decode", candidates, seen, context, mainUrl)
                 }
             } catch (_: Exception) {}
         }
@@ -464,39 +475,36 @@ class UniversalDataMiningEngine {
         html: String,
         candidates: MutableList<StreamCandidate>,
         seen: MutableSet<String>,
-        context: ResolutionContext
+        context: ResolutionContext,
+        mainUrl: String
     ) {
         try {
-            val doc = org.jsoup.Jsoup.parse(html)
+            val doc = Jsoup.parse(html)
             
-            // Standard attributes
             listOf("src", "href", "data-src", "data-url", "data-link", 
                    "data-video", "data-stream", "data-file").forEach { attr ->
                 doc.select("[$attr]").forEach { elem ->
                     elem.attr(attr).takeIf { it.isNotBlank() }?.let {
-                        normalizeAndAdd(it, "dom_attr_$attr", candidates, seen, context)
+                        normalizeAndAdd(it, "dom_attr_$attr", candidates, seen, context, mainUrl)
                     }
                 }
             }
             
-            // iframe sources
             doc.select("iframe").forEach { iframe ->
                 iframe.attr("src").takeIf { it.isNotBlank() }?.let {
-                    normalizeAndAdd(it, "dom_iframe", candidates, seen, context)
+                    normalizeAndAdd(it, "dom_iframe", candidates, seen, context, mainUrl)
                 }
             }
             
-            // video sources
             doc.select("video source").forEach { source ->
                 source.attr("src").takeIf { it.isNotBlank() }?.let {
-                    normalizeAndAdd(it, "dom_video", candidates, seen, context)
+                    normalizeAndAdd(it, "dom_video", candidates, seen, context, mainUrl)
                 }
             }
             
-            // Meta tags
             doc.select("meta[property=og:video], meta[property=og:video:url]").forEach { meta ->
                 meta.attr("content").takeIf { it.isNotBlank() }?.let {
-                    normalizeAndAdd(it, "dom_meta_video", candidates, seen, context)
+                    normalizeAndAdd(it, "dom_meta_video", candidates, seen, context, mainUrl)
                 }
             }
             
@@ -507,9 +515,9 @@ class UniversalDataMiningEngine {
         content: String,
         candidates: MutableList<StreamCandidate>,
         seen: MutableSet<String>,
-        context: ResolutionContext
+        context: ResolutionContext,
+        mainUrl: String
     ) {
-        // Look for variable assignments that might contain URLs
         val varPatterns = listOf(
             Regex("""(?:var|let|const)\s+(\w+)\s*=\s*["']([^"']+)["']"""),
             Regex("""(\w+)\s*=\s*["']([^"']*(?:http|//|m3u8|mp4)[^"']*)["']"""),
@@ -519,7 +527,7 @@ class UniversalDataMiningEngine {
         varPatterns.forEach { pattern ->
             pattern.findAll(content).forEach { match ->
                 val potentialUrl = match.groupValues.last()
-                normalizeAndAdd(potentialUrl, "script_token", candidates, seen, context)
+                normalizeAndAdd(potentialUrl, "script_token", candidates, seen, context, mainUrl)
             }
         }
     }
@@ -528,7 +536,8 @@ class UniversalDataMiningEngine {
         content: String,
         candidates: MutableList<StreamCandidate>,
         seen: MutableSet<String>,
-        context: ResolutionContext
+        context: ResolutionContext,
+        mainUrl: String
     ) {
         val jsonPatterns = listOf(
             Regex(""""(?:src|url|link|file|stream|video|source)"\s*:\s*"([^"]+)""""),
@@ -538,7 +547,7 @@ class UniversalDataMiningEngine {
         
         jsonPatterns.forEach { pattern ->
             pattern.findAll(content).forEach { match ->
-                normalizeAndAdd(match.groupValues[1], "json_field", candidates, seen, context)
+                normalizeAndAdd(match.groupValues[1], "json_field", candidates, seen, context, mainUrl)
             }
         }
     }
@@ -547,15 +556,17 @@ class UniversalDataMiningEngine {
         content: String,
         candidates: MutableList<StreamCandidate>,
         seen: MutableSet<String>,
-        context: ResolutionContext
+        context: ResolutionContext,
+        mainUrl: String
     ) {
-        // Find high-entropy blocks that might be encrypted data
         val blocks = Regex("""[A-Za-z0-9+/=]{100,500}""").findAll(content)
+            .map { it.value }
+            .distinct()
         
         blocks.forEach { block ->
-            val entropy = calculateEntropy(block.value)
+            val entropy = calculateEntropy(block)
             if (entropy > 7.0) {
-                tryBase64Decode(block.value, candidates, seen, context)
+                tryBase64Decode(block, candidates, seen, context, mainUrl)
             }
         }
     }
@@ -564,9 +575,9 @@ class UniversalDataMiningEngine {
         content: String,
         candidates: MutableList<StreamCandidate>,
         seen: MutableSet<String>,
-        context: ResolutionContext
+        context: ResolutionContext,
+        mainUrl: String
     ) {
-        // Find split URL constructions like "ht" + "tp" + "://"
         val concatPattern = Regex("""(["'][^"']+["']\s*\+\s*)+["'][^"']+["']""")
         
         concatPattern.findAll(content).forEach { match ->
@@ -575,46 +586,8 @@ class UniversalDataMiningEngine {
                 .replace("\"", "").replace("'", "")
             
             if (reconstructed.contains("http") || reconstructed.contains(".m3u8")) {
-                normalizeAndAdd(reconstructed, "concat_reconstruction", candidates, seen, context)
+                normalizeAndAdd(reconstructed, "concat_reconstruction", candidates, seen, context, mainUrl)
             }
-        }
-    }
-    
-    private fun calculateEntropy(input: String): Double {
-        if (input.isEmpty()) return 0.0
-        val freq = input.groupingBy { it }.eachCount()
-        val len = input.length.toDouble()
-        return -freq.values.sumOf { count ->
-            val p = count / len
-            p * kotlin.math.log2(p)
-        }
-    }
-    
-    private fun normalizeUrl(url: String?): String? {
-        if (url.isNullOrBlank()) return null
-        
-        var normalized = url.trim()
-            .replace("\\/", "/")
-            .replace(Regex("[\\x00-\\x1F\\x7F]"), "")
-        
-        // Decode URL encoding
-        try {
-            normalized = URLDecoder.decode(normalized, "UTF-8")
-        } catch (_: Exception) {}
-        
-        // Add protocol if missing
-        when {
-            normalized.startsWith("http://") || normalized.startsWith("https://") -> {}
-            normalized.startsWith("//") -> normalized = "https:$normalized"
-            normalized.startsWith("/") -> normalized = "https://boctem.com$normalized"
-            else -> normalized = "https://$normalized"
-        }
-        
-        // Validate URL structure
-        return try {
-            URL(normalized).toString()
-        } catch (_: Exception) {
-            null
         }
     }
 }
@@ -625,7 +598,7 @@ class UniversalDataMiningEngine {
 
 class JSStaticReverseEngine {
     
-    private val unpackers = listOf(
+    private val unpackers = listOf<(String) -> String?>(
         ::unpackDeanEdwards,
         ::unpackPacker,
         ::unpackEval,
@@ -646,7 +619,6 @@ class JSStaticReverseEngine {
         repeat(maxIterations) { iteration ->
             var modified = false
             
-            // Try each unpacker
             for (unpacker in unpackers) {
                 val result = unpacker(currentJS)
                 if (result != null && result != currentJS) {
@@ -656,15 +628,13 @@ class JSStaticReverseEngine {
                     context.forensicLog.add(ForensicTrace(
                         phase = "JS_REVERSE",
                         action = "UNPACK_SUCCESS",
-                        data = mapOf("iteration" to iteration, "unpacker" to unpacker.name)
+                        data = mapOf("iteration" to iteration, "unpacker" to unpacker.toString())
                     ))
                     
-                    // Extract URLs from unpacked code
                     extractUrlsFromJS(currentJS, extractedUrls)
                 }
             }
             
-            // Variable resolution
             val resolved = resolveVariableGraph(currentJS)
             if (resolved != currentJS) {
                 currentJS = resolved
@@ -675,29 +645,24 @@ class JSStaticReverseEngine {
             if (!modified) break
         }
         
-        // Final URL extraction
         extractUrlsFromJS(currentJS, extractedUrls)
         
         return extractedUrls.distinct()
     }
     
     private fun unpackDeanEdwards(js: String): String? {
-        // Dean Edwards Packer pattern
         val pattern = Regex("""eval\(function\(p,a,c,k,e,d\)\{[^}]+\}\(([^)]+)\)\)""")
         val match = pattern.find(js) ?: return null
         
         return try {
-            // Simplified unpacking - in real implementation would fully parse
             val args = match.groupValues[1].split(",").map { it.trim().removeSurrounding("\"") }
             if (args.size >= 4) {
-                // Reconstruct from packed data
                 args[0].replace("\\", "")
             } else null
         } catch (_: Exception) { null }
     }
     
     private fun unpackPacker(js: String): String? {
-        // Alternative packer patterns
         val patterns = listOf(
             Regex("""\}\('([^']+)',\s*(\d+),\s*(\d+),\s*'([^']+)'\.split\('\|'\)"""),
             Regex("""unescape\(['"]([^'"]+)['"]\)""")
@@ -713,13 +678,11 @@ class JSStaticReverseEngine {
     }
     
     private fun unpackEval(js: String): String? {
-        // Direct eval with string
         val pattern = Regex("""eval\((["'])(.+?)\1\)""")
         val match = pattern.find(js) ?: return null
         
         return try {
             val inner = match.groupValues[2]
-            // Try to decode if it's escaped
             inner.replace("\\x", "%").let {
                 URLDecoder.decode(it, "UTF-8")
             }
@@ -727,7 +690,6 @@ class JSStaticReverseEngine {
     }
     
     private fun unpackArrayLookup(js: String): String? {
-        // Pattern like _0x1234[0x1] + _0x1234[0x2] ...
         val arrayPattern = Regex("""var\s+(_0x\w+)\s*=\s*(\[[^\]]+\])""")
         val arrayMatch = arrayPattern.find(js) ?: return null
         
@@ -737,7 +699,6 @@ class JSStaticReverseEngine {
             .split(",")
             .map { it.trim().removeSurrounding("\"") }
         
-        // Replace all lookups
         var result = js
         val lookupPattern = Regex("""$varName\[(\d+)\]""")
         lookupPattern.findAll(js).forEach { lookup ->
@@ -751,7 +712,6 @@ class JSStaticReverseEngine {
     }
     
     private fun resolveVariableGraph(js: String): String {
-        // Simple variable substitution for string concatenations
         val varPattern = Regex("""var\s+(\w+)\s*=\s*["']([^"']+)["'];""")
         val variables = varPattern.findAll(js).associate {
             it.groupValues[1] to it.groupValues[2]
@@ -768,7 +728,7 @@ class JSStaticReverseEngine {
     private fun extractUrlsFromJS(js: String, output: MutableList<String>) {
         val patterns = listOf(
             Regex("""(https?://[^\s\"'<>]+)"""),
-            Regex("""["']([^"']*(?:m3u8|mp4|stream)[^"']*)["']""")
+            Regex("""["']([^\"']*(?:m3u8|mp4|stream)[^\"']*)["']""")
         )
         
         patterns.forEach { pattern ->
@@ -820,32 +780,22 @@ class EncryptionAutobreakSystem {
             data = mapOf("inputLength" to input.length, "inputSample" to input.take(50))
         ))
         
-        // Try base64 variants first
         val base64Result = tryBase64Variants(input)
         if (base64Result.success) {
             context.decryptionAttempts.add(DecryptionAttempt("base64", input, base64Result.output, true))
             return base64Result
         }
         
-        // Try AES variants
         val aesResult = tryAESVariants(input)
         if (aesResult.success) {
             context.decryptionAttempts.add(DecryptionAttempt("aes", input, aesResult.output, true))
             return aesResult
         }
         
-        // Try XOR
         val xorResult = tryXORVariants(input)
         if (xorResult.success) {
             context.decryptionAttempts.add(DecryptionAttempt("xor", input, xorResult.output, true))
             return xorResult
-        }
-        
-        // Try RC4
-        val rc4Result = tryRC4Variants(input)
-        if (rc4Result.success) {
-            context.decryptionAttempts.add(DecryptionAttempt("rc4", input, rc4Result.output, true))
-            return rc4Result
         }
         
         return DecryptionResult(false, null, "none", 0.0)
@@ -927,43 +877,141 @@ class EncryptionAutobreakSystem {
         return DecryptionResult(false, null, "xor", 0.0)
     }
     
-    private fun tryRC4Variants(input: String): DecryptionResult {
-        // Simplified RC4 attempt
-        return DecryptionResult(false, null, "rc4", 0.0)
-    }
-    
     private fun validateOutput(output: String): Double {
         var score = 0.0
         
-        // Check for URL patterns
         if (output.contains("http")) score += 0.3
         if (output.contains(".m3u8") || output.contains(".mp4")) score += 0.4
         
-        // Check for JSON structure
         if ((output.startsWith("{") && output.endsWith("}")) ||
             (output.startsWith("[") && output.endsWith("]"))) {
             score += 0.2
         }
         
-        // Check for printable characters
         val printableRatio = output.count { it.isLetterOrDigit() || it in ":/.?&=-" } / output.length.toDouble()
         score += printableRatio * 0.3
         
-        // Penalize high entropy (likely still encrypted)
         val entropy = calculateEntropy(output)
         if (entropy > 7.5) score -= 0.3
         
         return score.coerceIn(0.0, 1.0)
     }
+}
+
+// ============================================================================
+// MODULE 7: STREAM AUTHENTICITY VALIDATOR
+// ============================================================================
+
+class StreamAuthenticityValidator {
     
-    private fun calculateEntropy(input: String): Double {
-        if (input.isEmpty()) return 0.0
-        val freq = input.groupingBy { it }.eachCount()
-        val len = input.length.toDouble()
-        return -freq.values.sumOf { count ->
-            val p = count / len
-            p * kotlin.math.log2(p)
+    data class ValidationResult(
+        val isValid: Boolean,
+        val type: StreamType,
+        val quality: String?,
+        val headers: Map<String, String>
+    )
+    
+    enum class StreamType { M3U8, MP4, MKV, WEBM, DASH, UNKNOWN }
+    
+    suspend fun validate(
+        candidate: StreamCandidate,
+        networkEngine: NetworkReconstructionEngine,
+        context: ResolutionContext
+    ): ValidationResult = withContext(Dispatchers.IO) {
+        
+        context.forensicLog.add(ForensicTrace(
+            phase = "VALIDATE",
+            action = "START_VALIDATION",
+            data = mapOf("url" to candidate.url)
+        ))
+        
+        try {
+            val headSnapshot = networkEngine.executeWithTracing(
+                candidate.url,
+                method = "HEAD",
+                context = context
+            )
+            
+            val contentType = headSnapshot.responseHeaders["Content-Type"]?.firstOrNull() ?: ""
+            
+            val type = when {
+                contentType.contains("mpegurl") || contentType.contains("m3u8") -> StreamType.M3U8
+                contentType.contains("mp4") -> StreamType.MP4
+                contentType.contains("webm") -> StreamType.WEBM
+                contentType.contains("dash") -> StreamType.DASH
+                candidate.url.endsWith(".m3u8", ignoreCase = true) -> StreamType.M3U8
+                candidate.url.endsWith(".mp4", ignoreCase = true) -> StreamType.MP4
+                else -> StreamType.UNKNOWN
+            }
+            
+            if (type == StreamType.UNKNOWN) {
+                val getSnapshot = networkEngine.executeWithTracing(
+                    candidate.url,
+                    headers = mapOf("Range" to "bytes=0-1024"),
+                    context = context
+                )
+                
+                val body = getSnapshot.responseBody ?: ""
+                val detectedType = detectByContent(body)
+                
+                return@withContext ValidationResult(
+                    isValid = detectedType != StreamType.UNKNOWN,
+                    type = detectedType,
+                    quality = inferQuality(candidate.url),
+                    headers = generateHeaders(candidate)
+                )
+            }
+            
+            ValidationResult(
+                isValid = true,
+                type = type,
+                quality = inferQuality(candidate.url),
+                headers = generateHeaders(candidate)
+            )
+            
+        } catch (e: Exception) {
+            context.forensicLog.add(ForensicTrace(
+                phase = "VALIDATE",
+                action = "VALIDATION_ERROR",
+                data = mapOf("error" to e.message.toString())
+            ))
+            
+            ValidationResult(false, StreamType.UNKNOWN, null, emptyMap())
         }
+    }
+    
+    private fun detectByContent(content: String): StreamType {
+        return when {
+            content.contains("#EXTM3U") -> StreamType.M3U8
+            content.startsWith("\u0000\u0000\u0000") && content.contains("ftyp") -> StreamType.MP4
+            content.startsWith("\u001A\u0045\u00DF\u00A3") -> StreamType.MKV
+            content.startsWith("<MPD") -> StreamType.DASH
+            else -> StreamType.UNKNOWN
+        }
+    }
+    
+    private fun inferQuality(url: String): String? {
+        val patterns = listOf(
+            Regex("""(\d{3,4})p""") to { m: MatchResult -> m.groupValues[1] + "p" },
+            Regex("""(\d{3,4})[xX](\d{3,4})""") to { m: MatchResult -> m.groupValues[2] + "p" },
+            Regex("""[/_](720|1080|480|360|240)[/_]""") to { m: MatchResult -> m.groupValues[1] + "p" }
+        )
+        
+        for ((pattern, extractor) in patterns) {
+            pattern.find(url)?.let { return extractor(it) }
+        }
+        
+        return null
+    }
+    
+    private fun generateHeaders(candidate: StreamCandidate): Map<String, String> {
+        return mapOf(
+            "Referer" to candidate.source,
+            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.0.36",
+            "Accept" to "*/*",
+            "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8",
+            "Origin" to "https://boctem.com"
+        )
     }
 }
 
@@ -981,7 +1029,8 @@ class MultiDepthProviderCrawler(
     
     suspend fun crawl(
         startUrl: String,
-        context: ResolutionContext
+        context: ResolutionContext,
+        mainUrl: String = "https://boctem.com"
     ): List<StreamCandidate> = withContext(Dispatchers.IO) {
         val queue = ArrayDeque<Pair<String, Int>>()
         queue.add(startUrl to 0)
@@ -994,7 +1043,7 @@ class MultiDepthProviderCrawler(
             if (currentUrl in context.visitedUrls) continue
             if (currentDepth > context.maxDepth) continue
             
-            context.visitedUrls += currentUrl
+            context.visitedUrls.add(currentUrl)
             
             context.forensicLog.add(ForensicTrace(
                 phase = "CRAWL",
@@ -1006,20 +1055,18 @@ class MultiDepthProviderCrawler(
                 val snapshot = networkEngine.executeWithTracing(currentUrl, context = context)
                 val content = snapshot.responseBody ?: continue
                 
-                // Analyze content type
                 val contentType = analyzer.analyze(content)
                 
-                // Extract candidates based on content type
                 val candidates = when (contentType) {
                     is ResponseIntelligenceAnalyzer.ContentType.HtmlDOM -> {
-                        processHTML(content, currentUrl, context)
+                        processHTML(content, currentUrl, context, mainUrl)
                     }
                     is ResponseIntelligenceAnalyzer.ContentType.ObfuscatedJS,
                     is ResponseIntelligenceAnalyzer.ContentType.PackedJS -> {
                         processJS(content, currentUrl, context)
                     }
                     is ResponseIntelligenceAnalyzer.ContentType.EncryptedPayload -> {
-                        processEncrypted(content, currentUrl, context)
+                        processEncrypted(content, currentUrl, context, mainUrl)
                     }
                     is ResponseIntelligenceAnalyzer.ContentType.BinaryPlaylist,
                     is ResponseIntelligenceAnalyzer.ContentType.StreamingManifest -> {
@@ -1030,12 +1077,11 @@ class MultiDepthProviderCrawler(
                             confidence = 0.95
                         ))
                     }
-                    else -> miningEngine.deepScan(content, context)
+                    else -> miningEngine.deepScan(content, context, mainUrl)
                 }
                 
                 allCandidates.addAll(candidates)
                 
-                // Add embeds to queue for deeper crawling
                 candidates.filter { it.confidence < 0.9 }.forEach { candidate ->
                     if (candidate.url !in context.visitedUrls) {
                         queue.add(candidate.url to currentDepth + 1)
@@ -1054,14 +1100,14 @@ class MultiDepthProviderCrawler(
         allCandidates.distinctBy { it.url }
     }
     
-    private suspend fun processHTML(
+    private fun processHTML(
         html: String,
         sourceUrl: String,
-        context: ResolutionContext
+        context: ResolutionContext,
+        mainUrl: String
     ): List<StreamCandidate> {
-        val candidates = miningEngine.deepScan(html, context).toMutableList()
+        val candidates = miningEngine.deepScan(html, context, mainUrl).toMutableList()
         
-        // Extract and process iframes
         val iframePattern = Regex("""iframe[^>]+src=["']([^"']+)["']""")
         iframePattern.findAll(html).forEach { match ->
             val iframeUrl = match.groupValues[1]
@@ -1095,139 +1141,16 @@ class MultiDepthProviderCrawler(
     private fun processEncrypted(
         content: String,
         sourceUrl: String,
-        context: ResolutionContext
+        context: ResolutionContext,
+        mainUrl: String
     ): List<StreamCandidate> {
         val result = decryptEngine.attemptDecryption(content, context)
         
         return if (result.success && result.output != null) {
-            miningEngine.deepScan(result.output, context).map { 
+            miningEngine.deepScan(result.output, context, mainUrl).map { 
                 it.copy(extractionMethod = "decrypted_${result.method}") 
             }
         } else emptyList()
-    }
-}
-
-// ============================================================================
-// MODULE 7: STREAM AUTHENTICITY VALIDATOR
-// ============================================================================
-
-class StreamAuthenticityValidator {
-    
-    data class ValidationResult(
-        val isValid: Boolean,
-        val type: StreamType,
-        val quality: String?,
-        val headers: Map<String, String>
-    )
-    
-    enum class StreamType { M3U8, MP4, MKV, WEBM, DASH, UNKNOWN }
-    
-    suspend fun validate(
-        candidate: StreamCandidate,
-        networkEngine: NetworkReconstructionEngine,
-        context: ResolutionContext
-    ): ValidationResult = withContext(Dispatchers.IO) {
-        
-        context.forensicLog.add(ForensicTrace(
-            phase = "VALIDATE",
-            action = "START_VALIDATION",
-            data = mapOf("url" to candidate.url)
-        ))
-        
-        try {
-            // HEAD request first
-            val headSnapshot = networkEngine.executeWithTracing(
-                candidate.url,
-                method = "HEAD",
-                context = context
-            )
-            
-            val contentType = headSnapshot.responseHeaders["Content-Type"]?.firstOrNull() ?: ""
-            val contentLength = headSnapshot.responseHeaders["Content-Length"]?.firstOrNull()
-            
-            // Determine type from headers
-            val type = when {
-                contentType.contains("mpegurl") || contentType.contains("m3u8") -> StreamType.M3U8
-                contentType.contains("mp4") -> StreamType.MP4
-                contentType.contains("webm") -> StreamType.WEBM
-                contentType.contains("dash") -> StreamType.DASH
-                candidate.url.endsWith(".m3u8", ignoreCase = true) -> StreamType.M3U8
-                candidate.url.endsWith(".mp4", ignoreCase = true) -> StreamType.MP4
-                else -> StreamType.UNKNOWN
-            }
-            
-            // If HEAD is inconclusive, try partial GET
-            if (type == StreamType.UNKNOWN) {
-                val getSnapshot = networkEngine.executeWithTracing(
-                    candidate.url,
-                    headers = mapOf("Range" to "bytes=0-1024"),
-                    context = context
-                )
-                
-                val body = getSnapshot.responseBody ?: ""
-                val detectedType = detectByContent(body)
-                
-                return@withContext ValidationResult(
-                    isValid = detectedType != StreamType.UNKNOWN,
-                    type = detectedType,
-                    quality = inferQuality(candidate.url),
-                    headers = generateHeaders(candidate, context)
-                )
-            }
-            
-            ValidationResult(
-                isValid = true,
-                type = type,
-                quality = inferQuality(candidate.url),
-                headers = generateHeaders(candidate, context)
-            )
-            
-        } catch (e: Exception) {
-            context.forensicLog.add(ForensicTrace(
-                phase = "VALIDATE",
-                action = "VALIDATION_ERROR",
-                data = mapOf("error" to e.message.toString())
-            ))
-            
-            ValidationResult(false, StreamType.UNKNOWN, null, emptyMap())
-        }
-    }
-    
-    private fun detectByContent(content: String): StreamType {
-        return when {
-            content.contains("#EXTM3U") -> StreamType.M3U8
-            content.startsWith("\u0000\u0000\u0000") && content.contains("ftyp") -> StreamType.MP4
-            content.startsWith("\u001A\u0045\u00DF\u00A3") -> StreamType.MKV // EBML header
-            content.startsWith("<MPD") -> StreamType.DASH
-            else -> StreamType.UNKNOWN
-        }
-    }
-    
-    private fun inferQuality(url: String): String? {
-        val patterns = listOf(
-            Regex("""(\d{3,4})p""") to { m: MatchResult -> m.groupValues[1] + "p" },
-            Regex("""(\d{3,4})[xX](\d{3,4})""") to { m: MatchResult -> m.groupValues[2] + "p" },
-            Regex("""[/_](720|1080|480|360|240)[/_]""") to { m: MatchResult -> m.groupValues[1] + "p" }
-        )
-        
-        for ((pattern, extractor) in patterns) {
-            pattern.find(url)?.let { return extractor(it) }
-        }
-        
-        return null
-    }
-    
-    private fun generateHeaders(
-        candidate: StreamCandidate,
-        context: ResolutionContext
-    ): Map<String, String> {
-        return mapOf(
-            "Referer" to candidate.source,
-            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.0.36",
-            "Accept" to "*/*",
-            "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8",
-            "Origin" to "https://boctem.com"
-        )
     }
 }
 
@@ -1254,10 +1177,11 @@ class AdaptiveDecisionEngine(
         data: String,
         context: ResolutionContext,
         subtitleCallback: (SubtitleFile) -> Unit,
-        linkCallback: (ExtractorLink) -> Unit
+        linkCallback: (ExtractorLink) -> Unit,
+        mainUrl: String = "https://boctem.com"
     ): Boolean = withContext(Dispatchers.IO) {
         
-        val strategies = listOf(
+        val strategies = listOf<(String, ResolutionContext, (SubtitleFile) -> Unit, (ExtractorLink) -> Unit, String) -> Decision>(
             ::strategyDirectExtraction,
             ::strategyAjaxExtraction,
             ::strategyDeepCrawl,
@@ -1269,7 +1193,7 @@ class AdaptiveDecisionEngine(
         for ((index, strategy) in strategies.withIndex()) {
             context.strategyHistory.add("Strategy_$index")
             
-            val result = strategy(data, context, subtitleCallback, linkCallback)
+            val result = strategy(data, context, subtitleCallback, linkCallback, mainUrl)
             
             when (result) {
                 is Decision.Success -> {
@@ -1306,12 +1230,12 @@ class AdaptiveDecisionEngine(
         data: String,
         context: ResolutionContext,
         subtitleCallback: (SubtitleFile) -> Unit,
-        linkCallback: (ExtractorLink) -> Unit
+        linkCallback: (ExtractorLink) -> Unit,
+        mainUrl: String
     ): Decision {
         val snapshot = networkEngine.executeWithTracing(data, context = context)
         val content = snapshot.responseBody ?: return Decision.Fallback("No content", "ajax")
         
-        // Direct m3u8 or video file
         if (content.contains("#EXTM3U") || data.contains(".m3u8")) {
             val links = M3u8Helper.generateM3u8(
                 source = "BocTem",
@@ -1328,9 +1252,9 @@ class AdaptiveDecisionEngine(
         data: String,
         context: ResolutionContext,
         subtitleCallback: (SubtitleFile) -> Unit,
-        linkCallback: (ExtractorLink) -> Unit
+        linkCallback: (ExtractorLink) -> Unit,
+        mainUrl: String
     ): Decision {
-        // Try AJAX endpoints
         val postId = extractPostId(data, context)
         val nonce = extractNonce(data, context)
         val episode = extractEpisode(data)
@@ -1340,9 +1264,9 @@ class AdaptiveDecisionEngine(
         }
         
         val ajaxEndpoints = listOf(
-            "https://boctem.com/wp-admin/admin-ajax.php",
-            "https://boctem.com/ajax-player",
-            "https://boctem.com/api/player"
+            "$mainUrl/wp-admin/admin-ajax.php",
+            "$mainUrl/ajax-player",
+            "$mainUrl/api/player"
         )
         
         val payloads = listOf(
@@ -1366,19 +1290,17 @@ class AdaptiveDecisionEngine(
                         
                         val response = snapshot.responseBody ?: continue
                         
-                        // Try to extract from AJAX response
-                        val candidates = miningEngine.deepScan(response, context)
+                        val candidates = miningEngine.deepScan(response, context, mainUrl)
                         val validLinks = validateAndConvert(candidates, context)
                         
                         if (validLinks.isNotEmpty()) {
                             return Decision.Success(validLinks)
                         }
                         
-                        // Check for encrypted response
                         if (response.length > 100 && !response.contains("<")) {
                             val decryptResult = decryptEngine.attemptDecryption(response, context)
                             if (decryptResult.success && decryptResult.output != null) {
-                                val decryptedCandidates = miningEngine.deepScan(decryptResult.output, context)
+                                val decryptedCandidates = miningEngine.deepScan(decryptResult.output, context, mainUrl)
                                 val decryptedLinks = validateAndConvert(decryptedCandidates, context)
                                 if (decryptedLinks.isNotEmpty()) {
                                     return Decision.Success(decryptedLinks)
@@ -1398,9 +1320,10 @@ class AdaptiveDecisionEngine(
         data: String,
         context: ResolutionContext,
         subtitleCallback: (SubtitleFile) -> Unit,
-        linkCallback: (ExtractorLink) -> Unit
+        linkCallback: (ExtractorLink) -> Unit,
+        mainUrl: String
     ): Decision {
-        val candidates = crawler.crawl(data, context)
+        val candidates = crawler.crawl(data, context, mainUrl)
         val validLinks = validateAndConvert(candidates, context)
         
         return if (validLinks.isNotEmpty()) {
@@ -1414,13 +1337,12 @@ class AdaptiveDecisionEngine(
         data: String,
         context: ResolutionContext,
         subtitleCallback: (SubtitleFile) -> Unit,
-        linkCallback: (ExtractorLink) -> Unit
+        linkCallback: (ExtractorLink) -> Unit,
+        mainUrl: String
     ): Decision {
-        // Aggressive pattern expansion
         val snapshot = networkEngine.executeWithTracing(data, context = context)
         val content = snapshot.responseBody ?: return Decision.Failure("No content to mine")
         
-        // Expand regex search space
         val expandedPatterns = generateExpandedPatterns(content)
         val allMatches = mutableListOf<String>()
         
@@ -1430,11 +1352,10 @@ class AdaptiveDecisionEngine(
             }
         }
         
-        // Try every match as potential URL
         val candidates = allMatches.mapNotNull { match ->
             try {
                 StreamCandidate(
-                    url = normalizeUrl(match) ?: return@mapNotNull null,
+                    url = normalizeUrl(match, mainUrl) ?: return@mapNotNull null,
                     source = data,
                     extractionMethod = "brute_force",
                     confidence = 0.5
@@ -1454,12 +1375,12 @@ class AdaptiveDecisionEngine(
         data: String,
         context: ResolutionContext,
         subtitleCallback: (SubtitleFile) -> Unit,
-        linkCallback: (ExtractorLink) -> Unit
+        linkCallback: (ExtractorLink) -> Unit,
+        mainUrl: String
     ): Decision {
         val snapshot = networkEngine.executeWithTracing(data, context = context)
         val content = snapshot.responseBody ?: return Decision.Failure("No content")
         
-        // Look for encrypted blocks
         val encryptedBlocks = Regex("""[A-Za-z0-9+/=]{100,500}""").findAll(content)
             .map { it.value }
             .distinct()
@@ -1467,7 +1388,7 @@ class AdaptiveDecisionEngine(
         for (block in encryptedBlocks) {
             val result = decryptEngine.attemptDecryption(block, context)
             if (result.success && result.output != null) {
-                val candidates = miningEngine.deepScan(result.output, context)
+                val candidates = miningEngine.deepScan(result.output, context, mainUrl)
                 val validLinks = validateAndConvert(candidates, context)
                 if (validLinks.isNotEmpty()) {
                     return Decision.Success(validLinks)
@@ -1482,12 +1403,13 @@ class AdaptiveDecisionEngine(
         data: String,
         context: ResolutionContext,
         subtitleCallback: (SubtitleFile) -> Unit,
-        linkCallback: (ExtractorLink) -> Unit
+        linkCallback: (ExtractorLink) -> Unit,
+        mainUrl: String
     ): Decision {
         val snapshot = networkEngine.executeWithTracing(data, context = context)
         val content = snapshot.responseBody ?: return Decision.Failure("No content")
         
-        val doc = org.jsoup.Jsoup.parse(content)
+        val doc = Jsoup.parse(content)
         val scripts = doc.select("script").mapNotNull { 
             it.data().takeIf { it.isNotBlank() } ?: it.html().takeIf { it.isNotBlank() }
         }
@@ -1555,12 +1477,10 @@ class AdaptiveDecisionEngine(
             Regex("""id=(\d+)""")
         )
         
-        // Try URL patterns
         for (pattern in patterns) {
             pattern.find(url)?.groupValues?.get(1)?.let { return it }
         }
         
-        // Try from cached snapshots
         context.networkSnapshots.forEach { snapshot ->
             val body = snapshot.responseBody ?: return@forEach
             for (pattern in patterns) {
@@ -1608,19 +1528,9 @@ class AdaptiveDecisionEngine(
             Regex("""(https?://[^\s\"'<>]{20,})"""),
             Regex("""(//[^\s\"'<>]{20,})"""),
             Regex("""[\"']([^\"']*(?:m3u8|mp4)[^\"']*)[\"']"""),
-            Regex("""(eyJ[A-Za-z0-9_-]*\.eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*)"""), // JWT-like
-            Regex("""(U2FsdGVkX1[A-Za-z0-9+/=]+)""") // CryptoJS format
+            Regex("""(eyJ[A-Za-z0-9_-]*\.eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*)"""),
+            Regex("""(U2FsdGVkX1[A-Za-z0-9+/=]+)""")
         )
-    }
-    
-    private fun normalizeUrl(url: String?): String? {
-        if (url.isNullOrBlank()) return null
-        return when {
-            url.startsWith("http://") || url.startsWith("https://") -> url
-            url.startsWith("//") -> "https:$url"
-            url.startsWith("/") -> "https://boctem.com$url"
-            else -> "https://$url"
-        }
     }
 }
 
@@ -1637,7 +1547,7 @@ class BocTemProvider : MainAPI() {
     override val hasQuickSearch = false
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie)
     
-    // Module instances
+    // Module instances - lazy init to avoid circular dependency issues
     private val networkEngine by lazy { NetworkReconstructionEngine(this) }
     private val analyzer by lazy { ResponseIntelligenceAnalyzer() }
     private val miningEngine by lazy { UniversalDataMiningEngine() }
@@ -1798,9 +1708,8 @@ class BocTemProvider : MainAPI() {
         ))
         
         return try {
-            val success = decisionEngine.resolve(data, context, subtitleCallback, callback)
+            val success = decisionEngine.resolve(data, context, subtitleCallback, callback, mainUrl)
             
-            // Debug output if failed
             if (!success) {
                 println("=== FORENSIC TRACE ===")
                 context.forensicLog.forEach { trace ->

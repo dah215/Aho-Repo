@@ -2,6 +2,7 @@ package com.animevietsub
 
 import android.util.Base64
 import com.fasterxml.jackson.annotation.JsonProperty
+import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
@@ -21,7 +22,6 @@ import java.io.ByteArrayOutputStream
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
-import javax.crypto.spec.GCMParameterSpec
 
 @CloudstreamPlugin
 class AnimeVietSubPlugin : Plugin() {
@@ -31,251 +31,118 @@ class AnimeVietSubPlugin : Plugin() {
 }
 
 // ================================================================================
-// CORE DATA STRUCTURES
+// RESPONSE TYPE CLASSIFICATION
 // ================================================================================
 
-/**
- * Response type classification
- */
 enum class ResponseType {
-    HTML_DOM,
-    JAVASCRIPT,
-    JSON_API,
-    M3U8_PLAYLIST,
-    MPD_MANIFEST,
-    ENCRYPTED_PAYLOAD,
-    PACKED_JS,
-    UNKNOWN
+    HTML_DOM, JAVASCRIPT, JSON_API, M3U8_PLAYLIST, MPD_MANIFEST, ENCRYPTED_PAYLOAD, PACKED_JS, UNKNOWN
 }
-
-/**
- * Stream candidate với validation
- */
-data class StreamCandidate(
-    val url: String,
-    val source: String,
-    val extractionPath: List<String>,
-    val encryptionRequired: Boolean,
-    val headers: Map<String, String>,
-    val isValid: Boolean = false
-)
-
-/**
- * Session context cho stateful resolution
- */
-data class SessionContext(
-    val id: String = java.util.UUID.randomUUID().toString(),
-    var cookies: MutableMap<String, String> = mutableMapOf(),
-    var currentDepth: Int = 0,
-    val maxDepth: Int = 15,
-    val startTime: Long = System.currentTimeMillis(),
-    var failedStrategies: MutableList<String> = mutableListOf(),
-    val traceLog: MutableList<String> = mutableListOf()
-)
 
 // ================================================================================
 // RESPONSE INTELLIGENCE ANALYZER
 // ================================================================================
 
-/**
- * Phân loại response tự động bằng heuristic
- */
 object ResponseAnalyzer {
-    
-    private val htmlSignatures = listOf(
-        Regex("""<!DOCTYPE\s*html""", RegexOption.IGNORE_CASE),
-        Regex("""<html[\s>]""", RegexOption.IGNORE_CASE),
-        Regex("""<head[\s>]""", RegexOption.IGNORE_CASE)
-    )
-    
-    private val m3u8Signatures = listOf(
-        Regex("""#EXTM3U"""),
-        Regex("""#EXT-X-VERSION"""),
-        Regex("""#EXTINF""")
-    )
-    
-    private val jsonSignatures = listOf(
-        Regex("""^\s*\{[\s\S]*\}\s*$"""),
-        Regex("""^\s*\[[\s\S]*\]\s*$""")
-    )
-    
-    private val packedJsSignatures = listOf(
-        Regex("""eval\(function\(p,a,c,k,e,d"""),
-        Regex("""String\.fromCharCode"""),
-        Regex("""\\x[0-9a-fA-F]{2}""")
-    )
-    
+
+    private val m3u8Signatures = listOf("#EXTM3U", "#EXT-X-VERSION", "#EXTINF")
+    private val htmlSignatures = listOf("<!DOCTYPE html", "<html", "<head>", "<body>")
+    private val packedJsSignatures = listOf("eval(function(p,a,c,k,e,d", "String.fromCharCode")
+
     fun analyzeType(body: String?): ResponseType {
         if (body.isNullOrBlank()) return ResponseType.UNKNOWN
-        
-        if (m3u8Signatures.any { it.containsMatchIn(body) }) {
-            return ResponseType.M3U8_PLAYLIST
-        }
-        
-        if (htmlSignatures.any { it.containsMatchIn(body) }) {
-            return ResponseType.HTML_DOM
-        }
-        
-        if (jsonSignatures.any { it.containsMatchIn(body) }) {
-            return ResponseType.JSON_API
-        }
-        
-        if (packedJsSignatures.any { it.containsMatchIn(body) }) {
-            return ResponseType.PACKED_JS
-        }
-        
-        // Check for encrypted data (high entropy Base64)
-        val base64Pattern = Regex("""[A-Za-z0-9+/]{40,}={0,2}""")
-        if (base64Pattern.containsMatchIn(body) && !body.contains("<")) {
-            return ResponseType.ENCRYPTED_PAYLOAD
-        }
-        
+        if (m3u8Signatures.any { body.contains(it) }) return ResponseType.M3U8_PLAYLIST
+        if (htmlSignatures.any { body.contains(it, ignoreCase = true) }) return ResponseType.HTML_DOM
+        if (body.trimStart().startsWith("{") || body.trimStart().startsWith("[")) return ResponseType.JSON_API
+        if (packedJsSignatures.any { body.contains(it) }) return ResponseType.PACKED_JS
         return ResponseType.UNKNOWN
     }
-    
+
     fun extractUrlsFromResponse(body: String, baseUrl: String): List<String> {
         val urls = mutableListOf<String>()
-        
-        // Direct URL patterns
-        val urlPatterns = listOf(
+
+        // Direct stream URL patterns
+        val streamPatterns = listOf(
             Regex("""https?://[^\s"'`<>]+\.m3u8[^\s"'`<>]*"""),
             Regex("""https?://[^\s"'`<>]+\.mp4[^\s"'`<>]*"""),
-            Regex("""https?://[^\s"'`<>]+\.mpd[^\s"'`<>]*"""),
-            Regex("""["']https?://[^"']+["']""")
+            Regex("""https?://[^\s"'`<>]+\.mpd[^\s"'`<>]*""")
         )
-        
-        urlPatterns.forEach { pattern ->
-            pattern.findAll(body).forEach { match ->
-                val url = match.value.trim('"', '\'')
-                urls.add(url)
-            }
+        streamPatterns.forEach { pattern ->
+            pattern.findAll(body).forEach { urls.add(it.value) }
         }
-        
-        // DOM extraction if HTML
+
+        // Quoted URLs
+        Regex(""""(https?://[^"]+)"""").findAll(body).forEach { urls.add(it.groupValues[1]) }
+        Regex("""'(https?://[^']+)'""").findAll(body).forEach { urls.add(it.groupValues[1]) }
+
+        // DOM extraction
         if (body.contains("<")) {
             try {
                 val doc = Jsoup.parse(body)
-                
-                // Data attributes
-                listOf("data-src", "data-url", "data-href", "data-file", "data-link").forEach { attr ->
+                listOf("data-src", "data-url", "data-href", "data-file", "data-link", "data-source").forEach { attr ->
                     doc.select("[$attr]").forEach { el ->
-                        val value = el.attr(attr)
-                        if (value.isNotBlank()) urls.add(value)
+                        val v = el.attr(attr); if (v.isNotBlank()) urls.add(v)
                     }
                 }
-                
-                // Standard attributes
-                listOf("src", "href").forEach { attr ->
-                    doc.select("[$attr]").forEach { el ->
-                        val value = el.attr(attr)
-                        if (value.isNotBlank() && (value.contains("http") || value.contains(".m3u8") || value.contains(".mp4"))) {
-                            urls.add(value)
-                        }
-                    }
+                doc.select("source[src], video[src], iframe[src]").forEach { el ->
+                    val v = el.attr("src"); if (v.isNotBlank()) urls.add(v)
                 }
             } catch (e: Exception) { /* Skip */ }
         }
-        
-        // Fix relative URLs
-        return urls.map { url -> fixUrl(url, baseUrl) }.distinct()
+
+        return urls.map { fixUrlStatic(it, baseUrl) }.distinct().filter { it.startsWith("http") }
     }
-    
-    private fun fixUrl(url: String, baseUrl: String): String {
+
+    private fun fixUrlStatic(url: String, baseUrl: String): String {
         if (url.startsWith("http://") || url.startsWith("https://")) return url
         if (url.startsWith("//")) return "https:$url"
-        
-        return try {
-            val base = URL(baseUrl)
-            URL(base, url).toString()
-        } catch (e: Exception) { url }
+        return try { URL(URL(baseUrl), url).toString() } catch (e: Exception) { url }
     }
 }
 
 // ================================================================================
-// UNIVERSAL DATA MINING ENGINE
+// UNIVERSAL DATA MINER
 // ================================================================================
 
-/**
- * Khai thác mọi response bằng multi-regex deep scan
- */
 object DataMiner {
-    
-    private val hashPatterns = listOf(
-        Regex("""data-hash\s*=\s*["']([^"']+)["']"""),
-        Regex("""data-id\s*=\s*["']([^"']+)["']"""),
-        Regex("""data-key\s*=\s*["']([^"']+)["']""")
-    )
-    
+
     private val encryptedPatterns = listOf(
-        Regex("""file\s*[=:]\s*["']([A-Za-z0-9+/]{20,}={0,2})["']"""),
-        Regex("""link\s*[=:]\s*["']([A-Za-z0-9+/]{20,}={0,2})["']"""),
-        Regex("""source\s*[=:]\s*["']([A-Za-z0-9+/]{20,}={0,2})["']"""),
-        Regex("""url\s*[=:]\s*["']([A-Za-z0-9+/]{20,}={0,2})["']"""),
-        Regex("""enc\s*[=:]\s*["']([A-Za-z0-9+/]{20,}={0,2})["']""")
+        Regex("""(?:file|link|source|url|enc|stream|video)\s*[:=]\s*["']([A-Za-z0-9+/]{20,}={0,2})["']"""),
+        Regex("""["']([A-Za-z0-9+/]{40,}={0,2})["']""")
     )
-    
-    private val jsonInJsPatterns = listOf(
-        Regex("""\{[\s\S]*?"file"[\s\S]*?\}"""),
-        Regex("""\{[\s\S]*?"url"[\s\S]*?\}"""),
-        Regex("""\{[\s\S]*?"source"[\s\S]*?\}""")
-    )
-    
-    fun mineHashes(body: String): List<String> {
-        val hashes = mutableListOf<String>()
-        hashPatterns.forEach { pattern ->
-            pattern.findAll(body).forEach { match ->
-                hashes.add(match.groupValues[1])
-            }
-        }
-        return hashes.distinct()
-    }
-    
+
     fun mineEncryptedData(body: String): List<String> {
-        val encrypted = mutableListOf<String>()
+        val results = mutableListOf<String>()
         encryptedPatterns.forEach { pattern ->
             pattern.findAll(body).forEach { match ->
-                encrypted.add(match.groupValues[1])
+                val v = match.groupValues[1]
+                if (v.length > 20 && calculateEntropy(v) > 3.5) results.add(v)
             }
         }
-        
-        // Also find high-entropy blocks
-        val base64Pattern = Regex("""[A-Za-z0-9+/]{40,}={0,2}""")
-        base64Pattern.findAll(body).forEach { match ->
-            val block = match.value
-            if (calculateEntropy(block) > 4.0) {
-                encrypted.add(block)
-            }
-        }
-        
-        return encrypted.distinct()
+        return results.distinct()
     }
-    
-    fun mineJsonObjects(body: String): List<Map<String, Any?>> {
-        val objects = mutableListOf<Map<String, Any?>>()
-        jsonInJsPatterns.forEach { pattern ->
-            pattern.findAll(body).forEach { match ->
-                try {
-                    val jsonStr = match.value
-                    val mapper = com.fasterxml.jackson.module.kotlin.jacksonObjectMapper()
-                    val parsed = mapper.readValue(jsonStr, Map::class.java) as Map<String, Any?>
-                    if (parsed.isNotEmpty()) objects.add(parsed)
-                } catch (e: Exception) { /* Skip */ }
-            }
+
+    fun mineHashes(body: String): List<String> {
+        val results = mutableListOf<String>()
+        listOf(
+            Regex("""data-hash\s*=\s*["']([^"']+)["']"""),
+            Regex("""data-id\s*=\s*["']([^"']+)["']"""),
+            Regex("""data-key\s*=\s*["']([^"']+)["']"""),
+            Regex("""data-href\s*=\s*["']([^"']+)["']""")
+        ).forEach { pattern ->
+            pattern.findAll(body).forEach { results.add(it.groupValues[1]) }
         }
-        return objects
+        return results.distinct()
     }
-    
+
     private fun calculateEntropy(str: String): Double {
         val freq = mutableMapOf<Char, Int>()
         str.forEach { freq[it] = (freq[it] ?: 0) + 1 }
-        
         var entropy = 0.0
         val len = str.length.toDouble()
         freq.values.forEach { count ->
             val p = count / len
             if (p > 0) entropy -= p * (Math.log(p) / Math.log(2.0))
         }
-        
         return entropy
     }
 }
@@ -284,127 +151,72 @@ object DataMiner {
 // JS STATIC REVERSE ENGINE
 // ================================================================================
 
-/**
- * Unpack eval-packed JavaScript
- */
 object JSReverseEngine {
-    
+
     fun unpackEval(js: String): String {
         var result = js
-        var iterations = 0
-        val maxIterations = 10
-        
-        while (iterations < maxIterations) {
-            val unpacked = tryUnpackOneLevel(result)
-            if (unpacked == result) break
-            result = unpacked
-            iterations++
+        for (i in 1..5) {
+            val next = tryUnpackOneLevel(result)
+            if (next == result) break
+            result = next
         }
-        
         return result
     }
-    
+
     private fun tryUnpackOneLevel(js: String): String {
-        // Dean Edwards packer
-        val deanEdwardsPattern = Regex(
-            """eval\(function\(p,a,c,k,e,d?\)\s*\{[\s\S]*?\}\s*\([\s\S]*?\)\)"""
-        )
-        deanEdwardsPattern.find(js)?.let { match ->
+        // Dean Edwards P,A,C,K,E,R unpacker
+        val packed = Regex(
+            """\}\s*\(\s*['"]([^'"]+)['"]\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*['"]([^'"]+)['"]\s*,"""
+        ).find(js)
+        if (packed != null) {
             try {
-                val unpacked = unpackDeanEdwards(match.value)
-                if (unpacked != null) return js.replace(match.value, unpacked)
+                val p = packed.groupValues[1]
+                val a = packed.groupValues[2].toInt()
+                val c = packed.groupValues[3].toInt()
+                val k = packed.groupValues[4].split("|")
+                var res = p
+                for (i in c - 1 downTo 0) {
+                    if (i < k.size && k[i].isNotEmpty()) {
+                        res = res.replace(Regex("\\b${i.toString(a)}\\b"), k[i])
+                    }
+                }
+                return res
             } catch (e: Exception) { /* Continue */ }
         }
-        
-        // eval('...') patterns
-        val evalPattern = Regex("""eval\s*\(\s*(['"])([\s\S]*?)\1\s*\)""")
-        evalPattern.find(js)?.let { match ->
-            val content = match.groupValues[2]
-            val decoded = decodeEscapes(content)
-            return js.replace(match.value, decoded)
-        }
-        
-        // atob() Base64
-        val atobPattern = Regex("""atob\s*\(\s*['"]([A-Za-z0-9+/=]+)['"]\s*\)""")
-        atobPattern.find(js)?.let { match ->
+
+        // atob() decode
+        val atob = Regex("""atob\s*\(\s*['"]([A-Za-z0-9+/=]+)['"]\s*\)""").find(js)
+        if (atob != null) {
             try {
-                val decoded = String(Base64.decode(match.groupValues[1], Base64.DEFAULT))
-                return js.replace(match.value, "'$decoded'")
+                val decoded = String(Base64.decode(atob.groupValues[1], Base64.DEFAULT))
+                return js.replace(atob.value, "'$decoded'")
             } catch (e: Exception) { /* Continue */ }
         }
-        
+
         // String.fromCharCode
-        val charCodePattern = Regex("""String\.fromCharCode\s*\(([\d\s,]+)\)""")
-        charCodePattern.find(js)?.let { match ->
+        val sfc = Regex("""String\.fromCharCode\s*\(([\d\s,]+)\)""").find(js)
+        if (sfc != null) {
             try {
-                val codes = match.groupValues[1].split(",").map { it.trim().toInt() }
+                val codes = sfc.groupValues[1].split(",").map { it.trim().toInt() }
                 val decoded = codes.map { it.toChar() }.joinToString("")
-                return js.replace(match.value, "'$decoded'")
+                return js.replace(sfc.value, "'$decoded'")
             } catch (e: Exception) { /* Continue */ }
         }
-        
+
         return js
     }
-    
-    private fun unpackDeanEdwards(packed: String): String? {
-        try {
-            val altPattern = Regex(
-                """\}\s*\(\s*['"]([^'"]+)['"]\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*['"]([^'"]+)['"]\s*,"""
-            )
-            
-            val match = altPattern.find(packed) ?: return null
-            
-            val p = match.groupValues[1]
-            val a = match.groupValues[2].toInt()
-            val c = match.groupValues[3].toInt()
-            val k = match.groupValues[4].split("|")
-            
-            var result = p
-            for (i in c - 1 downTo 0) {
-                if (i < k.size && k[i].isNotEmpty()) {
-                    val pattern = Regex("\\b${i.toString(a)}\\b")
-                    result = result.replace(pattern, k[i])
-                }
-            }
-            
-            return result
-        } catch (e: Exception) {
-            return null
-        }
-    }
-    
-    private fun decodeEscapes(str: String): String {
-        return str
-            .replace("\\n", "\n")
-            .replace("\\r", "\r")
-            .replace("\\t", "\t")
-            .replace("\\'", "'")
-            .replace("\\\"", "\"")
-            .replace("\\\\", "\\")
-            .replace(Regex("\\\\x([0-9a-fA-F]{2})")) { match ->
-                match.groupValues[1].toInt(16).toChar().toString()
-            }
-            .replace(Regex("\\\\u([0-9a-fA-F]{4})")) { match ->
-                match.groupValues[1].toInt(16).toChar().toString()
-            }
-    }
-    
+
     fun extractUrlsFromJS(js: String): List<String> {
         val urls = mutableListOf<String>()
-        
-        val urlPatterns = listOf(
+        listOf(
             Regex("""['"]https?://[^'"]+\.m3u8[^'"]*['"]"""),
             Regex("""['"]https?://[^'"]+\.mp4[^'"]*['"]"""),
-            Regex("""['"]https?://[^'"]*(?:stream|video|play)[^'"]*['"]""")
-        )
-        
-        urlPatterns.forEach { pattern ->
+            Regex("""['"]https?://[^'"]*(?:stream|video|play|hls|cdn)[^'"]*['"]""")
+        ).forEach { pattern ->
             pattern.findAll(js).forEach { match ->
-                val url = match.value.trim('\'', '"')
-                urls.add(url)
+                urls.add(match.value.trim('\'', '"'))
             }
         }
-        
         return urls.distinct()
     }
 }
@@ -413,201 +225,155 @@ object JSReverseEngine {
 // ENCRYPTION AUTOBREAK SYSTEM
 // ================================================================================
 
-/**
- * Hệ thống brute-strategy tự động phá mã hóa
- */
 object EncryptionBreaker {
-    
-    // Known passwords to try
+
+    // Known passwords – ordered by most likely
     private val knownPasswords = listOf(
         "dm_thang_suc_vat_get_link_an_dbt",
         "animevietsub",
         "animevsub",
+        "animevsub_secret",
         "video_decrypt_key",
         "streaming_key",
         "player_key",
         "secret_key",
         "encryption_key",
+        "VSub@2024",
+        "VSub@2025",
         "pass",
         "password",
-        "key"
+        "key",
+        ""
     )
-    
-    // AES modes to try
+
+    private val hashAlgorithms = listOf("SHA-256", "MD5", "SHA-1")
     private val aesModes = listOf(
         "AES/CBC/PKCS5Padding",
         "AES/CBC/PKCS7Padding",
         "AES/CFB/NoPadding",
-        "AES/OFB/NoPadding",
-        "AES/CTR/NoPadding"
+        "AES/OFB/NoPadding"
     )
-    
-    // Hash algorithms for key derivation
-    private val hashAlgorithms = listOf(
-        "SHA-256",
-        "SHA-1",
-        "MD5"
-    )
-    
-    fun autoBreak(encrypted: String): String? {
-        // Strategy 1: Try known passwords
+
+    fun autoBreak(encrypted: String?): String? {
+        if (encrypted.isNullOrBlank()) return null
+
+        // Clean up the input
+        val cleaned = encrypted.trim()
+            .replace("\n", "").replace("\r", "").replace(" ", "")
+
+        // Strategy 1: direct Base64 decode
+        try {
+            val decoded = String(Base64.decode(cleaned, Base64.DEFAULT), StandardCharsets.UTF_8)
+            if (isValidOutput(decoded)) return decoded
+        } catch (e: Exception) { /* Continue */ }
+
+        // Strategy 2: known password AES
         for (password in knownPasswords) {
-            val result = tryDecryptWithPassword(encrypted, password)
-            if (result != null && isValidOutput(result)) {
-                return result
-            }
+            val result = tryAllAES(cleaned, password)
+            if (result != null) return result
         }
-        
-        // Strategy 2: Try different IV strategies
+
+        // Strategy 3: multi-layer
         for (password in knownPasswords) {
-            for (ivStrategy in listOf("prefix", "zero", "fromKey")) {
-                val result = tryDecryptWithIV(encrypted, password, ivStrategy)
-                if (result != null && isValidOutput(result)) {
-                    return result
+            for (ivStrat in listOf("prefix", "zero", "fromKey")) {
+                for (hash in hashAlgorithms) {
+                    for (mode in aesModes) {
+                        try {
+                            val r = decryptAES(cleaned, password, hash, mode, ivStrat)
+                            if (r != null && isValidOutput(r)) return r
+                            // Try one more layer
+                            if (r != null && r.length > 20) {
+                                val r2 = tryAllAES(r, password)
+                                if (r2 != null) return r2
+                            }
+                        } catch (e: Exception) { /* Continue */ }
+                    }
                 }
             }
         }
-        
-        // Strategy 3: Multi-layer decryption
-        return tryMultiLayer(encrypted)
+
+        return null
     }
-    
-    private fun tryDecryptWithPassword(encrypted: String, password: String): String? {
-        for (hashAlgo in hashAlgorithms) {
-            for (aesMode in aesModes) {
-                try {
-                    val result = decryptAES(encrypted, password, hashAlgo, aesMode, "prefix")
-                    if (result != null && isValidOutput(result)) {
-                        return result
-                    }
-                } catch (e: Exception) { /* Continue */ }
+
+    private fun tryAllAES(encrypted: String, password: String): String? {
+        for (hash in hashAlgorithms) {
+            for (mode in aesModes) {
+                for (ivStrat in listOf("prefix", "zero", "fromKey")) {
+                    try {
+                        val result = decryptAES(encrypted, password, hash, mode, ivStrat)
+                        if (result != null && isValidOutput(result)) return result
+                    } catch (e: Exception) { /* Continue */ }
+                }
             }
         }
         return null
     }
-    
-    private fun tryDecryptWithIV(encrypted: String, password: String, ivStrategy: String): String? {
-        for (hashAlgo in hashAlgorithms) {
-            for (aesMode in aesModes) {
-                try {
-                    val result = decryptAES(encrypted, password, hashAlgo, aesMode, ivStrategy)
-                    if (result != null && isValidOutput(result)) {
-                        return result
-                    }
-                } catch (e: Exception) { /* Continue */ }
-            }
-        }
-        return null
-    }
-    
+
     private fun decryptAES(
-        encrypted: String,
-        password: String,
-        hashAlgorithm: String,
-        aesMode: String,
-        ivStrategy: String
+        encrypted: String, password: String,
+        hashAlgorithm: String, aesMode: String, ivStrategy: String
     ): String? {
-        // Decode Base64
         val decoded = try {
-            Base64.decode(encrypted.replace("\\s".toRegex(), ""), Base64.DEFAULT)
+            Base64.decode(encrypted, Base64.DEFAULT)
         } catch (e: Exception) { return null }
-        
+
         if (decoded.size < 16) return null
-        
-        // Derive key
+
         val key = when (hashAlgorithm) {
-            "SHA-256" -> MessageDigest.getInstance("SHA-256").digest(password.toByteArray(StandardCharsets.UTF_8))
-            "SHA-1" -> {
-                val sha1 = MessageDigest.getInstance("SHA-1").digest(password.toByteArray(StandardCharsets.UTF_8))
-                sha1.copyOf(16)
-            }
-            "MD5" -> MessageDigest.getInstance("MD5").digest(password.toByteArray(StandardCharsets.UTF_8))
+            "SHA-256" -> MessageDigest.getInstance("SHA-256")
+                .digest(password.toByteArray(StandardCharsets.UTF_8))
+            "SHA-1" -> MessageDigest.getInstance("SHA-1")
+                .digest(password.toByteArray(StandardCharsets.UTF_8)).copyOf(16)
+            "MD5" -> MessageDigest.getInstance("MD5")
+                .digest(password.toByteArray(StandardCharsets.UTF_8))
             else -> return null
         }
-        
-        // Extract IV and ciphertext based on strategy
+
         val (iv, ciphertext) = when (ivStrategy) {
             "prefix" -> Pair(decoded.copyOfRange(0, 16), decoded.copyOfRange(16, decoded.size))
             "zero" -> Pair(ByteArray(16), decoded)
             "fromKey" -> Pair(key.copyOfRange(0, 16), decoded)
             else -> Pair(decoded.copyOfRange(0, 16), decoded.copyOfRange(16, decoded.size))
         }
-        
-        // Decrypt
+
+        if (ciphertext.isEmpty()) return null
+
         return try {
             val cipher = Cipher.getInstance(aesMode)
             cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
             val plain = cipher.doFinal(ciphertext)
-            
-            // Try decompression
             tryDecompress(plain) ?: String(plain, StandardCharsets.UTF_8)
         } catch (e: Exception) { null }
     }
-    
+
     private fun tryDecompress(data: ByteArray): String? {
-        // Try zlib decompression
         try {
-            val inflater = Inflater(true)
-            inflater.setInput(data)
+            val inflater = Inflater(true); inflater.setInput(data)
             val out = ByteArrayOutputStream()
             val buf = ByteArray(8192)
             while (!inflater.finished()) {
-                val n = inflater.inflate(buf)
-                if (n == 0) break
+                val n = inflater.inflate(buf); if (n == 0) break
                 out.write(buf, 0, n)
             }
             inflater.end()
             return String(out.toByteArray(), StandardCharsets.UTF_8)
         } catch (e: Exception) { /* Continue */ }
-        
-        // Try gzip decompression
         try {
-            val gzipIn = GZIPInputStream(ByteArrayInputStream(data))
+            val gzip = GZIPInputStream(ByteArrayInputStream(data))
             val out = ByteArrayOutputStream()
-            val buf = ByteArray(8192)
-            var n = gzipIn.read(buf)
-            while (n > 0) {
-                out.write(buf, 0, n)
-                n = gzipIn.read(buf)
-            }
-            gzipIn.close()
+            val buf = ByteArray(8192); var n = gzip.read(buf)
+            while (n > 0) { out.write(buf, 0, n); n = gzip.read(buf) }
+            gzip.close()
             return String(out.toByteArray(), StandardCharsets.UTF_8)
         } catch (e: Exception) { /* Continue */ }
-        
         return null
     }
-    
-    private fun tryMultiLayer(encrypted: String): String? {
-        var current = encrypted
-        
-        for (layer in 1..3) {
-            val result = autoBreak(current)
-            if (result == null) break
-            
-            if (looksEncrypted(result)) {
-                current = result
-            } else {
-                return result
-            }
-        }
-        
-        return null
-    }
-    
-    private fun isValidOutput(text: String?): Boolean {
+
+    fun isValidOutput(text: String?): Boolean {
         if (text.isNullOrBlank()) return false
-        
-        return text.startsWith("http://") ||
-               text.startsWith("https://") ||
-               text.startsWith("//") ||
-               text.contains(".m3u8") ||
-               text.contains(".mp4") ||
-               !looksEncrypted(text)
-    }
-    
-    private fun looksEncrypted(text: String): Boolean {
-        val printable = text.count { it.code in 32..126 || it in "\n\r\t" }
-        return printable.toFloat() / text.length.coerceAtLeast(1) < 0.7f
+        return text.startsWith("http://") || text.startsWith("https://") ||
+               text.startsWith("//") || text.contains(".m3u8") ||
+               text.contains(".mp4") || text.contains(".mpd")
     }
 }
 
@@ -615,30 +381,9 @@ object EncryptionBreaker {
 // STREAM VALIDATOR
 // ================================================================================
 
-/**
- * Xác thực stream link
- */
 object StreamValidator {
-    
-    private val m3u8Signatures = listOf("#EXTM3U", "#EXT-X-VERSION", "#EXTINF")
-    private val mpdSignatures = listOf("<MPD", "<Period", "<AdaptationSet")
-    
-    fun isM3U8(content: String?): Boolean {
-        if (content == null) return false
-        return m3u8Signatures.any { content.contains(it) }
-    }
-    
-    fun isMPD(content: String?): Boolean {
-        if (content == null) return false
-        return mpdSignatures.any { content.contains(it, ignoreCase = true) }
-    }
-    
-    fun isStreamUrl(url: String): Boolean {
-        return url.contains(".m3u8") ||
-               url.contains(".mp4") ||
-               url.contains(".mpd") ||
-               url.contains("/stream/")
-    }
+    fun isStreamUrl(url: String): Boolean = url.contains(".m3u8") ||
+            url.contains(".mp4") || url.contains(".mpd") || url.contains("/stream/")
 }
 
 // ================================================================================
@@ -646,6 +391,17 @@ object StreamValidator {
 // ================================================================================
 
 class AnimeVietSub : MainAPI() {
+
+    // Try multiple known domains
+    private val domains = listOf(
+        "https://animevietsub.ee",
+        "https://animevietsub.cc",
+        "https://animevietsub.tv",
+        "https://animevietsub.io",
+        "https://animevietsub.net",
+        "https://animevietsub.me"
+    )
+
     override var mainUrl = "https://animevietsub.ee"
     override var name = "AnimeVietSub"
     override var lang = "vi"
@@ -653,25 +409,39 @@ class AnimeVietSub : MainAPI() {
     override val hasChromecastSupport = true
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA)
-    
-    // Debug mode - bật để xem forensic trace
+
     private val debugMode = true
-    
     private val cfKiller = CloudflareKiller()
+    private val mapper = jacksonObjectMapper()
     private val ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-    
+
     private val defaultHeaders = mapOf(
         "User-Agent" to ua,
-        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language" to "vi-VN,vi;q=0.9,en;q=0.8",
-        "Priority" to "u=0, i",
-        "Sec-Ch-Ua" to "\"Not/A)Brand\";v=\"8\", \"Chromium\";v=\"126\", \"Google Chrome\";v=\"126\"",
         "Sec-Fetch-Dest" to "document",
         "Sec-Fetch-Mode" to "navigate",
-        "Sec-Fetch-Site" to "none",
-        "Sec-Fetch-User" to "?1"
+        "Sec-Fetch-Site" to "none"
     )
-    
+
+    private fun ajaxHeaders(referer: String) = defaultHeaders + mapOf(
+        "X-Requested-With" to "XMLHttpRequest",
+        "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
+        "Referer" to referer,
+        "Origin" to mainUrl,
+        "Accept" to "application/json, text/javascript, */*; q=0.01",
+        "Sec-Fetch-Dest" to "empty",
+        "Sec-Fetch-Mode" to "cors",
+        "Sec-Fetch-Site" to "same-origin"
+    )
+
+    private fun videoHeaders(referer: String) = mapOf(
+        "User-Agent" to ua,
+        "Referer" to referer,
+        "Origin" to mainUrl,
+        "Accept" to "*/*"
+    )
+
     override val mainPage = mainPageOf(
         "$mainUrl/" to "Trang Chủ",
         "$mainUrl/danh-sach/list-dang-chieu/" to "Đang Chiếu",
@@ -679,98 +449,166 @@ class AnimeVietSub : MainAPI() {
         "$mainUrl/anime-le/" to "Anime Lẻ",
         "$mainUrl/anime-bo/" to "Anime Bộ"
     )
-    
+
+    // ── Utility ──────────────────────────────────────────────────────────────
+
     private fun fixUrl(url: String?): String? {
         if (url.isNullOrBlank() || url.startsWith("javascript") || url == "#") return null
-        val trimmed = url.trim()
+        val t = url.trim()
         return when {
-            trimmed.startsWith("http") -> trimmed
-            trimmed.startsWith("//") -> "https:$trimmed"
-            trimmed.startsWith("/") -> "$mainUrl$trimmed"
-            else -> "$mainUrl/$trimmed"
+            t.startsWith("http") -> t
+            t.startsWith("//") -> "https:$t"
+            t.startsWith("/") -> "$mainUrl$t"
+            else -> "$mainUrl/$t"
         }
     }
-    
+
+    /** Extract filmId from a URL using multiple patterns */
+    private fun extractFilmId(url: String): String {
+        // Pattern 1: -a12345 or /a12345
+        Regex("""[/-]a(\d+)""").find(url)?.groupValues?.get(1)?.let { return it }
+        // Pattern 2: trailing digits before .html or /
+        Regex("""-(\d+)(?:\.html|/)?$""").find(url)?.groupValues?.get(1)?.let { return it }
+        // Pattern 3: query param id=
+        Regex("""[?&]id=(\d+)""").find(url)?.groupValues?.get(1)?.let { return it }
+        return ""
+    }
+
+    /** Extract episodeId from ep href using multiple patterns */
+    private fun extractEpisodeHrefId(href: String): String {
+        Regex("""tap[-_]?(\d+)""").find(href)?.groupValues?.get(1)?.let { return it }
+        Regex("""ep[-_]?(\d+)""").find(href)?.groupValues?.get(1)?.let { return it }
+        Regex("""episode[-_]?(\d+)""").find(href)?.groupValues?.get(1)?.let { return it }
+        return ""
+    }
+
+    private fun log(tag: String, msg: String) {
+        if (debugMode) println("AVS[$tag] $msg")
+    }
+
+    // ── Safe JSON field extractor ─────────────────────────────────────────────
+
+    /** Parse raw JSON response body – handles link as String OR Array */
+    private fun parsePlayerResponse(body: String): Pair<String?, List<String>> {
+        return try {
+            @Suppress("UNCHECKED_CAST")
+            val json = mapper.readValue(body, Map::class.java) as Map<String, Any?>
+            val link = json["link"]
+            when (link) {
+                is String -> Pair(link.takeIf { it.isNotBlank() }, emptyList())
+                is List<*> -> {
+                    val files = link.filterIsInstance<Map<String, Any?>>()
+                        .mapNotNull { it["file"] as? String }
+                        .filter { it.isNotBlank() }
+                    Pair(null, files)
+                }
+                else -> {
+                    // Try "links" key
+                    val linksArr = (json["links"] as? List<*>)
+                        ?.filterIsInstance<Map<String, Any?>>()
+                        ?.mapNotNull { it["file"] as? String } ?: emptyList()
+                    Pair(json["url"] as? String, linksArr)
+                }
+            }
+        } catch (e: Exception) {
+            log("PARSE", "JSON parse error: ${e.message}")
+            Pair(null, emptyList())
+        }
+    }
+
+    // ── Main page / search / load ─────────────────────────────────────────────
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val data = request.data.ifBlank { mainUrl }
         val url = if (page == 1) data else "${data.removeSuffix("/")}/trang-$page.html"
-        
-        val fixedUrl = fixUrl(url) ?: return newHomePageResponse(request.name, emptyList(), false)
-        
-        val res = app.get(fixedUrl, interceptor = cfKiller, headers = defaultHeaders)
-        val doc = res.document
-        
-        val items = doc.select("article, .TPostMv, .item, .list-film li, .TPost").mapNotNull { 
-            it.toSearchResponse() 
-        }.distinctBy { it.url }
-        
+        val doc = app.get(fixUrl(url) ?: mainUrl, interceptor = cfKiller, headers = defaultHeaders).document
+        val items = doc.select("article, .TPostMv, .item, .list-film li, .TPost")
+            .mapNotNull { it.toSearchResponse() }.distinctBy { it.url }
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
-    
+
     private fun Element.toSearchResponse(): SearchResponse? {
         val a = selectFirst("a") ?: return null
         val href = fixUrl(a.attr("href")) ?: return null
-        val title = selectFirst(".Title, h3, h2, .title, .name")?.text()?.trim() 
-                    ?: a.attr("title").trim()
-                    ?: return null
-        
+        val title = selectFirst(".Title, h3, h2, .title, .name")?.text()?.trim()
+            ?: a.attr("title").trim().ifBlank { return null }
         val img = selectFirst("img")
-        val poster = fixUrl(img?.attr("data-src")?.takeIf { it.isNotBlank() } 
-                     ?: img?.attr("src"))
-        
-        return newAnimeSearchResponse(title, href, TvType.Anime) { 
-            posterUrl = poster 
-        }
+        val poster = fixUrl(
+            img?.attr("data-src")?.takeIf { it.isNotBlank() } ?: img?.attr("src")
+        )
+        return newAnimeSearchResponse(title, href, TvType.Anime) { posterUrl = poster }
     }
-    
+
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/tim-kiem/${URLEncoder.encode(query, "utf-8")}/"
         return app.get(url, interceptor = cfKiller, headers = defaultHeaders).document
-            .select("article, .TPostMv, .item, .list-film li").mapNotNull { it.toSearchResponse() }
-            .distinctBy { it.url }
+            .select("article, .TPostMv, .item, .list-film li")
+            .mapNotNull { it.toSearchResponse() }.distinctBy { it.url }
     }
-    
+
     override suspend fun load(url: String): LoadResponse {
         val fixedUrl = fixUrl(url) ?: throw ErrorLoadingException("Invalid URL")
         var doc = app.get(fixedUrl, interceptor = cfKiller, headers = defaultHeaders).document
-        
-        var episodesNodes = doc.select("ul.list-episode li a")
+
+        // Find episode list – try multiple selectors
+        var episodesNodes = doc.select(
+            "ul.list-episode li a, " +
+            ".list-eps a, .server-list a, " +
+            ".list-episode a, .episodes a, " +
+            "#list_episodes a"
+        )
+
+        // If not found, follow "watch" link
         if (episodesNodes.isEmpty()) {
-            val watchUrl = doc.selectFirst("a.btn-see, a[href*='/tap-'], .btn-watch a, a.watch_button")?.attr("href")?.let { fixUrl(it) }
+            val watchUrl = doc.selectFirst(
+                "a.btn-see, a[href*='/tap-'], a[href*='/episode-'], .btn-watch a, a.watch_button, a.xem-phim"
+            )?.attr("href")?.let { fixUrl(it) }
             if (watchUrl != null) {
                 doc = app.get(watchUrl, interceptor = cfKiller, headers = defaultHeaders).document
-                episodesNodes = doc.select("ul.list-episode li a")
+                episodesNodes = doc.select(
+                    "ul.list-episode li a, .list-eps a, .server-list a, .list-episode a, .episodes a, #list_episodes a"
+                )
             }
         }
-        
-        val filmId = Regex("[/-]a(\\d+)").find(fixedUrl)?.groupValues?.get(1) ?: ""
+
+        val filmId = extractFilmId(fixedUrl)
+        log("LOAD", "filmId='$filmId' from $fixedUrl")
+
         val episodes = episodesNodes.mapNotNull { ep ->
-            val id = ep.attr("data-id").trim()
             val href = fixUrl(ep.attr("href")) ?: return@mapNotNull null
-            val name = ep.text().trim().ifEmpty { ep.attr("title") }
-            newEpisode("$href@@$filmId@@$id") {
+            // dataId from attribute, fallback to URL pattern
+            val dataId = ep.attr("data-id").trim()
+                .ifBlank { ep.attr("id").trim() }
+                .ifBlank { ep.attr("data-episodeid").trim() }
+            val hrefId = extractEpisodeHrefId(href)
+            val name = ep.text().trim().ifBlank { ep.attr("title").trim() }
+
+            log("LOAD", "ep href=$href dataId='$dataId' hrefId='$hrefId'")
+
+            // Encode: epUrl@@filmId@@dataId@@hrefId
+            newEpisode("$href@@$filmId@@$dataId@@$hrefId") {
                 this.name = name
-                this.episode = Regex("\\d+").find(name ?: "")?.value?.toIntOrNull()
+                this.episode = Regex("\\d+").find(name)?.value?.toIntOrNull()
+                    ?: hrefId.toIntOrNull()
             }
         }
-        
-        val title = doc.selectFirst("h1.Title, .Title, h1")?.text()?.trim() ?: "Anime"
-        val poster = doc.selectFirst(".Image img, .InfoImg img, img[itemprop=image]")?.let { 
-            fixUrl(it.attr("data-src").ifEmpty { it.attr("src") }) 
+
+        val title = doc.selectFirst("h1.Title, h1, .Title")?.text()?.trim() ?: "Anime"
+        val poster = doc.selectFirst(".Image img, .InfoImg img, img[itemprop=image]")?.let {
+            fixUrl(it.attr("data-src").ifBlank { it.attr("src") })
         }
-        
+
         return newAnimeLoadResponse(title, fixedUrl, TvType.Anime) {
-            this.posterUrl = poster
-            this.plot = doc.selectFirst(".Description, .InfoDesc, #film-content")?.text()?.trim()
+            posterUrl = poster
+            plot = doc.selectFirst(".Description, .InfoDesc, #film-content")?.text()?.trim()
             this.episodes = mutableMapOf(DubStatus.Subbed to episodes)
         }
     }
-    
-    /**
-     * ========================================================================
-     * ADAPTIVE RESOLUTION PIPELINE
-     * ========================================================================
-     */
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // LOADLINKS – STATEFUL RESOLUTION PIPELINE
+    // ═══════════════════════════════════════════════════════════════════════════
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -778,385 +616,504 @@ class AnimeVietSub : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val parts = data.split("@@")
-        if (parts.size < 3) return false
-        
-        val (epUrl, filmId, episodeId) = parts
-        
-        // Create session
-        val session = SessionContext()
-        
-        logTrace(session, "INIT", "Session started: filmId=$filmId, episodeId=$episodeId")
-        
-        val videoHeaders = mapOf(
-            "User-Agent" to ua,
-            "Referer" to epUrl,
-            "Origin" to mainUrl,
-            "Accept" to "*/*"
-        )
-        
-        val ajaxHeaders = defaultHeaders + mapOf(
-            "X-Requested-With" to "XMLHttpRequest",
-            "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
-            "Referer" to epUrl,
-            "Origin" to mainUrl,
-            "Accept" to "application/json, text/javascript, */*; q=0.01"
-        )
-        
-        return try {
-            // =========================================================================
-            // STRATEGY 1: DIRECT API
-            // =========================================================================
-            logTrace(session, "STRATEGY", "Trying DIRECT_API")
-            
-            // Step 1: Get initial page and cookies
-            val pageReq = app.get(epUrl, interceptor = cfKiller, headers = defaultHeaders)
-            session.cookies.putAll(pageReq.cookies)
-            
-            // Step 2: Get player HTML
-            val step1Req = app.post(
-                "$mainUrl/ajax/player",
-                data = mapOf("episodeId" to episodeId, "backup" to "1"),
-                headers = ajaxHeaders,
-                cookies = session.cookies.toMap(),
-                interceptor = cfKiller
-            )
-            session.cookies.putAll(step1Req.cookies)
-            
-            val step1 = step1Req.parsedSafe<ServerSelectionResp>()
-            if (step1 == null || step1.html.isNullOrBlank()) {
-                logTrace(session, "FAIL", "No server selection HTML")
-                return tryFallbackStrategies(epUrl, filmId, episodeId, session, videoHeaders, subtitleCallback, callback)
-            }
-            
-            val serverDoc = Jsoup.parse(step1.html)
-            val serverButtons = serverDoc.select("a.btn3dsv")
-            
-            if (serverButtons.isEmpty()) {
-                logTrace(session, "FAIL", "No server buttons found")
-                return tryFallbackStrategies(epUrl, filmId, episodeId, session, videoHeaders, subtitleCallback, callback)
-            }
-            
-            // Step 3: Try each server
-            for (btn in serverButtons) {
-                val hash = btn.attr("data-href")
-                val play = btn.attr("data-play")
-                val btnId = btn.attr("data-id")
-                
-                if (hash.isBlank()) continue
-                
-                logTrace(session, "SERVER", "Trying server: play=$play, hash=$hash")
-                
-                // Activate session
-                val activeReq = app.get(
-                    "$mainUrl/ajax/get_episode?filmId=$filmId&episodeId=$episodeId",
-                    headers = ajaxHeaders,
-                    cookies = session.cookies.toMap(),
+        val epUrl  = parts.getOrNull(0)?.takeIf { it.isNotBlank() } ?: return false
+        val filmId = parts.getOrNull(1) ?: ""
+        val dataId = parts.getOrNull(2) ?: ""  // data-id attribute
+        val hrefId = parts.getOrNull(3) ?: ""  // extracted from href
+
+        log("LINKS", "epUrl=$epUrl filmId='$filmId' dataId='$dataId' hrefId='$hrefId'")
+
+        val vHeaders = videoHeaders(epUrl)
+        val aHeaders = ajaxHeaders(epUrl)
+        var found = false
+
+        // ── Warm up session & cookies ──────────────────────────────────────────
+        val cookies = mutableMapOf<String, String>()
+        try {
+            val pageRes = app.get(epUrl, interceptor = cfKiller, headers = defaultHeaders)
+            cookies.putAll(pageRes.cookies)
+            log("LINKS", "Cookies loaded: ${cookies.keys}")
+        } catch (e: Exception) {
+            log("LINKS", "Page load failed: ${e.message}")
+        }
+
+        // ── STRATEGY A: AJAX Player API ────────────────────────────────────────
+        log("LINKS", "STRATEGY A: AJAX Player API")
+
+        // Determine all episodeId candidates to try
+        val episodeCandidates = mutableListOf<String>()
+        if (dataId.isNotBlank()) episodeCandidates.add(dataId)
+        if (hrefId.isNotBlank() && hrefId != dataId) episodeCandidates.add(hrefId)
+        if (filmId.isNotBlank()) episodeCandidates.add(filmId)
+
+        for (episodeId in episodeCandidates) {
+            if (found) break
+            log("LINKS", "Trying episodeId='$episodeId'")
+
+            try {
+                // Step 1: Get server list HTML
+                val serverHtml = app.post(
+                    "$mainUrl/ajax/player",
+                    data = mapOf("episodeId" to episodeId, "backup" to "1"),
+                    headers = aHeaders,
+                    cookies = cookies,
                     interceptor = cfKiller
                 )
-                session.cookies.putAll(activeReq.cookies)
-                
-                // Try both filmId and episodeId
-                val idsToTry = listOf(filmId, episodeId)
-                
-                for (id in idsToTry) {
-                    val params = if (play == "api") {
-                        mapOf("link" to hash, "id" to id)
-                    } else {
-                        mapOf("link" to hash, "play" to play, "id" to btnId, "backuplinks" to "1")
-                    }
-                    
-                    val step2Req = app.post(
-                        "$mainUrl/ajax/player",
-                        data = params,
-                        headers = ajaxHeaders,
-                        cookies = session.cookies.toMap(),
-                        interceptor = cfKiller
-                    )
-                    session.cookies.putAll(step2Req.cookies)
-                    
-                    val parsed = step2Req.parsedSafe<PlayerResp>()
-                    
-                    if (play == "api") {
-                        // Encrypted link
-                        val enc = parsed?.linkArray?.firstOrNull()?.file
-                        if (!enc.isNullOrBlank()) {
-                            logTrace(session, "DECRYPT", "Found encrypted link, attempting decryption")
-                            
-                            val decrypted = EncryptionBreaker.autoBreak(enc)
-                            
-                            if (decrypted != null && decrypted.startsWith("http")) {
-                                logTrace(session, "SUCCESS", "Decrypted successfully: $decrypted")
-                                
-                                // Follow redirects if needed
-                                val finalUrl = followRedirects(decrypted, session.cookies.toMap(), videoHeaders)
-                                
-                                if (finalUrl.contains(".m3u8")) {
-                                    return emitM3U8(finalUrl, videoHeaders, callback)
-                                } else if (finalUrl.startsWith("http")) {
-                                    return emitDirectLink(finalUrl, videoHeaders, callback)
-                                }
-                            } else {
-                                logTrace(session, "FAIL", "Decryption failed for this link")
-                            }
+                cookies.putAll(serverHtml.cookies)
+                val body1 = serverHtml.text ?: continue
+
+                log("LINKS", "Step1 response length=${body1.length}")
+
+                // Parse server HTML – try multiple selectors
+                val htmlContent = try {
+                    val j1 = mapper.readValue(body1, Map::class.java) as Map<*, *>
+                    (j1["html"] as? String) ?: body1
+                } catch (e: Exception) { body1 }
+
+                val serverDoc = Jsoup.parse(htmlContent)
+                val serverBtns = serverDoc.select(
+                    "a.btn3dsv, a[data-href], a[data-play], " +
+                    ".server-item a, .btn-server, li[data-id] a, .episodes-btn a"
+                )
+
+                log("LINKS", "Found ${serverBtns.size} server buttons")
+
+                if (serverBtns.isEmpty()) {
+                    // Try to mine URLs directly from htmlContent
+                    val directUrls = ResponseAnalyzer.extractUrlsFromResponse(htmlContent, epUrl)
+                    for (u in directUrls) {
+                        if (StreamValidator.isStreamUrl(u)) {
+                            log("LINKS", "Direct URL from server HTML: $u")
+                            found = emitStream(u, vHeaders, subtitleCallback, callback) || found
                         }
+                    }
+                    continue
+                }
+
+                // Step 2: Try each server button
+                for (btn in serverBtns) {
+                    if (found) break
+
+                    val hash   = btn.attr("data-href").ifBlank { btn.attr("href") }.trim()
+                    val play   = btn.attr("data-play").trim()
+                    val btnId  = btn.attr("data-id").trim().ifBlank { episodeId }
+
+                    if (hash.isBlank()) continue
+                    log("LINKS", "Server: play='$play' hash='$hash' btnId='$btnId'")
+
+                    // If hash looks like a direct URL → just use it
+                    if (hash.startsWith("http")) {
+                        log("LINKS", "Direct URL server: $hash")
+                        found = emitStream(hash, vHeaders, subtitleCallback, callback) || found
+                        if (found) break
+                    }
+
+                    // Step 2a: activate episode (optional, ignore errors)
+                    try {
+                        app.get(
+                            "$mainUrl/ajax/get_episode?filmId=$filmId&episodeId=$episodeId",
+                            headers = aHeaders, cookies = cookies, interceptor = cfKiller
+                        ).let { cookies.putAll(it.cookies) }
+                    } catch (e: Exception) { /* Continue */ }
+
+                    // Step 2b: Request actual stream link
+                    val paramSets = mutableListOf<Map<String, String>>()
+                    if (play == "api" || play.isBlank()) {
+                        paramSets.add(mapOf("link" to hash, "id" to episodeId))
+                        paramSets.add(mapOf("link" to hash, "id" to btnId))
+                        paramSets.add(mapOf("link" to hash, "id" to filmId))
                     } else {
-                        // Direct link
-                        val direct = parsed?.linkString
-                        if (!direct.isNullOrBlank() && direct.startsWith("http")) {
-                            logTrace(session, "SUCCESS", "Found direct link: $direct")
-                            
-                            if (direct.contains(".m3u8")) {
-                                return emitM3U8(direct, videoHeaders, callback)
-                            }
-                            
-                            // Try to load via extractor
-                            try {
-                                loadExtractor(direct, epUrl, subtitleCallback, callback)
-                                return true
-                            } catch (e: Exception) {
-                                logTrace(session, "WARN", "Extractor failed: ${e.message}")
-                            }
+                        paramSets.add(mapOf("link" to hash, "play" to play, "id" to btnId, "backuplinks" to "1"))
+                        paramSets.add(mapOf("link" to hash, "play" to play, "id" to episodeId))
+                    }
+
+                    for (params in paramSets) {
+                        if (found) break
+                        try {
+                            val step2 = app.post(
+                                "$mainUrl/ajax/player",
+                                data = params,
+                                headers = aHeaders,
+                                cookies = cookies,
+                                interceptor = cfKiller
+                            )
+                            cookies.putAll(step2.cookies)
+                            val body2 = step2.text ?: continue
+                            log("LINKS", "Step2 body (first 200): ${body2.take(200)}")
+
+                            found = processPlayerBody(body2, epUrl, play, vHeaders, subtitleCallback, callback) || found
+                        } catch (e: Exception) {
+                            log("LINKS", "Step2 error: ${e.message}")
                         }
                     }
                 }
+            } catch (e: Exception) {
+                log("LINKS", "Strategy A error with episodeId=$episodeId: ${e.message}")
             }
-            
-            // =========================================================================
-            // STRATEGY 2: FALLBACK STRATEGIES
-            // =========================================================================
-            return tryFallbackStrategies(epUrl, filmId, episodeId, session, videoHeaders, subtitleCallback, callback)
-            
-        } catch (e: Exception) {
-            logTrace(session, "ERROR", e.message ?: "Unknown error")
-            false
         }
+
+        // ── STRATEGY B: Direct page scraping ──────────────────────────────────
+        if (!found) {
+            log("LINKS", "STRATEGY B: Direct page scraping")
+            found = strategyDirectScrape(epUrl, cookies, vHeaders, subtitleCallback, callback) || found
+        }
+
+        // ── STRATEGY C: JS Reverse ────────────────────────────────────────────
+        if (!found) {
+            log("LINKS", "STRATEGY C: JS Reverse")
+            found = strategyJSReverse(epUrl, vHeaders, subtitleCallback, callback) || found
+        }
+
+        // ── STRATEGY D: Alternative AJAX endpoints ─────────────────────────────
+        if (!found) {
+            log("LINKS", "STRATEGY D: Alt endpoints")
+            found = strategyAltEndpoints(epUrl, filmId, dataId, hrefId, vHeaders, subtitleCallback, callback) || found
+        }
+
+        // ── STRATEGY E: Data mining + encryption break ─────────────────────────
+        if (!found) {
+            log("LINKS", "STRATEGY E: Data mining")
+            found = strategyDataMining(epUrl, vHeaders, subtitleCallback, callback) || found
+        }
+
+        log("LINKS", "Final result: found=$found")
+        return found
     }
-    
-    /**
-     * Fallback strategies khi direct API fail
-     */
-    private suspend fun tryFallbackStrategies(
-        epUrl: String,
-        filmId: String,
-        episodeId: String,
-        session: SessionContext,
-        videoHeaders: Map<String, String>,
+
+    // ── Process player API response body ──────────────────────────────────────
+
+    private suspend fun processPlayerBody(
+        body: String, epUrl: String, play: String,
+        vHeaders: Map<String, String>,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        logTrace(session, "STRATEGY", "Trying JS_REVERSE")
-        
-        // Strategy: JS Reverse - analyze page for inline JS
-        try {
-            val pageRes = app.get(epUrl, interceptor = cfKiller, headers = defaultHeaders)
-            val body = pageRes.text ?: return false
-            
-            // Unpack any packed JS
-            val unpacked = JSReverseEngine.unpackEval(body)
-            val urls = JSReverseEngine.extractUrlsFromJS(unpacked)
-            
-            for (url in urls) {
-                if (StreamValidator.isStreamUrl(url)) {
-                    logTrace(session, "SUCCESS", "Found URL via JS reverse: $url")
-                    
-                    val finalUrl = fixUrl(url) ?: continue
-                    
-                    if (finalUrl.contains(".m3u8")) {
-                        return emitM3U8(finalUrl, videoHeaders, callback)
-                    }
-                }
+        if (body.isBlank()) return false
+
+        val (directLink, encryptedFiles) = parsePlayerResponse(body)
+        var found = false
+
+        // Case 1: direct string link
+        if (!directLink.isNullOrBlank()) {
+            log("LINKS", "Direct link found: $directLink")
+            if (directLink.startsWith("http")) {
+                found = emitStream(directLink, vHeaders, subtitleCallback, callback) || found
             }
-        } catch (e: Exception) {
-            logTrace(session, "FAIL", "JS_REVERSE failed: ${e.message}")
         }
-        
-        // Strategy: Deep Data Mining
-        logTrace(session, "STRATEGY", "Trying DATA_MINING")
-        try {
-            val pageRes = app.get(epUrl, interceptor = cfKiller, headers = defaultHeaders)
-            val body = pageRes.text ?: return false
-            
-            // Mine encrypted data from response
-            val encryptedData = DataMiner.mineEncryptedData(body)
-            
-            for (enc in encryptedData) {
-                val decrypted = EncryptionBreaker.autoBreak(enc)
-                if (decrypted != null && decrypted.startsWith("http")) {
-                    logTrace(session, "SUCCESS", "Found URL via data mining: $decrypted")
-                    
-                    if (decrypted.contains(".m3u8")) {
-                        return emitM3U8(decrypted, videoHeaders, callback)
-                    }
-                }
+
+        // Case 2: encrypted file array
+        for (enc in encryptedFiles) {
+            log("LINKS", "Encrypted file: ${enc.take(60)}...")
+            // First try raw as URL
+            if (enc.startsWith("http")) {
+                found = emitStream(enc, vHeaders, subtitleCallback, callback) || found
+                continue
             }
-            
-            // Mine URLs directly
+            // Try decryption
+            val decrypted = EncryptionBreaker.autoBreak(enc)
+            if (decrypted != null) {
+                log("LINKS", "Decrypted: $decrypted")
+                val finalUrl = followRedirects(decrypted, vHeaders)
+                found = emitStream(finalUrl, vHeaders, subtitleCallback, callback) || found
+            }
+        }
+
+        // Case 3: fallback – mine URLs from raw body
+        if (!found) {
             val urls = ResponseAnalyzer.extractUrlsFromResponse(body, epUrl)
-            for (url in urls) {
-                if (StreamValidator.isStreamUrl(url)) {
-                    logTrace(session, "SUCCESS", "Found URL via response analysis: $url")
-                    
-                    if (url.contains(".m3u8")) {
-                        return emitM3U8(url, videoHeaders, callback)
-                    }
+            for (u in urls) {
+                if (StreamValidator.isStreamUrl(u)) {
+                    found = emitStream(u, vHeaders, subtitleCallback, callback) || found
                 }
             }
-        } catch (e: Exception) {
-            logTrace(session, "FAIL", "DATA_MINING failed: ${e.message}")
         }
-        
-        // Strategy: Alternative endpoints
-        logTrace(session, "STRATEGY", "Trying ALTERNATIVE_ENDPOINTS")
-        val altEndpoints = listOf(
-            "$mainUrl/ajax/player?episodeId=$episodeId",
-            "$mainUrl/ajax/getLink?filmId=$filmId&episodeId=$episodeId",
-            "$mainUrl/ajax/stream/$episodeId"
-        )
-        
-        for (endpoint in altEndpoints) {
-            try {
-                val res = app.get(endpoint, headers = defaultHeaders, interceptor = cfKiller)
-                val body = res.text ?: continue
-                
-                // Analyze response
-                val type = ResponseAnalyzer.analyzeType(body)
-                
-                when (type) {
-                    ResponseType.M3U8_PLAYLIST -> {
-                        // Extract URL from response
-                        val urls = ResponseAnalyzer.extractUrlsFromResponse(body, endpoint)
-                        for (url in urls) {
-                            if (url.contains(".m3u8")) {
-                                logTrace(session, "SUCCESS", "Found M3U8 via alt endpoint: $url")
-                                return emitM3U8(url, videoHeaders, callback)
-                            }
-                        }
-                    }
-                    ResponseType.JSON_API -> {
-                        // Parse JSON and extract
-                        val urls = ResponseAnalyzer.extractUrlsFromResponse(body, endpoint)
-                        for (url in urls) {
-                            if (StreamValidator.isStreamUrl(url)) {
-                                logTrace(session, "SUCCESS", "Found URL via JSON: $url")
-                                return emitM3U8(url, videoHeaders, callback)
-                            }
-                        }
-                    }
-                    ResponseType.ENCRYPTED_PAYLOAD -> {
-                        // Try to decrypt
-                        val decrypted = EncryptionBreaker.autoBreak(body.trim())
-                        if (decrypted != null && decrypted.startsWith("http")) {
-                            logTrace(session, "SUCCESS", "Decrypted from alt endpoint: $decrypted")
-                            return emitM3U8(decrypted, videoHeaders, callback)
-                        }
-                    }
-                    else -> { /* Continue */ }
-                }
-            } catch (e: Exception) {
-                // Continue to next endpoint
+
+        // Case 4: body itself is an encrypted string
+        if (!found && body.trim().let { !it.startsWith("{") && !it.startsWith("[") && !it.startsWith("<") }) {
+            val dec = EncryptionBreaker.autoBreak(body.trim())
+            if (dec != null) {
+                log("LINKS", "Body itself decrypted: $dec")
+                found = emitStream(dec, vHeaders, subtitleCallback, callback) || found
             }
         }
-        
-        logTrace(session, "FAIL", "All strategies failed")
-        return false
+
+        return found
     }
-    
-    /**
-     * Follow redirects to get final URL
-     */
-    private suspend fun followRedirects(
-        startUrl: String,
+
+    // ── Strategy B: Direct page scraping ──────────────────────────────────────
+
+    private suspend fun strategyDirectScrape(
+        epUrl: String,
         cookies: Map<String, String>,
-        headers: Map<String, String>
-    ): String {
-        if (startUrl.contains(".m3u8")) return startUrl
-        
-        var currentUrl = startUrl
-        
-        try {
-            for (i in 1..5) {
-                val res = app.get(currentUrl, headers = headers, cookies = cookies, interceptor = cfKiller)
-                if (res.url.contains(".m3u8")) {
-                    return res.url
+        vHeaders: Map<String, String>,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        return try {
+            val doc = app.get(epUrl, interceptor = cfKiller, headers = defaultHeaders, cookies = cookies).document
+
+            // Look for video sources in iframes
+            val iframeSrcs = doc.select("iframe[src], iframe[data-src]").map {
+                it.attr("src").ifBlank { it.attr("data-src") }
+            }.filter { it.isNotBlank() }
+
+            log("LINKS", "Found ${iframeSrcs.size} iframes")
+
+            var found = false
+            for (src in iframeSrcs) {
+                val fullSrc = fixUrl(src) ?: continue
+                log("LINKS", "Iframe: $fullSrc")
+                try {
+                    // Try CloudStream extractors first
+                    loadExtractor(fullSrc, epUrl, subtitleCallback, callback)
+                    found = true
+                } catch (e: Exception) {
+                    // Try fetching iframe content
+                    try {
+                        val iframeBody = app.get(fullSrc, headers = vHeaders, interceptor = cfKiller).text ?: continue
+                        val iUrls = ResponseAnalyzer.extractUrlsFromResponse(iframeBody, fullSrc)
+                        for (u in iUrls) {
+                            if (StreamValidator.isStreamUrl(u)) {
+                                found = emitStream(u, vHeaders, subtitleCallback, callback) || found
+                            }
+                        }
+                    } catch (e2: Exception) { /* Continue */ }
                 }
-                if (res.url == currentUrl) break
-                currentUrl = res.url
             }
+
+            // Look for video tags
+            val videoSrcs = doc.select("video source[src], video[src]").map {
+                it.attr("src")
+            }.filter { it.isNotBlank() }
+
+            for (src in videoSrcs) {
+                val fullSrc = fixUrl(src) ?: continue
+                found = emitStream(fullSrc, vHeaders, subtitleCallback, callback) || found
+            }
+
+            // Look for data attributes that might contain stream URLs
+            val dataSrcs = doc.select("[data-file], [data-url], [data-source], [data-stream]")
+                .map { it.attr("data-file").ifBlank { it.attr("data-url").ifBlank { it.attr("data-source").ifBlank { it.attr("data-stream") } } } }
+                .filter { it.isNotBlank() }
+
+            for (src in dataSrcs) {
+                val fullSrc = fixUrl(src) ?: continue
+                if (StreamValidator.isStreamUrl(fullSrc)) {
+                    found = emitStream(fullSrc, vHeaders, subtitleCallback, callback) || found
+                } else {
+                    val dec = EncryptionBreaker.autoBreak(src)
+                    if (dec != null) {
+                        found = emitStream(dec, vHeaders, subtitleCallback, callback) || found
+                    }
+                }
+            }
+
+            // Extract inline script URLs
+            val scripts = doc.select("script:not([src])").map { it.html() }
+            for (script in scripts) {
+                if (script.length < 50) continue
+                val unpacked = JSReverseEngine.unpackEval(script)
+                val urls = JSReverseEngine.extractUrlsFromJS(unpacked) +
+                           ResponseAnalyzer.extractUrlsFromResponse(unpacked, epUrl)
+                for (u in urls) {
+                    if (StreamValidator.isStreamUrl(u)) {
+                        found = emitStream(u, vHeaders, subtitleCallback, callback) || found
+                    }
+                }
+            }
+
+            found
         } catch (e: Exception) {
-            // Redirect following failed, return original URL
+            log("LINKS", "DirectScrape error: ${e.message}")
+            false
         }
-        
-        return currentUrl
     }
-    
-    /**
-     * Emit M3U8 stream
-     */
-    private suspend fun emitM3U8(
-        url: String,
-        headers: Map<String, String>,
+
+    // ── Strategy C: JS Reverse ─────────────────────────────────────────────────
+
+    private suspend fun strategyJSReverse(
+        epUrl: String, vHeaders: Map<String, String>,
+        subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        callback(newExtractorLink(name, name, url) {
-            this.headers = headers
-            this.type = ExtractorLinkType.M3U8
-        })
-        
-        // Also generate quality variants
+        return try {
+            val body = app.get(epUrl, interceptor = cfKiller, headers = defaultHeaders).text ?: return false
+            val unpacked = JSReverseEngine.unpackEval(body)
+            var found = false
+            val urls = JSReverseEngine.extractUrlsFromJS(unpacked) +
+                       ResponseAnalyzer.extractUrlsFromResponse(unpacked, epUrl)
+            for (u in urls.distinct()) {
+                if (StreamValidator.isStreamUrl(u)) {
+                    found = emitStream(u, vHeaders, subtitleCallback, callback) || found
+                }
+            }
+            found
+        } catch (e: Exception) {
+            log("LINKS", "JSReverse error: ${e.message}")
+            false
+        }
+    }
+
+    // ── Strategy D: Alternative endpoints ─────────────────────────────────────
+
+    private suspend fun strategyAltEndpoints(
+        epUrl: String, filmId: String, dataId: String, hrefId: String,
+        vHeaders: Map<String, String>,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val ids = listOf(dataId, hrefId, filmId).filter { it.isNotBlank() }.distinct()
+        var found = false
+
+        for (id in ids) {
+            val endpoints = listOf(
+                "$mainUrl/ajax/player?episodeId=$id",
+                "$mainUrl/ajax/getLink?filmId=$filmId&episodeId=$id",
+                "$mainUrl/ajax/stream/$id",
+                "$mainUrl/ajax/player?id=$id",
+                "$mainUrl/api/get_link/$id"
+            )
+            for (endpoint in endpoints) {
+                if (found) return true
+                try {
+                    val res = app.get(endpoint, headers = defaultHeaders, interceptor = cfKiller)
+                    val body = res.text ?: continue
+                    log("LINKS", "Alt endpoint $endpoint → ${body.take(100)}")
+                    found = processPlayerBody(body, epUrl, "", vHeaders, subtitleCallback, callback) || found
+                } catch (e: Exception) { /* Continue */ }
+            }
+        }
+        return found
+    }
+
+    // ── Strategy E: Data mining ───────────────────────────────────────────────
+
+    private suspend fun strategyDataMining(
+        epUrl: String, vHeaders: Map<String, String>,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        return try {
+            val body = app.get(epUrl, interceptor = cfKiller, headers = defaultHeaders).text ?: return false
+            var found = false
+
+            val encData = DataMiner.mineEncryptedData(body)
+            for (enc in encData) {
+                if (enc.startsWith("http")) {
+                    found = emitStream(enc, vHeaders, subtitleCallback, callback) || found
+                    continue
+                }
+                val dec = EncryptionBreaker.autoBreak(enc)
+                if (dec != null && EncryptionBreaker.isValidOutput(dec)) {
+                    log("LINKS", "DataMining decrypted: $dec")
+                    found = emitStream(dec, vHeaders, subtitleCallback, callback) || found
+                }
+            }
+
+            val urls = ResponseAnalyzer.extractUrlsFromResponse(body, epUrl)
+            for (u in urls) {
+                if (StreamValidator.isStreamUrl(u)) {
+                    found = emitStream(u, vHeaders, subtitleCallback, callback) || found
+                }
+            }
+
+            found
+        } catch (e: Exception) {
+            log("LINKS", "DataMining error: ${e.message}")
+            false
+        }
+    }
+
+    // ── Stream emitter ────────────────────────────────────────────────────────
+
+    private suspend fun emitStream(
+        url: String,
+        headers: Map<String, String>,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        if (url.isBlank() || !url.startsWith("http")) return false
+        val clean = url.trim()
+
+        return try {
+            when {
+                clean.contains(".m3u8") -> {
+                    callback(
+                        ExtractorLink(
+                            source = this.name,
+                            name = this.name,
+                            url = clean,
+                            referer = headers["Referer"] ?: mainUrl,
+                            quality = Qualities.Unknown.value,
+                            isM3u8 = true,
+                            headers = headers
+                        )
+                    )
+                    // Also try to generate quality variants
+                    try {
+                        M3u8Helper.generateM3u8(this.name, clean, mainUrl, headers = headers)
+                            .forEach { link -> link.headers = headers; callback(link) }
+                    } catch (e: Exception) { /* Main link still works */ }
+                    true
+                }
+                clean.contains(".mp4") -> {
+                    callback(
+                        ExtractorLink(
+                            source = this.name,
+                            name = this.name,
+                            url = clean,
+                            referer = headers["Referer"] ?: mainUrl,
+                            quality = Qualities.Unknown.value,
+                            isM3u8 = false,
+                            headers = headers
+                        )
+                    )
+                    true
+                }
+                else -> {
+                    // Try built-in extractors (handles many embed providers)
+                    try {
+                        loadExtractor(clean, headers["Referer"] ?: mainUrl, subtitleCallback, callback)
+                        true
+                    } catch (e: Exception) {
+                        // Emit as generic link
+                        callback(
+                            ExtractorLink(
+                                source = this.name,
+                                name = this.name,
+                                url = clean,
+                                referer = headers["Referer"] ?: mainUrl,
+                                quality = Qualities.Unknown.value,
+                                isM3u8 = false,
+                                headers = headers
+                            )
+                        )
+                        true
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            log("EMIT", "Error emitting $clean: ${e.message}")
+            false
+        }
+    }
+
+    // ── Redirect follower ─────────────────────────────────────────────────────
+
+    private suspend fun followRedirects(startUrl: String, headers: Map<String, String>): String {
+        if (startUrl.contains(".m3u8")) return startUrl
+        var current = startUrl
         try {
-            M3u8Helper.generateM3u8(name, url, url, headers = headers).forEach {
-                it.headers = headers
-                callback(it)
+            repeat(5) {
+                val res = app.get(current, headers = headers, interceptor = cfKiller)
+                if (res.url.contains(".m3u8") || res.url == current) return res.url
+                current = res.url
             }
-        } catch (e: Exception) {
-            // Quality variants failed, but main link still works
-        }
-        
-        return true
-    }
-    
-    /**
-     * Emit direct video link
-     */
-    private suspend fun emitDirectLink(
-        url: String,
-        headers: Map<String, String>,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        callback(newExtractorLink(name, name, url) {
-            this.headers = headers
-        })
-        return true
-    }
-    
-    /**
-     * Log trace for debugging
-     */
-    private fun logTrace(session: SessionContext, phase: String, message: String) {
-        if (debugMode) {
-            val entry = "[$phase] $message"
-            session.traceLog.add(entry)
-            println("ASES[${session.id.take(8)}] $entry")
-        }
+        } catch (e: Exception) { /* Return last known URL */ }
+        return current
     }
 }
 
-// ================================================================================
-// DATA CLASSES FOR API RESPONSES
-// ================================================================================
+// ── Data classes ──────────────────────────────────────────────────────────────
 
 data class ServerSelectionResp(@JsonProperty("html") val html: String? = null)
-
-data class PlayerResp(
-    @JsonProperty("link") val linkRaw: Any? = null,
-    @JsonProperty("success") val success: Int? = null
-) {
-    @Suppress("UNCHECKED_CAST")
-    val linkArray: List<LinkFile>? 
-        get() = (linkRaw as? List<*>)?.filterIsInstance<Map<String, Any?>>()?.map { 
-            LinkFile(it["file"] as? String) 
-        }
-    val linkString: String? get() = linkRaw as? String
-}
-
-data class LinkFile(@JsonProperty("file") val file: String? = null)

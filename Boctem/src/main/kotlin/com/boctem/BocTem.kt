@@ -1235,8 +1235,9 @@ class AdaptiveDecisionEngine(
     ): Decision {
         val snapshot = networkEngine.executeWithTracing(data, context = context)
         val content = snapshot.responseBody ?: return Decision.Fallback("No content", "ajax")
-        
-        if (content.contains("#EXTM3U") || data.contains(".m3u8")) {
+
+        // Case 1: data IS an m3u8 URL directly
+        if (content.contains("#EXTM3U") || data.endsWith(".m3u8", ignoreCase = true)) {
             val links = M3u8Helper.generateM3u8(
                 source = "BocTem",
                 streamUrl = data,
@@ -1244,8 +1245,26 @@ class AdaptiveDecisionEngine(
             )
             return Decision.Success(links)
         }
-        
-        return Decision.Fallback("No direct stream", "ajax")
+
+        // Case 2: Page HTML contains direct stream URLs (no AJAX needed)
+        val directPatterns = listOf(
+            Regex("""["'](https?://[^"']+\.m3u8[^"']*)["']"""),
+            Regex("""["'](https?://[^"']+\.mp4[^"']*)["']"""),
+            Regex("""file\s*:\s*["'](https?://[^"']+)["']"""),
+            Regex("""source\s*:\s*["'](https?://[^"']+)["']"""),
+            Regex("""src\s*:\s*["'](https?://[^"']+\.(?:m3u8|mp4)[^"']*)["']""")
+        )
+        val directLinks = mutableListOf<ExtractorLink>()
+        for (pattern in directPatterns) {
+            pattern.findAll(content).forEach { match ->
+                val url = match.groupValues[1].replace("\\/", "/")
+                val candidate = StreamCandidate(url, data, "direct_pattern", 0.9)
+                directLinks.addAll(validateAndConvert(listOf(candidate), context))
+            }
+        }
+        if (directLinks.isNotEmpty()) return Decision.Success(directLinks)
+
+        return Decision.Fallback("No direct stream found in page", "ajax")
     }
     
     private suspend fun strategyAjaxExtraction(
@@ -1255,65 +1274,93 @@ class AdaptiveDecisionEngine(
         linkCallback: (ExtractorLink) -> Unit,
         mainUrl: String
     ): Decision {
+        // Ensure the episode page is fetched so snapshots have postId/nonce
+        if (context.networkSnapshots.none { it.url == data }) {
+            networkEngine.executeWithTracing(data, context = context)
+        }
+
         val postId = extractPostId(data, context)
         val nonce = extractNonce(data, context)
         val episode = extractEpisode(data)
-        
+
         if (postId == null || nonce == null) {
-            return Decision.Fallback("Missing AJAX params", "deep_crawl")
+            return Decision.Fallback("Missing AJAX params (postId=$postId, nonce=$nonce)", "deep_crawl")
         }
-        
-        val ajaxEndpoints = listOf(
-            "$mainUrl/wp-admin/admin-ajax.php",
-            "$mainUrl/ajax-player",
-            "$mainUrl/api/player"
-        )
-        
-        val payloads = listOf(
-            mapOf("action" to "halim_ajax_player", "nonce" to nonce, "postid" to postId, "episode" to episode, "server" to "1"),
-            mapOf("action" to "ajax_player", "nonce" to nonce, "postid" to postId, "episode" to episode, "server" to "1"),
-            mapOf("action" to "player", "nonce" to nonce, "id" to postId, "ep" to episode)
-        )
-        
-        for (endpoint in ajaxEndpoints) {
-            for (payload in payloads) {
-                for (server in listOf("1", "2", "3", "4", "5")) {
-                    val finalPayload = payload + mapOf("server" to server)
-                    
-                    try {
-                        val snapshot = networkEngine.executeWithTracing(
-                            endpoint,
-                            method = "POST",
-                            body = finalPayload,
-                            context = context
-                        )
-                        
-                        val response = snapshot.responseBody ?: continue
-                        
-                        val candidates = miningEngine.deepScan(response, context, mainUrl)
-                        val validLinks = validateAndConvert(candidates, context)
-                        
-                        if (validLinks.isNotEmpty()) {
-                            return Decision.Success(validLinks)
+
+        val ajaxUrl = "$mainUrl/wp-admin/admin-ajax.php"
+
+        val actions = listOf("halim_ajax_player", "ajax_player", "player")
+        val serverRange = listOf("1", "2", "3", "4", "5")
+
+        for (action in actions) {
+            for (server in serverRange) {
+                val payload = mapOf(
+                    "action" to action,
+                    "nonce" to nonce,
+                    "postid" to postId,
+                    "episode" to episode,
+                    "server" to server
+                )
+
+                try {
+                    val snapshot = networkEngine.executeWithTracing(
+                        ajaxUrl,
+                        method = "POST",
+                        body = payload,
+                        context = context
+                    )
+
+                    val response = snapshot.responseBody ?: continue
+                    if (response.isBlank() || response == "0" || response == "-1") continue
+
+                    // Case 1: Response contains a direct stream URL
+                    val candidates = miningEngine.deepScan(response, context, mainUrl)
+                    val directLinks = validateAndConvert(candidates, context)
+                    if (directLinks.isNotEmpty()) {
+                        return Decision.Success(directLinks)
+                    }
+
+                    // Case 2: Response is HTML with iframe (embedded player)
+                    if (response.contains("<iframe", ignoreCase = true) ||
+                        response.contains("<iframe", ignoreCase = true)) {
+                        val iframePattern = Regex("""iframe[^>]+src=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+                        iframePattern.findAll(response).forEach { match ->
+                            val iframeUrl = normalizeUrl(match.groupValues[1], mainUrl) ?: return@forEach
+                            val iframeSnapshot = networkEngine.executeWithTracing(iframeUrl, context = context)
+                            val iframeCandidates = miningEngine.deepScan(iframeSnapshot.responseBody, context, mainUrl)
+                            val iframeLinks = validateAndConvert(iframeCandidates, context)
+                            if (iframeLinks.isNotEmpty()) return Decision.Success(iframeLinks)
                         }
-                        
-                        if (response.length > 100 && !response.contains("<")) {
-                            val decryptResult = decryptEngine.attemptDecryption(response, context)
-                            if (decryptResult.success && decryptResult.output != null) {
-                                val decryptedCandidates = miningEngine.deepScan(decryptResult.output, context, mainUrl)
-                                val decryptedLinks = validateAndConvert(decryptedCandidates, context)
-                                if (decryptedLinks.isNotEmpty()) {
-                                    return Decision.Success(decryptedLinks)
-                                }
+                    }
+
+                    // Case 3: Response is JSON with an embedded iframe/player URL field
+                    val urlFields = Regex(""""(?:link|url|src|file|stream|embed)"\s*:\s*"([^"]+)"""")
+                    urlFields.findAll(response).forEach { match ->
+                        val rawUrl = match.groupValues[1].replace("\\/", "/")
+                        val normalised = normalizeUrl(rawUrl, mainUrl) ?: return@forEach
+                        val embSnap = networkEngine.executeWithTracing(normalised, context = context)
+                        val embCandidates = miningEngine.deepScan(embSnap.responseBody, context, mainUrl)
+                        val embLinks = validateAndConvert(embCandidates, context)
+                        if (embLinks.isNotEmpty()) return Decision.Success(embLinks)
+                    }
+
+                    // Case 4: Encrypted response
+                    if (response.length > 100 && !response.contains("<")) {
+                        val decryptResult = decryptEngine.attemptDecryption(response, context)
+                        if (decryptResult.success && decryptResult.output != null) {
+                            val decryptedCandidates = miningEngine.deepScan(decryptResult.output, context, mainUrl)
+                            val decryptedLinks = validateAndConvert(decryptedCandidates, context)
+                            if (decryptedLinks.isNotEmpty()) {
+                                return Decision.Success(decryptedLinks)
                             }
                         }
-                        
-                    } catch (_: Exception) {}
-                }
+                    }
+
+                } catch (_: Exception) {}
             }
         }
-        
-        return Decision.Fallback("AJAX failed", "deep_crawl")
+
+        return Decision.Fallback("AJAX failed for all actions/servers", "deep_crawl")
     }
     
     private suspend fun strategyDeepCrawl(
@@ -1469,42 +1516,72 @@ class AdaptiveDecisionEngine(
     }
     
     private fun extractPostId(url: String, context: ResolutionContext): String? {
-        val patterns = listOf(
+        // URL-level patterns (safe, no false positives)
+        val urlPatterns = listOf(
             Regex("""postid-(\d+)"""),
-            Regex("""post-(\d+)"""),
-            Regex("""p=(\d+)"""),
-            Regex("""/(\d+)/"""),
-            Regex("""id=(\d+)""")
+            Regex("""[?&]p=(\d+)"""),
+            Regex("""[?&]post_id=(\d+)"""),
+            Regex("""[?&]id=(\d+)""")
         )
-        
-        for (pattern in patterns) {
+        for (pattern in urlPatterns) {
             pattern.find(url)?.groupValues?.get(1)?.let { return it }
         }
-        
+
+        // HTML body patterns – search in captured network snapshots
+        val htmlPatterns = listOf(
+            // WordPress body class: "postid-1234"
+            Regex("""class="[^"]*\bpostid-(\d+)\b"""),
+            // Halim localized script object
+            Regex("""post_id["']?\s*[:=]\s*["']?(\d+)["']?"""),
+            Regex("""postid["']?\s*[:=]\s*["']?(\d+)["']?"""),
+            Regex("""data-postid=["'](\d+)["']"""),
+            Regex("""data-post-id=["'](\d+)["']"""),
+            // Hidden input
+            Regex("""<input[^>]+name=["']postid["'][^>]+value=["'](\d+)["']"""),
+            Regex("""<input[^>]+value=["'](\d+)["'][^>]+name=["']postid["']"""),
+            // WordPress standard
+            Regex(""""post_id"\s*:\s*(\d+)"""),
+            Regex("""'post_id'\s*:\s*(\d+)"""),
+            // Fallback: any "id": number in JSON
+            Regex(""""id"\s*:\s*(\d+)""")
+        )
+
         context.networkSnapshots.forEach { snapshot ->
             val body = snapshot.responseBody ?: return@forEach
-            for (pattern in patterns) {
+            for (pattern in htmlPatterns) {
                 pattern.find(body)?.groupValues?.get(1)?.let { return it }
             }
         }
-        
+
         return null
     }
     
     private fun extractNonce(url: String, context: ResolutionContext): String? {
         val patterns = listOf(
-            Regex("""nonce["']?\s*[:=]\s*["']([^"']+)["']"""),
+            // Halim localized script: {"nonce":"abc123"} or nonce:"abc123"
+            Regex(""""nonce"\s*:\s*"([a-f0-9]+)""""),
+            Regex("""'nonce'\s*:\s*'([a-f0-9]+)'"""),
+            // data-nonce attribute
             Regex("""data-nonce=["']([^"']+)["']"""),
-            Regex("""nonce=([^&\s]+)""")
+            // Inline JS variable
+            Regex("""var\s+halim_nonce\s*=\s*["']([^"']+)["']"""),
+            Regex("""nonce\s*=\s*["']([a-f0-9]{5,20})["']"""),
+            // WordPress AJAX nonce in script
+            Regex(""""ajax_nonce"\s*:\s*"([^"]+)""""),
+            Regex("""security\s*:\s*["']([a-f0-9]{5,20})["']"""),
+            // Generic fallback
+            Regex("""nonce["']?\s*[:=]\s*["']([^"']{5,30})["']"""),
+            Regex("""nonce=([a-f0-9]{5,20})""")
         )
-        
+
         context.networkSnapshots.forEach { snapshot ->
             val body = snapshot.responseBody ?: return@forEach
             for (pattern in patterns) {
-                pattern.find(body)?.groupValues?.get(1)?.let { return it }
+                val result = pattern.find(body)?.groupValues?.get(1)
+                if (!result.isNullOrBlank() && result.length >= 5) return result
             }
         }
-        
+
         return null
     }
     
@@ -1585,7 +1662,7 @@ class BocTemProvider : MainAPI() {
     }
     
     override val mainPage = mainPageOf(
-        "/" to "Anime Mới",
+        "page/" to "Anime Mới",
         "release/2026/page/" to "Anime 2026"
     )
     
@@ -1615,7 +1692,7 @@ class BocTemProvider : MainAPI() {
     }
     
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = "$mainUrl/${request.data}$page"
+        val url = "$mainUrl/${request.data}$page/"
         val document = app.get(url, headers = requestHeaders(mainUrl)).document
         
         val items = document

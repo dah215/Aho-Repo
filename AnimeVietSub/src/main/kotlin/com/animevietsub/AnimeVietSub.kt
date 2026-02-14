@@ -7,7 +7,6 @@ import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
-import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
@@ -118,7 +117,6 @@ class AnimeVietSub : MainAPI() {
             .mapNotNull { it.toSearchResponse() }
     }
 
-    // Data format: "epUrl"
     override suspend fun load(url: String): LoadResponse {
         val document = app.get(url, interceptor = cfKiller, headers = defaultHeaders).document
         var episodesNodes = document.select("ul.list-episode li a[data-id], .list-episode a[data-id]")
@@ -168,7 +166,6 @@ class AnimeVietSub : MainAPI() {
     ): Boolean {
         val epUrl = data
 
-        // Load trang tập phim
         val pageResponse = runCatching {
             app.get(epUrl, interceptor = cfKiller, headers = defaultHeaders)
         }.getOrNull() ?: return false
@@ -176,30 +173,23 @@ class AnimeVietSub : MainAPI() {
         val html = pageResponse.text
         val doc = pageResponse.document
 
-        // Parse filmInfo từ JavaScript
         val filmId = Regex("""filmInfo\.filmID\s*=\s*parseInt\s*\(\s*['"](\d+)['"]\s*\)""")
             .find(html)?.groupValues?.get(1) ?: ""
         
         val episodeId = Regex("""filmInfo\.episodeID\s*=\s*parseInt\s*\(\s*['"](\d+)['"]\s*\)""")
             .find(html)?.groupValues?.get(1) ?: ""
 
-        // Parse hash từ AnimeVsub() call
         val jsHash = Regex("""AnimeVsub\s*\(\s*['"]([^'"]+)['"]\s*,\s*filmInfo\.filmID\s*\)""")
             .find(html)?.groupValues?.get(1) ?: ""
 
-        // Parse hash từ episode link đang active
         val activeEpHash = doc.selectFirst("a.episode.active, a.episode.playing, a.btn3dsv.active")?.attr("data-hash")?.trim() ?: ""
-        
-        // Parse hash từ data-hash của episode matching episodeId
         val epHash = doc.selectFirst("a[data-id=$episodeId]")?.attr("data-hash")?.trim() ?: ""
 
-        // Danh sách các hash để thử
         val hashList = mutableListOf<String>()
         if (jsHash.isNotEmpty()) hashList.add(jsHash)
         if (activeEpHash.isNotEmpty()) hashList.add(activeEpHash)
         if (epHash.isNotEmpty()) hashList.add(epHash)
 
-        // Thử lấy tất cả data-hash từ trang
         val allHashes = doc.select("a[data-hash]").mapNotNull { 
             it.attr("data-hash").takeIf { it.isNotEmpty() } 
         }.distinct()
@@ -208,31 +198,19 @@ class AnimeVietSub : MainAPI() {
         val ajaxHeaders = mapOf(
             "X-Requested-With" to "XMLHttpRequest",
             "Content-Type"     to "application/x-www-form-urlencoded; charset=UTF-8",
-            "User-Agent"       to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "User-Agent"       to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Accept"           to "application/json, text/javascript, */*; q=0.01",
-            "Accept-Language"  to "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
             "Origin"           to mainUrl,
             "Referer"          to epUrl
         )
 
-        // Thử từng hash với các API endpoints khác nhau
         for (hash in hashList.distinct()) {
-            // Cách 1: POST /ajax/player với link=hash&id=filmId
-            val result1 = callPlayerApi(hash, filmId, epUrl, ajaxHeaders, callback, subtitleCallback)
-            if (result1) return true
-
-            // Cách 2: POST /ajax/player với link=hash&id=filmId&backup=1
-            val result2 = callPlayerApi(hash, filmId, epUrl, ajaxHeaders, callback, subtitleCallback, backup = true)
-            if (result2) return true
-
-            // Cách 3: POST /ajax/player với play=embed
-            val result3 = callPlayerApiEmbed(hash, epUrl, ajaxHeaders, callback, subtitleCallback)
-            if (result3) return true
+            if (callPlayerApi(hash, filmId, epUrl, ajaxHeaders, callback, subtitleCallback)) return true
+            if (callPlayerApi(hash, filmId, epUrl, ajaxHeaders, callback, subtitleCallback, backup = true)) return true
+            if (callPlayerApiEmbed(hash, epUrl, ajaxHeaders, callback, subtitleCallback)) return true
         }
 
-        // Fallback: Thử gọi /ajax/all với EpisodeMess=1&EpisodeID=episodeId
-        val allResult = callAllApi(episodeId, epUrl, ajaxHeaders, callback, subtitleCallback)
-        if (allResult) return true
+        if (callAllApi(episodeId, epUrl, ajaxHeaders, callback, subtitleCallback)) return true
 
         return false
     }
@@ -253,44 +231,27 @@ class AnimeVietSub : MainAPI() {
         }
 
         val response = runCatching {
-            app.post(
-                "$mainUrl/ajax/player",
-                data        = params,
-                interceptor = cfKiller,
-                referer     = referer,
-                headers     = headers
-            )
+            app.post("$mainUrl/ajax/player", data = params, interceptor = cfKiller, referer = referer, headers = headers)
         }.getOrNull() ?: return false
 
         val respText = response.text.trim()
-
-        if (respText.isEmpty() || 
-            respText.contains("Không tải được") ||
-            respText.startsWith("<") ||
-            !respText.startsWith("{")) {
+        if (respText.isEmpty() || respText.contains("Không tải được") || respText.startsWith("<") || !respText.startsWith("{")) {
             return false
         }
 
-        val parsed = runCatching { 
-            response.parsedSafe<PlayerResponse>() 
-        }.getOrNull() ?: return false
+        val parsed = runCatching { response.parsedSafe<PlayerResponse>() }.getOrNull() ?: return false
 
         when (parsed.playTech) {
             "api" -> {
-                val encryptedFile = parsed.linkArray
-                    ?.firstNotNullOfOrNull { it.file?.takeIf(String::isNotBlank) }
-                    ?: return false
-                
+                val encryptedFile = parsed.linkArray?.firstNotNullOfOrNull { it.file?.takeIf(String::isNotBlank) } ?: return false
                 val decrypted = decryptLink(encryptedFile) ?: return false
                 return handleDecryptedLink(decrypted, referer, callback, subtitleCallback, "DU")
             }
             "embed" -> {
-                val directUrl = parsed.linkString?.takeIf { it.startsWith("http") }
-                    ?: return false
+                val directUrl = parsed.linkString?.takeIf { it.startsWith("http") } ?: return false
                 return handleEmbedLink(directUrl, referer, callback, subtitleCallback, "HDX")
             }
         }
-
         return false
     }
 
@@ -301,39 +262,19 @@ class AnimeVietSub : MainAPI() {
         callback: (ExtractorLink) -> Unit,
         subtitleCallback: (SubtitleFile) -> Unit
     ): Boolean {
-        val params = mapOf(
-            "link" to hash,
-            "play" to "embed",
-            "id" to "3",
-            "backuplinks" to "1"
-        )
+        val params = mapOf("link" to hash, "play" to "embed", "id" to "3", "backuplinks" to "1")
 
         val response = runCatching {
-            app.post(
-                "$mainUrl/ajax/player",
-                data        = params,
-                interceptor = cfKiller,
-                referer     = referer,
-                headers     = headers
-            )
+            app.post("$mainUrl/ajax/player", data = params, interceptor = cfKiller, referer = referer, headers = headers)
         }.getOrNull() ?: return false
 
         val respText = response.text.trim()
-
-        if (respText.isEmpty() || 
-            respText.contains("Không tải được") ||
-            respText.startsWith("<") ||
-            !respText.startsWith("{")) {
+        if (respText.isEmpty() || respText.contains("Không tải được") || respText.startsWith("<") || !respText.startsWith("{")) {
             return false
         }
 
-        val parsed = runCatching { 
-            response.parsedSafe<PlayerResponse>() 
-        }.getOrNull() ?: return false
-
-        val directUrl = parsed.linkString?.takeIf { it.startsWith("http") }
-            ?: return false
-        
+        val parsed = runCatching { response.parsedSafe<PlayerResponse>() }.getOrNull() ?: return false
+        val directUrl = parsed.linkString?.takeIf { it.startsWith("http") } ?: return false
         return handleEmbedLink(directUrl, referer, callback, subtitleCallback, "HDX")
     }
 
@@ -345,38 +286,22 @@ class AnimeVietSub : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit
     ): Boolean {
         val response = runCatching {
-            app.post(
-                "$mainUrl/ajax/all",
-                data        = mapOf("EpisodeMess" to "1", "EpisodeID" to episodeId),
-                interceptor = cfKiller,
-                referer     = referer,
-                headers     = headers
-            )
+            app.post("$mainUrl/ajax/all", data = mapOf("EpisodeMess" to "1", "EpisodeID" to episodeId), interceptor = cfKiller, referer = referer, headers = headers)
         }.getOrNull() ?: return false
 
         val respText = response.text.trim()
-        if (respText.isEmpty() || respText.contains("Không tải được")) {
-            return false
-        }
+        if (respText.isEmpty() || respText.contains("Không tải được")) return false
 
-        // Parse HTML response nếu có
         val doc = Jsoup.parse(respText)
         val links = doc.select("a[data-href], a[data-link], source[src], video[src]")
         
         for (link in links) {
-            val videoUrl = link.attr("data-href")
-                .ifEmpty { link.attr("data-link") }
-                .ifEmpty { link.attr("src") }
-                .ifEmpty { link.attr("href") }
-            
-            if (videoUrl.isNotEmpty() && (videoUrl.startsWith("http") || videoUrl.contains(".m3u8"))) {
-                if (videoUrl.contains(".m3u8")) {
-                    M3u8Helper.generateM3u8(name, videoUrl, referer).forEach(callback)
-                    return true
-                }
+            val videoUrl = link.attr("data-href").ifEmpty { link.attr("data-link") }.ifEmpty { link.attr("src") }.ifEmpty { link.attr("href") }
+            if (videoUrl.isNotEmpty() && videoUrl.startsWith("http") && videoUrl.contains(".m3u8")) {
+                M3u8Helper.generateM3u8(name, videoUrl, referer).forEach(callback)
+                return true
             }
         }
-
         return false
     }
 
@@ -388,38 +313,34 @@ class AnimeVietSub : MainAPI() {
         serverName: String = "DU"
     ): Boolean {
         val link = decrypted.trim()
-        return when {
+        when {
             link.contains(".m3u8") && link.startsWith("http") -> {
                 M3u8Helper.generateM3u8("$name - $serverName", link, referer).forEach(callback)
-                true
+                return true
             }
             link.startsWith("#EXTM3U") -> {
-                parseM3u8ContentSuspend(link, referer, callback, serverName)
-                true
+                parseM3u8Content(link, referer, callback, serverName)
+                return true
             }
             link.startsWith("http") -> {
                 loadExtractor(link, referer, subtitleCallback, callback)
-                true
+                return true
             }
             link.contains("\n") -> {
                 link.lines().filter { it.trim().startsWith("http") }.forEach { url ->
-                    if (url.contains(".m3u8"))
+                    if (url.contains(".m3u8")) {
                         M3u8Helper.generateM3u8("$name - $serverName", url.trim(), referer).forEach(callback)
-                    else
+                    } else {
                         loadExtractor(url.trim(), referer, subtitleCallback, callback)
+                    }
                 }
-                true
+                return true
             }
-            else -> false
         }
+        return false
     }
 
-    private suspend fun parseM3u8ContentSuspend(
-        content: String, 
-        referer: String, 
-        callback: (ExtractorLink) -> Unit,
-        serverName: String = "DU"
-    ) {
+    private fun parseM3u8Content(content: String, referer: String, callback: (ExtractorLink) -> Unit, serverName: String = "DU") {
         val lines = content.lines()
         if (content.contains("#EXT-X-STREAM-INF")) {
             lines.forEachIndexed { i, line ->
@@ -434,7 +355,7 @@ class AnimeVietSub : MainAPI() {
                     }
                     val urlLine = lines.getOrNull(i + 1)?.trim() ?: return@forEachIndexed
                     if (urlLine.startsWith("http")) {
-                        M3u8Helper.generateM3u8("$name - $serverName", urlLine, referer).forEach(callback)
+                        M3u8Helper.generateM3u8("$name - $serverName", urlLine, referer, q).forEach(callback)
                     }
                 }
             }
@@ -469,49 +390,30 @@ class AnimeVietSub : MainAPI() {
                 if (!location.isNullOrEmpty()) {
                     currentUrl = location
                     
-                    if (location.contains("storage.googleapis.com") || 
-                        location.contains(".m3u8") ||
-                        location.contains(".mp4") ||
-                        location.contains("googlevideo.com")) {
+                    if (location.contains("storage.googleapis.com") || location.contains(".m3u8") || location.contains(".mp4") || location.contains("googlevideo.com")) {
                         if (location.contains(".m3u8")) {
                             M3u8Helper.generateM3u8("$name - $serverName", location, "https://abysscdn.com/").forEach(callback)
                         } else {
-                            callback(ExtractorLink(
-                                source = name,
-                                name = "$name - $serverName",
-                                url = location,
-                                referer = "https://abysscdn.com/",
-                                quality = Qualities.Unknown.value,
-                                type = ExtractorLinkType.VIDEO
-                            ))
+                            // Use loadExtractor for mp4 links
+                            loadExtractor(location, "https://abysscdn.com/", subtitleCallback, callback)
                         }
                         return true
                     }
-                    
                     redirectCount++
                 } else {
-                    // Parse page for video URL
                     val doc = response.document
                     val videoUrl = extractVideoFromPage(doc, currentUrl)
                     if (!videoUrl.isNullOrEmpty()) {
                         if (videoUrl.contains(".m3u8")) {
                             M3u8Helper.generateM3u8("$name - $serverName", videoUrl, currentUrl).forEach(callback)
                         } else {
-                            callback(ExtractorLink(
-                                source = name,
-                                name = "$name - $serverName",
-                                url = videoUrl,
-                                referer = currentUrl,
-                                quality = Qualities.Unknown.value,
-                                type = ExtractorLinkType.VIDEO
-                            ))
+                            loadExtractor(videoUrl, currentUrl, subtitleCallback, callback)
                         }
                         return true
                     }
                     break
                 }
             }
-            
             false
         } catch (e: Exception) {
             false
@@ -519,37 +421,22 @@ class AnimeVietSub : MainAPI() {
     }
     
     private fun extractVideoFromPage(doc: org.jsoup.nodes.Document, baseUrl: String): String? {
-        // Try video/source tags
         doc.selectFirst("video source")?.attr("src")?.let { return fixUrl(it, baseUrl) }
         doc.selectFirst("video")?.attr("src")?.let { return fixUrl(it, baseUrl) }
-        
-        // Try iframe
         doc.selectFirst("iframe")?.attr("src")?.let { return fixUrl(it, baseUrl) }
-        
-        // Try m3u8/mp4 in attributes
         doc.selectFirst("[src*='.m3u8']")?.attr("src")?.let { return fixUrl(it, baseUrl) }
         doc.selectFirst("[src*='.mp4']")?.attr("src")?.let { return fixUrl(it, baseUrl) }
         
-        // Try JavaScript content
         val scripts = doc.select("script")
         for (script in scripts) {
             val content = script.html()
-            
-            // Look for m3u8 URLs
             Regex("""['"]([^'"]*\.m3u8[^'"]*)['"]""").find(content)?.groupValues?.get(1)?.let { return it }
-            
-            // Look for storage.googleapis.com URLs
             Regex("""['"](https?://storage\.googleapis\.com[^'"]+)['"]""").find(content)?.groupValues?.get(1)?.let { return it }
-            
-            // Look for googlevideo URLs
             Regex("""['"](https?://[^'"]*googlevideo\.com[^'"]+)['"]""").find(content)?.groupValues?.get(1)?.let { return it }
-            
-            // Look for file: "..." patterns
             Regex("""file\s*:\s*['"]([^'"]+)['"]""").find(content)?.groupValues?.get(1)?.let { 
                 if (it.startsWith("http") || it.contains(".m3u8")) return it 
             }
         }
-        
         return null
     }
     
@@ -573,14 +460,11 @@ class AnimeVietSub : MainAPI() {
     ) {
         @Suppress("UNCHECKED_CAST")
         val linkArray: List<LinkItem>?
-            get() = (linkRaw as? List<*>)?.filterIsInstance<Map<String, Any?>>()
-                ?.map { LinkItem(it["file"] as? String) }
+            get() = (linkRaw as? List<*>)?.filterIsInstance<Map<String, Any?>>()?.map { LinkItem(it["file"] as? String) }
 
         val linkString: String?
             get() = linkRaw as? String
     }
 
-    data class LinkItem(
-        val file: String? = null
-    )
+    data class LinkItem(val file: String? = null)
 }

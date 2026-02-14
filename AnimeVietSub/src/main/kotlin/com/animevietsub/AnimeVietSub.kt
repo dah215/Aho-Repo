@@ -19,16 +19,6 @@ import java.nio.charset.StandardCharsets
 import java.util.zip.Inflater
 import java.io.ByteArrayOutputStream
 
-/**
- * AnimeVietSub CloudStream3 Plugin - v14
- * 
- * Changelog v14:
- * - Sửa selector cho đúng class (btn-episode, btn3d)
- * - Thử nhiều cách lấy hash
- * - Thêm log chi tiết để debug
- * - Thử nhiều server fallback
- */
-
 @CloudstreamPlugin
 class AnimeVietSubPlugin : Plugin() {
     override fun load() {
@@ -47,16 +37,15 @@ class AnimeVietSub : MainAPI() {
 
     companion object {
         private const val DECODE_PASSWORD = "dm_thang_suc_vat_get_link_an_dbt"
-        private const val TAG = "[AVS_v14]"
     }
 
     private val cfKiller = CloudflareKiller()
+    private val ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
     private val defaultHeaders = mapOf(
-        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Referer"    to "$mainUrl/",
-        "Accept"     to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language" to "en-US,en;q=0.9,vi;q=0.8"
+        "User-Agent"      to ua,
+        "Referer"         to "$mainUrl/",
+        "Accept-Language" to "vi-VN,vi;q=0.9,en;q=0.8"
     )
 
     override val mainPage = mainPageOf(
@@ -66,33 +55,27 @@ class AnimeVietSub : MainAPI() {
         "$mainUrl/anime-bo/"                  to "Anime Bộ"
     )
 
-    private fun log(msg: String) {
-        println("$TAG $msg")
-    }
-
+    // ─────────────────────────────────────────────────────────────────────────
+    // DECRYPT: AES-256-CBC + pako.inflateRaw
+    // Key: SHA-256(password)
+    // IV: first 16 bytes của decoded data
+    // Base64: DEFAULT (standard +/=), KHÔNG phải URL_SAFE
+    // ─────────────────────────────────────────────────────────────────────────
     private fun decryptLink(aes: String): String? {
         return try {
             val cleaned = aes.replace(Regex("\\s"), "")
             val key     = MessageDigest.getInstance("SHA-256")
                             .digest(DECODE_PASSWORD.toByteArray(StandardCharsets.UTF_8))
             val decoded = Base64.decode(cleaned, Base64.DEFAULT)
-            
-            if (decoded.size < 16) {
-                log("Decoded data too short: ${decoded.size}")
-                return null
-            }
-            
-            val iv      = decoded.copyOfRange(0, 16)
-            val ct      = decoded.copyOfRange(16, decoded.size)
-            val cipher  = Cipher.getInstance("AES/CBC/PKCS5Padding")
+            if (decoded.size < 17) return null
+            val iv     = decoded.copyOfRange(0, 16)
+            val ct     = decoded.copyOfRange(16, decoded.size)
+            val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
             cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
-            val plain   = cipher.doFinal(ct)
-            val result  = String(pakoInflateRaw(plain), StandardCharsets.UTF_8)
-            result.replace("\\n", "\n").replace("\"", "").trim()
-        } catch (e: Exception) {
-            log("Decrypt failed: ${e.message}")
-            null
-        }
+            val plain  = cipher.doFinal(ct)
+            String(pakoInflateRaw(plain), StandardCharsets.UTF_8)
+                .replace("\\n", "\n").replace("\"", "").trim()
+        } catch (e: Exception) { null }
     }
 
     private fun pakoInflateRaw(data: ByteArray): ByteArray {
@@ -110,6 +93,7 @@ class AnimeVietSub : MainAPI() {
         return out.toByteArray()
     }
 
+    // ── Search / MainPage ─────────────────────────────────────────────────────
     private fun Element.toSearchResponse(): SearchResponse? {
         val title  = selectFirst(".Title, h3")?.text()?.trim() ?: return null
         val href   = selectFirst("a")?.attr("href")            ?: return null
@@ -140,33 +124,35 @@ class AnimeVietSub : MainAPI() {
             .mapNotNull { it.toSearchResponse() }
     }
 
-    // Data format: "epUrl@@filmId@@episodeId"
+    // ── Load ──────────────────────────────────────────────────────────────────
+    // Episode data: "epUrl@@filmId@@episodeId"
+    //   epUrl:     trang xem tập (vd: /tap-01-111047.html) — dùng làm Referer
+    //   filmId:    từ URL phim (a5820 → "5820") — dùng trong POST bước 2
+    //   episodeId: data-id của tập (111047) — dùng trong POST bước 1
     override suspend fun load(url: String): LoadResponse {
         var document      = app.get(url, interceptor = cfKiller, headers = defaultHeaders).document
         var episodesNodes = document.select("ul.list-episode li a[data-id]")
 
         if (episodesNodes.isEmpty()) {
-            val firstEpHref = document.selectFirst("a[href*='/tap-']")
+            document.selectFirst("a[href*='/tap-']")
                 ?.attr("href")?.let { if (it.startsWith("http")) it else "$mainUrl$it" }
-            if (firstEpHref != null) {
-                runCatching {
-                    app.get(firstEpHref, interceptor = cfKiller, headers = defaultHeaders).document
-                }.getOrNull()?.also { doc2 ->
-                    episodesNodes = doc2.select("ul.list-episode li a[data-id]")
-                    if (episodesNodes.isNotEmpty()) document = doc2
+                ?.let { firstEp ->
+                    runCatching {
+                        app.get(firstEp, interceptor = cfKiller, headers = defaultHeaders).document
+                    }.getOrNull()?.also { doc2 ->
+                        episodesNodes = doc2.select("ul.list-episode li a[data-id]")
+                        if (episodesNodes.isNotEmpty()) document = doc2
+                    }
                 }
-            }
         }
 
         val filmId = Regex("[/-]a(\\d+)").find(url)?.groupValues?.get(1) ?: ""
 
-        val episodesList = episodesNodes.mapNotNull { ep ->
+        val epList = episodesNodes.mapNotNull { ep ->
             val episodeId = ep.attr("data-id").trim()
             val epName    = ep.attr("title").ifEmpty { ep.text().trim() }
             val epUrl     = ep.attr("href").let { if (it.startsWith("http")) it else "$mainUrl$it" }
-
             if (episodeId.isEmpty() || epUrl.isEmpty()) return@mapNotNull null
-
             newEpisode("$epUrl@@$filmId@@$episodeId") {
                 name    = epName
                 episode = Regex("\\d+").find(epName)?.value?.toIntOrNull()
@@ -176,15 +162,13 @@ class AnimeVietSub : MainAPI() {
         val title = document.selectFirst("h1.Title, .TPost h1")?.text()?.trim() ?: "Anime"
         return newAnimeLoadResponse(title, url, TvType.Anime) {
             posterUrl = document.selectFirst(".Image img, .InfoImg img")
-                ?.let { img -> img.attr("data-src").ifEmpty { img.attr("src") } }
-            plot = document.selectFirst(".Description, .InfoDesc, .TPost .Description")
-                ?.text()?.trim()
-            episodes = if (episodesList.isNotEmpty())
-                mutableMapOf(DubStatus.Subbed to episodesList)
-            else mutableMapOf()
+                ?.let { it.attr("data-src").ifEmpty { it.attr("src") } }
+            plot = document.selectFirst(".Description, .InfoDesc, .TPost .Description")?.text()?.trim()
+            episodes = if (epList.isNotEmpty()) mutableMapOf(DubStatus.Subbed to epList) else mutableMapOf()
         }
     }
 
+    // ── loadLinks ─────────────────────────────────────────────────────────────
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -193,370 +177,139 @@ class AnimeVietSub : MainAPI() {
     ): Boolean {
         val parts = data.split("@@")
         if (parts.size < 3) return false
+        val epUrl     = parts[0]  // URL trang tập
+        val filmId    = parts[1]  // Film ID (5820)
+        val episodeId = parts[2]  // Episode ID (111047)
 
-        val epUrl     = parts[0]
-        val filmId    = parts[1]
-        val episodeId = parts[2]
+        // Warm CF cookies
+        runCatching { app.get(epUrl, interceptor = cfKiller, headers = defaultHeaders) }
 
-        log("═══════════════════════════════════════════════════")
-        log("Loading episode: $episodeId, filmId: $filmId")
-        log("URL: $epUrl")
-
-        // Lấy trang episode
-        val epDoc = runCatching {
-            app.get(epUrl, interceptor = cfKiller, headers = defaultHeaders).document
-        }.getOrNull()
-        
-        if (epDoc == null) {
-            log("Failed to load episode page!")
-            return false
-        }
-
-        // ═══════════════════════════════════════════════════════════════
-        // BƯỚC 1: Tìm hash
-        // ═══════════════════════════════════════════════════════════════
-        
-        var hash: String? = null
-        var playType = "api"
-
-        // Cách 1: Từ data-hash attribute (ưu tiên episode đang active)
-        val selectors = listOf(
-            "a.btn-episode[data-id=$episodeId][data-hash]",
-            "a.btn3d[data-id=$episodeId][data-hash]",
-            "a.episode-link[data-id=$episodeId][data-hash]",
-            "a[data-id=$episodeId][data-hash]"
-        )
-        
-        for (selector in selectors) {
-            val el = epDoc.selectFirst(selector)
-            if (el != null) {
-                hash = el.attr("data-hash").trim()
-                playType = el.attr("data-play").ifEmpty { "api" }.trim()
-                log("Found hash from selector '$selector'")
-                break
-            }
-        }
-
-        // Cách 2: Từ JavaScript AnimeVsub() call
-        if (hash.isNullOrBlank()) {
-            log("Trying to find hash from AnimeVsub() JavaScript...")
-            val scripts = epDoc.select("script")
-            for (script in scripts) {
-                val content = script.html()
-                if (content.contains("AnimeVsub(")) {
-                    // Pattern: AnimeVsub('hash', filmID)
-                    val match = Regex("""AnimeVsub\s*\(\s*['"]([^'"]+)['"]\s*,""").find(content)
-                    if (match != null) {
-                        hash = match.groupValues[1]
-                        log("Found hash from AnimeVsub() call")
-                        break
-                    }
-                }
-            }
-        }
-
-        // Cách 3: Episode đang active (class contains "active" or "playing")
-        if (hash.isNullOrBlank()) {
-            log("Looking for active episode...")
-            hash = epDoc.selectFirst("a.episode-link.active[data-hash]")?.attr("data-hash")?.trim()
-                ?: epDoc.selectFirst("a.btn-episode.active[data-hash]")?.attr("data-hash")?.trim()
-                ?: epDoc.selectFirst("a.playing[data-hash]")?.attr("data-hash")?.trim()
-            
-            if (!hash.isNullOrBlank()) {
-                playType = epDoc.selectFirst("a.active[data-hash]")?.attr("data-play")?.trim() ?: "api"
-                log("Found hash from active episode")
-            }
-        }
-
-        // Cách 4: Fallback - lấy hash đầu tiên
-        if (hash.isNullOrBlank()) {
-            log("Fallback to first hash found...")
-            hash = epDoc.selectFirst("a[data-hash]")?.attr("data-hash")?.trim()
-            playType = epDoc.selectFirst("a[data-hash]")?.attr("data-play")?.trim() ?: "api"
-        }
-
-        if (hash.isNullOrBlank()) {
-            log("ERROR: No hash found!")
-            return false
-        }
-
-        log("Hash: ${hash.take(50)}...")
-        log("PlayType: $playType")
-        log("FilmID: $filmId")
-
-        // ═══════════════════════════════════════════════════════════════
-        // BƯỚC 2: Gọi API
-        // ═══════════════════════════════════════════════════════════════
-        
         val ajaxHeaders = mapOf(
             "X-Requested-With" to "XMLHttpRequest",
             "Content-Type"     to "application/x-www-form-urlencoded; charset=UTF-8",
-            "User-Agent"       to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Referer"          to epUrl,
+            "Accept"           to "application/json, text/javascript, */*; q=0.01",
             "Origin"           to mainUrl,
-            "Accept"           to "application/json, text/javascript, */*; q=0.01"
+            "User-Agent"       to ua
         )
 
-        // Thử API server
-        log("─────────────────────────────────────────")
-        log("Trying API server...")
-        val apiParams = mapOf("link" to hash, "id" to filmId)
-        log("Params: link=${hash.take(30)}..., id=$filmId")
-        
-        val apiResult = tryApiCall(apiParams, epUrl, ajaxHeaders, callback, subtitleCallback)
-        if (apiResult) {
-            log("SUCCESS with API server!")
-            return true
-        }
-
-        // Thử Embed server
-        log("─────────────────────────────────────────")
-        log("Trying Embed server...")
-        val embedParams = mapOf(
-            "link" to hash,
-            "play" to "embed",
-            "id" to "3",
-            "backuplinks" to "1"
-        )
-        log("Params: link=${hash.take(30)}..., play=embed, id=3")
-        
-        val embedResult = tryEmbedCall(embedParams, epUrl, ajaxHeaders, callback, subtitleCallback)
-        if (embedResult) {
-            log("SUCCESS with Embed server!")
-            return true
-        }
-
-        // Thử tất cả servers từ HTML
-        log("─────────────────────────────────────────")
-        log("Trying all servers from HTML...")
-        val servers = epDoc.select("a[data-hash][data-source]")
-        log("Found ${servers.size} servers")
-        
-        for ((index, server) in servers.withIndex()) {
-            val serverHash = server.attr("data-hash").trim()
-            val serverPlay = server.attr("data-play").ifEmpty { "api" }.trim()
-            val serverName = server.text().trim()
-            
-            if (serverHash == hash) continue // Đã thử rồi
-            
-            log("Server $index: $serverName (play=$serverPlay)")
-            
-            val params = when (serverPlay) {
-                "api" -> mapOf("link" to serverHash, "id" to filmId)
-                else -> mapOf("link" to serverHash, "play" to serverPlay, "id" to "3", "backuplinks" to "1")
-            }
-            
-            val result = when (serverPlay) {
-                "api" -> tryApiCall(params, epUrl, ajaxHeaders, callback, subtitleCallback)
-                else -> tryEmbedCall(params, epUrl, ajaxHeaders, callback, subtitleCallback)
-            }
-            
-            if (result) {
-                log("SUCCESS with server: $serverName")
-                return true
-            }
-        }
-
-        log("All methods failed!")
-        return false
-    }
-
-    private suspend fun tryApiCall(
-        params: Map<String, String>,
-        referer: String,
-        headers: Map<String, String>,
-        callback: (ExtractorLink) -> Unit,
-        subtitleCallback: (SubtitleFile) -> Unit
-    ): Boolean {
-        return try {
-            val response = app.post(
+        // ═══════════════════════════════════════════════════════════════════════
+        // BƯỚC 1: Lấy FRESH hash từ server
+        //
+        // v14 BUG: lấy hash từ HTML trang tập → STALE, server reject
+        // FIX: gọi /ajax/player với episodeId → nhận hash MỚI trong response
+        //
+        // Xác nhận từ Player2.txt:
+        //   POST /ajax/player   body: episodeId=111047&backup=1
+        //   Response: {"html":"<a data-href='FRESH_HASH' data-play='api'>DU</a>"}
+        // ═══════════════════════════════════════════════════════════════════════
+        val step1 = runCatching {
+            app.post(
                 "$mainUrl/ajax/player",
-                data        = params,
+                data        = mapOf("episodeId" to episodeId, "backup" to "1"),
                 interceptor = cfKiller,
-                referer     = referer,
-                headers     = headers
-            )
-            
-            val respText = response.text.trim()
-            log("Response: ${respText.take(200)}...")
-            
-            if (respText.isBlank() || respText.contains("Không tải được") || respText.startsWith("<")) {
-                log("Invalid response")
-                return false
-            }
-            
-            val parsed = response.parsedSafe<PlayerResponse>()
-            log("Parsed: fxStatus=${parsed?.fxStatus}, playTech=${parsed?.playTech}")
-            
-            if (parsed?.fxStatus != 1 || parsed.playTech != "api") {
-                return false
-            }
-            
-            val encryptedFile = parsed.linkArray
-                ?.firstNotNullOfOrNull { it.file?.takeIf(String::isNotBlank) }
-            
-            if (encryptedFile == null) {
-                log("No encrypted file found")
-                return false
-            }
-            
-            log("Decrypting... length: ${encryptedFile.length}")
-            val decrypted = decryptLink(encryptedFile)
-            
-            if (decrypted == null) {
-                log("Decrypt failed")
-                return false
-            }
-            
-            log("Decrypted: ${decrypted.take(100)}...")
-            handleDecryptedLink(decrypted, referer, callback, subtitleCallback)
-            
-        } catch (e: Exception) {
-            log("API call error: ${e.message}")
-            false
-        }
-    }
+                referer     = epUrl,
+                headers     = ajaxHeaders
+            ).parsedSafe<ServerSelectionResp>()
+        }.getOrNull()
 
-    private suspend fun tryEmbedCall(
-        params: Map<String, String>,
-        referer: String,
-        headers: Map<String, String>,
-        callback: (ExtractorLink) -> Unit,
-        subtitleCallback: (SubtitleFile) -> Unit
-    ): Boolean {
-        return try {
-            val response = app.post(
+        val serverHtml = step1?.html ?: return false
+        val serverDoc  = Jsoup.parse(serverHtml)
+
+        // Ưu tiên server "api" (DU) — không có quảng cáo
+        val prefServer = serverDoc.selectFirst("a.btn3dsv[data-play=api]")
+            ?: serverDoc.selectFirst("a.btn3dsv")
+            ?: return false
+
+        val freshHash  = prefServer.attr("data-href").trim().ifEmpty { return false }
+        val serverPlay = prefServer.attr("data-play").trim().ifEmpty { "api" }
+        val serverBtnId = prefServer.attr("data-id").trim() // data-id của SERVER BUTTON
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // BƯỚC 2: Lấy encrypted link dùng FRESH hash
+        //
+        // Xác nhận từ Player1.txt:
+        //   POST /ajax/player   body: link=FRESH_HASH&id=5820  (id = FILM ID)
+        //   Response: {"_fxStatus":1,"link":[{"file":"Q/x+SJ6..."}],"playTech":"api"}
+        //
+        // Xác nhận từ Player3.txt (HDX embed):
+        //   POST /ajax/player   body: link=hash&play=embed&id=3&backuplinks=1  (id = SERVER BTN ID)
+        //   Response: {"_fxStatus":1,"link":"https://short.icu/...","playTech":"embed"}
+        // ═══════════════════════════════════════════════════════════════════════
+        val step2Params = when (serverPlay) {
+            "api"  -> mapOf("link" to freshHash, "id" to filmId)
+            else   -> mapOf("link" to freshHash, "play" to serverPlay, "id" to serverBtnId, "backuplinks" to "1")
+        }
+
+        val step2Resp = runCatching {
+            app.post(
                 "$mainUrl/ajax/player",
-                data        = params,
+                data        = step2Params,
                 interceptor = cfKiller,
-                referer     = referer,
-                headers     = headers
+                referer     = epUrl,
+                headers     = ajaxHeaders
             )
-            
-            val respText = response.text.trim()
-            log("Response: ${respText.take(200)}...")
-            
-            if (respText.isBlank() || respText.contains("Không tải được")) {
-                return false
-            }
-            
-            val parsed = response.parsedSafe<PlayerResponse>()
-            log("Parsed: fxStatus=${parsed?.fxStatus}, playTech=${parsed?.playTech}")
-            
-            if (parsed?.fxStatus != 1 || parsed.playTech != "embed") {
-                return false
-            }
-            
-            val directUrl = parsed.linkString?.takeIf { it.startsWith("http") }
-            
-            if (directUrl == null) {
-                log("No embed URL found")
-                return false
-            }
-            
-            log("Embed URL: $directUrl")
-            followShortLink(directUrl, referer, callback, subtitleCallback)
-            
-        } catch (e: Exception) {
-            log("Embed call error: ${e.message}")
-            false
-        }
-    }
+        }.getOrNull() ?: return false
 
-    private suspend fun followShortLink(
-        shortUrl: String,
-        referer: String,
-        callback: (ExtractorLink) -> Unit,
-        subtitleCallback: (SubtitleFile) -> Unit
-    ): Boolean {
-        log("Following: $shortUrl")
-        
-        return try {
-            val response = app.get(
-                shortUrl,
-                interceptor = cfKiller,
-                headers = mapOf(
-                    "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                    "Referer" to referer,
-                    "Accept" to "text/html,application/xhtml+xml"
-                )
-            )
-            
-            val finalUrl = response.url
-            log("Final URL: $finalUrl")
-            
-            if (finalUrl.contains("abyss") || response.text.contains("abyss")) {
-                extractAbyss(response.text, finalUrl, callback, subtitleCallback)
-            } else {
-                loadExtractor(shortUrl, referer, subtitleCallback, callback)
-            }
-            
-        } catch (e: Exception) {
-            log("Short link error: ${e.message}")
-            runCatching { loadExtractor(shortUrl, referer, subtitleCallback, callback) }.getOrDefault(false)
-        }
-    }
+        val body = step2Resp.text.trim()
+        if (body.isBlank() || body.startsWith("<")) return false
 
-    private suspend fun extractAbyss(
-        body: String,
-        url: String,
-        callback: (ExtractorLink) -> Unit,
-        subtitleCallback: (SubtitleFile) -> Unit
-    ): Boolean {
-        log("Extracting Abyss from: $url")
-        
-        val patterns = listOf(
-            Regex("""file\s*:\s*['"](https?://[^'"]+)['"]"""),
-            Regex("""source\s*:\s*['"](https?://[^'"]+)['"]"""),
-            Regex("""['"](https?://storage\.googleapis\.com[^'"]+)['"]"""),
-            Regex("""['"](https?://[^'"]*\.m3u8[^'"]*)['"]""")
-        )
-        
-        for (pattern in patterns) {
-            pattern.find(body)?.let { match ->
-                val videoUrl = match.groupValues[1]
-                log("Found video: $videoUrl")
-                
-                callback.invoke(newExtractorLink(name, name, videoUrl) {
-                    this.referer = "https://abysscdn.com/"
-                    this.quality = Qualities.Unknown.value
-                    this.type = if (videoUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                })
-                return true
-            }
-        }
-        
-        runCatching { loadExtractor(url, "https://abysscdn.com/", subtitleCallback, callback) }
-        return true
-    }
+        val parsed = step2Resp.parsedSafe<PlayerResp>() ?: return false
+        if (parsed.fxStatus != 1 && parsed.success != 1) return false
 
-    private suspend fun handleDecryptedLink(
-        decrypted: String,
-        referer: String,
-        callback: (ExtractorLink) -> Unit,
-        subtitleCallback: (SubtitleFile) -> Unit
-    ): Boolean {
-        val link = decrypted.trim()
-        
-        return when {
-            link.contains(".m3u8") && link.startsWith("http") -> {
-                M3u8Helper.generateM3u8(name, link, referer).forEach(callback)
+        return when (serverPlay) {
+            // ── DU server: link là [{file: "<standard_base64_encrypted>"}]
+            "api" -> {
+                val enc = parsed.linkArray?.firstNotNullOfOrNull { it.file?.takeIf(String::isNotBlank) }
+                    ?: return false
+                // Decrypt: Base64.DEFAULT (standard, có +/=) → AES → inflate → URL
+                val dec = decryptLink(enc) ?: return false
+                handleDecrypted(dec, epUrl, callback, subtitleCallback)
+            }
+            // ── HDX server: link là URL trực tiếp (short link, có quảng cáo)
+            else -> {
+                val direct = parsed.linkString?.takeIf { it.startsWith("http") } ?: return false
+                loadExtractor(direct, epUrl, subtitleCallback, callback)
                 true
+            }
+        }
+    }
+
+    private suspend fun handleDecrypted(
+        dec: String,
+        referer: String,
+        callback: (ExtractorLink) -> Unit,
+        subtitleCallback: (SubtitleFile) -> Unit
+    ): Boolean {
+        val link = dec.trim()
+        return when {
+            link.startsWith("http") && link.contains(".m3u8") -> {
+                M3u8Helper.generateM3u8(name, link, referer).forEach(callback); true
             }
             link.startsWith("#EXTM3U") -> {
-                parseM3u8Content(link, referer, callback)
+                link.lines().forEachIndexed { i, line ->
+                    if (line.startsWith("#EXT-X-STREAM-INF")) {
+                        val bw = Regex("BANDWIDTH=(\\d+)").find(line)?.groupValues?.get(1)?.toIntOrNull()
+                        val q  = when {
+                            bw == null      -> Qualities.Unknown.value
+                            bw >= 4_000_000 -> Qualities.P1080.value
+                            bw >= 2_000_000 -> Qualities.P720.value
+                            bw >= 1_000_000 -> Qualities.P480.value
+                            else            -> Qualities.P360.value
+                        }
+                        link.lines().getOrNull(i + 1)?.trim()?.takeIf { it.startsWith("http") }?.let { u ->
+                            callback(newExtractorLink(name, name, u) {
+                                this.referer = referer; this.quality = q; this.type = ExtractorLinkType.M3U8
+                            })
+                        }
+                    }
+                }
                 true
             }
-            link.startsWith("http") -> {
-                loadExtractor(link, referer, subtitleCallback, callback)
-                true
-            }
+            link.startsWith("http") -> { loadExtractor(link, referer, subtitleCallback, callback); true }
             link.contains("\n") -> {
-                link.lines().filter { it.trim().startsWith("http") }.forEach { url ->
-                    if (url.contains(".m3u8"))
-                        M3u8Helper.generateM3u8(name, url.trim(), referer).forEach(callback)
-                    else
-                        loadExtractor(url.trim(), referer, subtitleCallback, callback)
+                link.lines().filter { it.startsWith("http") }.forEach { u ->
+                    if (u.contains(".m3u8")) M3u8Helper.generateM3u8(name, u, referer).forEach(callback)
+                    else loadExtractor(u, referer, subtitleCallback, callback)
                 }
                 true
             }
@@ -564,43 +317,28 @@ class AnimeVietSub : MainAPI() {
         }
     }
 
-    private suspend fun parseM3u8Content(content: String, referer: String, callback: (ExtractorLink) -> Unit) {
-        val lines = content.lines()
-        lines.forEachIndexed { i, line ->
-            if (line.startsWith("#EXT-X-STREAM-INF")) {
-                val bw = Regex("BANDWIDTH=(\\d+)").find(line)?.groupValues?.get(1)?.toIntOrNull()
-                val q = when {
-                    bw == null -> Qualities.Unknown.value
-                    bw >= 4_000_000 -> Qualities.P1080.value
-                    bw >= 2_000_000 -> Qualities.P720.value
-                    bw >= 1_000_000 -> Qualities.P480.value
-                    else -> Qualities.P360.value
-                }
-                lines.getOrNull(i + 1)?.trim()?.takeIf { it.startsWith("http") }?.let { urlLine ->
-                    callback.invoke(newExtractorLink(name, name, urlLine) {
-                        this.referer = referer
-                        this.quality = q
-                        this.type = ExtractorLinkType.M3U8
-                    })
-                }
-            }
-        }
-    }
+    // ── Data classes ──────────────────────────────────────────────────────────
 
-    data class PlayerResponse(
-        @JsonProperty("_fxStatus") val fxStatus: Int? = null,
-        @JsonProperty("success")   val success: Int? = null,
+    data class ServerSelectionResp(
+        @JsonProperty("success") val success: Int?  = null,
+        @JsonProperty("html")    val html: String?  = null
+    )
+
+    data class PlayerResp(
+        @JsonProperty("_fxStatus") val fxStatus: Int?    = null,
+        @JsonProperty("success")   val success: Int?     = null,
         @JsonProperty("playTech")  val playTech: String? = null,
-        @JsonProperty("link") private val linkRaw: Any? = null
+        @JsonProperty("link") private val linkRaw: Any?  = null
     ) {
         @Suppress("UNCHECKED_CAST")
-        val linkArray: List<LinkItem>?
-            get() = (linkRaw as? List<*>)?.filterIsInstance<Map<String, Any?>>()
-                ?.map { LinkItem(it["file"] as? String) }
+        val linkArray: List<LinkFile>?
+            get() = (linkRaw as? List<*>)
+                ?.filterIsInstance<Map<String, Any?>>()
+                ?.map { LinkFile(it["file"] as? String) }
 
         val linkString: String?
             get() = linkRaw as? String
     }
 
-    data class LinkItem(val file: String? = null)
+    data class LinkFile(val file: String? = null)
 }

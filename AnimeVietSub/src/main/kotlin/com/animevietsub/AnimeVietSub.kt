@@ -41,10 +41,17 @@ class AnimeVietSub : MainAPI() {
     private val cfKiller = CloudflareKiller()
 
     private val defaultHeaders = mapOf(
-        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
         "Accept"     to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Referer"    to "$mainUrl/"
+        "Referer"    to "$mainUrl/",
+        "sec-ch-ua" to "\"Mises\";v=\"141\", \"Not?A_Brand\";v=\"8\", \"Chromium\";v=\"141\"",
+        "sec-ch-ua-mobile" to "?1",
+        "sec-ch-ua-platform" to "\"Android\"",
+        "sec-fetch-dest" to "document",
+        "sec-fetch-mode" to "navigate",
+        "sec-fetch-site" to "same-origin",
+        "sec-fetch-user" to "?1"
     )
 
     override val mainPage = mainPageOf(
@@ -166,6 +173,7 @@ class AnimeVietSub : MainAPI() {
     ): Boolean {
         val epUrl = data
 
+        // Load trang tập phim để lấy cookies và token
         val pageResponse = runCatching {
             app.get(epUrl, interceptor = cfKiller, headers = defaultHeaders)
         }.getOrNull() ?: return false
@@ -173,12 +181,22 @@ class AnimeVietSub : MainAPI() {
         val html = pageResponse.text
         val doc = pageResponse.document
 
+        // Extract cookies từ response
+        val responseCookies = pageResponse.headers.entries()
+            .filter { it.first.equals("set-cookie", ignoreCase = true) }
+            .map { it.second }
+        
+        // Tìm token trong HTML/JavaScript
+        val tokenFromHtml = extractTokenFromHtml(html)
+        
+        // Parse filmInfo
         val filmId = Regex("""filmInfo\.filmID\s*=\s*parseInt\s*\(\s*['"](\d+)['"]\s*\)""")
             .find(html)?.groupValues?.get(1) ?: ""
         
         val episodeId = Regex("""filmInfo\.episodeID\s*=\s*parseInt\s*\(\s*['"](\d+)['"]\s*\)""")
             .find(html)?.groupValues?.get(1) ?: ""
 
+        // Parse hash từ AnimeVsub() call
         val jsHash = Regex("""AnimeVsub\s*\(\s*['"]([^'"]+)['"]\s*,\s*filmInfo\.filmID\s*\)""")
             .find(html)?.groupValues?.get(1) ?: ""
 
@@ -195,15 +213,10 @@ class AnimeVietSub : MainAPI() {
         }.distinct()
         hashList.addAll(allHashes)
 
-        val ajaxHeaders = mapOf(
-            "X-Requested-With" to "XMLHttpRequest",
-            "Content-Type"     to "application/x-www-form-urlencoded; charset=UTF-8",
-            "User-Agent"       to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept"           to "application/json, text/javascript, */*; q=0.01",
-            "Origin"           to mainUrl,
-            "Referer"          to epUrl
-        )
+        // Build headers với token nếu tìm thấy
+        val ajaxHeaders = buildAjaxHeaders(epUrl, tokenFromHtml)
 
+        // Thử từng hash
         for (hash in hashList.distinct()) {
             if (callPlayerApi(hash, filmId, epUrl, ajaxHeaders, callback, subtitleCallback)) return true
             if (callPlayerApi(hash, filmId, epUrl, ajaxHeaders, callback, subtitleCallback, backup = true)) return true
@@ -213,6 +226,58 @@ class AnimeVietSub : MainAPI() {
         if (callAllApi(episodeId, epUrl, ajaxHeaders, callback, subtitleCallback)) return true
 
         return false
+    }
+
+    private fun extractTokenFromHtml(html: String): String? {
+        // Tìm token trong JavaScript
+        // Pattern có thể là: tokene... = "..." hoặc setCookie("tokene...", "...")
+        
+        // Pattern 1: tokeneXXXX = "value"
+        Regex("""tokene[a-f0-9]+\s*=\s*['"]([^'"]+)['"]""").find(html)?.groupValues?.get(1)?.let { return it }
+        
+        // Pattern 2: setCookie("tokene...", "value")
+        Regex("""setCookie\s*\(\s*['"](tokene[a-f0-9]+)['"]\s*,\s*['"]([^'"]+)['"]""").find(html)?.let {
+            return "${it.groupValues[1]}=${it.groupValues[2]}"
+        }
+        
+        // Pattern 3: Cookies.set("tokene...", "value")
+        Regex("""Cookies\.set\s*\(\s*['"](tokene[a-f0-9]+)['"]\s*,\s*['"]([^'"]+)['"]""").find(html)?.let {
+            return "${it.groupValues[1]}=${it.groupValues[2]}"
+        }
+        
+        // Pattern 4: document.cookie = "tokene...=value"
+        Regex("""document\.cookie\s*=\s*['"]?(tokene[a-f0-9]+)=([^;'" ]+)""").find(html)?.let {
+            return "${it.groupValues[1]}=${it.groupValues[2]}"
+        }
+        
+        return null
+    }
+
+    private fun buildAjaxHeaders(referer: String, tokenCookie: String?): Map<String, String> {
+        val baseHeaders = mutableMapOf(
+            "X-Requested-With" to "XMLHttpRequest",
+            "Content-Type"     to "application/x-www-form-urlencoded; charset=UTF-8",
+            "User-Agent"       to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+            "Accept"           to "application/json, text/javascript, */*; q=0.01",
+            "Accept-Language"  to "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept-Encoding"  to "gzip, deflate, br, zstd",
+            "Origin"           to mainUrl,
+            "Referer"          to referer,
+            "sec-ch-ua"        to "\"Mises\";v=\"141\", \"Not?A_Brand\";v=\"8\", \"Chromium\";v=\"141\"",
+            "sec-ch-ua-mobile" to "?1",
+            "sec-ch-ua-platform" to "\"Android\"",
+            "sec-fetch-dest"   to "empty",
+            "sec-fetch-mode"   to "cors",
+            "sec-fetch-site"   to "same-origin",
+            "dnt"              to "1"
+        )
+        
+        // Thêm token cookie nếu có
+        if (!tokenCookie.isNullOrEmpty()) {
+            baseHeaders["Cookie"] = tokenCookie
+        }
+        
+        return baseHeaders
     }
 
     private suspend fun callPlayerApi(
@@ -379,7 +444,7 @@ class AnimeVietSub : MainAPI() {
                     currentUrl,
                     allowRedirects = false,
                     headers = mapOf(
-                        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36",
                         "Referer" to referer,
                         "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
                     )
@@ -394,7 +459,6 @@ class AnimeVietSub : MainAPI() {
                         if (location.contains(".m3u8")) {
                             M3u8Helper.generateM3u8("$name - $serverName", location, "https://abysscdn.com/").forEach(callback)
                         } else {
-                            // Use loadExtractor for mp4 links
                             loadExtractor(location, "https://abysscdn.com/", subtitleCallback, callback)
                         }
                         return true

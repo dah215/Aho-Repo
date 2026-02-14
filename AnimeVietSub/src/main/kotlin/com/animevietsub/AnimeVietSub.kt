@@ -45,14 +45,12 @@ class AnimeVietSub : MainAPI() {
         "User-Agent" to ua,
         "Accept"     to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "Accept-Language" to "vi-VN,vi;q=0.9,en;q=0.8",
-        "Sec-Ch-Ua" to "\"Not/A)Brand\";v=\"8\", \"Chromium\";v=\"126\", \"Google Chrome\";v=\"126\"",
-        "Sec-Ch-Ua-Mobile" to "?0",
-        "Sec-Ch-Ua-Platform" to "\"Windows\"",
+        "Priority"   to "u=0, i",
+        "Sec-Ch-Ua"  to "\"Not/A)Brand\";v=\"8\", \"Chromium\";v=\"126\", \"Google Chrome\";v=\"126\"",
         "Sec-Fetch-Dest" to "document",
         "Sec-Fetch-Mode" to "navigate",
         "Sec-Fetch-Site" to "none",
-        "Sec-Fetch-User" to "?1",
-        "Upgrade-Insecure-Requests" to "1"
+        "Sec-Fetch-User" to "?1"
     )
 
     private fun fixUrl(url: String?): String? {
@@ -127,10 +125,9 @@ class AnimeVietSub : MainAPI() {
     ): Boolean {
         val parts = data.split("@@")
         if (parts.size < 3) return false
-        val epUrl = parts[0]
-        val filmId = parts[1]
-        val episodeId = parts[2]
+        val (epUrl, filmId, episodeId) = parts
 
+        // Lấy Cookie phiên làm việc
         val pageReq = app.get(epUrl, interceptor = cfKiller, headers = defaultHeaders)
         val cookies = pageReq.cookies
 
@@ -143,10 +140,11 @@ class AnimeVietSub : MainAPI() {
             "Accept"           to "application/json, text/javascript, */*; q=0.01"
         )
 
-        // Step 1: Lấy Hash
+        // Bước 1: Lấy Hash (player2 trong log của bạn)
         val step1 = app.post(
             "$mainUrl/ajax/player",
             data = mapOf("episodeId" to episodeId, "backup" to "1"),
+            interceptor = cfKiller,
             headers = ajaxHeaders,
             cookies = cookies
         ).parsedSafe<ServerSelectionResp>() ?: return false
@@ -157,18 +155,14 @@ class AnimeVietSub : MainAPI() {
         val play = btn.attr("data-play")
         val btnId = btn.attr("data-id")
 
-        // Step 2: Lấy Link (Sử dụng episodeId thay vì filmId cho server api)
-        val params = if (play == "api") mapOf("link" to hash, "id" to episodeId)
+        // Bước 2: Lấy Link (player1 trong log của bạn - dùng filmId)
+        val params = if (play == "api") mapOf("link" to hash, "id" to filmId)
                      else mapOf("link" to hash, "play" to play, "id" to btnId, "backuplinks" to "1")
         
-        val step2 = app.post("$mainUrl/ajax/player", data = params, headers = ajaxHeaders, cookies = cookies)
+        val step2 = app.post("$mainUrl/ajax/player", data = params, interceptor = cfKiller, headers = ajaxHeaders, cookies = cookies)
         val parsed = step2.parsedSafe<PlayerResp>() ?: return false
 
-        val videoHeaders = mapOf(
-            "User-Agent" to ua,
-            "Referer"    to "$mainUrl/",
-            "Origin"     to mainUrl
-        )
+        val videoHeaders = mapOf("User-Agent" to ua, "Referer" to epUrl, "Origin" to mainUrl)
 
         if (play == "api") {
             val enc = parsed.linkArray?.firstOrNull()?.file ?: return false
@@ -180,10 +174,7 @@ class AnimeVietSub : MainAPI() {
                     this.type = ExtractorLinkType.M3U8
                 })
                 runCatching {
-                    M3u8Helper.generateM3u8(name, dec, epUrl, headers = videoHeaders).forEach { 
-                        it.headers = videoHeaders
-                        callback(it) 
-                    }
+                    M3u8Helper.generateM3u8(name, dec, epUrl, headers = videoHeaders).forEach(callback)
                 }
             } else if (dec.startsWith("http")) {
                 callback(newExtractorLink(name, name, dec) { this.headers = videoHeaders })
@@ -196,21 +187,33 @@ class AnimeVietSub : MainAPI() {
 
     private fun decryptLink(aes: String): String? {
         return try {
+            if (aes.startsWith("http")) return aes
             val key = MessageDigest.getInstance("SHA-256").digest(DECODE_PASSWORD.toByteArray(StandardCharsets.UTF_8))
             val decoded = Base64.decode(aes.replace("\\s".toRegex(), ""), Base64.DEFAULT)
+            if (decoded.size < 17) return null
+            
+            val iv = decoded.copyOfRange(0, 16)
+            val ct = decoded.copyOfRange(16, decoded.size)
+            
             val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
-            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(decoded.copyOfRange(0, 16)))
-            val plain = cipher.doFinal(decoded.copyOfRange(16, decoded.size))
-            val inflater = Inflater(true).apply { setInput(plain) }
-            val out = ByteArrayOutputStream()
-            val buf = ByteArray(8192)
-            while (!inflater.finished()) {
-                val n = inflater.inflate(buf)
-                if (n == 0) break
-                out.write(buf, 0, n)
+            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
+            val plain = cipher.doFinal(ct)
+            
+            // Thử giải nén (deflate), nếu lỗi thì trả về chuỗi thô
+            try {
+                val inflater = Inflater(true).apply { setInput(plain) }
+                val out = ByteArrayOutputStream()
+                val buf = ByteArray(8192)
+                while (!inflater.finished()) {
+                    val n = inflater.inflate(buf)
+                    if (n == 0) break
+                    out.write(buf, 0, n)
+                }
+                inflater.end()
+                String(out.toByteArray(), StandardCharsets.UTF_8).replace("\"", "").trim()
+            } catch (e: Exception) {
+                String(plain, StandardCharsets.UTF_8).replace("\"", "").trim()
             }
-            inflater.end()
-            String(out.toByteArray(), StandardCharsets.UTF_8).replace("\"", "").trim()
         } catch (e: Exception) { null }
     }
 

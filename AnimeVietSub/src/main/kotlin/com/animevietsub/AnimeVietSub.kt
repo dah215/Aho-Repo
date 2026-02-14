@@ -228,4 +228,43 @@ class AnimeVietSub : MainAPI() {
             val decoded = Base64.decode(aes.replace("\\s".toRegex(), ""), Base64.DEFAULT)
             if (decoded.size < 17) return null
             
-            val iv = decoded
+            val iv = decoded.copyOfRange(0, 16)
+            val ct = decoded.copyOfRange(16, decoded.size)
+            
+            val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
+            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
+            val plain = cipher.doFinal(ct)
+            
+            try {
+                val inflater = Inflater(true).apply { setInput(plain) }
+                val out = ByteArrayOutputStream()
+                val buf = ByteArray(8192)
+                while (!inflater.finished()) {
+                    val n = inflater.inflate(buf)
+                    if (n == 0) break
+                    out.write(buf, 0, n)
+                }
+                inflater.end()
+                String(out.toByteArray(), StandardCharsets.UTF_8).replace("\"", "").trim()
+            } catch (e: Exception) {
+                String(plain, StandardCharsets.UTF_8).replace("\"", "").trim()
+            }
+        } catch (e: Exception) { null }
+    }
+
+    data class ServerSelectionResp(@JsonProperty("html") val html: String? = null)
+    
+    data class PlayerResp(
+        @JsonProperty("link") val linkRaw: Any? = null,
+        @JsonProperty("success") val success: Int? = null
+    ) {
+        @Suppress("UNCHECKED_CAST")
+        val linkArray: List<LinkFile>? 
+            get() = (linkRaw as? List<*>)?.filterIsInstance<Map<String, Any?>>()?.map { 
+                LinkFile(it["file"] as? String) 
+            }
+        val linkString: String? get() = linkRaw as? String
+    }
+
+    data class LinkFile(@JsonProperty("file") val file: String? = null)
+}

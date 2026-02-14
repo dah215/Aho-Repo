@@ -37,6 +37,7 @@ class AnimeVietSub : MainAPI() {
 
     companion object {
         private const val DECODE_PASSWORD = "dm_thang_suc_vat_get_link_an_dbt"
+        private const val TAG = "AnimeVietSub"
     }
 
     private val cfKiller = CloudflareKiller()
@@ -55,18 +56,35 @@ class AnimeVietSub : MainAPI() {
 
     // ─────────────────────────────────────────────────────────────────────────
     // DECRYPT: AES-256-CBC + pako.inflateRaw
-    //
-    // ✅ XÁC NHẬN từ network Player1 response:
-    //    file = "Q/x+SJ6lo..." → có ký tự + và / → STANDARD base64 (DEFAULT)
-    //    KHÔNG phải URL_SAFE (đó là lý do decrypt thất bại tất cả lần trước!)
     // ─────────────────────────────────────────────────────────────────────────
     private fun decryptLink(aes: String): String? {
         return try {
             val cleaned = aes.replace(Regex("\\s"), "")
             val key     = MessageDigest.getInstance("SHA-256")
                             .digest(DECODE_PASSWORD.toByteArray(StandardCharsets.UTF_8))
-            // *** FIX QUAN TRỌNG: Base64.DEFAULT, KHÔNG phải URL_SAFE ***
-            val decoded = Base64.decode(cleaned, Base64.DEFAULT)
+            
+            // Thử cả STANDARD và URL_SAFE base64
+            val decoded = try {
+                Base64.decode(cleaned, Base64.DEFAULT)
+            } catch (e: Exception) {
+                try {
+                    Base64.decode(cleaned, Base64.URL_SAFE)
+                } catch (e2: Exception) {
+                    // Thử thay thế ký tự URL-safe thành standard
+                    val standardBase64 = cleaned
+                        .replace("-", "+")
+                        .replace("_", "/")
+                    val padding = (4 - standardBase64.length % 4) % 4
+                    val padded = standardBase64 + "=".repeat(padding)
+                    Base64.decode(padded, Base64.DEFAULT)
+                }
+            }
+            
+            if (decoded.size < 16) {
+                android.util.Log.e(TAG, "Decoded data too short: ${decoded.size}")
+                return null
+            }
+            
             val iv      = decoded.copyOfRange(0, 16)
             val ct      = decoded.copyOfRange(16, decoded.size)
             val cipher  = Cipher.getInstance("AES/CBC/PKCS5Padding")
@@ -75,6 +93,7 @@ class AnimeVietSub : MainAPI() {
             val result  = String(pakoInflateRaw(plain), StandardCharsets.UTF_8)
             result.replace("\\n", "\n").replace("\"", "").trim()
         } catch (e: Exception) {
+            android.util.Log.e(TAG, "decryptLink error: ${e.message}")
             e.printStackTrace()
             null
         }
@@ -97,7 +116,7 @@ class AnimeVietSub : MainAPI() {
 
     // ── Search response ───────────────────────────────────────────────────────
     private fun Element.toSearchResponse(): SearchResponse? {
-        val title  = selectFirst(".Title, h3")?.text()?.trim() ?: return null
+        val title  = selectFirst(".Title, h3, h2.Title")?.text()?.trim() ?: return null
         val href   = selectFirst("a")?.attr("href")            ?: return null
         val poster = selectFirst("img")?.let { img ->
             img.attr("data-src").ifEmpty { img.attr("data-original").ifEmpty { img.attr("src") } }
@@ -112,7 +131,7 @@ class AnimeVietSub : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page == 1) request.data else "${request.data}trang-$page.html"
         val items = app.get(url, interceptor = cfKiller, headers = defaultHeaders).document
-            .select("article.TPostMv, article.TPost")
+            .select("article.TPostMv, article.TPost, .TPostMv, .TPost")
             .distinctBy { it.selectFirst("a")?.attr("href") ?: it.text() }
             .mapNotNull { it.toSearchResponse() }
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
@@ -121,28 +140,24 @@ class AnimeVietSub : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/tim-kiem/${URLEncoder.encode(query, "utf-8")}/"
         return app.get(url, interceptor = cfKiller, headers = defaultHeaders).document
-            .select("article.TPostMv, article.TPost")
+            .select("article.TPostMv, article.TPost, .TPostMv, .TPost")
             .distinctBy { it.selectFirst("a")?.attr("href") ?: it.text() }
             .mapNotNull { it.toSearchResponse() }
     }
 
     // ── Load ──────────────────────────────────────────────────────────────────
-    // Data format: "epUrl@@filmId@@episodeId"
-    // epUrl     = URL trang xem tập (Referer)
-    // filmId    = ID phim từ URL (a5820 → 5820), dùng trong POST /ajax/player
-    // episodeId = data-id của tập (111047), dùng để lấy server list
     override suspend fun load(url: String): LoadResponse {
         var document      = app.get(url, interceptor = cfKiller, headers = defaultHeaders).document
-        var episodesNodes = document.select("ul.list-episode li a[data-id]")
+        var episodesNodes = document.select("ul.list-episode li a[data-id], .list-episode a[data-id], ul.list-ep a[data-id]")
 
         if (episodesNodes.isEmpty()) {
-            val firstEpHref = document.selectFirst("a[href*='/tap-']")
+            val firstEpHref = document.selectFirst("a[href*='/tap-'], a[href*='/xem-']")
                 ?.attr("href")?.let { if (it.startsWith("http")) it else "$mainUrl$it" }
             if (firstEpHref != null) {
                 runCatching {
                     app.get(firstEpHref, interceptor = cfKiller, headers = defaultHeaders).document
                 }.getOrNull()?.also { doc2 ->
-                    episodesNodes = doc2.select("ul.list-episode li a[data-id]")
+                    episodesNodes = doc2.select("ul.list-episode li a[data-id], .list-episode a[data-id], ul.list-ep a[data-id]")
                     if (episodesNodes.isNotEmpty()) document = doc2
                 }
             }
@@ -164,11 +179,11 @@ class AnimeVietSub : MainAPI() {
             }
         }
 
-        val title = document.selectFirst("h1.Title, .TPost h1")?.text()?.trim() ?: "Anime"
+        val title = document.selectFirst("h1.Title, .TPost h1, h1.entry-title")?.text()?.trim() ?: "Anime"
         return newAnimeLoadResponse(title, url, TvType.Anime) {
-            posterUrl = document.selectFirst(".Image img, .InfoImg img")
+            posterUrl = document.selectFirst(".Image img, .InfoImg img, .poster img")
                 ?.let { img -> img.attr("data-src").ifEmpty { img.attr("src") } }
-            plot = document.selectFirst(".Description, .InfoDesc, .TPost .Description")
+            plot = document.selectFirst(".Description, .InfoDesc, .TPost .Description, .entry-content")
                 ?.text()?.trim()
             episodes = if (episodesList.isNotEmpty())
                 mutableMapOf(DubStatus.Subbed to episodesList)
@@ -184,26 +199,32 @@ class AnimeVietSub : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val parts = data.split("@@")
-        if (parts.size < 3) return false
+        if (parts.size < 3) {
+            android.util.Log.e(TAG, "Invalid data format: $data")
+            return false
+        }
 
         val epUrl     = parts[0]  // URL trang tập (Referer)
         val filmId    = parts[1]  // Film ID (5820)
         val episodeId = parts[2]  // Episode ID (111047)
 
+        android.util.Log.d(TAG, "loadLinks: epUrl=$epUrl, filmId=$filmId, episodeId=$episodeId")
+
         val ajaxHeaders = mapOf(
             "X-Requested-With" to "XMLHttpRequest",
             "Content-Type"     to "application/x-www-form-urlencoded; charset=UTF-8",
-            "User-Agent"       to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            "User-Agent"       to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept"           to "application/json, text/javascript, */*; q=0.01",
+            "Origin"           to mainUrl
         )
 
         // Warm CF cookies
-        runCatching { app.get(epUrl, interceptor = cfKiller, headers = defaultHeaders) }
+        runCatching { 
+            app.get(epUrl, interceptor = cfKiller, headers = defaultHeaders) 
+        }
 
         // ═══════════════════════════════════════════════════════════════════════
         // BƯỚC 1: POST /ajax/player với episodeId để lấy server selection HTML
-        //
-        // ✅ Xác nhận từ Player2: episodeId=111047&backup=1
-        //    Response: {"html": "<a data-href='7tEB...' data-play='api'>DU</a>..."}
         // ═══════════════════════════════════════════════════════════════════════
         val step1 = runCatching {
             app.post(
@@ -215,37 +236,59 @@ class AnimeVietSub : MainAPI() {
             ).parsedSafe<ServerSelectionResponse>()
         }.getOrNull()
 
-        val htmlContent = step1?.html ?: return false
-        val serverDoc   = Jsoup.parse(htmlContent)
+        val htmlContent = step1?.html
+        if (htmlContent.isNullOrBlank()) {
+            android.util.Log.e(TAG, "Step 1 failed: no HTML content")
+            // Thử lại với backup=0
+            val step1Retry = runCatching {
+                app.post(
+                    "$mainUrl/ajax/player",
+                    data        = mapOf("episodeId" to episodeId, "backup" to "0"),
+                    interceptor = cfKiller,
+                    referer     = epUrl,
+                    headers     = ajaxHeaders
+                ).parsedSafe<ServerSelectionResponse>()
+            }.getOrNull()
+            
+            if (step1Retry?.html.isNullOrBlank()) {
+                android.util.Log.e(TAG, "Step 1 retry also failed")
+                return false
+            }
+        }
+
+        val serverDoc = Jsoup.parse(htmlContent ?: step1?.html ?: "")
 
         // Ưu tiên server api (DU), bỏ qua embed (HDX/ADS có quảng cáo)
-        val server = serverDoc.selectFirst("a.btn3dsv[data-play=api]")
-            ?: serverDoc.selectFirst("a.btn3dsv")
-            ?: return false
+        var server = serverDoc.selectFirst("a.btn3dsv[data-play=api], a[data-play=api]")
+        if (server == null) {
+            server = serverDoc.selectFirst("a.btn3dsv, a.server-item, a[data-href]")
+        }
+        
+        if (server == null) {
+            android.util.Log.e(TAG, "No server found in HTML: ${serverDoc.html().take(500)}")
+            return false
+        }
 
         val serverHash = server.attr("data-href").trim()
-        val serverPlay = server.attr("data-play").trim()
-        val serverId   = server.attr("data-id").trim()   // data-id của SERVER button (không phải episode)
+        val serverPlay = server.attr("data-play").ifEmpty { "api" }.trim()
+        val serverId   = server.attr("data-id").trim()
 
-        if (serverHash.isEmpty()) return false
+        android.util.Log.d(TAG, "Server: hash=$serverHash, play=$serverPlay, id=$serverId")
+
+        if (serverHash.isEmpty()) {
+            android.util.Log.e(TAG, "Server hash is empty")
+            return false
+        }
 
         // ═══════════════════════════════════════════════════════════════════════
         // BƯỚC 2: POST /ajax/player với server hash để lấy encrypted/direct link
-        //
-        // ✅ Xác nhận từ Player1 (DU/api):
-        //    Payload: link=7tEB...&id=5820
-        //    Response: {"link":[{"file":"Q/x+SJ6lo..."}], "playTech":"api"}
-        //    → file dùng STANDARD BASE64 (có + và /)
-        //
-        // ✅ Xác nhận từ Player3 (HDX/embed):
-        //    Payload: link=PP_g8...&play=embed&id=3&backuplinks=1
-        //    Response: {"link":"https://short.icu/...","playTech":"embed"}
-        //    → link là URL trực tiếp (có quảng cáo)
         // ═══════════════════════════════════════════════════════════════════════
         val step2Params = when (serverPlay) {
             "api"   -> mapOf("link" to serverHash, "id" to filmId)
             else    -> mapOf("link" to serverHash, "play" to serverPlay, "id" to serverId, "backuplinks" to "1")
         }
+
+        android.util.Log.d(TAG, "Step 2 params: $step2Params")
 
         val step2Resp = runCatching {
             app.post(
@@ -255,30 +298,90 @@ class AnimeVietSub : MainAPI() {
                 referer     = epUrl,
                 headers     = ajaxHeaders
             )
-        }.getOrNull() ?: return false
+        }.getOrNull()
+
+        if (step2Resp == null) {
+            android.util.Log.e(TAG, "Step 2: No response")
+            return false
+        }
 
         val respText = step2Resp.text.trim()
-        if (respText.isBlank() || respText.startsWith("<")) return false
+        android.util.Log.d(TAG, "Step 2 response: ${respText.take(500)}")
 
-        val parsed = step2Resp.parsedSafe<PlayerResponse>() ?: return false
+        if (respText.isBlank() || respText.startsWith("<")) {
+            android.util.Log.e(TAG, "Step 2: Invalid response format")
+            return false
+        }
+
+        val parsed = step2Resp.parsedSafe<PlayerResponse>()
+        if (parsed == null) {
+            android.util.Log.e(TAG, "Step 2: Failed to parse JSON")
+            return false
+        }
+
+        android.util.Log.d(TAG, "Parsed: playTech=${parsed.playTech}, linkString=${parsed.linkString?.take(100)}, linkArray=${parsed.linkArray?.size}")
 
         return when (parsed.playTech) {
             // ── API server (DU): link là array [{file: "<standard_base64_encrypted>"}]
             "api" -> {
                 val encryptedFile = parsed.linkArray
                     ?.firstNotNullOfOrNull { it.file?.takeIf(String::isNotBlank) }
-                    ?: return false
-                val decrypted = decryptLink(encryptedFile) ?: return false
+                
+                if (encryptedFile == null) {
+                    android.util.Log.e(TAG, "No encrypted file found in linkArray")
+                    
+                    // Thử lấy từ linkString nếu linkArray null
+                    val directLink = parsed.linkString?.takeIf { it.startsWith("http") }
+                    if (directLink != null) {
+                        android.util.Log.d(TAG, "Found direct link in linkString")
+                        return loadExtractor(directLink, epUrl, subtitleCallback, callback)
+                    }
+                    return false
+                }
+                
+                val decrypted = decryptLink(encryptedFile)
+                if (decrypted == null) {
+                    android.util.Log.e(TAG, "Decryption failed for: ${encryptedFile.take(50)}")
+                    return false
+                }
+                
+                android.util.Log.d(TAG, "Decrypted: ${decrypted.take(200)}")
                 handleDecryptedLink(decrypted, epUrl, callback, subtitleCallback)
             }
             // ── Embed server (HDX): link là string URL trực tiếp
             "embed" -> {
                 val directUrl = parsed.linkString?.takeIf { it.startsWith("http") }
-                    ?: return false
+                if (directUrl == null) {
+                    android.util.Log.e(TAG, "No direct URL in embed mode")
+                    return false
+                }
                 loadExtractor(directUrl, epUrl, subtitleCallback, callback)
                 true
             }
-            else -> false
+            // ── Unknown playTech - thử xử lý linh hoạt
+            else -> {
+                android.util.Log.d(TAG, "Unknown playTech: ${parsed.playTech}, trying flexible handling")
+                
+                // Thử linkArray trước
+                val encryptedFile = parsed.linkArray
+                    ?.firstNotNullOfOrNull { it.file?.takeIf(String::isNotBlank) }
+                
+                if (encryptedFile != null) {
+                    val decrypted = decryptLink(encryptedFile)
+                    if (decrypted != null) {
+                        return handleDecryptedLink(decrypted, epUrl, callback, subtitleCallback)
+                    }
+                }
+                
+                // Thử linkString
+                val directUrl = parsed.linkString?.takeIf { it.startsWith("http") }
+                if (directUrl != null) {
+                    loadExtractor(directUrl, epUrl, subtitleCallback, callback)
+                    return true
+                }
+                
+                false
+            }
         }
     }
 
@@ -290,6 +393,8 @@ class AnimeVietSub : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit
     ): Boolean {
         val link = decrypted.trim()
+        android.util.Log.d(TAG, "handleDecryptedLink: ${link.take(200)}")
+        
         return when {
             link.contains(".m3u8") && link.startsWith("http") -> {
                 M3u8Helper.generateM3u8(name, link, referer).forEach(callback)
@@ -304,15 +409,20 @@ class AnimeVietSub : MainAPI() {
                 true
             }
             link.contains("\n") -> {
+                var foundAny = false
                 link.lines().filter { it.trim().startsWith("http") }.forEach { url ->
+                    foundAny = true
                     if (url.contains(".m3u8"))
                         M3u8Helper.generateM3u8(name, url.trim(), referer).forEach(callback)
                     else
                         loadExtractor(url.trim(), referer, subtitleCallback, callback)
                 }
-                true
+                foundAny
             }
-            else -> false
+            else -> {
+                android.util.Log.e(TAG, "Unknown decrypted format: ${link.take(100)}")
+                false
+            }
         }
     }
 

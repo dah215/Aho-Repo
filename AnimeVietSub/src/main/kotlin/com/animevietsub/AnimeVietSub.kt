@@ -73,7 +73,6 @@ class AnimeVietSub : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val data = request.data.ifBlank { return newHomePageResponse(request.name, emptyList(), false) }
         val url = if (page == 1) data else "${data.removeSuffix("/")}/trang-$page.html"
-        
         val fixedUrl = fixUrl(url) ?: return newHomePageResponse(request.name, emptyList(), false)
         
         val doc = app.get(fixedUrl, interceptor = cfKiller, headers = defaultHeaders).document
@@ -141,6 +140,7 @@ class AnimeVietSub : MainAPI() {
         if (parts.size < 3) return false
         val (epUrl, filmId, episodeId) = parts
 
+        // 1. Khởi tạo Session và lấy Cookie
         val pageReq = app.get(epUrl, interceptor = cfKiller, headers = defaultHeaders)
         val cookies = pageReq.cookies
 
@@ -150,14 +150,16 @@ class AnimeVietSub : MainAPI() {
             "Referer"          to epUrl,
             "Origin"           to mainUrl,
             "User-Agent"       to ua,
-            "Accept"           to "application/json, text/javascript, */*; q=0.01"
+            "Accept"           to "application/json, text/javascript, */*; q=0.01",
+            "Sec-Fetch-Mode"   to "cors",
+            "Sec-Fetch-Site"   to "same-origin"
         )
 
-        // Gọi get_episode để kích hoạt session (Dựa trên log của bạn)
+        // 2. Gọi get_episode (Dựa trên log của bạn - Rất quan trọng để tránh lỗi 2001)
         app.get("$mainUrl/ajax/get_episode?filmId=$filmId&episodeId=$episodeId", 
                 headers = ajaxHeaders, cookies = cookies, interceptor = cfKiller)
 
-        // Bước 1: Lấy Hash
+        // 3. Bước 1: Lấy Hash
         val step1 = app.post(
             "$mainUrl/ajax/player",
             data = mapOf("episodeId" to episodeId, "backup" to "1"),
@@ -172,32 +174,41 @@ class AnimeVietSub : MainAPI() {
         val play = btn.attr("data-play")
         val btnId = btn.attr("data-id")
 
-        // Bước 2: Lấy Link (Dùng filmId đúng như log bạn bắt được)
+        // 4. Bước 2: Lấy Link mã hóa
         val params = if (play == "api") mapOf("link" to hash, "id" to filmId)
                      else mapOf("link" to hash, "play" to play, "id" to btnId, "backuplinks" to "1")
         
         val step2 = app.post("$mainUrl/ajax/player", data = params, interceptor = cfKiller, headers = ajaxHeaders, cookies = cookies)
         val parsed = step2.parsedSafe<PlayerResp>() ?: return false
 
-        val videoHeaders = mapOf("User-Agent" to ua, "Referer" to epUrl, "Origin" to mainUrl)
+        val videoHeaders = mapOf(
+            "User-Agent" to ua, 
+            "Referer"    to epUrl, 
+            "Origin"     to mainUrl,
+            "Accept"     to "*/*"
+        )
 
         if (play == "api") {
             val enc = parsed.linkArray?.firstOrNull()?.file ?: return false
             val dec = decryptLink(enc) ?: return false
             
-            if (dec.contains(".m3u8") || dec.contains(".html")) {
-                callback(newExtractorLink(name, name, dec) {
+            // 5. Xử lý Redirect (Dựa trên log video0.html, video1.html... trả về 302)
+            // Chúng ta sẽ tự follow redirect để lấy link m3u8 cuối cùng
+            val finalUrl = if (dec.startsWith("http")) {
+                val res = app.get(dec, headers = videoHeaders, cookies = cookies, interceptor = cfKiller, followRedirects = true)
+                res.url
+            } else dec
+
+            if (finalUrl.contains(".m3u8")) {
+                callback(newExtractorLink(name, name, finalUrl) {
                     this.headers = videoHeaders
-                    this.type = if (dec.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                    this.type = ExtractorLinkType.M3U8
                 })
-                
-                if (dec.contains(".m3u8")) {
-                    runCatching {
-                        M3u8Helper.generateM3u8(name, dec, epUrl, headers = videoHeaders).forEach(callback)
-                    }
+                runCatching {
+                    M3u8Helper.generateM3u8(name, finalUrl, epUrl, headers = videoHeaders).forEach(callback)
                 }
-            } else if (dec.startsWith("http")) {
-                callback(newExtractorLink(name, name, dec) { this.headers = videoHeaders })
+            } else if (finalUrl.startsWith("http")) {
+                callback(newExtractorLink(name, name, finalUrl) { this.headers = videoHeaders })
             }
         } else {
             parsed.linkString?.let { if (it.startsWith("http")) loadExtractor(it, epUrl, subtitleCallback, callback) }

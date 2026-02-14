@@ -45,7 +45,6 @@ class AnimeVietSub : MainAPI() {
         "User-Agent" to ua,
         "Accept"     to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "Accept-Language" to "vi-VN,vi;q=0.9,en;q=0.8",
-        "Priority"   to "u=0, i",
         "Sec-Ch-Ua"  to "\"Not/A)Brand\";v=\"8\", \"Chromium\";v=\"126\", \"Google Chrome\";v=\"126\"",
         "Sec-Fetch-Dest" to "document",
         "Sec-Fetch-Mode" to "navigate",
@@ -127,7 +126,7 @@ class AnimeVietSub : MainAPI() {
         if (parts.size < 3) return false
         val (epUrl, filmId, episodeId) = parts
 
-        // Lấy Cookie phiên làm việc
+        // 1. Lấy Cookie và gọi get_episode (Dựa trên log của bạn)
         val pageReq = app.get(epUrl, interceptor = cfKiller, headers = defaultHeaders)
         val cookies = pageReq.cookies
 
@@ -140,7 +139,11 @@ class AnimeVietSub : MainAPI() {
             "Accept"           to "application/json, text/javascript, */*; q=0.01"
         )
 
-        // Bước 1: Lấy Hash (player2 trong log của bạn)
+        // Gọi get_episode để kích hoạt session
+        app.get("$mainUrl/ajax/get_episode?filmId=$filmId&episodeId=$episodeId", 
+                headers = ajaxHeaders, cookies = cookies, interceptor = cfKiller)
+
+        // 2. Bước 1: Lấy Hash (player request đầu tiên)
         val step1 = app.post(
             "$mainUrl/ajax/player",
             data = mapOf("episodeId" to episodeId, "backup" to "1"),
@@ -155,26 +158,35 @@ class AnimeVietSub : MainAPI() {
         val play = btn.attr("data-play")
         val btnId = btn.attr("data-id")
 
-        // Bước 2: Lấy Link (player1 trong log của bạn - dùng filmId)
+        // 3. Bước 2: Lấy Link mã hóa (player request thứ hai)
         val params = if (play == "api") mapOf("link" to hash, "id" to filmId)
                      else mapOf("link" to hash, "play" to play, "id" to btnId, "backuplinks" to "1")
         
         val step2 = app.post("$mainUrl/ajax/player", data = params, interceptor = cfKiller, headers = ajaxHeaders, cookies = cookies)
         val parsed = step2.parsedSafe<PlayerResp>() ?: return false
 
-        val videoHeaders = mapOf("User-Agent" to ua, "Referer" to epUrl, "Origin" to mainUrl)
+        val videoHeaders = mapOf(
+            "User-Agent" to ua, 
+            "Referer"    to epUrl, 
+            "Origin"     to mainUrl,
+            "Accept"     to "*/*"
+        )
 
         if (play == "api") {
             val enc = parsed.linkArray?.firstOrNull()?.file ?: return false
             val dec = decryptLink(enc) ?: return false
             
-            if (dec.contains(".m3u8")) {
+            if (dec.contains(".m3u8") || dec.contains(".html")) {
+                // Gửi link kèm Header, Cloudstream sẽ tự động follow redirect (302)
                 callback(newExtractorLink(name, name, dec) {
                     this.headers = videoHeaders
-                    this.type = ExtractorLinkType.M3U8
+                    this.type = if (dec.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                 })
-                runCatching {
-                    M3u8Helper.generateM3u8(name, dec, epUrl, headers = videoHeaders).forEach(callback)
+                
+                if (dec.contains(".m3u8")) {
+                    runCatching {
+                        M3u8Helper.generateM3u8(name, dec, epUrl, headers = videoHeaders).forEach(callback)
+                    }
                 }
             } else if (dec.startsWith("http")) {
                 callback(newExtractorLink(name, name, dec) { this.headers = videoHeaders })
@@ -199,7 +211,6 @@ class AnimeVietSub : MainAPI() {
             cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
             val plain = cipher.doFinal(ct)
             
-            // Thử giải nén (deflate), nếu lỗi thì trả về chuỗi thô
             try {
                 val inflater = Inflater(true).apply { setInput(plain) }
                 val out = ByteArrayOutputStream()

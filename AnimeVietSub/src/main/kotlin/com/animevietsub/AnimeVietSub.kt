@@ -45,10 +45,8 @@ class AnimeVietSub : MainAPI() {
         "User-Agent" to ua,
         "Accept"     to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "Accept-Language" to "vi-VN,vi;q=0.9,en;q=0.8",
-        "Cache-Control" to "no-cache",
-        "Pragma" to "no-cache",
-        "Priority" to "u=0, i",
-        "Sec-Ch-Ua" to "\"Not/A)Brand\";v=\"8\", \"Chromium\";v=\"126\", \"Google Chrome\";v=\"126\"",
+        "Priority"   to "u=0, i",
+        "Sec-Ch-Ua"  to "\"Not/A)Brand\";v=\"8\", \"Chromium\";v=\"126\", \"Google Chrome\";v=\"126\"",
         "Sec-Fetch-Dest" to "document",
         "Sec-Fetch-Mode" to "navigate",
         "Sec-Fetch-Site" to "none",
@@ -56,6 +54,7 @@ class AnimeVietSub : MainAPI() {
     )
 
     override val mainPage = mainPageOf(
+        "$mainUrl/"                           to "Trang Chủ",
         "$mainUrl/danh-sach/list-dang-chieu/" to "Đang Chiếu",
         "$mainUrl/danh-sach/list-tron-bo/"    to "Trọn Bộ",
         "$mainUrl/anime-le/"                  to "Anime Lẻ",
@@ -80,8 +79,8 @@ class AnimeVietSub : MainAPI() {
         val res = app.get(url, interceptor = cfKiller, headers = defaultHeaders)
         val doc = res.document
         
-        // Sử dụng Selector rộng hơn để tránh màn hình đen
-        val items = doc.select("article, .TPostMv, .item, .list-film li, .TPost").mapNotNull { 
+        // Selector cực mạnh để tránh màn hình đen
+        val items = doc.select(".TPostMv, article.TPost, .item-film, .list-film li, .item").mapNotNull { 
             it.toSearchResponse() 
         }.distinctBy { it.url }
         
@@ -89,9 +88,12 @@ class AnimeVietSub : MainAPI() {
     }
 
     private fun Element.toSearchResponse(): SearchResponse? {
-        val title = selectFirst(".Title, h3, h2, .title")?.text()?.trim() ?: return null
         val a = selectFirst("a") ?: return null
         val href = fixUrl(a.attr("href")) ?: return null
+        val title = selectFirst(".Title, h3, h2, .title, .name")?.text()?.trim() 
+                    ?: a.attr("title").trim()
+                    ?: selectFirst("img")?.attr("alt")?.trim()
+                    ?: return null
         
         val img = selectFirst("img")
         val poster = fixUrl(img?.attr("data-src")?.takeIf { it.isNotBlank() } 
@@ -106,7 +108,7 @@ class AnimeVietSub : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/tim-kiem/${URLEncoder.encode(query, "utf-8")}/"
         return app.get(url, interceptor = cfKiller, headers = defaultHeaders).document
-            .select("article, .TPostMv, .item, .list-film li").mapNotNull { it.toSearchResponse() }
+            .select(".TPostMv, article.TPost, .item-film, .list-film li").mapNotNull { it.toSearchResponse() }
             .distinctBy { it.url }
     }
 
@@ -156,6 +158,7 @@ class AnimeVietSub : MainAPI() {
         if (parts.size < 3) return false
         val (epUrl, filmId, episodeId) = parts
 
+        // 1. Khởi tạo Session
         val pageReq = app.get(epUrl, interceptor = cfKiller, headers = defaultHeaders)
         val cookies = pageReq.cookies
 
@@ -168,6 +171,7 @@ class AnimeVietSub : MainAPI() {
             "Accept"           to "application/json, text/javascript, */*; q=0.01"
         )
 
+        // 2. Bước 1: Lấy Hash (player request đầu tiên trong log)
         val step1 = app.post(
             "$mainUrl/ajax/player",
             data = mapOf("episodeId" to episodeId, "backup" to "1"),
@@ -182,35 +186,16 @@ class AnimeVietSub : MainAPI() {
         val play = btn.attr("data-play")
         val btnId = btn.attr("data-id")
 
+        // 3. Kích hoạt tập phim (get_episode trong log - CỰC KỲ QUAN TRỌNG)
         app.get("$mainUrl/ajax/get_episode?filmId=$filmId&episodeId=$episodeId", 
                 headers = ajaxHeaders, cookies = cookies, interceptor = cfKiller)
 
-        val idsToTry = listOf(filmId, episodeId)
-        var finalDecrypted: String? = null
-
-        for (id in idsToTry) {
-            val params = if (play == "api") mapOf("link" to hash, "id" to id)
-                         else mapOf("link" to hash, "play" to play, "id" to btnId, "backuplinks" to "1")
-            
-            val step2 = app.post("$mainUrl/ajax/player", data = params, interceptor = cfKiller, headers = ajaxHeaders, cookies = cookies)
-            val parsed = step2.parsedSafe<PlayerResp>()
-            
-            if (play == "api") {
-                val enc = parsed?.linkArray?.firstOrNull()?.file
-                if (enc != null) {
-                    finalDecrypted = decryptLink(enc)
-                    if (finalDecrypted != null && finalDecrypted.startsWith("http")) break
-                }
-            } else {
-                val direct = parsed?.linkString
-                if (direct != null && direct.startsWith("http")) {
-                    loadExtractor(direct, epUrl, subtitleCallback, callback)
-                    return true
-                }
-            }
-        }
-
-        val decrypted = finalDecrypted ?: return false
+        // 4. Bước 2: Lấy Link mã hóa (player request thứ hai trong log)
+        val params = if (play == "api") mapOf("link" to hash, "id" to filmId)
+                     else mapOf("link" to hash, "play" to play, "id" to btnId, "backuplinks" to "1")
+        
+        val step2 = app.post("$mainUrl/ajax/player", data = params, interceptor = cfKiller, headers = ajaxHeaders, cookies = cookies)
+        val parsed = step2.parsedSafe<PlayerResp>() ?: return false
 
         val videoHeaders = mapOf(
             "User-Agent" to ua, 
@@ -219,29 +204,36 @@ class AnimeVietSub : MainAPI() {
             "Accept"     to "*/*"
         )
 
-        var realUrl = decrypted
-        if (decrypted.startsWith("http") && (decrypted.contains(".html") || !decrypted.contains(".m3u8"))) {
-            runCatching {
-                val res = app.get(decrypted, headers = videoHeaders, cookies = cookies, interceptor = cfKiller)
-                realUrl = res.url
-            }
-        }
-
-        if (realUrl.contains(".m3u8")) {
-            callback(newExtractorLink(name, name, realUrl) {
-                this.headers = videoHeaders
-                this.type = ExtractorLinkType.M3U8
-            })
-            runCatching {
-                M3u8Helper.generateM3u8(name, realUrl, epUrl, headers = videoHeaders).forEach { 
-                    it.headers = videoHeaders
-                    callback(it)
+        if (play == "api") {
+            val enc = parsed.linkArray?.firstOrNull()?.file ?: return false
+            val dec = decryptLink(enc) ?: return false
+            
+            // 5. Xử lý Redirect (video0.html... trong log)
+            var finalUrl = dec
+            if (dec.startsWith("http") && (dec.contains(".html") || !dec.contains(".m3u8"))) {
+                runCatching {
+                    val res = app.get(dec, headers = videoHeaders, cookies = cookies, interceptor = cfKiller)
+                    finalUrl = res.url
                 }
             }
-        } else if (realUrl.startsWith("http")) {
-            callback(newExtractorLink(name, name, realUrl) { this.headers = videoHeaders })
-        }
 
+            if (finalUrl.contains(".m3u8")) {
+                callback(newExtractorLink(name, name, finalUrl) {
+                    this.headers = videoHeaders
+                    this.type = ExtractorLinkType.M3U8
+                })
+                runCatching {
+                    M3u8Helper.generateM3u8(name, finalUrl, epUrl, headers = videoHeaders).forEach { 
+                        it.headers = videoHeaders
+                        callback(it)
+                    }
+                }
+            } else if (finalUrl.startsWith("http")) {
+                callback(newExtractorLink(name, name, finalUrl) { this.headers = videoHeaders })
+            }
+        } else {
+            parsed.linkString?.let { if (it.startsWith("http")) loadExtractor(it, epUrl, subtitleCallback, callback) }
+        }
         return true
     }
 

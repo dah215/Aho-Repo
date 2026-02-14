@@ -19,6 +19,15 @@ import java.nio.charset.StandardCharsets
 import java.util.zip.Inflater
 import java.io.ByteArrayOutputStream
 
+/**
+ * AnimeVietSub CloudStream3 Plugin - v14
+ * 
+ * Changelog v14:
+ * - Sửa selector cho đúng class (btn-episode, btn3d)
+ * - Thử nhiều cách lấy hash
+ * - Thêm log chi tiết để debug
+ * - Thử nhiều server fallback
+ */
 
 @CloudstreamPlugin
 class AnimeVietSubPlugin : Plugin() {
@@ -555,7 +564,7 @@ class AnimeVietSub : MainAPI() {
         }
     }
 
-    private fun parseM3u8Content(content: String, referer: String, callback: (ExtractorLink) -> Unit) {
+    private suspend fun parseM3u8Content(content: String, referer: String, callback: (ExtractorLink) -> Unit) {
         val lines = content.lines()
         lines.forEachIndexed { i, line ->
             if (line.startsWith("#EXT-X-STREAM-INF")) {

@@ -195,9 +195,10 @@ class AnimeVietSub : MainAPI() {
                 if (!href.contains("/a") && !href.contains("/phim-")) continue
                 
                 val img = link.selectFirst("img") ?: link.selectFirst("img[data-src]")
-                val title = link.attr("title").ifEmpty { link.text() }
-                    .ifEmpty { img?.attr("alt") }
-                    .ifEmpty { img?.attr("title") }
+                val title = link.attr("title").takeIf { it.isNotBlank() }
+                    ?: link.text().trim().takeIf { it.isNotBlank() }
+                    ?: img?.attr("alt")?.takeIf { it.isNotBlank() }
+                    ?: img?.attr("title")?.takeIf { it.isNotBlank() }
                     ?: continue
                 
                 val poster = fixUrl(
@@ -386,13 +387,13 @@ class AnimeVietSub : MainAPI() {
         logInfo("Film ID: $filmId")
 
         val episodes = episodesNodes.mapNotNull { ep ->
-            val id = ep.attr("data-id").trim()
-                .ifEmpty { ep.attr("data-episode-id").trim() }
-                .ifEmpty { Regex("tap-(\\d+)").find(ep.attr("href"))?.groupValues?.get(1) }
+            val id = ep.attr("data-id").trim().takeIf { it.isNotBlank() }
+                ?: ep.attr("data-episode-id").trim().takeIf { it.isNotBlank() }
+                ?: Regex("tap-(\\d+)").find(ep.attr("href"))?.groupValues?.get(1)
             
             val href = fixUrl(ep.attr("href")) ?: return@mapNotNull null
-            val name = ep.text().trim().ifEmpty { ep.attr("title") }
-            val epNum = Regex("\\d+").find(name ?: "")?.value?.toIntOrNull()
+            val name = ep.text().trim().takeIf { it.isNotBlank() } ?: ep.attr("title").takeIf { it.isNotBlank() } ?: "Tập $id"
+            val epNum = Regex("\\d+").find(name)?.value?.toIntOrNull()
                 ?: Regex("tap-(\\d+)").find(href)?.groupValues?.get(1)?.toIntOrNull()
             
             newEpisode("$href@@$filmId@@$id@@$name") {
@@ -436,11 +437,9 @@ class AnimeVietSub : MainAPI() {
         for (selector in posterSelectors) {
             val img = doc.selectFirst(selector) ?: continue
             val url = fixUrl(
-                img.attr("data-src").ifEmpty { 
-                    img.attr("data-original").ifEmpty { 
-                        img.attr("src") 
-                    } 
-                }
+                img.attr("data-src").takeIf { it.isNotBlank() }
+                ?: img.attr("data-original").takeIf { it.isNotBlank() }
+                ?: img.attr("src").takeIf { it.isNotBlank() }
             )
             if (!url.isNullOrBlank()) return url
         }
@@ -536,9 +535,9 @@ class AnimeVietSub : MainAPI() {
         
         for (selector in embeddedSelectors) {
             val el = pageDoc.selectFirst(selector) ?: continue
-            val url = el.attr("src")
-                .ifEmpty { el.attr("data-src") }
-                .ifEmpty { el.attr("data-video-url") }
+            val url = el.attr("src").takeIf { it.isNotBlank() }
+                ?: el.attr("data-src").takeIf { it.isNotBlank() }
+                ?: el.attr("data-video-url").takeIf { it.isNotBlank() }
             
             if (!url.isNullOrBlank() && url.startsWith("http")) {
                 logInfo("Found embedded URL with $selector: $url")
@@ -646,10 +645,10 @@ class AnimeVietSub : MainAPI() {
 
         // Try each button
         for (btn in buttons) {
-            val hash = btn.attr("data-href")
-                .ifEmpty { btn.attr("data-link") }
-                .ifEmpty { btn.attr("href") }
-                .ifEmpty { btn.attr("onclick")?.let { Regex("['\"]([a-zA-Z0-9+/=]+)['\"]").find(it)?.groupValues?.get(1) } }
+            val hash = btn.attr("data-href").takeIf { it.isNotBlank() }
+                ?: btn.attr("data-link").takeIf { it.isNotBlank() }
+                ?: btn.attr("href").takeIf { it.isNotBlank() }
+                ?: btn.attr("onclick")?.let { Regex("['\"]([a-zA-Z0-9+/=]+)['\"]").find(it)?.groupValues?.get(1) }
             
             val play = btn.attr("data-play")
             val btnId = btn.attr("data-id")
@@ -789,9 +788,9 @@ class AnimeVietSub : MainAPI() {
 
             for (selector in videoSelectors) {
                 val el = doc.selectFirst(selector) ?: continue
-                val url = el.attr("src")
-                    .ifEmpty { el.attr("data-src") }
-                    .ifEmpty { el.attr("data-video-url") }
+                val url = el.attr("src").takeIf { it.isNotBlank() }
+                    ?: el.attr("data-src").takeIf { it.isNotBlank() }
+                    ?: el.attr("data-video-url").takeIf { it.isNotBlank() }
                 
                 if (!url.isNullOrBlank() && url.startsWith("http")) {
                     logInfo("Direct extraction found: $url")

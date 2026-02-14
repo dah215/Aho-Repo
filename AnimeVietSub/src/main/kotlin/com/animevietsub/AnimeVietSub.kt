@@ -39,16 +39,19 @@ object Crypto {
         if (b64.isNullOrBlank()) return null
         val cleaned = b64.trim().replace("\\s".toRegex(), "")
 
+        // Special Case: Base64 direct check
         try {
             val s = String(Base64.decode(cleaned, Base64.DEFAULT), StandardCharsets.UTF_8)
             if (isUrl(s)) return s
         } catch (_: Exception) {}
 
+        // Strategy 1: OpenSSL AES-256-CBC
         for (pass in PASSES) {
             val r = tryOpenSSL(cleaned, pass) ?: continue
             if (isUrl(r)) return r
         }
 
+        // Strategy 2: Raw AES with multiple hashes
         for (pass in PASSES) {
             for (algo in listOf("MD5", "SHA-256")) {
                 for (usePrefix in listOf(true, false)) {
@@ -311,7 +314,7 @@ class AnimeVietSub : MainAPI() {
 
         var found = false
 
-        // STRATEGY A: RSS/XML get_episode API (Most stable for direct links)
+        // STRATEGY A: RSS/XML get_episode API (Stable for direct links)
         found = withTimeoutOrNull(20_000L) {
             rssStrategy(filmId, candidates, aH, cookies, vH, subtitleCallback, callback)
         } ?: false
@@ -364,9 +367,24 @@ class AnimeVietSub : MainAPI() {
     ): Boolean {
         for (epId in candidates) {
             try {
-                // Try multiple parameter combinations including the new 'link' payload found by user
-                val doc = Jsoup.parse(app.get(epUrl, headers = baseHeaders, cookies = cookies, interceptor = cfKiller).text ?: "")
+                // Step 1: Get player HTML to find server buttons
+                val r1 = app.post("$mainUrl/ajax/player",
+                    data = mapOf("episodeId" to epId, "backup" to "1"),
+                    headers = aH, cookies = cookies, interceptor = cfKiller)
+                cookies.putAll(r1.cookies)
+                val raw1 = r1.text ?: continue
+
+                val html = try {
+                    @Suppress("UNCHECKED_CAST")
+                    (mapper.readValue(raw1, Map::class.java) as Map<String, Any?>)["html"]?.toString()
+                } catch (_: Exception) { null } ?: raw1
+
+                val doc = Jsoup.parse(html)
                 val btns = doc.select("a.btn3dsv,a[data-href],a[data-play],.server-item a,.btn-server,li[data-id] a,button[data-href],a[data-link]")
+
+                if (btns.isEmpty()) {
+                    if (processPlayerResponse(raw1, epUrl, vH, sub, cb)) return true
+                }
 
                 for (btn in btns) {
                     val hash = (btn.attr("data-href").ifBlank { btn.attr("data-link").ifBlank { btn.attr("href") } }).trim()
@@ -376,8 +394,9 @@ class AnimeVietSub : MainAPI() {
 
                     if (hash.startsWith("http")) { if (emit(hash, vH, sub, cb)) return true; continue }
 
+                    // CRITICAL: Use the exact payload structure found by user
                     val paramSets = listOf(
-                        mapOf("link" to hash, "id" to filmId), // User's found payload
+                        mapOf("link" to hash, "id" to filmId), // Found in user's @player1
                         mapOf("link" to hash, "id" to btnId, "play" to play),
                         mapOf("link" to hash, "id" to epId, "play" to play),
                         mapOf("link" to hash, "episodeId" to epId)

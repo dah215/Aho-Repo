@@ -1036,18 +1036,16 @@ class AnimeVietSub : MainAPI() {
         val clean = url.trim()
 
         return try {
+            val referer = headers["Referer"] ?: mainUrl
             when {
                 clean.contains(".m3u8") -> {
                     callback(
-                        ExtractorLink(
-                            source = this.name,
-                            name = this.name,
-                            url = clean,
-                            referer = headers["Referer"] ?: mainUrl,
-                            quality = Qualities.Unknown.value,
-                            isM3u8 = true,
-                            headers = headers
-                        )
+                        newExtractorLink(this.name, this.name, clean) {
+                            this.referer = referer
+                            this.quality = Qualities.Unknown.value
+                            this.type = ExtractorLinkType.M3U8
+                            this.headers = headers
+                        }
                     )
                     // Also try to generate quality variants
                     try {
@@ -1058,35 +1056,29 @@ class AnimeVietSub : MainAPI() {
                 }
                 clean.contains(".mp4") -> {
                     callback(
-                        ExtractorLink(
-                            source = this.name,
-                            name = this.name,
-                            url = clean,
-                            referer = headers["Referer"] ?: mainUrl,
-                            quality = Qualities.Unknown.value,
-                            isM3u8 = false,
-                            headers = headers
-                        )
+                        newExtractorLink(this.name, this.name, clean) {
+                            this.referer = referer
+                            this.quality = Qualities.Unknown.value
+                            this.type = ExtractorLinkType.VIDEO
+                            this.headers = headers
+                        }
                     )
                     true
                 }
                 else -> {
                     // Try built-in extractors (handles many embed providers)
                     try {
-                        loadExtractor(clean, headers["Referer"] ?: mainUrl, subtitleCallback, callback)
+                        loadExtractor(clean, referer, subtitleCallback, callback)
                         true
                     } catch (e: Exception) {
                         // Emit as generic link
                         callback(
-                            ExtractorLink(
-                                source = this.name,
-                                name = this.name,
-                                url = clean,
-                                referer = headers["Referer"] ?: mainUrl,
-                                quality = Qualities.Unknown.value,
-                                isM3u8 = false,
-                                headers = headers
-                            )
+                            newExtractorLink(this.name, this.name, clean) {
+                                this.referer = referer
+                                this.quality = Qualities.Unknown.value
+                                this.type = ExtractorLinkType.VIDEO
+                                this.headers = headers
+                            }
                         )
                         true
                     }

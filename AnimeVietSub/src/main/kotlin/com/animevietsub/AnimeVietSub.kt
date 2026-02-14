@@ -910,11 +910,12 @@ class AnimeVietSub : MainAPI() {
                             }
                             
                             // Try to load via extractor
-                            runCatching {
+                            try {
                                 loadExtractor(direct, epUrl, subtitleCallback, callback)
+                                return true
+                            } catch (e: Exception) {
+                                logTrace(session, "WARN", "Extractor failed: ${e.message}")
                             }
-                            
-                            return true
                         }
                     }
                 }
@@ -1072,7 +1073,7 @@ class AnimeVietSub : MainAPI() {
         
         var currentUrl = startUrl
         
-        runCatching {
+        try {
             for (i in 1..5) {
                 val res = app.get(currentUrl, headers = headers, cookies = cookies, interceptor = cfKiller)
                 if (res.url.contains(".m3u8")) {
@@ -1081,6 +1082,8 @@ class AnimeVietSub : MainAPI() {
                 if (res.url == currentUrl) break
                 currentUrl = res.url
             }
+        } catch (e: Exception) {
+            // Redirect following failed, return original URL
         }
         
         return currentUrl
@@ -1089,7 +1092,7 @@ class AnimeVietSub : MainAPI() {
     /**
      * Emit M3U8 stream
      */
-    private fun emitM3U8(
+    private suspend fun emitM3U8(
         url: String,
         headers: Map<String, String>,
         callback: (ExtractorLink) -> Unit
@@ -1100,11 +1103,13 @@ class AnimeVietSub : MainAPI() {
         })
         
         // Also generate quality variants
-        runCatching {
+        try {
             M3u8Helper.generateM3u8(name, url, url, headers = headers).forEach {
                 it.headers = headers
                 callback(it)
             }
+        } catch (e: Exception) {
+            // Quality variants failed, but main link still works
         }
         
         return true
@@ -1113,7 +1118,7 @@ class AnimeVietSub : MainAPI() {
     /**
      * Emit direct video link
      */
-    private fun emitDirectLink(
+    private suspend fun emitDirectLink(
         url: String,
         headers: Map<String, String>,
         callback: (ExtractorLink) -> Unit

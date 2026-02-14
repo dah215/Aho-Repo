@@ -82,8 +82,7 @@ class AnimeVietSub : MainAPI() {
                     ?: a.attr("title").trim()
                     ?: return null
         val img = selectFirst("img")
-        val poster = fixUrl(img?.attr("data-src")?.takeIf { it.isNotBlank() } 
-                     ?: img?.attr("src"))
+        val poster = fixUrl(img?.attr("data-src").takeIf { !it.isNullOrBlank() } ?: img?.attr("src"))
         return newAnimeSearchResponse(title, href, TvType.Anime) { posterUrl = poster }
     }
 
@@ -143,7 +142,7 @@ class AnimeVietSub : MainAPI() {
             "Accept"           to "application/json, text/javascript, */*; q=0.01"
         )
 
-        // 2. Bước 1: Lấy Hash (player request 1)
+        // 2. Bước 1: Lấy Hash
         val step1 = app.post("$mainUrl/ajax/player", data = mapOf("episodeId" to episodeId, "backup" to "1"), 
                              headers = ajaxHeaders, cookies = cookies, interceptor = cfKiller).parsedSafe<ServerSelectionResp>() ?: return false
 
@@ -185,13 +184,28 @@ class AnimeVietSub : MainAPI() {
 
         val decrypted = finalDecrypted ?: return false
 
-        // 5. Bước 4: Xuyên thấu Redirect (Sửa lỗi 2001/1002)
-        val videoHeaders = mapOf("User-Agent" to ua, "Referer" to epUrl, "Origin" to mainUrl)
+        // 5. Bước 4: Xuyên thấu Redirect (Recursive Resolver)
+        // Plugin sẽ tự mình đi xuyên qua video0.html, video1.html... để lấy link m3u8 thật
+        val videoHeaders = mapOf(
+            "User-Agent" to ua, 
+            "Referer"    to epUrl, 
+            "Origin"     to mainUrl,
+            "Accept"     to "*/*"
+        )
+
         var realUrl = decrypted
-        if (decrypted.startsWith("http") && (decrypted.contains(".html") || !decrypted.contains(".m3u8"))) {
+        if (decrypted.startsWith("http") && !decrypted.contains(".m3u8")) {
             runCatching {
-                val res = app.get(decrypted, headers = videoHeaders, cookies = cookies, interceptor = cfKiller)
-                realUrl = res.url
+                // Thực hiện tối đa 5 lần redirect để tìm link m3u8
+                var currentUrl = decrypted
+                for (i in 1..5) {
+                    val res = app.get(currentUrl, headers = videoHeaders, cookies = cookies, interceptor = cfKiller)
+                    currentUrl = res.url
+                    if (currentUrl.contains(".m3u8")) {
+                        realUrl = currentUrl
+                        break
+                    }
+                }
             }
         }
 

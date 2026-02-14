@@ -55,18 +55,20 @@ class AnimeVietSub : MainAPI() {
         "$mainUrl/anime-bo/"                  to "Anime Bộ"
     )
 
-    private fun fixUrl(url: String): String {
-        if (url.isBlank()) return ""
-        return if (url.startsWith("http")) url 
-               else if (url.startsWith("//")) "https:$url"
-               else "$mainUrl${if (url.startsWith("/")) "" else "/"}$url"
+    // Hàm sửa URL cực kỳ an toàn
+    private fun fixUrl(url: String?): String? {
+        if (url.isNullOrBlank() || url.startsWith("javascript") || url == "#") return null
+        return try {
+            if (url.startsWith("http")) url 
+            else if (url.startsWith("//")) "https:$url"
+            else "$mainUrl${if (url.startsWith("/")) "" else "/"}$url"
+        } catch (e: Exception) { null }
     }
 
     // ── Search / MainPage ─────────────────────────────────────────────────────
     private fun Element.toSearchResponse(): SearchResponse? {
         val title  = selectFirst(".Title, h3")?.text()?.trim() ?: return null
-        val rawHref = selectFirst("a")?.attr("href") ?: return null
-        val href   = fixUrl(rawHref) // FIX: Đảm bảo URL có scheme http/https
+        val href   = fixUrl(selectFirst("a")?.attr("href")) ?: return null // Bỏ qua nếu URL lỗi
         
         val poster = selectFirst("img")?.let { img ->
             val src = img.attr("data-src").ifEmpty { img.attr("data-original").ifEmpty { img.attr("src") } }
@@ -81,11 +83,14 @@ class AnimeVietSub : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = if (page == 1) request.data else "${request.data.removeSuffix("/")}/trang-$page.html"
-        val items = app.get(url, interceptor = cfKiller, headers = defaultHeaders).document
-            .select("article.TPostMv, article.TPost")
+        val baseUrl = request.data.ifBlank { return newHomePageResponse(request.name, emptyList(), false) }
+        val url = if (page == 1) baseUrl else "${baseUrl.removeSuffix("/")}/trang-$page.html"
+        
+        val doc = app.get(url, interceptor = cfKiller, headers = defaultHeaders).document
+        val items = doc.select("article.TPostMv, article.TPost")
             .distinctBy { it.selectFirst("a")?.attr("href") ?: it.text() }
             .mapNotNull { it.toSearchResponse() }
+            
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
 
@@ -99,7 +104,7 @@ class AnimeVietSub : MainAPI() {
 
     // ── Load ──────────────────────────────────────────────────────────────────
     override suspend fun load(url: String): LoadResponse {
-        val fixedUrl = fixUrl(url)
+        val fixedUrl = fixUrl(url) ?: throw Exception("URL không hợp lệ")
         var document = app.get(fixedUrl, interceptor = cfKiller, headers = defaultHeaders).document
         var episodesNodes = document.select("ul.list-episode li a[data-id]")
 
@@ -121,8 +126,7 @@ class AnimeVietSub : MainAPI() {
         val epList = episodesNodes.mapNotNull { ep ->
             val episodeId = ep.attr("data-id").trim()
             val epName    = ep.attr("title").ifEmpty { ep.text().trim() }
-            val epUrl     = fixUrl(ep.attr("href"))
-            if (episodeId.isEmpty() || epUrl.isEmpty()) return@mapNotNull null
+            val epUrl     = fixUrl(ep.attr("href")) ?: return@mapNotNull null
             newEpisode("$epUrl@@$filmId@@$episodeId") {
                 name    = epName
                 episode = Regex("\\d+").find(epName)?.value?.toIntOrNull()
@@ -150,6 +154,8 @@ class AnimeVietSub : MainAPI() {
         val epUrl     = parts[0]
         val filmId    = parts[1]
         val episodeId = parts[2]
+
+        if (fixUrl(epUrl) == null) return false
 
         runCatching { app.get(epUrl, interceptor = cfKiller, headers = defaultHeaders) }
 

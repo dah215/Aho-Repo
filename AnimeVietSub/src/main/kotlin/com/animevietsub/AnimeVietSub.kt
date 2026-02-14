@@ -143,7 +143,8 @@ class AnimeVietSub : MainAPI() {
         "Accept-Language" to "vi-VN,vi;q=0.9,en;q=0.8",
         "Sec-Fetch-Dest" to "document",
         "Sec-Fetch-Mode" to "navigate",
-        "Sec-Fetch-Site" to "none"
+        "Sec-Fetch-Site" to "none",
+        "Priority" to "u=0, i"
     )
 
     private fun ajaxH(ref: String) = mapOf(
@@ -158,7 +159,16 @@ class AnimeVietSub : MainAPI() {
         "Sec-Fetch-Site" to "same-origin"
     )
 
-    private fun vidH(ref: String) = mapOf("User-Agent" to ua, "Referer" to ref, "Origin" to mainUrl, "Accept" to "*/*")
+    private fun vidH(ref: String) = mapOf(
+        "User-Agent" to ua,
+        "Referer" to ref,
+        "Origin" to mainUrl,
+        "Accept" to "*/*",
+        "Connection" to "keep-alive",
+        "Sec-Fetch-Dest" to "video",
+        "Sec-Fetch-Mode" to "no-cors",
+        "Sec-Fetch-Site" to "cross-site"
+    )
 
     private fun fixUrl(u: String?): String? {
         if (u.isNullOrBlank() || u.startsWith("javascript") || u == "#") return null
@@ -268,8 +278,14 @@ class AnimeVietSub : MainAPI() {
         val aH = ajaxH(epUrl)
         val cookies = mutableMapOf<String, String>()
 
+        // CRITICAL: Pre-fetch main page to get fresh cookies/tokens
+        try {
+            val mainRes = app.get(mainUrl, interceptor = cfKiller, headers = baseHeaders)
+            cookies.putAll(mainRes.cookies)
+        } catch (_: Exception) {}
+
         val pageRes = try {
-            app.get(epUrl, interceptor = cfKiller, headers = baseHeaders)
+            app.get(epUrl, interceptor = cfKiller, headers = baseHeaders, cookies = cookies)
         } catch (e: Exception) { log("ERR", "Page fetch: ${e.message}"); return false }
         cookies.putAll(pageRes.cookies)
         val pageBody = pageRes.text ?: return false
@@ -296,7 +312,7 @@ class AnimeVietSub : MainAPI() {
 
         var found = false
 
-        // STRATEGY A: RSS/XML get_episode API (NEW DEFINITIVE FIX)
+        // STRATEGY A: RSS/XML get_episode API (Most stable for direct links)
         found = withTimeoutOrNull(20_000L) {
             rssStrategy(filmId, candidates, aH, cookies, vH, subtitleCallback, callback)
         } ?: false
@@ -306,6 +322,7 @@ class AnimeVietSub : MainAPI() {
             ajaxStrategy(epUrl, filmId, candidates, cookies, aH, vH, subtitleCallback, callback)
         } ?: false
         
+        // STRATEGY C: Page scraping
         if (!found) found = withTimeoutOrNull(8_000L) {
             pageStrategy(pageBody, epUrl, vH, subtitleCallback, callback)
         } ?: false
@@ -327,13 +344,11 @@ class AnimeVietSub : MainAPI() {
                 if (res.contains("<file>")) {
                     val encrypted = res.substringAfter("<file>").substringBefore("</file>")
                     if (encrypted.isNotBlank()) {
-                        log("RSS", "Found encrypted file in RSS")
                         val decrypted = Crypto.decrypt(encrypted)
                         if (decrypted != null && emit(decrypted, vH, sub, cb)) return true
                     }
                 }
                 
-                // Also check for direct links in RSS
                 Regex("""<file><!\[CDATA\[(https?://[^\]]+)\]\]></file>""").find(res)?.groupValues?.get(1)?.let {
                     if (emit(it, vH, sub, cb)) return true
                 }
@@ -460,18 +475,29 @@ class AnimeVietSub : MainAPI() {
         if (!clean.startsWith("http")) return false
         val ref = headers["Referer"] ?: mainUrl
         log("EMIT", clean)
+        
+        // CRITICAL: Ensure headers are sent with the stream request to bypass server checks
+        val streamHeaders = headers.toMutableMap().apply {
+            put("Referer", ref)
+            put("Origin", mainUrl)
+            put("User-Agent", ua)
+            put("Sec-Fetch-Dest", "video")
+            put("Sec-Fetch-Mode", "no-cors")
+            put("Sec-Fetch-Site", "cross-site")
+        }
+
         return try {
             when {
                 clean.contains(".m3u8") || clean.contains("storage.googleapiscdn.com") -> {
                     cb(newExtractorLink(name, name, clean) {
                         this.referer = ref; this.quality = Qualities.Unknown.value
-                        this.type = ExtractorLinkType.M3U8; this.headers = headers
+                        this.type = ExtractorLinkType.M3U8; this.headers = streamHeaders
                     }); true
                 }
                 clean.contains(".mp4") || clean.contains(".mkv") || clean.contains(".webm") -> {
                     cb(newExtractorLink(name, name, clean) {
                         this.referer = ref; this.quality = Qualities.Unknown.value
-                        this.type = ExtractorLinkType.VIDEO; this.headers = headers
+                        this.type = ExtractorLinkType.VIDEO; this.headers = streamHeaders
                     }); true
                 }
                 else -> try {
@@ -479,7 +505,7 @@ class AnimeVietSub : MainAPI() {
                 } catch (_: Exception) {
                     cb(newExtractorLink(name, name, clean) {
                         this.referer = ref; this.quality = Qualities.Unknown.value
-                        this.type = ExtractorLinkType.VIDEO; this.headers = headers
+                        this.type = ExtractorLinkType.VIDEO; this.headers = streamHeaders
                     }); true
                 }
             }

@@ -11,6 +11,8 @@ import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
+import java.net.URL
+import java.net.HttpURLConnection
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
@@ -63,27 +65,17 @@ class AnimeVietSub : MainAPI() {
             val key     = MessageDigest.getInstance("SHA-256")
                             .digest(DECODE_PASSWORD.toByteArray(StandardCharsets.UTF_8))
             
-            // Thử cả STANDARD và URL_SAFE base64
             val decoded = try {
                 Base64.decode(cleaned, Base64.DEFAULT)
             } catch (e: Exception) {
                 try {
-                    Base64.decode(cleaned, Base64.URL_SAFE)
-                } catch (e2: Exception) {
-                    // Thử thay thế ký tự URL-safe thành standard
-                    val standardBase64 = cleaned
-                        .replace("-", "+")
-                        .replace("_", "/")
-                    val padding = (4 - standardBase64.length % 4) % 4
-                    val padded = standardBase64 + "=".repeat(padding)
-                    Base64.decode(padded, Base64.DEFAULT)
-                }
-            }
+                    val urlSafe = cleaned.replace("-", "+").replace("_", "/")
+                    val padding = (4 - urlSafe.length % 4) % 4
+                    Base64.decode(urlSafe + "=".repeat(padding), Base64.DEFAULT)
+                } catch (e2: Exception) { null }
+            } ?: return null
             
-            if (decoded.size < 16) {
-                android.util.Log.e(TAG, "Decoded data too short: ${decoded.size}")
-                return null
-            }
+            if (decoded.size < 16) return null
             
             val iv      = decoded.copyOfRange(0, 16)
             val ct      = decoded.copyOfRange(16, decoded.size)
@@ -94,7 +86,6 @@ class AnimeVietSub : MainAPI() {
             result.replace("\\n", "\n").replace("\"", "").trim()
         } catch (e: Exception) {
             android.util.Log.e(TAG, "decryptLink error: ${e.message}")
-            e.printStackTrace()
             null
         }
     }
@@ -102,7 +93,7 @@ class AnimeVietSub : MainAPI() {
     private fun pakoInflateRaw(data: ByteArray): ByteArray {
         val inflater = Inflater(true)
         inflater.setInput(data)
-        val buf = ByteArray(8192)
+        val buf = ByteArray(16384)
         val out = ByteArrayOutputStream()
         try {
             while (!inflater.finished()) {
@@ -112,6 +103,125 @@ class AnimeVietSub : MainAPI() {
             }
         } finally { inflater.end() }
         return out.toByteArray()
+    }
+
+    // ── Follow redirect để lấy final URL từ short link ───────────────────────
+    private fun followRedirects(startUrl: String, maxRedirects: Int = 10): String? {
+        var currentUrl = startUrl
+        var redirectCount = 0
+        
+        try {
+            while (redirectCount < maxRedirects) {
+                val url = URL(currentUrl)
+                val connection = url.openConnection() as HttpURLConnection
+                connection.instanceFollowRedirects = false
+                connection.connectTimeout = 15000
+                connection.readTimeout = 15000
+                connection.setRequestProperty("User-Agent", 
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+                
+                val responseCode = connection.responseCode
+                
+                if (responseCode == HttpURLConnection.HTTP_MOVED_PERM || 
+                    responseCode == HttpURLConnection.HTTP_MOVED_TEMP ||
+                    responseCode == HttpURLConnection.HTTP_SEE_OTHER ||
+                    responseCode == 307 || responseCode == 308) {
+                    
+                    val newUrl = connection.getHeaderField("Location")
+                    connection.disconnect()
+                    
+                    if (newUrl.isNullOrEmpty()) return currentUrl
+                    
+                    currentUrl = if (newUrl.startsWith("http")) {
+                        newUrl
+                    } else {
+                        val baseUrl = URL(currentUrl)
+                        URL(baseUrl.protocol, baseUrl.host, newUrl).toString()
+                    }
+                    
+                    android.util.Log.d(TAG, "Redirect $redirectCount -> $currentUrl")
+                    redirectCount++
+                } else {
+                    connection.disconnect()
+                    return currentUrl
+                }
+            }
+        } catch (e: Exception) {
+            android.util.Log.e(TAG, "followRedirects error: ${e.message}")
+        }
+        
+        return currentUrl
+    }
+
+    // ── Extract video từ Abyss ───────────────────────────────────────────────
+    private suspend fun extractAbyssVideo(abyssUrl: String, referer: String, callback: (ExtractorLink) -> Unit): Boolean {
+        return try {
+            android.util.Log.d(TAG, "Extracting Abyss URL: $abyssUrl")
+            
+            // Thử loadExtractor trước (CloudStream có thể đã có extractor)
+            val extracted = loadExtractor(abyssUrl, referer, { }, callback)
+            if (extracted) {
+                android.util.Log.d(TAG, "loadExtractor succeeded for $abyssUrl")
+                return true
+            }
+            
+            // Nếu không, tự parse trang
+            val doc = app.get(abyssUrl, 
+                headers = mapOf(
+                    "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Referer" to referer
+                )
+            ).document
+            
+            // Tìm video URL trong trang
+            val scripts = doc.select("script")
+            for (script in scripts) {
+                val content = script.html()
+                
+                // Tìm URL dạng storage.googleapis.com hoặc .mp4
+                val videoPatterns = listOf(
+                    Regex("""["'](https?://storage\.googleapis\.com[^"']+)["']"""),
+                    Regex("""["'](https?://[^\s"']+\.mp4[^\s"']*)["']"""),
+                    Regex("""["'](https?://[^\s"']+\.m3u8[^\s"']*)["']"""),
+                    Regex("""file\s*:\s*["']([^"']+)["']"""),
+                    Regex("""sources?\s*:\s*\[?\s*["']([^"']+)["']""")
+                )
+                
+                for (pattern in videoPatterns) {
+                    val match = pattern.find(content)
+                    if (match != null) {
+                        val videoUrl = match.groupValues[1]
+                        android.util.Log.d(TAG, "Found video URL: $videoUrl")
+                        
+                        if (videoUrl.contains(".m3u8")) {
+                            M3u8Helper.generateM3u8(name, videoUrl, "https://abysscdn.com/").forEach(callback)
+                        } else {
+                            callback.invoke(newExtractorLink(name, name, videoUrl) {
+                                this.referer = "https://abysscdn.com/"
+                                this.quality = Qualities.Unknown.value
+                                this.type = ExtractorLinkType.VIDEO
+                            })
+                        }
+                        return true
+                    }
+                }
+            }
+            
+            // Tìm iframe hoặc embed
+            val iframe = doc.selectFirst("iframe")
+            if (iframe != null) {
+                val iframeSrc = iframe.attr("src")
+                if (iframeSrc.isNotEmpty()) {
+                    android.util.Log.d(TAG, "Found iframe: $iframeSrc")
+                    return loadExtractor(iframeSrc, abyssUrl, { }, callback)
+                }
+            }
+            
+            false
+        } catch (e: Exception) {
+            android.util.Log.e(TAG, "extractAbyssVideo error: ${e.message}")
+            false
+        }
     }
 
     // ── Search response ───────────────────────────────────────────────────────
@@ -163,7 +273,6 @@ class AnimeVietSub : MainAPI() {
             }
         }
 
-        // filmId từ URL: ".../a5820/..." → "5820"
         val filmId = Regex("[/-]a(\\d+)").find(url)?.groupValues?.get(1) ?: ""
 
         val episodesList = episodesNodes.mapNotNull { ep ->
@@ -199,14 +308,11 @@ class AnimeVietSub : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val parts = data.split("@@")
-        if (parts.size < 3) {
-            android.util.Log.e(TAG, "Invalid data format: $data")
-            return false
-        }
+        if (parts.size < 3) return false
 
-        val epUrl     = parts[0]  // URL trang tập (Referer)
-        val filmId    = parts[1]  // Film ID (5820)
-        val episodeId = parts[2]  // Episode ID (111047)
+        val epUrl     = parts[0]
+        val filmId    = parts[1]
+        val episodeId = parts[2]
 
         android.util.Log.d(TAG, "loadLinks: epUrl=$epUrl, filmId=$filmId, episodeId=$episodeId")
 
@@ -219,12 +325,10 @@ class AnimeVietSub : MainAPI() {
         )
 
         // Warm CF cookies
-        runCatching { 
-            app.get(epUrl, interceptor = cfKiller, headers = defaultHeaders) 
-        }
+        runCatching { app.get(epUrl, interceptor = cfKiller, headers = defaultHeaders) }
 
         // ═══════════════════════════════════════════════════════════════════════
-        // BƯỚC 1: POST /ajax/player với episodeId để lấy server selection HTML
+        // BƯỚC 1: Lấy server list
         // ═══════════════════════════════════════════════════════════════════════
         val step1 = runCatching {
             app.post(
@@ -239,153 +343,152 @@ class AnimeVietSub : MainAPI() {
         val htmlContent = step1?.html
         if (htmlContent.isNullOrBlank()) {
             android.util.Log.e(TAG, "Step 1 failed: no HTML content")
-            // Thử lại với backup=0
-            val step1Retry = runCatching {
-                app.post(
-                    "$mainUrl/ajax/player",
-                    data        = mapOf("episodeId" to episodeId, "backup" to "0"),
-                    interceptor = cfKiller,
-                    referer     = epUrl,
-                    headers     = ajaxHeaders
-                ).parsedSafe<ServerSelectionResponse>()
-            }.getOrNull()
-            
-            if (step1Retry?.html.isNullOrBlank()) {
-                android.util.Log.e(TAG, "Step 1 retry also failed")
-                return false
+            return false
+        }
+
+        val serverDoc = Jsoup.parse(htmlContent)
+        val servers = serverDoc.select("a.btn3dsv")
+        
+        if (servers.isEmpty()) {
+            android.util.Log.e(TAG, "No servers found")
+            return false
+        }
+
+        android.util.Log.d(TAG, "Found ${servers.size} servers: ${servers.map { it.text() }}")
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // BƯỚC 2: Thử từng server
+        // ═══════════════════════════════════════════════════════════════════════
+        for (server in servers) {
+            val serverHash = server.attr("data-href").trim()
+            val serverPlay = server.attr("data-play").ifEmpty { "api" }.trim()
+            val serverId   = server.attr("data-id").trim()
+            val serverName = server.text().trim()
+
+            android.util.Log.d(TAG, "Trying server: $serverName, play=$serverPlay")
+            if (serverHash.isEmpty()) continue
+
+            val result = tryLoadServer(
+                serverHash, serverPlay, serverId, filmId, epUrl, ajaxHeaders,
+                callback, subtitleCallback
+            )
+
+            if (result) {
+                android.util.Log.d(TAG, "Successfully loaded from: $serverName")
+                return true
             }
         }
 
-        val serverDoc = Jsoup.parse(htmlContent ?: step1?.html ?: "")
+        return false
+    }
 
-        // Ưu tiên server api (DU), bỏ qua embed (HDX/ADS có quảng cáo)
-        var server = serverDoc.selectFirst("a.btn3dsv[data-play=api], a[data-play=api]")
-        if (server == null) {
-            server = serverDoc.selectFirst("a.btn3dsv, a.server-item, a[data-href]")
-        }
-        
-        if (server == null) {
-            android.util.Log.e(TAG, "No server found in HTML: ${serverDoc.html().take(500)}")
-            return false
-        }
+    // ── Load server ───────────────────────────────────────────────────────────
+    private suspend fun tryLoadServer(
+        serverHash: String,
+        serverPlay: String,
+        serverId: String,
+        filmId: String,
+        referer: String,
+        headers: Map<String, String>,
+        callback: (ExtractorLink) -> Unit,
+        subtitleCallback: (SubtitleFile) -> Unit
+    ): Boolean {
+        return try {
+            val step2Params = when (serverPlay) {
+                "api" -> mapOf("link" to serverHash, "id" to filmId)
+                else -> mapOf("link" to serverHash, "play" to serverPlay, "id" to serverId, "backuplinks" to "1")
+            }
 
-        val serverHash = server.attr("data-href").trim()
-        val serverPlay = server.attr("data-play").ifEmpty { "api" }.trim()
-        val serverId   = server.attr("data-id").trim()
-
-        android.util.Log.d(TAG, "Server: hash=$serverHash, play=$serverPlay, id=$serverId")
-
-        if (serverHash.isEmpty()) {
-            android.util.Log.e(TAG, "Server hash is empty")
-            return false
-        }
-
-        // ═══════════════════════════════════════════════════════════════════════
-        // BƯỚC 2: POST /ajax/player với server hash để lấy encrypted/direct link
-        // ═══════════════════════════════════════════════════════════════════════
-        val step2Params = when (serverPlay) {
-            "api"   -> mapOf("link" to serverHash, "id" to filmId)
-            else    -> mapOf("link" to serverHash, "play" to serverPlay, "id" to serverId, "backuplinks" to "1")
-        }
-
-        android.util.Log.d(TAG, "Step 2 params: $step2Params")
-
-        val step2Resp = runCatching {
-            app.post(
+            val step2Resp = app.post(
                 "$mainUrl/ajax/player",
                 data        = step2Params,
                 interceptor = cfKiller,
-                referer     = epUrl,
-                headers     = ajaxHeaders
+                referer     = referer,
+                headers     = headers
             )
-        }.getOrNull()
 
-        if (step2Resp == null) {
-            android.util.Log.e(TAG, "Step 2: No response")
-            return false
-        }
+            val respText = step2Resp.text.trim()
+            android.util.Log.d(TAG, "Response ($serverPlay): ${respText.take(300)}")
 
-        val respText = step2Resp.text.trim()
-        android.util.Log.d(TAG, "Step 2 response: ${respText.take(500)}")
+            if (respText.isBlank() || respText.startsWith("<")) return false
 
-        if (respText.isBlank() || respText.startsWith("<")) {
-            android.util.Log.e(TAG, "Step 2: Invalid response format")
-            return false
-        }
+            val parsed = step2Resp.parsedSafe<PlayerResponse>() ?: return false
 
-        val parsed = step2Resp.parsedSafe<PlayerResponse>()
-        if (parsed == null) {
-            android.util.Log.e(TAG, "Step 2: Failed to parse JSON")
-            return false
-        }
+            when (parsed.playTech ?: serverPlay) {
+                "api" -> {
+                    val encryptedFile = parsed.linkArray
+                        ?.firstNotNullOfOrNull { it.file?.takeIf(String::isNotBlank) }
+                        ?: return false
 
-        android.util.Log.d(TAG, "Parsed: playTech=${parsed.playTech}, linkString=${parsed.linkString?.take(100)}, linkArray=${parsed.linkArray?.size}")
-
-        return when (parsed.playTech) {
-            // ── API server (DU): link là array [{file: "<standard_base64_encrypted>"}]
-            "api" -> {
-                val encryptedFile = parsed.linkArray
-                    ?.firstNotNullOfOrNull { it.file?.takeIf(String::isNotBlank) }
-                
-                if (encryptedFile == null) {
-                    android.util.Log.e(TAG, "No encrypted file found in linkArray")
-                    
-                    // Thử lấy từ linkString nếu linkArray null
-                    val directLink = parsed.linkString?.takeIf { it.startsWith("http") }
-                    if (directLink != null) {
-                        android.util.Log.d(TAG, "Found direct link in linkString")
-                        return loadExtractor(directLink, epUrl, subtitleCallback, callback)
-                    }
-                    return false
-                }
-                
-                val decrypted = decryptLink(encryptedFile)
-                if (decrypted == null) {
-                    android.util.Log.e(TAG, "Decryption failed for: ${encryptedFile.take(50)}")
-                    return false
-                }
-                
-                android.util.Log.d(TAG, "Decrypted: ${decrypted.take(200)}")
-                handleDecryptedLink(decrypted, epUrl, callback, subtitleCallback)
-            }
-            // ── Embed server (HDX): link là string URL trực tiếp
-            "embed" -> {
-                val directUrl = parsed.linkString?.takeIf { it.startsWith("http") }
-                if (directUrl == null) {
-                    android.util.Log.e(TAG, "No direct URL in embed mode")
-                    return false
-                }
-                loadExtractor(directUrl, epUrl, subtitleCallback, callback)
-                true
-            }
-            // ── Unknown playTech - thử xử lý linh hoạt
-            else -> {
-                android.util.Log.d(TAG, "Unknown playTech: ${parsed.playTech}, trying flexible handling")
-                
-                // Thử linkArray trước
-                val encryptedFile = parsed.linkArray
-                    ?.firstNotNullOfOrNull { it.file?.takeIf(String::isNotBlank) }
-                
-                if (encryptedFile != null) {
                     val decrypted = decryptLink(encryptedFile)
-                    if (decrypted != null) {
-                        return handleDecryptedLink(decrypted, epUrl, callback, subtitleCallback)
+                    if (decrypted.isNullOrEmpty()) return false
+
+                    handleDecryptedLink(decrypted, referer, callback, subtitleCallback)
+                }
+                "embed" -> {
+                    val shortUrl = parsed.linkString?.takeIf { it.startsWith("http") }
+                        ?: return false
+
+                    android.util.Log.d(TAG, "Embed URL: $shortUrl")
+
+                    // Follow redirects từ short link
+                    val finalUrl = followRedirects(shortUrl)
+                    android.util.Log.d(TAG, "Final URL after redirects: $finalUrl")
+
+                    if (finalUrl.isNullOrEmpty()) return false
+
+                    // Xử lý dựa trên domain cuối
+                    when {
+                        finalUrl.contains("abyss.to") || finalUrl.contains("abysscdn.com") -> {
+                            extractAbyssVideo(finalUrl, referer, callback)
+                        }
+                        finalUrl.contains(".m3u8") -> {
+                            M3u8Helper.generateM3u8(name, finalUrl, referer).forEach(callback)
+                            true
+                        }
+                        finalUrl.contains(".mp4") -> {
+                            callback.invoke(newExtractorLink(name, name, finalUrl) {
+                                this.referer = "https://abysscdn.com/"
+                                this.quality = Qualities.Unknown.value
+                                this.type = ExtractorLinkType.VIDEO
+                            })
+                            true
+                        }
+                        else -> {
+                            // Thử loadExtractor
+                            loadExtractor(finalUrl, referer, subtitleCallback, callback)
+                            true
+                        }
                     }
                 }
-                
-                // Thử linkString
-                val directUrl = parsed.linkString?.takeIf { it.startsWith("http") }
-                if (directUrl != null) {
-                    loadExtractor(directUrl, epUrl, subtitleCallback, callback)
-                    return true
+                else -> {
+                    // Fallback
+                    val encryptedFile = parsed.linkArray
+                        ?.firstNotNullOfOrNull { it.file?.takeIf(String::isNotBlank) }
+                    
+                    if (encryptedFile != null) {
+                        val decrypted = decryptLink(encryptedFile)
+                        if (!decrypted.isNullOrEmpty()) {
+                            return handleDecryptedLink(decrypted, referer, callback, subtitleCallback)
+                        }
+                    }
+
+                    val directUrl = parsed.linkString?.takeIf { it.startsWith("http") }
+                    if (directUrl != null) {
+                        val finalUrl = followRedirects(directUrl) ?: directUrl
+                        loadExtractor(finalUrl, referer, subtitleCallback, callback)
+                        return true
+                    }
+                    false
                 }
-                
-                false
             }
+        } catch (e: Exception) {
+            android.util.Log.e(TAG, "tryLoadServer error: ${e.message}")
+            false
         }
     }
 
-    // ── Handle decrypted m3u8 URL hoặc content ────────────────────────────────
+    // ── Handle decrypted link ─────────────────────────────────────────────────
     private suspend fun handleDecryptedLink(
         decrypted: String,
         referer: String,
@@ -393,7 +496,6 @@ class AnimeVietSub : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit
     ): Boolean {
         val link = decrypted.trim()
-        android.util.Log.d(TAG, "handleDecryptedLink: ${link.take(200)}")
         
         return when {
             link.contains(".m3u8") && link.startsWith("http") -> {
@@ -409,20 +511,17 @@ class AnimeVietSub : MainAPI() {
                 true
             }
             link.contains("\n") -> {
-                var foundAny = false
+                var found = false
                 link.lines().filter { it.trim().startsWith("http") }.forEach { url ->
-                    foundAny = true
+                    found = true
                     if (url.contains(".m3u8"))
                         M3u8Helper.generateM3u8(name, url.trim(), referer).forEach(callback)
                     else
                         loadExtractor(url.trim(), referer, subtitleCallback, callback)
                 }
-                foundAny
+                found
             }
-            else -> {
-                android.util.Log.e(TAG, "Unknown decrypted format: ${link.take(100)}")
-                false
-            }
+            else -> false
         }
     }
 
@@ -432,19 +531,19 @@ class AnimeVietSub : MainAPI() {
             lines.forEachIndexed { i, line ->
                 if (line.startsWith("#EXT-X-STREAM-INF")) {
                     val bw = Regex("BANDWIDTH=(\\d+)").find(line)?.groupValues?.get(1)?.toIntOrNull()
-                    val q  = when {
-                        bw == null      -> Qualities.Unknown.value
+                    val q = when {
+                        bw == null -> Qualities.Unknown.value
                         bw >= 4_000_000 -> Qualities.P1080.value
                         bw >= 2_000_000 -> Qualities.P720.value
                         bw >= 1_000_000 -> Qualities.P480.value
-                        else            -> Qualities.P360.value
+                        else -> Qualities.P360.value
                     }
                     val urlLine = lines.getOrNull(i + 1)?.trim() ?: return@forEachIndexed
                     if (urlLine.startsWith("http")) {
                         callback.invoke(newExtractorLink(name, name, urlLine) {
                             this.referer = referer
                             this.quality = q
-                            this.type    = ExtractorLinkType.M3U8
+                            this.type = ExtractorLinkType.M3U8
                         })
                     }
                 }
@@ -453,21 +552,16 @@ class AnimeVietSub : MainAPI() {
     }
 
     // ── Data classes ──────────────────────────────────────────────────────────
-
     data class ServerSelectionResponse(
-        @JsonProperty("success") val success: Int?  = null,
-        @JsonProperty("html")    val html: String?  = null
+        @JsonProperty("success") val success: Int? = null,
+        @JsonProperty("html")    val html: String? = null
     )
 
-    // PlayerResponse xử lý cả 2 format:
-    //   api server:   "link": [{"file": "base64..."}]
-    //   embed server: "link": "https://..."
     data class PlayerResponse(
-        @JsonProperty("_fxStatus") val fxStatus: Int?    = null,
-        @JsonProperty("success")   val success: Int?     = null,
+        @JsonProperty("_fxStatus") val fxStatus: Int? = null,
+        @JsonProperty("success")   val success: Int? = null,
         @JsonProperty("playTech")  val playTech: String? = null,
-        // Dùng Any? để xử lý cả Array lẫn String
-        @JsonProperty("link") private val linkRaw: Any?  = null
+        @JsonProperty("link") private val linkRaw: Any? = null
     ) {
         @Suppress("UNCHECKED_CAST")
         val linkArray: List<LinkItem>?
@@ -478,7 +572,5 @@ class AnimeVietSub : MainAPI() {
             get() = linkRaw as? String
     }
 
-    data class LinkItem(
-        val file: String? = null
-    )
+    data class LinkItem(val file: String? = null)
 }

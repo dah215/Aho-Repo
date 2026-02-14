@@ -53,14 +53,6 @@ class AnimeVietSub : MainAPI() {
         "Sec-Fetch-User" to "?1"
     )
 
-    override val mainPage = mainPageOf(
-        "$mainUrl/"                           to "Trang Chủ",
-        "$mainUrl/danh-sach/list-dang-chieu/" to "Đang Chiếu",
-        "$mainUrl/danh-sach/list-tron-bo/"    to "Trọn Bộ",
-        "$mainUrl/anime-le/"                  to "Anime Lẻ",
-        "$mainUrl/anime-bo/"                  to "Anime Bộ"
-    )
-
     private fun fixUrl(url: String?): String? {
         if (url.isNullOrBlank() || url.startsWith("javascript") || url == "#") return null
         val trimmed = url.trim()
@@ -75,15 +67,11 @@ class AnimeVietSub : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val data = request.data
         val url = if (page == 1) data else "${data.removeSuffix("/")}/trang-$page.html"
-        
         val res = app.get(url, interceptor = cfKiller, headers = defaultHeaders)
         val doc = res.document
-        
-        // Selector cực mạnh để tránh màn hình đen
         val items = doc.select(".TPostMv, article.TPost, .item-film, .list-film li, .item").mapNotNull { 
             it.toSearchResponse() 
         }.distinctBy { it.url }
-        
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
 
@@ -92,17 +80,11 @@ class AnimeVietSub : MainAPI() {
         val href = fixUrl(a.attr("href")) ?: return null
         val title = selectFirst(".Title, h3, h2, .title, .name")?.text()?.trim() 
                     ?: a.attr("title").trim()
-                    ?: selectFirst("img")?.attr("alt")?.trim()
                     ?: return null
-        
         val img = selectFirst("img")
         val poster = fixUrl(img?.attr("data-src")?.takeIf { it.isNotBlank() } 
-                     ?: img?.attr("data-original")?.takeIf { it.isNotBlank() }
                      ?: img?.attr("src"))
-        
-        return newAnimeSearchResponse(title, href, TvType.Anime) { 
-            posterUrl = poster 
-        }
+        return newAnimeSearchResponse(title, href, TvType.Anime) { posterUrl = poster }
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
@@ -115,35 +97,25 @@ class AnimeVietSub : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         val fixedUrl = fixUrl(url) ?: throw Exception("Invalid URL")
         var doc = app.get(fixedUrl, interceptor = cfKiller, headers = defaultHeaders).document
-        
         var episodesNodes = doc.select("ul.list-episode li a")
         if (episodesNodes.isEmpty()) {
-            val watchUrl = doc.selectFirst("a.btn-see, a[href*='/tap-'], .btn-watch a, a.watch_button")?.attr("href")?.let { fixUrl(it) }
+            val watchUrl = doc.selectFirst("a.btn-see, a[href*='/tap-'], .btn-watch a")?.attr("href")?.let { fixUrl(it) }
             if (watchUrl != null) {
                 doc = app.get(watchUrl, interceptor = cfKiller, headers = defaultHeaders).document
                 episodesNodes = doc.select("ul.list-episode li a")
             }
         }
-
         val filmId = Regex("[/-]a(\\d+)").find(fixedUrl)?.groupValues?.get(1) ?: ""
         val episodes = episodesNodes.mapNotNull { ep ->
             val id = ep.attr("data-id").trim()
             val href = fixUrl(ep.attr("href")) ?: return@mapNotNull null
-            val name = ep.text().trim().ifEmpty { ep.attr("title") }
             newEpisode("$href@@$filmId@@$id") {
-                this.name = name
-                this.episode = Regex("\\d+").find(name ?: "")?.value?.toIntOrNull()
+                this.name = ep.text().trim()
+                this.episode = Regex("\\d+").find(this.name ?: "")?.value?.toIntOrNull()
             }
         }
-
-        val title = doc.selectFirst("h1.Title, .Title, h1")?.text()?.trim() ?: "Anime"
-        val poster = doc.selectFirst(".Image img, .InfoImg img, img[itemprop=image]")?.let { 
-            fixUrl(it.attr("data-src").ifEmpty { it.attr("src") }) 
-        }
-
-        return newAnimeLoadResponse(title, fixedUrl, TvType.Anime) {
-            this.posterUrl = poster
-            this.plot = doc.selectFirst(".Description, .InfoDesc, #film-content")?.text()?.trim()
+        return newAnimeLoadResponse(doc.selectFirst("h1.Title, .Title, h1")?.text()?.trim() ?: "Anime", fixedUrl, TvType.Anime) {
+            this.posterUrl = doc.selectFirst(".Image img, .InfoImg img")?.let { fixUrl(it.attr("data-src").ifEmpty { it.attr("src") }) }
             this.episodes = mutableMapOf(DubStatus.Subbed to episodes)
         }
     }
@@ -158,7 +130,7 @@ class AnimeVietSub : MainAPI() {
         if (parts.size < 3) return false
         val (epUrl, filmId, episodeId) = parts
 
-        // 1. Khởi tạo Session
+        // 1. Khởi tạo Session (Lấy Cookie)
         val pageReq = app.get(epUrl, interceptor = cfKiller, headers = defaultHeaders)
         val cookies = pageReq.cookies
 
@@ -171,14 +143,9 @@ class AnimeVietSub : MainAPI() {
             "Accept"           to "application/json, text/javascript, */*; q=0.01"
         )
 
-        // 2. Bước 1: Lấy Hash (player request đầu tiên trong log)
-        val step1 = app.post(
-            "$mainUrl/ajax/player",
-            data = mapOf("episodeId" to episodeId, "backup" to "1"),
-            interceptor = cfKiller,
-            headers = ajaxHeaders,
-            cookies = cookies
-        ).parsedSafe<ServerSelectionResp>() ?: return false
+        // 2. Bước 1: Lấy Hash (player request 1)
+        val step1 = app.post("$mainUrl/ajax/player", data = mapOf("episodeId" to episodeId, "backup" to "1"), 
+                             headers = ajaxHeaders, cookies = cookies, interceptor = cfKiller).parsedSafe<ServerSelectionResp>() ?: return false
 
         val serverDoc = Jsoup.parse(step1.html ?: "")
         val btn = serverDoc.selectFirst("a.btn3dsv[data-play=api]") ?: serverDoc.selectFirst("a.btn3dsv") ?: return false
@@ -186,53 +153,61 @@ class AnimeVietSub : MainAPI() {
         val play = btn.attr("data-play")
         val btnId = btn.attr("data-id")
 
-        // 3. Kích hoạt tập phim (get_episode trong log - CỰC KỲ QUAN TRỌNG)
+        // 3. Bước 2: Kích hoạt Session (get_episode - CỰC KỲ QUAN TRỌNG)
         app.get("$mainUrl/ajax/get_episode?filmId=$filmId&episodeId=$episodeId", 
                 headers = ajaxHeaders, cookies = cookies, interceptor = cfKiller)
 
-        // 4. Bước 2: Lấy Link mã hóa (player request thứ hai trong log)
-        val params = if (play == "api") mapOf("link" to hash, "id" to filmId)
-                     else mapOf("link" to hash, "play" to play, "id" to btnId, "backuplinks" to "1")
-        
-        val step2 = app.post("$mainUrl/ajax/player", data = params, interceptor = cfKiller, headers = ajaxHeaders, cookies = cookies)
-        val parsed = step2.parsedSafe<PlayerResp>() ?: return false
+        // 4. Bước 3: Lấy Link mã hóa (Thử cả filmId và episodeId)
+        val idsToTry = listOf(filmId, episodeId)
+        var finalDecrypted: String? = null
 
-        val videoHeaders = mapOf(
-            "User-Agent" to ua, 
-            "Referer"    to epUrl, 
-            "Origin"     to mainUrl,
-            "Accept"     to "*/*"
-        )
-
-        if (play == "api") {
-            val enc = parsed.linkArray?.firstOrNull()?.file ?: return false
-            val dec = decryptLink(enc) ?: return false
+        for (id in idsToTry) {
+            val params = if (play == "api") mapOf("link" to hash, "id" to id)
+                         else mapOf("link" to hash, "play" to play, "id" to btnId, "backuplinks" to "1")
             
-            // 5. Xử lý Redirect (video0.html... trong log)
-            var finalUrl = dec
-            if (dec.startsWith("http") && (dec.contains(".html") || !dec.contains(".m3u8"))) {
-                runCatching {
-                    val res = app.get(dec, headers = videoHeaders, cookies = cookies, interceptor = cfKiller)
-                    finalUrl = res.url
+            val step2 = app.post("$mainUrl/ajax/player", data = params, headers = ajaxHeaders, cookies = cookies, interceptor = cfKiller)
+            val parsed = step2.parsedSafe<PlayerResp>()
+            
+            if (play == "api") {
+                val enc = parsed?.linkArray?.firstOrNull()?.file
+                if (enc != null) {
+                    finalDecrypted = decryptLink(enc)
+                    if (finalDecrypted != null && finalDecrypted.startsWith("http")) break
+                }
+            } else {
+                val direct = parsed?.linkString
+                if (direct != null && direct.startsWith("http")) {
+                    loadExtractor(direct, epUrl, subtitleCallback, callback)
+                    return true
                 }
             }
+        }
 
-            if (finalUrl.contains(".m3u8")) {
-                callback(newExtractorLink(name, name, finalUrl) {
-                    this.headers = videoHeaders
-                    this.type = ExtractorLinkType.M3U8
-                })
-                runCatching {
-                    M3u8Helper.generateM3u8(name, finalUrl, epUrl, headers = videoHeaders).forEach { 
-                        it.headers = videoHeaders
-                        callback(it)
-                    }
-                }
-            } else if (finalUrl.startsWith("http")) {
-                callback(newExtractorLink(name, name, finalUrl) { this.headers = videoHeaders })
+        val decrypted = finalDecrypted ?: return false
+
+        // 5. Bước 4: Xuyên thấu Redirect (Sửa lỗi 2001/1002)
+        val videoHeaders = mapOf("User-Agent" to ua, "Referer" to epUrl, "Origin" to mainUrl)
+        var realUrl = decrypted
+        if (decrypted.startsWith("http") && (decrypted.contains(".html") || !decrypted.contains(".m3u8"))) {
+            runCatching {
+                val res = app.get(decrypted, headers = videoHeaders, cookies = cookies, interceptor = cfKiller)
+                realUrl = res.url
             }
-        } else {
-            parsed.linkString?.let { if (it.startsWith("http")) loadExtractor(it, epUrl, subtitleCallback, callback) }
+        }
+
+        if (realUrl.contains(".m3u8")) {
+            callback(newExtractorLink(name, name, realUrl) {
+                this.headers = videoHeaders
+                this.type = ExtractorLinkType.M3U8
+            })
+            runCatching {
+                M3u8Helper.generateM3u8(name, realUrl, epUrl, headers = videoHeaders).forEach { 
+                    it.headers = videoHeaders
+                    callback(it)
+                }
+            }
+        } else if (realUrl.startsWith("http")) {
+            callback(newExtractorLink(name, name, realUrl) { this.headers = videoHeaders })
         }
         return true
     }
@@ -243,14 +218,11 @@ class AnimeVietSub : MainAPI() {
             val key = MessageDigest.getInstance("SHA-256").digest(DECODE_PASSWORD.toByteArray(StandardCharsets.UTF_8))
             val decoded = Base64.decode(aes.replace("\\s".toRegex(), ""), Base64.DEFAULT)
             if (decoded.size < 17) return null
-            
             val iv = decoded.copyOfRange(0, 16)
             val ct = decoded.copyOfRange(16, decoded.size)
-            
             val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
             cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
             val plain = cipher.doFinal(ct)
-            
             try {
                 val inflater = Inflater(true).apply { setInput(plain) }
                 val out = ByteArrayOutputStream()
@@ -269,18 +241,10 @@ class AnimeVietSub : MainAPI() {
     }
 
     data class ServerSelectionResp(@JsonProperty("html") val html: String? = null)
-    
-    data class PlayerResp(
-        @JsonProperty("link") val linkRaw: Any? = null,
-        @JsonProperty("success") val success: Int? = null
-    ) {
+    data class PlayerResp(@JsonProperty("link") val linkRaw: Any? = null) {
         @Suppress("UNCHECKED_CAST")
-        val linkArray: List<LinkFile>? 
-            get() = (linkRaw as? List<*>)?.filterIsInstance<Map<String, Any?>>()?.map { 
-                LinkFile(it["file"] as? String) 
-            }
+        val linkArray: List<LinkFile>? get() = (linkRaw as? List<*>)?.filterIsInstance<Map<String, Any?>>()?.map { LinkFile(it["file"] as? String) }
         val linkString: String? get() = linkRaw as? String
     }
-
     data class LinkFile(@JsonProperty("file") val file: String? = null)
 }

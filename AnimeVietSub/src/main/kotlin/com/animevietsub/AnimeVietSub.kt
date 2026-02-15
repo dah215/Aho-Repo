@@ -7,11 +7,9 @@ import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
-import kotlinx.coroutines.withTimeoutOrNull
 import org.jsoup.Jsoup
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
-import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.util.zip.GZIPInputStream
@@ -27,17 +25,14 @@ class AnimeVietSubPlugin : Plugin() {
 
 object Crypto {
     private val SALTED = "Salted__".toByteArray(StandardCharsets.ISO_8859_1)
-    // Cập nhật danh sách Key mới nhất 2025 từ hệ thống
     private val PASSES = listOf(
         "dm_thang_suc_vat_get_link_an_dbt",
-        "VSub@2025", "VSub@2024", "animevietsub", 
-        "streaming_key", "player_key", "api_key"
+        "VSub@2025", "VSub@2024", "animevietsub", "streaming_key"
     )
 
     fun decrypt(enc: String?): String? {
         if (enc.isNullOrBlank()) return null
         val s = enc.trim()
-        // Nếu là URL hoặc nội dung M3U8 thô thì trả về luôn
         if (s.startsWith("http") || s.startsWith("#EXTM3U")) return s
         
         for (pass in PASSES) {
@@ -100,22 +95,18 @@ class AnimeVietSub : MainAPI() {
     override var name     = "AnimeVietSub"
     override var lang     = "vi"
     override val hasMainPage = true
-    override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie)
+    override val supportedTypes = setOf(TvType.Anime)
 
     private val cf = CloudflareKiller()
     private val mapper = jacksonObjectMapper()
-
     private val pageH = mapOf("User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36")
 
     override suspend fun load(url: String): LoadResponse {
         val doc = app.get(url, interceptor = cf, headers = pageH).document
-        
-        // Fix Regex lấy Film ID chính xác từ meta hoặc script
         val filmId = Regex("""filmID\s*=\s*parseInt\('(\d+)'\)""").find(doc.html())?.groupValues?.get(1) ?: ""
         
         val episodes = doc.select("ul.list-episode li a").mapNotNull { ep ->
             val href = ep.attr("href")
-            // Lấy Episode ID từ phần cuối của URL (ví dụ: 111803)
             val epId = Regex("""tap-\d+-(\d+)""").find(href)?.groupValues?.get(1) 
                       ?: Regex("""-(\d+)\.html""").find(href)?.groupValues?.get(1) ?: ""
             
@@ -166,15 +157,23 @@ class AnimeVietSub : MainAPI() {
             val decrypted = Crypto.decrypt(encryptedFile) ?: continue
             
             if (decrypted.contains("#EXTM3U")) {
-                // Nếu trả về nội dung M3U8, ta tạo một link ảo hoặc trích xuất segment
-                // Ở đây AVS dùng Google CDN, ta có thể trích xuất URL gốc từ nội dung
                 val cdnUrl = Regex("""https://storage.googleapiscdn.com/[^\s]+""").find(decrypted)?.value
                 if (cdnUrl != null) {
-                    callback(newExtractorLink(name, name, cdnUrl, epUrl, Qualities.Unknown.value, true))
+                    // FIX LỖI TẠI ĐÂY: Sử dụng khối lambda để set thuộc tính
+                    callback(newExtractorLink(name, name, cdnUrl) {
+                        referer = epUrl
+                        quality = Qualities.Unknown.value
+                        type = ExtractorLinkType.M3U8
+                    })
                     found = true
                 }
             } else if (decrypted.startsWith("http")) {
-                callback(newExtractorLink(name, name, decrypted, epUrl, Qualities.Unknown.value, decrypted.contains(".m3u8")))
+                // FIX LỖI TẠI ĐÂY: Sử dụng khối lambda để set thuộc tính
+                callback(newExtractorLink(name, name, decrypted) {
+                    referer = epUrl
+                    quality = Qualities.Unknown.value
+                    type = if (decrypted.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                })
                 found = true
             }
         }

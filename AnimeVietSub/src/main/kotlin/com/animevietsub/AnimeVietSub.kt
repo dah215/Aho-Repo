@@ -211,8 +211,10 @@ class AnimeVietSub : MainAPI() {
         val filmId = Regex("""[/-]a(\d+)""").find(fUrl)?.groupValues?.get(1)
                   ?: Regex("""-(\d+)(?:\.html|/)?$""").find(fUrl)?.groupValues?.get(1) ?: ""
 
-        // Tạo MutableList để có thể thêm phần tử sau
+        // Tạo MutableList để thêm tập
         val episodes = mutableListOf<Episode>()
+
+        // Thêm các tập từ epNodes
         episodes.addAll(
             epNodes.mapNotNull { ep ->
                 val href = fix(ep.attr("href")) ?: return@mapNotNull null
@@ -225,11 +227,11 @@ class AnimeVietSub : MainAPI() {
             }.distinctBy { it.data }
         )
 
+        // Nếu không có tập, thử fallback từ data-episodeid hoặc data-id
         if (episodes.isEmpty()) {
-            // Nếu vẫn không có tập, thử lấy từ thuộc tính data-episode hoặc data-id trong các thẻ khác
             val fallback = doc.select("[data-episodeid], [data-id]").mapNotNull { el ->
                 val epId = el.attr("data-episodeid").takeIf { it.isNotBlank() } ?: el.attr("data-id").takeIf { it.isNotBlank() } ?: return@mapNotNull null
-                val epUrl = "$fUrl?ep=$epId" // tạm thời dùng URL hiện tại
+                val epUrl = "$fUrl?ep=$epId"
                 val name = el.text().trim().ifBlank { "Tập $epId" }
                 newEpisode("$epUrl@@$filmId@@$epId") {
                     name = name

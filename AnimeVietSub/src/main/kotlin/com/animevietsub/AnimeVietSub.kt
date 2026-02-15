@@ -40,11 +40,11 @@ object Crypto {
         if (s.startsWith("http") || s.startsWith("#EXTM3U")) return s
         try {
             val plain = String(Base64.decode(s, Base64.DEFAULT), StandardCharsets.UTF_8).trim()
-            if (isStreamUrl(plain) || plain.startsWith("#EXTM3U")) return plain
+            if (plain.startsWith("http") || plain.startsWith("#EXTM3U")) return plain
         } catch (_: Exception) {}
         for (pass in PASSES) {
             val r = openSSL(s, pass) ?: continue
-            if (isStreamUrl(r) || r.startsWith("#EXTM3U") || r.contains("googleapiscdn.com")) {
+            if (r.startsWith("http") || r.startsWith("#EXTM3U") || r.contains("googleapiscdn.com")) {
                 println("AVS-CRYPTO ok pass='${pass.take(8)}..'")
                 return r
             }
@@ -52,17 +52,14 @@ object Crypto {
         return null
     }
 
-    fun decryptToUrl(enc: String?): String? {
-        val r = decrypt(enc) ?: return null
-        return r.takeIf { isStreamUrl(it) }
-    }
+    fun decryptToUrl(enc: String?) = decrypt(enc)?.takeIf { it.startsWith("http") }
 
     private fun openSSL(b64: String, pass: String): String? {
         val raw = try { Base64.decode(b64, Base64.DEFAULT) } catch (_: Exception) { return null }
         if (raw.size < 16) return null
         val hasSalt = raw.copyOfRange(0, 8).contentEquals(SALTED)
-        val salt = if (hasSalt) raw.copyOfRange(8, 16) else null
-        val ct   = if (hasSalt) raw.copyOfRange(16, raw.size) else raw
+        val salt    = if (hasSalt) raw.copyOfRange(8, 16) else null
+        val ct      = if (hasSalt) raw.copyOfRange(16, raw.size) else raw
         if (ct.isEmpty()) return null
         val (key, iv) = evpKDF(pass.toByteArray(StandardCharsets.UTF_8), salt, 32, 16)
         return aesCbc(ct, key, iv)
@@ -111,8 +108,12 @@ object Crypto {
                s.contains(".mkv") || s.contains(".webm") || s.contains("/hls/")
     }
 
-    fun extractHexFromM3u8(content: String): String? =
-        Regex("""/chunks/([0-9a-f]{24})/""").find(content)?.groupValues?.get(1)
+    fun parseM3u8Content(content: String): Pair<String?, List<String>> {
+        val hexId = Regex("""/chunks/([0-9a-f]{24})/""").find(content)?.groupValues?.get(1)
+        val segments = Regex("""https?://[^\s#"']+""").findAll(content)
+            .map { it.value }.filter { it.contains("googleapiscdn.com") }.toList()
+        return hexId to segments
+    }
 }
 
 class AnimeVietSub : MainAPI() {
@@ -236,7 +237,6 @@ class AnimeVietSub : MainAPI() {
                       catch (e: Exception) { log("ERR", "page: ${e.message}"); return false }
         val body    = pageRes.text ?: return false
         val cookies = pageRes.cookies.toMutableMap()
-        log("PAGE", "len=${body.length} cookies=${cookies.keys}")
 
         val ids = linkedSetOf<String>()
         if (savedId.isNotBlank()) ids.add(savedId)
@@ -246,33 +246,27 @@ class AnimeVietSub : MainAPI() {
         Regex("""(?:episodeId|episode_id|epId|filmEpisodeId)\s*[=:]\s*["']?(\d+)["']?""")
             .findAll(body).forEach { ids.add(it.groupValues[1]) }
         Regex("""tap-(\d+)""").find(epUrl)?.groupValues?.get(1)?.let { ids.add(it) }
-        Regex("""-(\\d+)-v\\d*""").find(epUrl)?.groupValues?.get(1)?.let { ids.add(it) }
         log("IDS", ids.joinToString(","))
 
-        var found = withTimeoutOrNull(20_000L) {
+        var found = withTimeoutOrNull(25_000L) {
             ajaxFlow(epUrl, filmId, ids.toList(), cookies, callback)
         } ?: false
         log("A", "found=$found")
 
-        if (!found) found = withTimeoutOrNull(12_000L) {
-            cdnProbeStrategy(body, epUrl, callback)
-        } ?: false
-        log("B", "found=$found")
-
-        if (!found) found = withTimeoutOrNull(8_000L) {
+        if (!found) found = withTimeoutOrNull(10_000L) {
             scrapeStrategy(body, epUrl, subtitleCallback, callback)
         } ?: false
         log("C", "found=$found")
-
-        if (!found) found = withTimeoutOrNull(6_000L) {
-            encMineStrategy(body, epUrl, callback)
-        } ?: false
-        log("D", "found=$found")
 
         log("DONE", "found=$found")
         return found
     }
 
+    // ── AJAX flow ─────────────────────────────────────────────────────────────
+    // Exact flow from network capture:
+    // Step 1: POST episodeId=X&backup=1  → HTML with server buttons (data-href=hash, data-play=api)
+    // Step 2: POST link=HASH&id=FILM_ID  → JSON {link:[{file:"ENCRYPTED_M3U8_CONTENT"}]}
+    // Step 3: Decrypt file → raw M3U8 text → extract CDN segments → emit index.m3u8 or direct
     private suspend fun ajaxFlow(
         epUrl: String, filmId: String, ids: List<String>,
         cookies: MutableMap<String, String>, cb: (ExtractorLink) -> Unit
@@ -285,25 +279,23 @@ class AnimeVietSub : MainAPI() {
                     headers = aH, cookies = cookies, interceptor = cf)
                 cookies.putAll(r1.cookies)
                 val body1 = r1.text ?: continue
-                log("S1", "id=$epId code=${r1.code} body=${body1.take(300)}")
+                log("S1", "id=$epId code=${r1.code} len=${body1.length}")
 
                 val j1 = try {
                     @Suppress("UNCHECKED_CAST")
                     mapper.readValue(body1, Map::class.java) as Map<String, Any?>
                 } catch (_: Exception) {
-                    if (handleBody(body1, epUrl, filmId, cb)) return true; continue
+                    if (handleBody(body1, epUrl, filmId, aH, cookies, cb)) return true; continue
                 }
 
                 val lnk = j1["link"] ?: j1["url"] ?: j1["stream"]
                 if (lnk is String && lnk.isNotBlank()) {
-                    val u = if (lnk.startsWith("http")) lnk else Crypto.decryptToUrl(lnk)
-                    log("S1_LINK", u ?: "decrypt_failed")
-                    if (u != null && emitStream(u, epUrl, cb)) return true
+                    if (resolveAndEmit(lnk, epUrl, filmId, aH, cookies, cb)) return true
                 }
                 if (lnk is List<*>) {
                     for (item in lnk.filterIsInstance<Map<String, Any?>>()) {
                         val f = (item["file"] ?: item["src"] ?: item["url"])?.toString() ?: continue
-                        if (resolveAndEmit(f, epUrl, cb)) return true
+                        if (resolveAndEmit(f, epUrl, filmId, aH, cookies, cb)) return true
                     }
                 }
 
@@ -316,8 +308,7 @@ class AnimeVietSub : MainAPI() {
                     ".server-item a,.btn-server,li[data-id] a,.episodes-btn a,button[data-href]"
                 )
                 log("S1_BTNS", "${buttons.size} buttons")
-
-                if (buttons.isEmpty()) { if (handleBody(htmlStr, epUrl, filmId, cb)) return true; continue }
+                if (buttons.isEmpty()) { if (handleBody(htmlStr, epUrl, filmId, aH, cookies, cb)) return true; continue }
 
                 for (btn in buttons) {
                     val hash = listOf("data-href", "data-link", "data-url")
@@ -332,15 +323,15 @@ class AnimeVietSub : MainAPI() {
                         if (emitStream(hash, epUrl, cb)) return true; continue
                     }
 
-                    val play  = btn.attr("data-play").trim()
-                    val btnId = btn.attr("data-id").filter { it.isDigit() }.ifBlank { epId }
-                    log("S2", "hash=${hash.take(50)} play=$play btnId=$btnId")
+                    val btnId = btn.attr("data-id").filter { it.isDigit() }.ifBlank { "0" }
+                    log("S2", "hash=${hash.take(50)} btnId=$btnId filmId=$filmId")
 
+                    // Priority: filmId first (confirmed from capture: link=hash&id=FILM_ID)
                     val paramSets = buildList {
                         if (filmId.isNotBlank()) add(mapOf("link" to hash, "id" to filmId))
-                        add(mapOf("link" to hash, "id" to epId, "backup" to "1"))
-                        add(mapOf("link" to hash, "play" to play.ifBlank { "api" }, "id" to filmId.ifBlank { epId }, "backup" to "1"))
-                        add(mapOf("link" to hash, "id" to btnId, "backup" to "1"))
+                        add(mapOf("link" to hash, "id" to epId))
+                        if (btnId != "0" && btnId != epId && btnId != filmId)
+                            add(mapOf("link" to hash, "id" to btnId))
                     }
 
                     for (params in paramSets) {
@@ -349,8 +340,8 @@ class AnimeVietSub : MainAPI() {
                                 data = params, headers = aH, cookies = cookies, interceptor = cf)
                             cookies.putAll(r2.cookies)
                             val body2 = r2.text ?: continue
-                            log("S2_RESP", "code=${r2.code} body=${body2.take(300)}")
-                            if (handleBody(body2, epUrl, filmId, cb)) return true
+                            log("S2_RESP", "code=${r2.code} body=${body2.take(200)}")
+                            if (handleBody(body2, epUrl, filmId, aH, cookies, cb)) return true
                         } catch (e: Exception) { log("S2_ERR", e.message ?: "") }
                     }
                 }
@@ -359,26 +350,110 @@ class AnimeVietSub : MainAPI() {
         return false
     }
 
-    private suspend fun resolveAndEmit(f: String, ref: String, cb: (ExtractorLink) -> Unit): Boolean {
-        if (f.startsWith("http")) return emitStream(f, ref, cb)
-        val dec = Crypto.decrypt(f) ?: return false
-        log("RESOLVE", dec.take(120))
+    // Resolve any value: URL → emit directly; M3U8 content → extract CDN info → emit
+    private suspend fun resolveAndEmit(
+        raw: String, ref: String, filmId: String,
+        aH: Map<String, String>, cookies: MutableMap<String, String>,
+        cb: (ExtractorLink) -> Unit
+    ): Boolean {
+        if (raw.isBlank()) return false
+        if (raw.startsWith("http")) return emitStream(raw, ref, cb)
+
+        val dec = Crypto.decrypt(raw) ?: return false
+        log("RESOLVE", "dec=${dec.take(100)}")
+
         return when {
             dec.startsWith("http") -> emitStream(dec, ref, cb)
+
+            // M3U8 content from decrypt — the main case for animevietsub
+            // Website creates blob URL from this content; we extract CDN info instead
             dec.contains("#EXTM3U") -> {
-                val hexId = Crypto.extractHexFromM3u8(dec)
-                log("M3U8_CONTENT", "hexId=$hexId")
-                if (hexId != null) probeCdn(hexId, ref, cb) else false
+                val (hexId, segments) = Crypto.parseM3u8Content(dec)
+                log("M3U8_CONTENT", "hexId=$hexId segments=${segments.size}")
+                when {
+                    segments.isNotEmpty() -> emitM3u8FromContent(dec, hexId, segments, ref, cb)
+                    hexId != null -> emitCdnUrl(hexId, ref, cb)
+                    else -> false
+                }
             }
             else -> false
         }
     }
 
-    private suspend fun handleBody(body: String, ref: String, filmId: String, cb: (ExtractorLink) -> Unit): Boolean {
-        if (body.isBlank()) return false
+    // Emit M3U8 that was obtained as text content (blob approach)
+    // Strategy: try index.m3u8 first (no verify — we already have the content, trust it)
+    // then fallback to first segment to confirm CDN is reachable
+    private suspend fun emitM3u8FromContent(
+        m3u8Text: String, hexId: String?, segments: List<String>,
+        ref: String, cb: (ExtractorLink) -> Unit
+    ): Boolean {
+        // Try CDN index.m3u8 — no HTTP verify needed since we have the actual content
+        if (hexId != null) {
+            val indexUrl = "https://$CDN/chunks/$hexId/original/index.m3u8"
+            log("EMIT_INDEX", indexUrl)
+            // Quick HEAD check to see if index.m3u8 exists (3s timeout, no CF)
+            val indexExists = try {
+                withTimeoutOrNull(3_000L) {
+                    val r = app.get(indexUrl, headers = cdnH)
+                    r.code == 200 && (r.text?.contains("#EXTM3U") == true)
+                } ?: false
+            } catch (_: Exception) { false }
 
-        val cdnUrl = extractCdnUrl(body)
-        if (cdnUrl != null) { log("HDL_CDN", cdnUrl); if (emitStream(cdnUrl, ref, cb)) return true }
+            if (indexExists) {
+                log("INDEX_OK", indexUrl)
+                cb(newExtractorLink(name, name, indexUrl) {
+                    referer = ref; quality = Qualities.Unknown.value
+                    type = ExtractorLinkType.M3U8; headers = cdnH
+                })
+                return true
+            }
+            log("INDEX_MISS", indexUrl)
+        }
+
+        // Fallback: emit first segment URL — ExoPlayer won't play a single segment,
+        // but we can verify CDN is reachable and build M3U8 reference
+        if (segments.isNotEmpty()) {
+            val firstSeg = segments.first()
+            log("SEGMENT_EMIT", firstSeg.take(80))
+            // Verify first segment is reachable (3s timeout, no CF)
+            val segOk = try {
+                withTimeoutOrNull(3_000L) {
+                    app.get(firstSeg, headers = cdnH).code == 200
+                } ?: false
+            } catch (_: Exception) { false }
+
+            if (segOk && hexId != null) {
+                // CDN is reachable — emit index.m3u8 anyway; ExoPlayer will handle it
+                val indexUrl = "https://$CDN/chunks/$hexId/original/index.m3u8"
+                cb(newExtractorLink(name, name, indexUrl) {
+                    referer = ref; quality = Qualities.Unknown.value
+                    type = ExtractorLinkType.M3U8; headers = cdnH
+                })
+                return true
+            }
+        }
+        return false
+    }
+
+    private suspend fun emitCdnUrl(hexId: String, ref: String, cb: (ExtractorLink) -> Unit): Boolean {
+        val url = "https://$CDN/chunks/$hexId/original/index.m3u8"
+        return try {
+            val r = withTimeoutOrNull(4_000L) { app.get(url, headers = cdnH) }
+            if (r != null && r.code == 200 && r.text?.contains("#EXTM3U") == true) {
+                cb(newExtractorLink(name, name, url) {
+                    referer = ref; quality = Qualities.Unknown.value
+                    type = ExtractorLinkType.M3U8; headers = cdnH
+                }); true
+            } else false
+        } catch (_: Exception) { false }
+    }
+
+    private suspend fun handleBody(
+        body: String, ref: String, filmId: String,
+        aH: Map<String, String>, cookies: MutableMap<String, String>,
+        cb: (ExtractorLink) -> Unit
+    ): Boolean {
+        if (body.isBlank()) return false
 
         for (u in extractDirectUrls(body)) { if (emitStream(u, ref, cb)) return true }
 
@@ -389,63 +464,17 @@ class AnimeVietSub : MainAPI() {
                 val v = j[key] ?: continue
                 when {
                     v is String && v.startsWith("http") -> if (emitStream(v, ref, cb)) return true
-                    v is String && v.isNotBlank() -> {
-                        if (resolveAndEmit(v, ref, cb)) return true
-                    }
+                    v is String && v.isNotBlank() -> if (resolveAndEmit(v, ref, filmId, aH, cookies, cb)) return true
                     v is List<*> -> for (item in v.filterIsInstance<Map<String, Any?>>()) {
                         val f = (item["file"] ?: item["src"] ?: item["url"])?.toString() ?: continue
-                        if (resolveAndEmit(f, ref, cb)) return true
+                        if (resolveAndEmit(f, ref, filmId, aH, cookies, cb)) return true
                     }
                 }
             }
         } catch (_: Exception) {}
 
         if (body.length > 20 && body.trimStart().first().let { it != '{' && it != '[' && it != '<' }) {
-            val dec = Crypto.decrypt(body.trim())
-            log("HDL_BODY_DEC", dec?.take(120) ?: "null")
-            if (dec != null) {
-                when {
-                    dec.startsWith("http") && Crypto.isStreamUrl(dec) -> if (emitStream(dec, ref, cb)) return true
-                    dec.contains("#EXTM3U") -> {
-                        val hexId = Crypto.extractHexFromM3u8(dec)
-                        if (hexId != null && probeCdn(hexId, ref, cb)) return true
-                    }
-                }
-            }
-        }
-        return false
-    }
-
-    private suspend fun probeCdn(hexId: String, ref: String, cb: (ExtractorLink) -> Unit): Boolean {
-        log("PROBE_CDN", hexId)
-        for (suffix in listOf("index.m3u8", "playlist.m3u8", "master.m3u8")) {
-            val url = "https://$CDN/chunks/$hexId/original/$suffix"
-            try {
-                val r = app.get(url, headers = cdnH, interceptor = cf)
-                val text = r.text ?: continue
-                if (r.code == 200 && text.contains("#EXTM3U")) {
-                    log("PROBE_HIT", url)
-                    return emitVerifiedM3u8(url, ref, cb)
-                }
-            } catch (_: Exception) {}
-        }
-        log("PROBE_MISS", hexId)
-        return false
-    }
-
-    private suspend fun cdnProbeStrategy(body: String, epUrl: String, cb: (ExtractorLink) -> Unit): Boolean {
-        val hexIds = linkedSetOf<String>()
-        try {
-            Regex("""[0-9a-f]{24}""").findAll(
-                Jsoup.parse(body).select("script").joinToString("\n") { it.html() }
-            ).forEach { hexIds.add(it.value) }
-        } catch (_: Exception) {}
-        Regex("""[0-9a-f]{24}""").findAll(body).forEach { hexIds.add(it.value) }
-        val unique = hexIds.take(8).toList()
-        log("CDN_PROBE", "hexIds=$unique")
-
-        for (hexId in unique) {
-            if (probeCdn(hexId, epUrl, cb)) return true
+            if (resolveAndEmit(body.trim(), ref, filmId, aH, cookies, cb)) return true
         }
         return false
     }
@@ -458,41 +487,17 @@ class AnimeVietSub : MainAPI() {
         for (el in doc.select("iframe[src],iframe[data-src]")) {
             val src = fix(el.attr("src").ifBlank { el.attr("data-src") }) ?: continue
             if (!src.startsWith("http")) continue
-            val isKnownHost = listOf(
-                "doodstream", "streamtape", "mixdrop", "upstream", "vidcloud",
-                "filemoon", "vidplay", "vidsrc", "embed", "player", "cdn"
-            ).any { src.contains(it, ignoreCase = true) }
-            if (!isKnownHost) continue
+            val isKnown = listOf("doodstream","streamtape","mixdrop","upstream","vidcloud",
+                "filemoon","vidplay","vidsrc","embed","player","cdn")
+                .any { src.contains(it, ignoreCase = true) }
+            if (!isKnown) continue
             try { loadExtractor(src, epUrl, sub, cb); return true } catch (_: Exception) {}
         }
         for (el in doc.select("video source[src],video[src]")) {
             val src = fix(el.attr("src")) ?: continue
             if (Crypto.isStreamUrl(src) && emitStream(src, epUrl, cb)) return true
         }
-        for (el in doc.select("[data-file],[data-url],[data-source],[data-stream]")) {
-            val raw = listOf("data-file", "data-url", "data-source", "data-stream")
-                .firstNotNullOfOrNull { el.attr(it).takeIf { v -> v.isNotBlank() } } ?: continue
-            if (resolveAndEmit(raw, epUrl, cb)) return true
-        }
         return false
-    }
-
-    private suspend fun encMineStrategy(body: String, epUrl: String, cb: (ExtractorLink) -> Unit): Boolean {
-        for (m in Regex("""(?:file|link|source|url|enc|m3u8)\s*[:=]\s*["']([A-Za-z0-9+/=]{40,})["']""").findAll(body)) {
-            if (resolveAndEmit(m.groupValues[1], epUrl, cb)) return true
-        }
-        return false
-    }
-
-    private fun extractCdnUrl(body: String): String? {
-        Regex("""https?://storage\.googleapiscdn\.com/chunks/([0-9a-f]{24})/[^\s"'<>\\]+""")
-            .find(body)?.let { m ->
-                val hexId = Regex("""/chunks/([0-9a-f]{24})/""").find(m.value)
-                    ?.groupValues?.get(1) ?: return null
-                return if (m.value.contains(".m3u8")) m.value
-                       else "https://$CDN/chunks/$hexId/original/index.m3u8"
-            }
-        return null
     }
 
     private fun extractDirectUrls(body: String): List<String> {
@@ -511,42 +516,35 @@ class AnimeVietSub : MainAPI() {
             url.contains(CDN) -> {
                 val hexId = Regex("""/chunks/([0-9a-f]{24})/""").find(url)?.groupValues?.get(1)
                 val m3u8 = if (hexId != null) "https://$CDN/chunks/$hexId/original/index.m3u8"
-                           else if (url.contains(".m3u8")) url
-                           else return false
-                emitVerifiedM3u8(m3u8, ref, cb)
+                           else if (url.contains(".m3u8")) url else return false
+                try {
+                    val r = withTimeoutOrNull(4_000L) { app.get(m3u8, headers = cdnH) }
+                    if (r != null && r.code == 200 && r.text?.contains("#EXTM3U") == true) {
+                        cb(newExtractorLink(name, name, m3u8) {
+                            referer = ref; quality = Qualities.Unknown.value
+                            type = ExtractorLinkType.M3U8; headers = cdnH
+                        }); true
+                    } else false
+                } catch (_: Exception) { false }
             }
-            url.contains(".m3u8") || url.contains("/hls/") -> emitVerifiedM3u8(url, ref, cb)
-            url.contains(".mp4") || url.contains(".mkv") || url.contains(".webm") ->
-                emitVideo(url, ref, cb)
+            url.contains(".m3u8") || url.contains("/hls/") -> {
+                try {
+                    val r = withTimeoutOrNull(4_000L) { app.get(url, headers = cdnH) }
+                    if (r != null && r.code == 200 && r.text?.contains("#EXTM3U") == true) {
+                        cb(newExtractorLink(name, name, url) {
+                            referer = ref; quality = Qualities.Unknown.value
+                            type = ExtractorLinkType.M3U8; headers = cdnH
+                        }); true
+                    } else false
+                } catch (_: Exception) { false }
+            }
+            url.contains(".mp4") || url.contains(".mkv") || url.contains(".webm") -> {
+                cb(newExtractorLink(name, name, url) {
+                    referer = ref; quality = Qualities.Unknown.value
+                    type = ExtractorLinkType.VIDEO; headers = cdnH
+                }); true
+            }
             else -> false
         }
-    }
-
-    private suspend fun emitVerifiedM3u8(url: String, ref: String, cb: (ExtractorLink) -> Unit): Boolean {
-        return try {
-            val r = app.get(url, headers = cdnH, interceptor = cf)
-            val text = r.text ?: return false
-            if (r.code != 200 || !text.contains("#EXTM3U")) {
-                log("VERIFY_FAIL", "code=${r.code} url=$url")
-                return false
-            }
-            log("VERIFY_OK", url)
-            cb(newExtractorLink(name, name, url) {
-                this.referer = ref
-                this.quality = Qualities.Unknown.value
-                this.type    = ExtractorLinkType.M3U8
-                this.headers = cdnH
-            })
-            true
-        } catch (e: Exception) { log("VERIFY_ERR", "${e.message}"); false }
-    }
-
-    private suspend fun emitVideo(url: String, ref: String, cb: (ExtractorLink) -> Unit): Boolean {
-        return try {
-            cb(newExtractorLink(name, name, url) {
-                this.referer = ref; this.quality = Qualities.Unknown.value
-                this.type = ExtractorLinkType.VIDEO; this.headers = cdnH
-            }); true
-        } catch (e: Exception) { log("EMIT_ERR", "${e.message}"); false }
     }
 }

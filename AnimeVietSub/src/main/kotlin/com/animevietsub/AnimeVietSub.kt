@@ -211,16 +211,19 @@ class AnimeVietSub : MainAPI() {
         val filmId = Regex("""[/-]a(\d+)""").find(fUrl)?.groupValues?.get(1)
                   ?: Regex("""-(\d+)(?:\.html|/)?$""").find(fUrl)?.groupValues?.get(1) ?: ""
 
-        // Sử dụng MutableList để có thể thay đổi sau
-        var episodes = epNodes.mapNotNull { ep ->
-            val href = fix(ep.attr("href")) ?: return@mapNotNull null
-            val dataId = ep.attr("data-id").takeIf { it.isNotBlank() } ?: ""
-            val nm = ep.text().trim().ifBlank { ep.attr("title").trim() }
-            newEpisode("$href@@$filmId@@$dataId") {
-                name = nm
-                episode = Regex("\\d+").find(nm)?.value?.toIntOrNull()
-            }
-        }.distinctBy { it.data }.toMutableList()
+        // Tạo MutableList để có thể thêm phần tử sau
+        val episodes = mutableListOf<Episode>()
+        episodes.addAll(
+            epNodes.mapNotNull { ep ->
+                val href = fix(ep.attr("href")) ?: return@mapNotNull null
+                val dataId = ep.attr("data-id").takeIf { it.isNotBlank() } ?: ""
+                val nm = ep.text().trim().ifBlank { ep.attr("title").trim() }
+                newEpisode("$href@@$filmId@@$dataId") {
+                    name = nm
+                    episode = Regex("\\d+").find(nm)?.value?.toIntOrNull()
+                }
+            }.distinctBy { it.data }
+        )
 
         if (episodes.isEmpty()) {
             // Nếu vẫn không có tập, thử lấy từ thuộc tính data-episode hoặc data-id trong các thẻ khác

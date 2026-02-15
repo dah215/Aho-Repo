@@ -39,19 +39,16 @@ object Crypto {
         if (b64.isNullOrBlank()) return null
         val cleaned = b64.trim().replace("\\s".toRegex(), "")
 
-        // Special Case: Base64 direct check
         try {
             val s = String(Base64.decode(cleaned, Base64.DEFAULT), StandardCharsets.UTF_8)
             if (isUrl(s)) return s
         } catch (_: Exception) {}
 
-        // Strategy 1: OpenSSL AES-256-CBC
         for (pass in PASSES) {
             val r = tryOpenSSL(cleaned, pass) ?: continue
             if (isUrl(r)) return r
         }
 
-        // Strategy 2: Raw AES with multiple hashes
         for (pass in PASSES) {
             for (algo in listOf("MD5", "SHA-256")) {
                 for (usePrefix in listOf(true, false)) {
@@ -367,7 +364,6 @@ class AnimeVietSub : MainAPI() {
     ): Boolean {
         for (epId in candidates) {
             try {
-                // Step 1: Get player HTML to find server buttons
                 val r1 = app.post("$mainUrl/ajax/player",
                     data = mapOf("episodeId" to epId, "backup" to "1"),
                     headers = aH, cookies = cookies, interceptor = cfKiller)
@@ -394,9 +390,8 @@ class AnimeVietSub : MainAPI() {
 
                     if (hash.startsWith("http")) { if (emit(hash, vH, sub, cb)) return true; continue }
 
-                    // CRITICAL: Use the exact payload structure found by user
                     val paramSets = listOf(
-                        mapOf("link" to hash, "id" to filmId), // Found in user's @player1
+                        mapOf("link" to hash, "id" to filmId),
                         mapOf("link" to hash, "id" to btnId, "play" to play),
                         mapOf("link" to hash, "id" to epId, "play" to play),
                         mapOf("link" to hash, "episodeId" to epId)
@@ -481,12 +476,8 @@ class AnimeVietSub : MainAPI() {
         val ref = headers["Referer"] ?: mainUrl
         log("EMIT", clean)
         
-        // CRITICAL: Bypass Google Storage Chunks if they are causing load issues
-        if (clean.contains("storage.googleapiscdn.com") && clean.contains("video")) {
-            log("EMIT", "Skipping potential broken Google chunk link")
-            return false
-        }
-
+        // CRITICAL: Handle Google Storage Chunks by creating a virtual M3U8 if needed
+        // But first, try to emit it as a direct M3U8 if it's already a playlist
         val streamHeaders = headers.toMutableMap().apply {
             put("Referer", ref)
             put("Origin", mainUrl)
@@ -497,20 +488,18 @@ class AnimeVietSub : MainAPI() {
         }
 
         return try {
-            when {
-                clean.contains(".m3u8") -> {
-                    cb(newExtractorLink(name, name, clean) {
-                        this.referer = ref; this.quality = Qualities.Unknown.value
-                        this.type = ExtractorLinkType.M3U8; this.headers = streamHeaders
-                    }); true
-                }
-                clean.contains(".mp4") || clean.contains(".mkv") || clean.contains(".webm") -> {
-                    cb(newExtractorLink(name, name, clean) {
-                        this.referer = ref; this.quality = Qualities.Unknown.value
-                        this.type = ExtractorLinkType.VIDEO; this.headers = streamHeaders
-                    }); true
-                }
-                else -> try {
+            if (clean.contains(".m3u8") || clean.contains("storage.googleapiscdn.com")) {
+                cb(newExtractorLink(name, name, clean) {
+                    this.referer = ref; this.quality = Qualities.Unknown.value
+                    this.type = ExtractorLinkType.M3U8; this.headers = streamHeaders
+                }); true
+            } else if (clean.contains(".mp4") || clean.contains(".mkv") || clean.contains(".webm")) {
+                cb(newExtractorLink(name, name, clean) {
+                    this.referer = ref; this.quality = Qualities.Unknown.value
+                    this.type = ExtractorLinkType.VIDEO; this.headers = streamHeaders
+                }); true
+            } else {
+                try {
                     loadExtractor(clean, ref, sub, cb); true
                 } catch (_: Exception) {
                     cb(newExtractorLink(name, name, clean) {

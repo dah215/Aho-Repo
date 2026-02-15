@@ -56,18 +56,17 @@ class PhimMoiChillProvider : MainAPI() {
         val isSeries = label.contains("TẬP") || label.contains("HOÀN TẤT") || Regex("""\d+/\d+""").containsMatchIn(label)
         val has4k = el.selectFirst("span.film-badge.badge-4k") != null
         val hasTM = el.selectFirst("span.film-badge.badge-tm") != null
-        val quality = when {
-            has4k || label.contains("4K") -> SearchQuality.UHD
-            label.contains("CAM") -> SearchQuality.Cam
-            else -> SearchQuality.HD
-        }
         val dubs = java.util.EnumSet.noneOf(DubStatus::class.java).apply {
             if (!label.contains("RAW")) add(DubStatus.Subbed)
             if (label.contains("THUYẾT MINH") || hasTM) add(DubStatus.Dubbed)
         }
         return newAnimeSearchResponse(title, href, if (isSeries) TvType.TvSeries else TvType.Movie) {
             this.posterUrl = poster
-            this.quality = quality
+            this.quality = when {
+                has4k || label.contains("4K") -> SearchQuality.UHD
+                label.contains("CAM") -> SearchQuality.Cam
+                else -> SearchQuality.HD
+            }
             this.dubStatus = dubs
         }
     }
@@ -112,62 +111,135 @@ class PhimMoiChillProvider : MainAPI() {
         }
     }
 
-    override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
-        val res = app.get(data, headers = headers)
-        val html = res.text
-        val cookies = res.cookies
+    override suspend fun loadLinks(
+        data: String,
+        isCasting: Boolean,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        try {
+            val res = app.get(data, headers = headers)
+            val html = res.text
+            val cookies = res.cookies
 
-        val epId = Regex("""[/-]pm(\d+)""").find(data)?.groupValues?.get(1)
-            ?: Regex("""data-id="(\d+)"""").find(html)?.groupValues?.get(1)
+            // Extract episode ID
+            val epId = Regex("""[/-]pm(\d+)""").find(data)?.groupValues?.get(1)
+                ?: Regex("""data-id="(\d+)"""").find(html)?.groupValues?.get(1)
+                ?: return false
 
-        if (epId == null) return false
+            val postHeaders = mapOf(
+                "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+                "Accept" to "*/*",
+                "X-Requested-With" to "XMLHttpRequest",
+                "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
+                "Referer" to data,
+                "Origin" to mainUrl
+            )
 
-        val postHeaders = mapOf(
-            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept" to "*/*",
-            "X-Requested-With" to "XMLHttpRequest",
-            "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
-            "Referer" to data,
-            "Origin" to mainUrl
-        )
-
-        var foundLinks = false
-        val addedKeys = mutableSetOf<String>()
-
-        // Danh sách server cần lấy: Vietsub và Thuyết Minh
-        val servers = listOf(
-            "Vietsub" to null,
-            "Thuyết Minh" to "1"
-        )
-
-        for ((serverName, qualityIndex) in servers) {
+            // ============================================
+            // BƯỚC 1: LẤY KEY VIETSUB (không có quality_index)
+            // ============================================
+            var vietsubKey: String? = null
+            
             for (sv in 0..3) {
                 try {
-                    val payload = mutableMapOf("qcao" to epId, "sv" to sv.toString())
-                    if (qualityIndex != null) payload["quality_index"] = qualityIndex
+                    val response = app.post(
+                        "$mainUrl/chillsplayer.php",
+                        data = mapOf("qcao" to epId, "sv" to sv.toString()),
+                        headers = postHeaders,
+                        cookies = cookies
+                    ).text
 
-                    val resp = app.post("$mainUrl/chillsplayer.php", data = payload, headers = postHeaders, cookies = cookies).text
-                    val key = Regex("""iniPlayers\s*\(\s*["']([a-fA-F0-9]+)["']""").find(resp)?.groupValues?.get(1)
-
-                    if (!key.isNullOrEmpty() && key.length >= 20 && key !in addedKeys) {
-                        addedKeys.add(key)
-                        
-                        listOf(
-                            "$serverName - PMHLS" to "https://sotrim.topphimmoi.org/mpeg/$key/index.m3u8",
-                            "$serverName - PMPRO" to "https://dash.megacdn.xyz/mpeg/$key/index.m3u8"
-                        ).forEach { (name, m3u8Url) ->
-                            callback(newExtractorLink(name, name, m3u8Url, ExtractorLinkType.M3U8) {
-                                this.referer = "$mainUrl/"
-                                this.quality = Qualities.P1080.value
-                            })
-                        }
-                        foundLinks = true
-                        break // Tìm thấy key cho server này, chuyển sang server tiếp theo
+                    val match = Regex("""iniPlayers\s*\(\s*["']([a-fA-F0-9]{20,})["']""").find(response)
+                    if (match != null) {
+                        vietsubKey = match.groupValues[1]
+                        break
                     }
-                } catch (_: Exception) { }
+                } catch (e: Exception) { continue }
             }
-        }
 
-        return foundLinks
+            // ============================================
+            // BƯỚC 2: LẤY KEY THUYẾT MINH (có quality_index=1)
+            // ============================================
+            var tmKey: String? = null
+            
+            for (sv in 0..3) {
+                try {
+                    val response = app.post(
+                        "$mainUrl/chillsplayer.php",
+                        data = mapOf("qcao" to epId, "sv" to sv.toString(), "quality_index" to "1"),
+                        headers = postHeaders,
+                        cookies = cookies
+                    ).text
+
+                    val match = Regex("""iniPlayers\s*\(\s*["']([a-fA-F0-9]{20,})["']""").find(response)
+                    if (match != null) {
+                        tmKey = match.groupValues[1]
+                        break
+                    }
+                } catch (e: Exception) { continue }
+            }
+
+            // ============================================
+            // BƯỚC 3: THÊM LINKS
+            // ============================================
+            
+            // Thêm Vietsub
+            if (!vietsubKey.isNullOrEmpty()) {
+                callback(
+                    newExtractorLink(
+                        "Vietsub - PMHLS",
+                        "Vietsub - PMHLS",
+                        "https://sotrim.topphimmoi.org/mpeg/$vietsubKey/index.m3u8",
+                        ExtractorLinkType.M3U8
+                    ) {
+                        this.referer = "$mainUrl/"
+                        this.quality = Qualities.P1080.value
+                    }
+                )
+                callback(
+                    newExtractorLink(
+                        "Vietsub - PMPRO",
+                        "Vietsub - PMPRO",
+                        "https://dash.megacdn.xyz/mpeg/$vietsubKey/index.m3u8",
+                        ExtractorLinkType.M3U8
+                    ) {
+                        this.referer = "$mainUrl/"
+                        this.quality = Qualities.P1080.value
+                    }
+                )
+            }
+
+            // Thêm Thuyết Minh (chỉ nếu key khác với Vietsub)
+            if (!tmKey.isNullOrEmpty() && tmKey != vietsubKey) {
+                callback(
+                    newExtractorLink(
+                        "Thuyết Minh - PMHLS",
+                        "Thuyết Minh - PMHLS",
+                        "https://sotrim.topphimmoi.org/mpeg/$tmKey/index.m3u8",
+                        ExtractorLinkType.M3U8
+                    ) {
+                        this.referer = "$mainUrl/"
+                        this.quality = Qualities.P1080.value
+                    }
+                )
+                callback(
+                    newExtractorLink(
+                        "Thuyết Minh - PMPRO",
+                        "Thuyết Minh - PMPRO",
+                        "https://dash.megacdn.xyz/mpeg/$tmKey/index.m3u8",
+                        ExtractorLinkType.M3U8
+                    ) {
+                        this.referer = "$mainUrl/"
+                        this.quality = Qualities.P1080.value
+                    }
+                )
+            }
+
+            return !vietsubKey.isNullOrEmpty() || !tmKey.isNullOrEmpty()
+
+        } catch (e: Exception) {
+            return false
+        }
     }
 }

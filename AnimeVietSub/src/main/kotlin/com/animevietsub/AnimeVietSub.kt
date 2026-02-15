@@ -549,7 +549,7 @@ class AnimeVietSub : MainAPI() {
         }
     }
 
-    private fun emitM3u8(url: String, ref: String, cb: (ExtractorLink) -> Unit): Boolean {
+    private suspend fun emitM3u8(url: String, ref: String, cb: (ExtractorLink) -> Unit): Boolean {
         if (!url.startsWith("http")) return false
         log("EMIT_M3U8", url)
         return try {

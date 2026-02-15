@@ -5,7 +5,7 @@ import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
 import java.net.URLEncoder
-
+ 
 @CloudstreamPlugin
 class PhimMoiChillPlugin : Plugin() {
     override fun load() {

@@ -131,29 +131,26 @@ class PhimMoiChillProvider : MainAPI() {
             "Origin" to mainUrl
         )
 
-        // Lấy cả Vietsub và Thuyết Minh
-        val serverTypes = listOf(
-            "Vietsub" to null,           // Không có quality_index
-            "Thuyết Minh" to "1"         // quality_index=1
-        )
-
         var foundLinks = false
+        val addedKeys = mutableSetOf<String>()
 
-        for ((serverName, qualityIndex) in serverTypes) {
+        // Tự động quét cả Vietsub và Thuyết Minh
+        // quality_index: null = Vietsub, "1" = Thuyết Minh
+        listOf(null, "1").forEach { qualityIndex ->
             for (sv in 0..3) {
                 try {
-                    // Tạo payload với hoặc không có quality_index
-                    val payload = if (qualityIndex != null) {
-                        mapOf("qcao" to epId, "sv" to sv.toString(), "quality_index" to qualityIndex)
-                    } else {
-                        mapOf("qcao" to epId, "sv" to sv.toString())
-                    }
+                    val payload = mutableMapOf("qcao" to epId, "sv" to sv.toString())
+                    if (qualityIndex != null) payload["quality_index"] = qualityIndex
 
                     val resp = app.post("$mainUrl/chillsplayer.php", data = payload, headers = postHeaders, cookies = cookies).text
 
                     val key = Regex("""iniPlayers\s*\(\s*["']([a-fA-F0-9]+)["']""").find(resp)?.groupValues?.get(1)
 
-                    if (!key.isNullOrEmpty() && key.length >= 20) {
+                    if (!key.isNullOrEmpty() && key.length >= 20 && !addedKeys.contains(key)) {
+                        addedKeys.add(key)
+                        
+                        val serverName = if (qualityIndex == "1") "Thuyết Minh" else "Vietsub"
+                        
                         listOf(
                             "$serverName - PMHLS" to "https://sotrim.topphimmoi.org/mpeg/$key/index.m3u8",
                             "$serverName - PMPRO" to "https://dash.megacdn.xyz/mpeg/$key/index.m3u8"
@@ -164,15 +161,7 @@ class PhimMoiChillProvider : MainAPI() {
                             })
                         }
                         foundLinks = true
-                        break // Tìm thấy key, chuyển sang server type tiếp theo
-                    }
-
-                    // Fallback: tìm direct m3u8
-                    Regex("""https?://[^\s"'<>]+\.m3u8[^\s"'<>]*""").findAll(resp).forEach { m ->
-                        callback(newExtractorLink(serverName, serverName, m.value, ExtractorLinkType.M3U8) {
-                            this.referer = "$mainUrl/"
-                        })
-                        foundLinks = true
+                        break
                     }
                 } catch (_: Exception) { }
             }

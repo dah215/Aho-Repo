@@ -164,7 +164,7 @@ class PhimMoiChillProvider : MainAPI() {
         return null
     }
 
-    private fun addLinks(serverName: String, key: String, callback: (ExtractorLink) -> Unit) {
+    private suspend fun addLinks(serverName: String, key: String, callback: (ExtractorLink) -> Unit) {
         listOf(
             "$serverName - PMHLS" to "https://sotrim.topphimmoi.org/mpeg/$key/index.m3u8",
             "$serverName - PMPRO" to "https://dash.megacdn.xyz/mpeg/$key/index.m3u8"

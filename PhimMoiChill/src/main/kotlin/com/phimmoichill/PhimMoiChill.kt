@@ -131,33 +131,53 @@ class PhimMoiChillProvider : MainAPI() {
             "Origin" to mainUrl
         )
 
-        for (sv in 0..3) {
-            try {
-                val resp = app.post("$mainUrl/chillsplayer.php", data = mapOf("qcao" to epId, "sv" to sv.toString()), headers = postHeaders, cookies = cookies).text
+        // Lấy cả Vietsub và Thuyết Minh
+        val serverTypes = listOf(
+            "Vietsub" to null,           // Không có quality_index
+            "Thuyết Minh" to "1"         // quality_index=1
+        )
 
-                val key = Regex("""iniPlayers\s*\(\s*["']([a-fA-F0-9]+)["']""").find(resp)?.groupValues?.get(1)
+        var foundLinks = false
 
-                if (!key.isNullOrEmpty() && key.length >= 20) {
-                    // FIX: Path đúng là /mpeg/ không phải /raw/
-                    listOf(
-                        "PMHLS" to "https://sotrim.topphimmoi.org/mpeg/$key/index.m3u8",
-                        "PMPRO" to "https://dash.megacdn.xyz/mpeg/$key/index.m3u8"
-                    ).forEach { (name, m3u8Url) ->
-                        callback(newExtractorLink(name, name, m3u8Url, ExtractorLinkType.M3U8) {
-                            this.referer = "$mainUrl/"
-                            this.quality = Qualities.P1080.value
-                        })
+        for ((serverName, qualityIndex) in serverTypes) {
+            for (sv in 0..3) {
+                try {
+                    // Tạo payload với hoặc không có quality_index
+                    val payload = if (qualityIndex != null) {
+                        mapOf("qcao" to epId, "sv" to sv.toString(), "quality_index" to qualityIndex)
+                    } else {
+                        mapOf("qcao" to epId, "sv" to sv.toString())
                     }
-                    return true
-                }
 
-                Regex("""https?://[^\s"'<>]+\.m3u8[^\s"'<>]*""").findAll(resp).forEach { m ->
-                    callback(newExtractorLink("Direct", "Direct", m.value, ExtractorLinkType.M3U8) {
-                        this.referer = "$mainUrl/"
-                    })
-                }
-            } catch (_: Exception) { }
+                    val resp = app.post("$mainUrl/chillsplayer.php", data = payload, headers = postHeaders, cookies = cookies).text
+
+                    val key = Regex("""iniPlayers\s*\(\s*["']([a-fA-F0-9]+)["']""").find(resp)?.groupValues?.get(1)
+
+                    if (!key.isNullOrEmpty() && key.length >= 20) {
+                        listOf(
+                            "$serverName - PMHLS" to "https://sotrim.topphimmoi.org/mpeg/$key/index.m3u8",
+                            "$serverName - PMPRO" to "https://dash.megacdn.xyz/mpeg/$key/index.m3u8"
+                        ).forEach { (name, m3u8Url) ->
+                            callback(newExtractorLink(name, name, m3u8Url, ExtractorLinkType.M3U8) {
+                                this.referer = "$mainUrl/"
+                                this.quality = Qualities.P1080.value
+                            })
+                        }
+                        foundLinks = true
+                        break // Tìm thấy key, chuyển sang server type tiếp theo
+                    }
+
+                    // Fallback: tìm direct m3u8
+                    Regex("""https?://[^\s"'<>]+\.m3u8[^\s"'<>]*""").findAll(resp).forEach { m ->
+                        callback(newExtractorLink(serverName, serverName, m.value, ExtractorLinkType.M3U8) {
+                            this.referer = "$mainUrl/"
+                        })
+                        foundLinks = true
+                    }
+                } catch (_: Exception) { }
+            }
         }
-        return false
+
+        return foundLinks
     }
 }

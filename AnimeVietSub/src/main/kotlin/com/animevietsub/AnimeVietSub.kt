@@ -31,7 +31,7 @@ object Crypto {
     private val PASSES = listOf(
         "dm_thang_suc_vat_get_link_an_dbt",
         "animevietsub", "animevsub",
-        "VSub@2026", "VSub@2025", "VSub@2024",  // thêm key mới
+        "VSub@2026", "VSub@2025", "VSub@2024",
         "streaming_key", "player_key", "api_key", "secret", ""
     )
 
@@ -45,9 +45,9 @@ object Crypto {
         } catch (_: Exception) {}
         for (pass in PASSES) {
             val r = openSSL(s, pass) ?: continue
-            if (isStreamUrl(r)) { 
+            if (isStreamUrl(r)) {
                 println("AVS-CRYPTO ok pass='${pass.take(8)}..' -> $r")
-                return r 
+                return r
             }
         }
         return null
@@ -136,7 +136,6 @@ class AnimeVietSub : MainAPI() {
         "Accept-Language" to "vi-VN,vi;q=0.9", "Sec-Fetch-Dest" to "empty",
         "Sec-Fetch-Mode" to "cors", "Sec-Fetch-Site" to "same-origin"
     )
-    // headers cho CDN: thêm Referer để tăng tỉ lệ thành công
     private fun cdnH(ref: String) = mapOf(
         "User-Agent" to ua,
         "Referer" to ref
@@ -187,35 +186,66 @@ class AnimeVietSub : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         val fUrl = fix(url) ?: throw ErrorLoadingException("Invalid URL")
         var doc  = app.get(fUrl, interceptor = cf, headers = pageH).document
-        val sel  = "ul.list-episode li a,.list-eps a,.server-list a,.list-episode a,.episodes a,#list_episodes a"
-        var epNodes = doc.select(sel)
+
+        // Mở rộng selector cho danh sách tập
+        var epNodes = doc.select(
+            "a[data-id][href*='/tap-'], " +
+            "a.btn-episode.episode-link, " +
+            ".list-episode a, .episodes a, #episodes a, " +
+            "ul.server-list a, ul.list-episode a"
+        )
+
         if (epNodes.isEmpty()) {
-            doc.selectFirst("a.btn-see,a[href*='/tap-'],a[href*='/episode-'],.btn-watch a")
-                ?.attr("href")?.let { fix(it) }?.let { wUrl ->
-                    doc = app.get(wUrl, interceptor = cf, headers = pageH).document
-                    epNodes = doc.select(sel)
-                }
-        }
-        val filmId = Regex("""[/-]a(\d+)""").find(fUrl)?.groupValues?.get(1)
-                  ?: Regex("""-(\d+)(?:\.html|/)?$""").find(fUrl)?.groupValues?.get(1) ?: ""
-        val episodes = epNodes.mapNotNull { ep ->
-            val href   = fix(ep.attr("href")) ?: return@mapNotNull null
-            val dataId = listOf(
-                ep.attr("data-id"), ep.attr("data-episodeid"),
-                ep.parent()?.attr("data-id") ?: "", ep.parent()?.attr("data-episodeid") ?: ""
-            ).firstOrNull { it.matches(Regex("\\d+")) } ?: ""
-            val nm = ep.text().trim().ifBlank { ep.attr("title").trim() }
-            newEpisode("$href@@$filmId@@$dataId") {
-                name = nm; episode = Regex("\\d+").find(nm)?.value?.toIntOrNull()
+            // Thử chuyển đến trang xem phim nếu có nút xem
+            doc.selectFirst("a.btn-see, a[href*='/xem-phim'], a[href*='/watch']")?.attr("href")?.let { fix(it) }?.let { wUrl ->
+                doc = app.get(wUrl, interceptor = cf, headers = pageH).document
+                epNodes = doc.select(
+                    "a[data-id][href*='/tap-'], " +
+                    "a.btn-episode.episode-link, " +
+                    ".list-episode a, .episodes a, #episodes a, " +
+                    "ul.server-list a, ul.list-episode a"
+                )
             }
         }
-        val title  = doc.selectFirst("h1.Title,h1,.Title")?.text()?.trim() ?: "Anime"
-        val poster = doc.selectFirst(".Image img,.InfoImg img,img[itemprop=image]")?.let {
+
+        val filmId = Regex("""[/-]a(\d+)""").find(fUrl)?.groupValues?.get(1)
+                  ?: Regex("""-(\d+)(?:\.html|/)?$""").find(fUrl)?.groupValues?.get(1) ?: ""
+
+        val episodes = epNodes.mapNotNull { ep ->
+            val href = fix(ep.attr("href")) ?: return@mapNotNull null
+            val dataId = ep.attr("data-id").takeIf { it.isNotBlank() } ?: ""
+            val nm = ep.text().trim().ifBlank { ep.attr("title").trim() }
+            newEpisode("$href@@$filmId@@$dataId") {
+                name = nm
+                episode = Regex("\\d+").find(nm)?.value?.toIntOrNull()
+            }
+        }.distinctBy { it.data }
+
+        if (episodes.isEmpty()) {
+            // Nếu vẫn không có tập, thử lấy từ thuộc tính data-episode hoặc data-id trong các thẻ khác
+            val fallback = doc.select("[data-episodeid], [data-id]").mapNotNull { el ->
+                val epId = el.attr("data-episodeid").takeIf { it.isNotBlank() } ?: el.attr("data-id").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                val epUrl = "$fUrl?ep=$epId" // tạm thời dùng URL hiện tại
+                val name = el.text().trim().ifBlank { "Tập $epId" }
+                newEpisode("$epUrl@@$filmId@@$epId") {
+                    name = name
+                    episode = Regex("\\d+").find(name)?.value?.toIntOrNull() ?: epId.toIntOrNull()
+                }
+            }.distinctBy { it.data }
+            if (fallback.isNotEmpty()) {
+                episodes.addAll(fallback)
+            }
+        }
+
+        val title  = doc.selectFirst("h1.Title, h1, .Title")?.text()?.trim() ?: "Anime"
+        val poster = doc.selectFirst(".Image img, .InfoImg img, img[itemprop=image]")?.let {
             fix(it.attr("data-src").ifBlank { it.attr("src") })
         }
+        val plot   = doc.selectFirst(".Description, .InfoDesc, #film-content")?.text()?.trim()
+
         return newAnimeLoadResponse(title, fUrl, TvType.Anime) {
-            posterUrl = poster
-            plot = doc.selectFirst(".Description,.InfoDesc,#film-content")?.text()?.trim()
+            this.posterUrl = poster
+            this.plot = plot
             this.episodes = mutableMapOf(DubStatus.Subbed to episodes)
         }
     }
@@ -340,7 +370,6 @@ class AnimeVietSub : MainAPI() {
                             continue
                         }
 
-                    // hash that starts with http is a direct URL
                     if (hash.startsWith("http")) {
                         if (emitStream(hash, epUrl, cb)) return true; continue
                     }
@@ -525,13 +554,11 @@ class AnimeVietSub : MainAPI() {
 
     private suspend fun emitVerifiedM3u8(url: String, ref: String, cb: (ExtractorLink) -> Unit): Boolean {
         return try {
-            val headers = cdnH(ref)  // thêm Referer = trang episode
+            val headers = cdnH(ref)
             val r = app.get(url, headers = headers, interceptor = cf)
             val text = r.text ?: return false
             if (r.code != 200 || !text.contains("#EXTM3U")) {
                 log("VERIFY_FAIL", "code=${r.code} url=$url")
-                // fallback: vẫn emit nếu URL hợp lệ? để tránh false negative
-                // nhưng tốt nhất vẫn nên kiểm tra, nếu không thì thôi
                 return false
             }
             log("VERIFY_OK", url)
@@ -542,11 +569,8 @@ class AnimeVietSub : MainAPI() {
                 this.headers = headers
             })
             true
-        } catch (e: Exception) { 
+        } catch (e: Exception) {
             log("VERIFY_ERR", "${e.message}")
-            // Nếu có lỗi mạng, vẫn thử emit (có thể server chặn HEAD/GET)
-            // Nhưng để an toàn, ta vẫn emit nhưng không verify? 
-            // Tạm thời không emit để tránh link chết
             false
         }
     }

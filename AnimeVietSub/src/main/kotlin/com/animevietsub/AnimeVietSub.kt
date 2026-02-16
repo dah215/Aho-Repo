@@ -131,10 +131,7 @@ class AnimeVietSub : MainAPI() {
     private val pageH = mapOf(
         "User-Agent" to ua,
         "Accept" to "text/html,*/*;q=0.8",
-        "Accept-Language" to "vi-VN,vi;q=0.9",
-        "Sec-Fetch-Dest" to "document",
-        "Sec-Fetch-Mode" to "navigate",
-        "Sec-Fetch-Site" to "none"
+        "Accept-Language" to "vi-VN,vi;q=0.9"
     )
 
     private fun ajaxH(ref: String) = mapOf(
@@ -143,11 +140,7 @@ class AnimeVietSub : MainAPI() {
         "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
         "Referer" to ref,
         "Origin" to mainUrl,
-        "Accept" to "application/json, text/javascript, */*; q=0.01",
-        "Accept-Language" to "vi-VN,vi;q=0.9",
-        "Sec-Fetch-Dest" to "empty",
-        "Sec-Fetch-Mode" to "cors",
-        "Sec-Fetch-Site" to "same-origin"
+        "Accept" to "application/json, text/javascript, */*; q=0.01"
     )
 
     private val streamH = mapOf("User-Agent" to ua)
@@ -265,11 +258,10 @@ class AnimeVietSub : MainAPI() {
         // PRIORITY: Direct hash POST
         if (savedHash.isNotBlank() && filmId.isNotBlank()) {
             log("DIRECT_HASH", "POST link=$savedHash&id=$filmId")
-            val aH = ajaxH(epUrl)
             try {
                 val r = app.post("$mainUrl/ajax/player",
                     data = mapOf("link" to savedHash, "id" to filmId),
-                    headers = aH,
+                    headers = ajaxH(epUrl),
                     interceptor = cf
                 )
                 val body = r.text ?: ""
@@ -284,12 +276,8 @@ class AnimeVietSub : MainAPI() {
         }
 
         // FALLBACK: Old flow
-        val pageRes = try {
-            app.get(epUrl, interceptor = cf, headers = pageH)
-        } catch (e: Exception) {
-            log("ERR", "page: ${e.message}")
-            return false
-        }
+        val pageRes = try { app.get(epUrl, interceptor = cf, headers = pageH) }
+            catch (e: Exception) { log("ERR", "page: ${e.message}"); return false }
         val body = pageRes.text ?: return false
         val cookies = pageRes.cookies.toMutableMap()
 
@@ -306,9 +294,7 @@ class AnimeVietSub : MainAPI() {
         val found = ajaxFlow(epUrl, filmId, ids.toList(), cookies, callback)
         log("AJAX", "found=$found")
 
-        if (!found) {
-            scrapeStrategy(body, epUrl, subtitleCallback, callback)
-        }
+        if (!found) scrapeStrategy(body, epUrl, subtitleCallback, callback)
         log("DONE", "done")
         return found
     }
@@ -418,7 +404,7 @@ class AnimeVietSub : MainAPI() {
     }
 
     // ==================== HANDLE API RESPONSE ====================
-    private fun handleApiResponse(body: String, ref: String, cb: (ExtractorLink) -> Unit): Boolean {
+    private suspend fun handleApiResponse(body: String, ref: String, cb: (ExtractorLink) -> Unit): Boolean {
         if (body.isBlank()) return false
 
         for (u in extractDirectUrls(body)) {
@@ -450,7 +436,7 @@ class AnimeVietSub : MainAPI() {
     }
 
     // ==================== RESOLVE AND EMIT ====================
-    private fun resolveAndEmit(raw: String, ref: String, cb: (ExtractorLink) -> Unit): Boolean {
+    private suspend fun resolveAndEmit(raw: String, ref: String, cb: (ExtractorLink) -> Unit): Boolean {
         if (raw.isBlank()) return false
         if (raw.startsWith("http")) return emitStream(raw, ref, cb)
 
@@ -501,8 +487,8 @@ class AnimeVietSub : MainAPI() {
         }
     }
 
-    // ==================== EMIT STREAM (NON-SUSPEND) ====================
-    private fun emitStream(url: String, ref: String, cb: (ExtractorLink) -> Unit, label: String = ""): Boolean {
+    // ==================== EMIT STREAM ====================
+    private suspend fun emitStream(url: String, ref: String, cb: (ExtractorLink) -> Unit, label: String = ""): Boolean {
         if (!url.startsWith("http")) return false
         log("EMIT", "url=${url.take(100)} label=$label")
 
@@ -521,7 +507,6 @@ class AnimeVietSub : MainAPI() {
         val linkType = if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
         val displayName = if (label.isNotBlank()) "$name $label" else name
 
-        // Emit directly - let player handle it
         cb(newExtractorLink(name, displayName, url) {
             referer = ref
             this.quality = quality

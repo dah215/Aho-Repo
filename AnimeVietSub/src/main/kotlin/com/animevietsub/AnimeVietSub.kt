@@ -1,12 +1,14 @@
 package com.animevietsub
 
 import android.annotation.SuppressLint
+import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.webkit.ConsoleMessage
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -132,7 +134,7 @@ class AnimeVietSubV2 : MainAPI() {
         return newAnimeSearchResponse(ttl, url, TvType.Anime) { 
             posterUrl = poster
             this.year = year
-            addQuality(quality)
+            if (!quality.isNullOrBlank()) addQuality(quality)
         }
     }
 
@@ -152,9 +154,12 @@ class AnimeVietSubV2 : MainAPI() {
         var epNodes = doc.select(sel)
 
         if (epNodes.isEmpty()) {
-            doc.selectFirst("a.btn-see,a[href*="/tap/"],.watch-btn a,.play-btn a")?.attr("href")?.let { fix(it) }?.let { wUrl ->
-                doc = app.get(wUrl, interceptor = cf, headers = pageH).document
-                epNodes = doc.select(sel)
+            val watchBtn = doc.selectFirst("a.btn-see,a[href*=\"/tap-"],.watch-btn a,.play-btn a")
+            watchBtn?.attr("href")?.let { href ->
+                fix(href)?.let { wUrl ->
+                    doc = app.get(wUrl, interceptor = cf, headers = pageH).document
+                    epNodes = doc.select(sel)
+                }
             }
         }
 
@@ -280,10 +285,8 @@ class AnimeVietSubV2 : MainAPI() {
     }
 }
 
-
 // ============================================================================
 // SITE INTELLIGENCE ANALYZER
-// Phân tích cấu trúc website và network flow cho animevietsub.ee
 // ============================================================================
 
 class SiteIntelligenceAnalyzer {
@@ -329,17 +332,14 @@ class SiteIntelligenceAnalyzer {
             val resp = app.get(url, interceptor = cf, headers = headers)
             val doc = resp.document
 
-            // Detect player type
             val playerType = detectPlayerType(doc)
 
-            // Find AJAX endpoints
             val ajaxEndpoints = doc.select("script").mapNotNull { script ->
                 val content = script.data()
                 Regex("""(ajax/player|api/[^"']+|/ajax/[^"']+)""").findAll(content)
                     .map { it.value }.toList()
             }.flatten().distinct()
 
-            // Find script dependencies
             val scripts = doc.select("script[src]").map { it.attr("src") }
 
             val profile = SiteProfile(
@@ -361,10 +361,8 @@ class SiteIntelligenceAnalyzer {
         val resp = app.get(url, interceptor = cf, headers = headers)
         val doc = resp.document
 
-        // Extract all script content for analysis
         val allScripts = doc.select("script").joinToString("\n") { it.data() }
 
-        // Detect APIs
         val apis = mutableListOf<String>()
         Regex("""fetch\s*\(\s*['"]([^'"]+)['"]""").findAll(allScripts).forEach { 
             apis.add(it.groupValues[1]) 
@@ -373,7 +371,6 @@ class SiteIntelligenceAnalyzer {
             apis.add(it.groupValues[1]) 
         }
 
-        // Extract player config if exists
         val playerConfig = extractPlayerConfig(allScripts)
 
         return PageAnalysis(
@@ -413,7 +410,6 @@ class SiteIntelligenceAnalyzer {
     }
 
     private fun extractPlayerConfig(scripts: String): Map<String, Any>? {
-        // Tìm config JSON trong scripts
         val configMatch = Regex("""playerConfig\s*=\s*(\{[^;]+\});""").find(scripts)
             ?: Regex("""config\s*:\s*(\{[^}]+\})""").find(scripts)
             ?: return null
@@ -426,10 +422,8 @@ class SiteIntelligenceAnalyzer {
     }
 }
 
-
 // ============================================================================
 // VIRTUAL BROWSER CORE
-// Mô phỏng hành vi trình duyệt với WebView nâng cao
 // ============================================================================
 
 class VirtualBrowserCore {
@@ -456,10 +450,23 @@ class VirtualBrowserCore {
         val completed = AtomicBoolean(false)
 
         try {
-            val ctx = app.context
+            // Sửa lỗi: Không dùng app.context mà dùng cách lấy context an toàn
+            // Trong CloudStream3 extension, ta có thể dùng null check và return early
+            val ctx = try {
+                Class.forName("com.lagradost.cloudstream3.MainActivity")
+                    .getMethod("getContext")
+                    .invoke(null) as? Context
+            } catch (e: Exception) {
+                null
+            }
+
+            if (ctx == null) {
+                // Fallback: Không dùng WebView nếu không có context
+                return@withContext ExtractionResult(emptyList(), emptyList())
+            }
+
             val webView = WebView(ctx)
 
-            // Cấu hình WebSettings nâng cao
             webView.settings.apply {
                 javaScriptEnabled = true
                 domStorageEnabled = true
@@ -474,7 +481,6 @@ class VirtualBrowserCore {
                 javaScriptCanOpenWindowsAutomatically = true
             }
 
-            // JavaScript Interface để nhận data từ page
             webView.addJavascriptInterface(object {
                 @JavascriptInterface
                 fun onStreamFound(url: String, type: String) {
@@ -502,14 +508,12 @@ class VirtualBrowserCore {
                 ): WebResourceResponse? {
                     val url = request?.url?.toString() ?: return super.shouldInterceptRequest(view, request)
 
-                    // Intercept M3U8/MP4 streams
                     if (isStreamUrl(url)) {
                         if (!isAdUrl(url)) {
                             streams.add(url)
                         }
                     }
 
-                    // Intercept subtitle files
                     if (url.contains(".vtt", ignoreCase = true) || 
                         url.contains(".srt", ignoreCase = true) ||
                         url.contains("subtitle", ignoreCase = true)) {
@@ -522,13 +526,10 @@ class VirtualBrowserCore {
                 override fun onPageFinished(view: WebView?, url: String?) {
                     super.onPageFinished(view, url)
 
-                    // Inject behavior mimicry scripts
                     view?.evaluateJavascript(behaviorEngine.generateBehaviorScript(), null)
 
-                    // Inject stream extraction hook
-                    view?.evaluateJavascript("""
+                    val jsCode = """
                         (function() {
-                            // Hook video elements
                             const originalCreateElement = document.createElement;
                             document.createElement = function(tagName) {
                                 const elem = originalCreateElement.call(document, tagName);
@@ -538,7 +539,6 @@ class VirtualBrowserCore {
                                 return elem;
                             };
 
-                            // Hook existing videos
                             document.querySelectorAll('video').forEach(hookVideoElement);
 
                             function hookVideoElement(video) {
@@ -554,14 +554,12 @@ class VirtualBrowserCore {
                                     }
                                 });
 
-                                // Monitor source changes
                                 const sources = video.querySelectorAll('source');
                                 sources.forEach(src => {
                                     if (src.src) VBrowser.onStreamFound(src.src, 'source');
                                 });
                             }
 
-                            // Hook jwplayer if exists
                             if (typeof jwplayer !== 'undefined') {
                                 const originalSetup = jwplayer.prototype.setup;
                                 jwplayer.prototype.setup = function(config) {
@@ -575,7 +573,6 @@ class VirtualBrowserCore {
                                 };
                             }
 
-                            // Hook fetch for API interception
                             const originalFetch = window.fetch;
                             window.fetch = function(url, options) {
                                 return originalFetch(url, options).then(response => {
@@ -598,9 +595,7 @@ class VirtualBrowserCore {
                                 });
                             };
 
-                            // Check after delay
                             setTimeout(() => {
-                                // Check jwplayer playlist
                                 if (typeof jwplayer !== 'undefined') {
                                     try {
                                         const player = jwplayer('mediaplayer') || jwplayer();
@@ -620,22 +615,21 @@ class VirtualBrowserCore {
                                     } catch(e) {}
                                 }
 
-                                // Signal completion
                                 VBrowser.onExtractionComplete();
                             }, 3000);
                         })();
-                    """.trimIndent(), null)
+                    """.trimIndent()
+
+                    view?.evaluateJavascript(jsCode, null)
                 }
             }
 
             webView.webChromeClient = object : WebChromeClient() {
                 override fun onConsoleMessage(message: ConsoleMessage?): Boolean {
-                    // Log console messages for debugging
                     return true
                 }
             }
 
-            // Load page với POST data
             val postHtml = """
                 <!DOCTYPE html>
                 <html>
@@ -660,7 +654,6 @@ class VirtualBrowserCore {
 
             webView.loadDataWithBaseURL(mainUrl, postHtml, "text/html", "UTF-8", null)
 
-            // Timeout sau 15 giây
             Handler(Looper.getMainLooper()).postDelayed({
                 if (!completed.get()) {
                     latch.countDown()
@@ -669,7 +662,6 @@ class VirtualBrowserCore {
 
             latch.await(15, TimeUnit.SECONDS)
 
-            // Cleanup
             webView.stopLoading()
             webView.destroy()
 
@@ -685,8 +677,7 @@ class VirtualBrowserCore {
                url.contains(".mp4", ignoreCase = true) ||
                url.contains("/hls/", ignoreCase = true) ||
                url.contains("/stream/", ignoreCase = true) ||
-               url.contains("video", ignoreCase = true) && 
-               (url.contains(".ts") || url.contains(".m4s"))
+               (url.contains("video", ignoreCase = true) && (url.contains(".ts") || url.contains(".m4s")))
     }
 
     private fun isAdUrl(url: String): Boolean {
@@ -696,10 +687,8 @@ class VirtualBrowserCore {
     }
 }
 
-
 // ============================================================================
 // HUMAN BEHAVIOR ENGINE
-// Sinh hành vi người dùng tự nhiên để tránh phát hiện automation
 // ============================================================================
 
 class HumanBehaviorEngine {
@@ -721,12 +710,10 @@ class HumanBehaviorEngine {
 
         return """
             (function() {
-                // Anti-detection: Override automation flags
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
                 Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
                 Object.defineProperty(navigator, 'languages', { get: () => ['vi-VN', 'vi', 'en-US', 'en'] });
 
-                // Override Chrome runtime
                 if (window.chrome) {
                     Object.defineProperty(window.chrome, 'runtime', { 
                         get: () => ({ 
@@ -736,11 +723,9 @@ class HumanBehaviorEngine {
                     });
                 }
 
-                // Canvas fingerprint randomization (subtle)
                 const originalGetImageData = CanvasRenderingContext2D.prototype.getImageData;
                 CanvasRenderingContext2D.prototype.getImageData = function(x, y, w, h) {
                     const data = originalGetImageData.call(this, x, y, w, h);
-                    // Add imperceptible noise
                     for (let i = 0; i < data.data.length; i += 4) {
                         if (Math.random() < 0.001) {
                             data.data[i] = Math.max(0, Math.min(255, data.data[i] + (Math.random() > 0.5 ? 1 : -1)));
@@ -749,7 +734,6 @@ class HumanBehaviorEngine {
                     return data;
                 };
 
-                // Simulate human-like scroll behavior
                 let scrollTimeout;
                 const humanScroll = () => {
                     const scrollAmount = ${random.nextInt(100, 500)};
@@ -761,7 +745,6 @@ class HumanBehaviorEngine {
                     const animate = (currentTime) => {
                         const elapsed = currentTime - startTime;
                         const progress = Math.min(elapsed / duration, 1);
-                        // Easing function (ease-out)
                         const ease = 1 - Math.pow(1 - progress, 3);
                         window.scrollTo(0, start + (target - start) * ease);
 
@@ -773,20 +756,16 @@ class HumanBehaviorEngine {
                     requestAnimationFrame(animate);
                 };
 
-                // Random scroll after random delay
                 scrollTimeout = setTimeout(humanScroll, ${random.nextInt(500, 2000)});
 
-                // Simulate focus/blur patterns
                 let visibilityChanges = 0;
                 document.addEventListener('visibilitychange', () => {
                     visibilityChanges++;
                     if (visibilityChanges > 3) {
-                        // Human-like pause when switching tabs
                         clearTimeout(scrollTimeout);
                     }
                 });
 
-                // Random mouse movements (subtle)
                 let mouseX = ${random.nextInt(100, 800)};
                 let mouseY = ${random.nextInt(100, 600)};
 
@@ -796,7 +775,6 @@ class HumanBehaviorEngine {
                     mouseX += dx;
                     mouseY += dy;
 
-                    // Dispatch synthetic mouse move
                     try {
                         const event = new MouseEvent('mousemove', {
                             clientX: mouseX,
@@ -806,13 +784,11 @@ class HumanBehaviorEngine {
                         document.dispatchEvent(event);
                     } catch(e) {}
 
-                    // Schedule next move
                     setTimeout(moveMouse, ${random.nextInt(100, 500)});
                 };
 
                 setTimeout(moveMouse, ${random.nextInt(1000, 3000)});
 
-                // Random idle pause
                 const idlePause = () => {
                     const pauseDuration = ${random.nextInt(500, 3000)};
                     setTimeout(() => {
@@ -858,10 +834,8 @@ class HumanBehaviorEngine {
     }
 }
 
-
 // ============================================================================
 // DEEP STREAM EXTRACTOR
-// Trích xuất stream ở cấp độ thấp nhất với nhiều phương pháp fallback
 // ============================================================================
 
 class DeepStreamExtractor {
@@ -884,7 +858,6 @@ class DeepStreamExtractor {
         val subtitles = mutableListOf<SubtitleFile>()
 
         try {
-            // Primary AJAX endpoint
             val resp = app.post(
                 "$mainUrl/ajax/player",
                 data = mapOf("link" to dataHash, "id" to filmId),
@@ -894,22 +867,18 @@ class DeepStreamExtractor {
 
             val text = resp.text
 
-            // Extract direct URLs
             Regex("""https?://[^\s"'<>]+?\.(?:m3u8|mp4)(?:[^\s"'<>]*)?""").findAll(text).forEach {
                 streams.add(it.value)
             }
 
-            // Parse JSON response
             if (text.trimStart().startsWith("{")) {
                 try {
                     val json = mapper.readValue(text, Map::class.java) as Map<String, Any?>
 
-                    // Extract from 'link' field
                     (json["link"] as? String)?.let { link ->
                         Regex("""https?://[^\s"']+""").find(link)?.let { streams.add(it.value) }
                     }
 
-                    // Extract from playlist
                     (json["link"] as? List<*>)?.let { links ->
                         links.filterIsInstance<Map<String, Any?>>().forEach { item ->
                             item["file"]?.toString()?.let { file ->
@@ -921,7 +890,6 @@ class DeepStreamExtractor {
                         }
                     }
 
-                    // Extract subtitles
                     (json["subtitles"] as? List<*>)?.let { subs ->
                         subs.filterIsInstance<Map<String, Any?>>().forEach { sub ->
                             val file = sub["file"]?.toString()
@@ -932,9 +900,7 @@ class DeepStreamExtractor {
                         }
                     }
 
-                    // Check for encrypted/encoded data
                     (json["data"] as? String)?.let { data ->
-                        // Try base64 decode
                         try {
                             val decoded = String(android.util.Base64.decode(data, android.util.Base64.DEFAULT))
                             Regex("""https?://[^\s"'<>]+?\.(?:m3u8|mp4)""").findAll(decoded).forEach {
@@ -965,22 +931,18 @@ class DeepStreamExtractor {
         try {
             val pageHtml = app.get(epUrl, interceptor = cf, headers = headers).text
 
-            // Pattern 1: Direct URLs in HTML
             Regex("""https?://[^\s"'<>]+?(?:\.m3u8|\.mp4|/hls/|/stream/)[^\s"'<>]*""").findAll(pageHtml).forEach {
                 streams.add(it.value)
             }
 
-            // Pattern 2: URLs in JavaScript variables
             Regex("""(var\s+\w+\s*=\s*['"])([^'"]+\.(?:m3u8|mp4))(['"])""").findAll(pageHtml).forEach {
                 streams.add(it.groupValues[2])
             }
 
-            // Pattern 3: JSON encoded URLs
             Regex(""""file"\s*:\s*"([^"]+)"""").findAll(pageHtml).forEach {
                 streams.add(it.groupValues[1].replace("\\", ""))
             }
 
-            // Pattern 4: Base64 encoded sources
             Regex("""atob\(['"]([A-Za-z0-9+/=]+)['"]\)""").findAll(pageHtml).forEach { match ->
                 try {
                     val decoded = String(android.util.Base64.decode(match.groupValues[1], android.util.Base64.DEFAULT))
@@ -990,12 +952,10 @@ class DeepStreamExtractor {
                 } catch (e: Exception) {}
             }
 
-            // Parse iframes
             val doc = Jsoup.parse(pageHtml)
             doc.select("iframe[data-src],iframe[src]").forEach { iframe ->
                 val src = iframe.attr("data-src").ifBlank { iframe.attr("src") }
                 if (src.isNotBlank() && !src.startsWith("javascript")) {
-                    // Recursively check iframe sources
                     try {
                         val iframeHtml = app.get(src, interceptor = cf, headers = headers).text
                         Regex("""https?://[^\s"'<>]+?\.(?:m3u8|mp4)[^\s"'<>]*""").findAll(iframeHtml).forEach {
@@ -1033,15 +993,12 @@ class DeepStreamExtractor {
                     else -> src
                 }
 
-                // Skip ads/analytics
                 if (isAdUrl(fixedSrc)) return@forEach
 
                 try {
-                    // Use CloudStream's extractor system
                     loadExtractor(fixedSrc, epUrl, subtitleCallback, callback)
                     success = true
                 } catch (e: Exception) {
-                    // Try manual extraction
                     try {
                         val iframeDoc = app.get(fixedSrc, interceptor = cf, headers = headers).document
                         val iframeHtml = iframeDoc.toString()
@@ -1076,10 +1033,8 @@ class DeepStreamExtractor {
     }
 }
 
-
 // ============================================================================
 // ADAPTIVE BYPASS CORE
-// Engine thích ứng chống anti-bot với chiến lược động
 // ============================================================================
 
 class AdaptiveBypassCore {
@@ -1159,21 +1114,18 @@ class AdaptiveBypassCore {
 
     private fun createCloudflareTactic(): BypassTactic {
         return BypassTactic("CloudflareKiller", {
-            // CloudflareKiller đã được tích hợp sẵn
             true
         })
     }
 
     private fun createJSTactic(): BypassTactic {
         return BypassTactic("JSEvaluation", {
-            // Sử dụng WebView để evaluate JS challenges
             true
         })
     }
 
     private fun createWebViewTactic(): BypassTactic {
         return BypassTactic("WebViewSimulation", {
-            // Full browser simulation
             true
         })
     }
@@ -1187,21 +1139,18 @@ class AdaptiveBypassCore {
 
     private fun createSessionRenewalTactic(): BypassTactic {
         return BypassTactic("SessionRenewal", {
-            // Renew session cookies
             true
         })
     }
 
     private fun createCookiePersistenceTactic(): BypassTactic {
         return BypassTactic("CookiePersistence", {
-            // Maintain cookie jar
             true
         })
     }
 
     private fun createProxyRotationTactic(): BypassTactic {
         return BypassTactic("ProxyRotation", {
-            // Rotate proxies if available
             true
         })
     }
@@ -1224,7 +1173,6 @@ class AdaptiveBypassCore {
         return false
     }
 }
-
 // ============================================================================
 // END OF PLUGIN
 // ============================================================================

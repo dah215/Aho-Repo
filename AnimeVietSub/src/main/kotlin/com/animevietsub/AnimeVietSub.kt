@@ -7,9 +7,15 @@ import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
+import java.util.zip.GZIPInputStream
+import java.util.zip.Inflater
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
@@ -20,20 +26,76 @@ class AnimeVietSubPlugin : Plugin() {
 }
 
 object Crypto {
-    private const val AES_KEY = "dm_thang_suc_vat_get_link_an_dbt"
-    private const val AES_IV = "dm_thang_suc_vat"
+    private val SALTED = "Salted__".toByteArray(StandardCharsets.ISO_8859_1)
+    private const val PASS = "dm_thang_suc_vat_get_link_an_dbt"
 
     fun decrypt(enc: String?): String? {
         if (enc.isNullOrBlank()) return null
+        val s = enc.trim()
+        if (s.startsWith("http") || s.startsWith("{") || s.startsWith("[")) return s
+        return openSSL(s)
+    }
+
+    private fun openSSL(b64: String): String? {
         return try {
-            val safeEnc = enc.replace("-", "+").replace("_", "/")
-            val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
-            val keySpec = SecretKeySpec(AES_KEY.toByteArray(StandardCharsets.UTF_8), "AES")
-            val ivSpec = IvParameterSpec(AES_IV.toByteArray(StandardCharsets.UTF_8))
-            cipher.init(Cipher.DECRYPT_MODE, keySpec, ivSpec)
-            val decoded = Base64.decode(safeEnc, Base64.DEFAULT)
-            String(cipher.doFinal(decoded), StandardCharsets.UTF_8).trim()
-        } catch (e: Exception) { null }
+            val raw = Base64.decode(b64, Base64.DEFAULT)
+            if (raw.size < 16) return null
+            val hasSalt = raw.copyOfRange(0, 8).contentEquals(SALTED)
+            val salt = if (hasSalt) raw.copyOfRange(8, 16) else null
+            val ct = if (hasSalt) raw.copyOfRange(16, raw.size) else raw
+            if (ct.isEmpty()) return null
+            val (key, iv) = evpKDF(PASS.toByteArray(StandardCharsets.UTF_8), salt, 32, 16)
+            aesCbc(ct, key, iv)
+        } catch (_: Exception) { null }
+    }
+
+    private fun evpKDF(pwd: ByteArray, salt: ByteArray?, kLen: Int, ivLen: Int): Pair<ByteArray, ByteArray> {
+        val md = MessageDigest.getInstance("MD5")
+        val out = ByteArrayOutputStream()
+        var prev = ByteArray(0)
+        while (out.size() < kLen + ivLen) {
+            md.reset()
+            md.update(prev)
+            md.update(pwd)
+            if (salt != null) md.update(salt)
+            prev = md.digest()
+            out.write(prev)
+        }
+        val b = out.toByteArray()
+        return b.copyOfRange(0, kLen) to b.copyOfRange(kLen, kLen + ivLen)
+    }
+
+    private fun aesCbc(ct: ByteArray, key: ByteArray, iv: ByteArray): String? {
+        return try {
+            val c = Cipher.getInstance("AES/CBC/PKCS5Padding")
+            c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
+            val plain = c.doFinal(ct)
+            decompress(plain) ?: String(plain, StandardCharsets.UTF_8).trim()
+        } catch (_: Exception) { null }
+    }
+
+    private fun decompress(d: ByteArray): String? {
+        try {
+            GZIPInputStream(ByteArrayInputStream(d)).use { g ->
+                val o = ByteArrayOutputStream()
+                g.copyTo(o)
+                return String(o.toByteArray(), StandardCharsets.UTF_8).trim()
+            }
+        } catch (_: Exception) {}
+        try {
+            val inf = Inflater(true)
+            inf.setInput(d)
+            val o = ByteArrayOutputStream()
+            val buf = ByteArray(8192)
+            while (!inf.finished()) {
+                val n = inf.inflate(buf)
+                if (n == 0) break
+                o.write(buf, 0, n)
+            }
+            inf.end()
+            return String(o.toByteArray(), StandardCharsets.UTF_8).trim()
+        } catch (_: Exception) {}
+        return null
     }
 }
 
@@ -44,98 +106,100 @@ class AnimeVietSub : MainAPI() {
     override val hasMainPage = true
     override val hasChromecastSupport = true
     override val hasDownloadSupport = true
-    override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie)
-
-    companion object {
-        // Giả lập trình duyệt mạnh nhất
-        private const val ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
-    }
+    override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA)
 
     private val cf = CloudflareKiller()
     private val mapper = jacksonObjectMapper()
-    
-    private val defaultHeaders = mapOf(
+    private const val ua = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36"
+
+    private val pageH = mapOf("User-Agent" to ua, "Accept-Language" to "vi-VN,vi;q=0.9")
+
+    private fun ajaxH(ref: String) = mapOf(
         "User-Agent" to ua,
-        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-        "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Cache-Control" to "max-age=0",
-        "Sec-Ch-Ua" to "\"Not A(Brand\";v=\"99\", \"Google Chrome\";v=\"121\", \"Chromium\";v=\"121\"",
-        "Sec-Ch-Ua-Mobile" to "?0",
-        "Sec-Ch-Ua-Platform" to "\"Windows\"",
-        "Upgrade-Insecure-Requests" to "1"
+        "X-Requested-With" to "XMLHttpRequest",
+        "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
+        "Referer" to ref,
+        "Origin" to mainUrl
     )
 
     private fun fix(u: String?): String? {
-        if (u.isNullOrBlank()) return null
-        return if (u.startsWith("http")) u else "$mainUrl/${u.removePrefix("/")}"
+        if (u.isNullOrBlank() || u.startsWith("javascript") || u == "#") return null
+        return when {
+            u.startsWith("http") -> u.trim()
+            u.startsWith("//") -> "https:${u.trim()}"
+            u.startsWith("/") -> "$mainUrl${u.trim()}"
+            else -> "$mainUrl/$u"
+        }
     }
 
     override val mainPage = mainPageOf(
         "$mainUrl/" to "Trang Chủ",
-        "$mainUrl/anime-moi/" to "Đang Chiếu",
-        "$mainUrl/anime-hoan-thanh/" to "Trọn Bộ",
+        "$mainUrl/danh-sach/list-dang-chieu/" to "Đang Chiếu",
+        "$mainUrl/danh-sach/list-tron-bo/" to "Trọn Bộ",
         "$mainUrl/anime-le/" to "Anime Lẻ",
         "$mainUrl/anime-bo/" to "Anime Bộ"
     )
 
     override suspend fun getMainPage(page: Int, req: MainPageRequest): HomePageResponse {
-        val url = if (page == 1) req.data else "${req.data.removeSuffix("/")}/trang-$page.html"
-        val res = app.get(url, interceptor = cf, headers = defaultHeaders)
-        val doc = res.document
-        val items = doc.select("div.item, article.TPostMv").mapNotNull { it.toSR() }
+        val base = req.data.ifBlank { mainUrl }
+        val url = if (page == 1) base else "${base.removeSuffix("/")}/trang-$page.html"
+        val doc = app.get(fix(url) ?: mainUrl, interceptor = cf, headers = pageH).document
+        val items = doc.select("article,.TPostMv,.TPost,.item,.list-film li,figure.Objf,.movie-item")
+            .mapNotNull { it.toSR() }.distinctBy { it.url }
         return newHomePageResponse(req.name, items, hasNext = items.isNotEmpty())
     }
 
     private fun Element.toSR(): SearchResponse? {
         val a = selectFirst("a") ?: return null
         val url = fix(a.attr("href")) ?: return null
-        val ttl = selectFirst(".title, h3, h2")?.text()?.trim() ?: a.attr("title") ?: ""
-        val img = selectFirst("figure.Objf img, img")
-        val poster = fix(img?.attr("src")?.ifBlank { img.attr("data-src") })
+        val ttl = (selectFirst(".Title,h3,h2,.title,.name")?.text() ?: a.attr("title")).trim().ifBlank { return null }
+        val img = selectFirst("img")
+        val poster = fix(img?.attr("data-src")?.ifBlank { null } ?: img?.attr("src"))
         return newAnimeSearchResponse(ttl, url, TvType.Anime) { posterUrl = poster }
     }
 
-    override suspend fun search(q: String): List<SearchResponse> {
-        val url = "$mainUrl/tim-kiem/${URLEncoder.encode(q, "utf-8")}/"
-        return app.get(url, interceptor = cf, headers = defaultHeaders).document
-            .select("div.item").mapNotNull { it.toSR() }
-    }
+    override suspend fun search(q: String): List<SearchResponse> =
+        app.get("$mainUrl/tim-kiem/${URLEncoder.encode(q, "utf-8")}/", interceptor = cf, headers = pageH).document
+            .select("article,.TPostMv,.TPost,.item,.list-film li,figure.Objf,.movie-item")
+            .mapNotNull { it.toSR() }.distinctBy { it.url }
 
     override suspend fun load(url: String): LoadResponse {
-        val res = app.get(url, interceptor = cf, headers = defaultHeaders)
-        val doc = res.document
-        
-        val title = doc.selectFirst("h1.Title, meta[property='og:title']")?.let { 
-            if (it.tagName() == "meta") it.attr("content") else it.text() 
-        }?.trim() ?: ""
-        
-        val poster = fix(doc.selectFirst("meta[property='og:image']")?.attr("content") 
-            ?: doc.selectFirst("figure.Objf img")?.attr("src"))
+        val fUrl = fix(url) ?: throw ErrorLoadingException("Invalid URL")
+        var doc = app.get(fUrl, interceptor = cf, headers = pageH).document
 
-        // BIỆN PHÁP MẠNH: Lấy Film ID trực tiếp từ mã nguồn Script
-        val filmId = Regex("""filmID\s*=\s*parseInt\('(\d+)'\)""").find(res.text)?.groupValues?.get(1)
-            ?: Regex("""-a(\d+)\.html""").find(url)?.groupValues?.get(1) 
-            ?: ""
+        val sel = ".btn-episode,.episode-link,a[data-id][data-hash],ul.list-episode li a"
+        var epNodes = doc.select(sel)
 
-        // Tìm danh sách tập phim - Quét tất cả các tab server
-        val episodes = doc.select("ul.list-episode li a").mapNotNull { ep ->
-            val href = fix(ep.attr("href")) ?: return@mapNotNull null
-            val name = ep.text().trim()
-            val hash = ep.attr("data-hash")
-            
-            // Đóng gói dữ liệu để loadLinks sử dụng
-            newEpisode("$href|$filmId|$hash") {
-                this.name = "Tập $name"
-                this.episode = Regex("""\d+""").find(name)?.value?.toIntOrNull()
+        if (epNodes.isEmpty()) {
+            doc.selectFirst("a.btn-see,a[href*='/tap-']")?.attr("href")?.let { fix(it) }?.let { wUrl ->
+                doc = app.get(wUrl, interceptor = cf, headers = pageH).document
+                epNodes = doc.select(sel)
             }
         }
 
-        return newAnimeLoadResponse(title, url, TvType.Anime) {
+        // Film ID từ URL: /phim/xxx-a5868/ hoặc /xxx-a5868.html
+        val filmId = Regex("""[/-]a(\d+)""").find(fUrl)?.groupValues?.get(1) ?: ""
+
+        val episodes = epNodes.mapNotNull { ep ->
+            val href = fix(ep.attr("href")) ?: return@mapNotNull null
+            val dataHash = ep.attr("data-hash").trim().ifBlank { null } ?: return@mapNotNull null
+            val nm = ep.text().trim().ifBlank { ep.attr("title").trim() }
+            // Format: href@@filmId@@dataHash
+            newEpisode("$href@@$filmId@@$dataHash") {
+                name = nm
+                episode = Regex("\\d+").find(nm)?.value?.toIntOrNull()
+            }
+        }
+
+        val title = doc.selectFirst("h1.Title,h1,.Title")?.text()?.trim() ?: "Anime"
+        val poster = doc.selectFirst(".Image img,.InfoImg img,img[itemprop=image],.MovieThumb img,figure.Objf img")?.let {
+            fix(it.attr("data-src").ifBlank { it.attr("src") })
+        }
+
+        return newAnimeLoadResponse(title, fUrl, TvType.Anime) {
             posterUrl = poster
+            plot = doc.selectFirst(".Description,.InfoDesc,#film-content")?.text()?.trim()
             this.episodes = mutableMapOf(DubStatus.Subbed to episodes)
-            plot = doc.selectFirst(".Description, meta[name='description']")?.let {
-                if (it.tagName() == "meta") it.attr("content") else it.text()
-            }?.trim()
         }
     }
 
@@ -145,64 +209,50 @@ class AnimeVietSub : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val parts = data.split("|")
-        if (parts.size < 3) return false
-        
-        val epUrl = parts[0]
-        val filmId = parts[1]
-        val dataHash = parts[2]
+        val parts = data.split("@@")
+        val epUrl = parts.getOrNull(0) ?: return false
+        val filmId = parts.getOrNull(1) ?: return false
+        val dataHash = parts.getOrNull(2) ?: return false
 
-        // Giả lập AJAX request với đầy đủ Header bảo mật
-        val response = app.post(
-            "$mainUrl/ajax/player",
-            data = mapOf("id" to filmId, "link" to dataHash),
-            headers = mapOf(
-                "User-Agent" to ua,
-                "X-Requested-With" to "XMLHttpRequest",
-                "Referer" to epUrl,
-                "Origin" to mainUrl,
-                "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
-                "Accept" to "application/json, text/javascript, */*; q=0.01"
-            ),
-            interceptor = cf
-        ).text
+        // Bước 1: POST link=HASH&id=FILM_ID đến /ajax/player
+        val resp = try {
+            app.post("$mainUrl/ajax/player",
+                data = mapOf("link" to dataHash, "id" to filmId),
+                headers = ajaxH(epUrl),
+                interceptor = cf
+            ).text
+        } catch (_: Exception) { return false } ?: return false
 
-        if (!response.isNullOrBlank()) {
-            try {
-                val json = mapper.readTree(response)
-                val linkArray = json.get("link")
-                
-                linkArray?.forEach { item ->
-                    val encryptedFile = item.get("file").asText()
-                    
-                    // Giải mã lớp 1 (Chuỗi file trong JSON)
-                    val decryptedFileJson = Crypto.decrypt(encryptedFile)
-                    
-                    if (!decryptedFileJson.isNullOrBlank()) {
-                        // Giải mã lớp 2 (Parse JSON nội bộ)
-                        val sources = mapper.readTree(decryptedFileJson)
-                        sources.forEach { src ->
-                            val fileUrl = src.get("file").asText()
-                            val label = src.get("label")?.asText() ?: "FHD"
-                            
-                            callback(newExtractorLink(
-                                source = "AnimeVietSub",
-                                name = "Server DU - $label",
-                                url = fileUrl
-                            ) {
-                                this.referer = mainUrl
-                                this.quality = when {
-                                    label.contains("1080") -> 1080
-                                    label.contains("720") -> 720
-                                    else -> 480
-                                }
-                                this.type = if (fileUrl.contains("m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                            })
-                        }
-                    }
+        // Bước 2: Parse JSON {"link":[{"file":"ENCRYPTED"}]}
+        val json = try {
+            @Suppress("UNCHECKED_CAST")
+            mapper.readValue(resp, Map::class.java) as Map<String, Any?>
+        } catch (_: Exception) { return false }
+
+        val linkArray = json["link"] as? List<*> ?: return false
+
+        // Bước 3: Decrypt và emit
+        for (item in linkArray.filterIsInstance<Map<String, Any?>>()) {
+            val encryptedFile = item["file"]?.toString() ?: continue
+            
+            // Decrypt
+            val decrypted = Crypto.decrypt(encryptedFile) ?: continue
+
+            // Parse decrypted - có thể là URL hoặc JSON array
+            when {
+                decrypted.startsWith("http") -> {
+                    emitUrl(decrypted, epUrl, "", callback)
+                    return true
                 }
-            } catch (e: Exception) { }
-        }
-        return true
-    }
-}
+                decrypted.trimStart().startsWith("[") -> {
+                    @Suppress("UNCHECKED_CAST")
+                    val arr = mapper.readValue(decrypted, List::class.java) as List<*>
+                    for (src in arr.filterIsInstance<Map<String, Any?>>()) {
+                        val file = (src["file"] ?: src["url"])?.toString() ?: continue
+                        val label = src["label"]?.toString() ?: ""
+                        emitUrl(file, epUrl, label, callback)
+                    }
+                    return true
+                }
+                decrypted.trimStart().startsWith("{") -> {
+                    @Suppress

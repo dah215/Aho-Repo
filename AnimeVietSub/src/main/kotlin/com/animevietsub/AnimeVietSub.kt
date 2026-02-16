@@ -149,7 +149,8 @@ class AnimeVietSub : MainAPI() {
 
             runOnMainThread {
                 try {
-                    val webView = WebView(context).apply {
+                    val ctx = app.context
+                    val webView = WebView(ctx).apply {
                         settings.javaScriptEnabled = true
                         settings.domStorageEnabled = true
                         settings.mediaPlaybackRequiresUserGesture = false

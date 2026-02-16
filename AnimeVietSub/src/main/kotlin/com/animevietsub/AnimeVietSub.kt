@@ -1,6 +1,10 @@
 package com.animevietsub
 
-import android.util.Base64
+import android.annotation.SuppressLint
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.network.CloudflareKiller
@@ -9,94 +13,14 @@ import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
-import java.io.ByteArrayInputStream
-import java.io.ByteArrayOutputStream
 import java.net.URLEncoder
-import java.nio.charset.StandardCharsets
-import java.security.MessageDigest
-import java.util.zip.GZIPInputStream
-import java.util.zip.Inflater
-import javax.crypto.Cipher
-import javax.crypto.spec.IvParameterSpec
-import javax.crypto.spec.SecretKeySpec
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 @CloudstreamPlugin
 class AnimeVietSubPlugin : Plugin() {
     override fun load() { registerMainAPI(AnimeVietSub()) }
-}
-
-object Crypto {
-    private val SALTED = "Salted__".toByteArray(StandardCharsets.ISO_8859_1)
-    private const val PASS = "dm_thang_suc_vat_get_link_an_dbt"
-
-    fun decrypt(enc: String?): String? {
-        if (enc.isNullOrBlank()) return null
-        val s = enc.trim()
-        if (s.startsWith("http") || s.startsWith("{") || s.startsWith("[")) return s
-        return openSSL(s)
-    }
-
-    private fun openSSL(b64: String): String? {
-        return try {
-            val raw = Base64.decode(b64, Base64.DEFAULT)
-            if (raw.size < 16) return null
-            val hasSalt = raw.copyOfRange(0, 8).contentEquals(SALTED)
-            val salt = if (hasSalt) raw.copyOfRange(8, 16) else null
-            val ct = if (hasSalt) raw.copyOfRange(16, raw.size) else raw
-            if (ct.isEmpty()) return null
-            val (key, iv) = evpKDF(PASS.toByteArray(StandardCharsets.UTF_8), salt, 32, 16)
-            aesCbc(ct, key, iv)
-        } catch (_: Exception) { null }
-    }
-
-    private fun evpKDF(pwd: ByteArray, salt: ByteArray?, kLen: Int, ivLen: Int): Pair<ByteArray, ByteArray> {
-        val md = MessageDigest.getInstance("MD5")
-        val out = ByteArrayOutputStream()
-        var prev = ByteArray(0)
-        while (out.size() < kLen + ivLen) {
-            md.reset()
-            md.update(prev)
-            md.update(pwd)
-            if (salt != null) md.update(salt)
-            prev = md.digest()
-            out.write(prev)
-        }
-        val b = out.toByteArray()
-        return b.copyOfRange(0, kLen) to b.copyOfRange(kLen, kLen + ivLen)
-    }
-
-    private fun aesCbc(ct: ByteArray, key: ByteArray, iv: ByteArray): String? {
-        return try {
-            val c = Cipher.getInstance("AES/CBC/PKCS5Padding")
-            c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
-            val plain = c.doFinal(ct)
-            decompress(plain) ?: String(plain, StandardCharsets.UTF_8).trim()
-        } catch (_: Exception) { null }
-    }
-
-    private fun decompress(d: ByteArray): String? {
-        try {
-            GZIPInputStream(ByteArrayInputStream(d)).use { g ->
-                val o = ByteArrayOutputStream()
-                g.copyTo(o)
-                return String(o.toByteArray(), StandardCharsets.UTF_8).trim()
-            }
-        } catch (_: Exception) {}
-        try {
-            val inf = Inflater(true)
-            inf.setInput(d)
-            val o = ByteArrayOutputStream()
-            val buf = ByteArray(8192)
-            while (!inf.finished()) {
-                val n = inf.inflate(buf)
-                if (n == 0) break
-                o.write(buf, 0, n)
-            }
-            inf.end()
-            return String(o.toByteArray(), StandardCharsets.UTF_8).trim()
-        } catch (_: Exception) {}
-        return null
-    }
 }
 
 class AnimeVietSub : MainAPI() {
@@ -177,14 +101,12 @@ class AnimeVietSub : MainAPI() {
             }
         }
 
-        // Film ID từ URL: /phim/xxx-a5868/ hoặc /xxx-a5868.html
         val filmId = Regex("""[/-]a(\d+)""").find(fUrl)?.groupValues?.get(1) ?: ""
 
         val episodes = epNodes.mapNotNull { ep ->
             val href = fix(ep.attr("href")) ?: return@mapNotNull null
             val dataHash = ep.attr("data-hash").trim().ifBlank { null } ?: return@mapNotNull null
             val nm = ep.text().trim().ifBlank { ep.attr("title").trim() }
-            // Format: href@@filmId@@dataHash
             newEpisode("$href@@$filmId@@$dataHash") {
                 name = nm
                 episode = Regex("\\d+").find(nm)?.value?.toIntOrNull()
@@ -203,6 +125,7 @@ class AnimeVietSub : MainAPI() {
         }
     }
 
+    @SuppressLint("SetJavaScriptEnabled")
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -214,45 +137,185 @@ class AnimeVietSub : MainAPI() {
         val filmId = parts.getOrNull(1) ?: return false
         val dataHash = parts.getOrNull(2) ?: return false
 
-        // Bước 1: POST link=HASH&id=FILM_ID đến /ajax/player
-        val resp = try {
-            app.post("$mainUrl/ajax/player",
-                data = mapOf("link" to dataHash, "id" to filmId),
-                headers = ajaxH(epUrl),
-                interceptor = cf
-            ).text
-        } catch (_: Exception) { return false } ?: return false
+        val foundUrls = mutableSetOf<String>()
 
-        // Bước 2: Parse JSON {"link":[{"file":"ENCRYPTED"}]}
-        val json = try {
-            @Suppress("UNCHECKED_CAST")
-            mapper.readValue(resp, Map::class.java) as Map<String, Any?>
-        } catch (_: Exception) { return false }
+        // ===== PHƯƠNG ÁN 1: WebView Interception =====
+        try {
+            val latch = CountDownLatch(1)
+            val videoUrlRef = AtomicReference<String?>(null)
 
-        val linkArray = json["link"] as? List<*> ?: return false
+            withMainwork {
+                val webView = WebView(app.context).apply {
+                    settings.javaScriptEnabled = true
+                    settings.domStorageEnabled = true
+                    settings.mediaPlaybackRequiresUserGesture = false
+                    settings.userAgentString = ua
 
-        // Bước 3: Decrypt và emit
-        for (item in linkArray.filterIsInstance<Map<String, Any?>>()) {
-            val encryptedFile = item["file"]?.toString() ?: continue
-            
-            // Decrypt
-            val decrypted = Crypto.decrypt(encryptedFile) ?: continue
+                    webViewClient = object : WebViewClient() {
+                        override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                            val url = request?.url.toString()
+                            
+                            // Intercept M3U8 và MP4
+                            if (url.contains(".m3u8", ignoreCase = true) || 
+                                url.contains("/hls/", ignoreCase = true) ||
+                                url.contains("m3u8.animevietsub", ignoreCase = true) ||
+                                url.contains(".mp4", ignoreCase = true)) {
+                                
+                                if (!url.contains("googleads") && !url.contains("ads")) {
+                                    videoUrlRef.set(url)
+                                    latch.countDown()
+                                }
+                            }
+                            return super.shouldInterceptRequest(view, request)
+                        }
 
-            // Parse decrypted - có thể là URL hoặc JSON array
-            when {
-                decrypted.startsWith("http") -> {
-                    emitUrl(decrypted, epUrl, "", callback)
-                    return true
-                }
-                decrypted.trimStart().startsWith("[") -> {
-                    @Suppress("UNCHECKED_CAST")
-                    val arr = mapper.readValue(decrypted, List::class.java) as List<*>
-                    for (src in arr.filterIsInstance<Map<String, Any?>>()) {
-                        val file = (src["file"] ?: src["url"])?.toString() ?: continue
-                        val label = src["label"]?.toString() ?: ""
-                        emitUrl(file, epUrl, label, callback)
+                        override fun onPageFinished(view: WebView?, url: String?) {
+                            // Inject JS để lấy video URL từ jwplayer
+                            evaluateJavascript("""
+                                (function() {
+                                    try {
+                                        if (typeof jwplayer !== 'undefined') {
+                                            var p = jwplayer('mediaplayer') || jwplayer();
+                                            if (p && p.getPlaylist) {
+                                                var pl = p.getPlaylist();
+                                                if (pl && pl.length > 0) {
+                                                    for (var i = 0; i < pl.length; i++) {
+                                                        if (pl[i].file) return pl[i].file;
+                                                        if (pl[i].sources && pl[i].sources.length > 0) {
+                                                            return pl[i].sources[0].file;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        var videos = document.querySelectorAll('video');
+                                        for (var i = 0; i < videos.length; i++) {
+                                            if (videos[i].src && !videos[i].src.startsWith('blob:')) {
+                                                return videos[i].src;
+                                            }
+                                            var sources = videos[i].querySelectorAll('source');
+                                            for (var j = 0; j < sources.length; j++) {
+                                                if (sources[j].src) return sources[j].src;
+                                            }
+                                        }
+                                    } catch(e) {}
+                                    return null;
+                                })();
+                            """) { result ->
+                                val url = result?.trim('"')?.takeIf { it.startsWith("http") }
+                                if (url != null) {
+                                    videoUrlRef.set(url)
+                                    latch.countDown()
+                                }
+                            }
+                        }
                     }
-                    return true
+
+                    // Tạo form và POST
+                    val html = """
+                        <!DOCTYPE html>
+                        <html>
+                        <head><meta charset="UTF-8"></head>
+                        <body>
+                        <form id="f" method="POST" action="$mainUrl/ajax/player">
+                            <input type="hidden" name="link" value="$dataHash">
+                            <input type="hidden" name="id" value="$filmId">
+                        </form>
+                        <script>document.getElementById('f').submit();</script>
+                        </body>
+                        </html>
+                    """
+                    loadDataWithBaseURL(mainUrl, html, "text/html", "UTF-8", null)
                 }
-                decrypted.trimStart().startsWith("{") -> {
-                    @Suppress
+
+                // Timeout cleanup
+                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                    try { latch.countDown() } catch (_: Exception) {}
+                }, 15000)
+            }
+
+            latch.await(15, TimeUnit.SECONDS)
+            videoUrlRef.get()?.let { foundUrls.add(it) }
+        } catch (_: Exception) {}
+
+        // ===== PHƯƠNG ÁN 2: Direct POST + Parse HTML Response =====
+        if (foundUrls.isEmpty()) {
+            try {
+                val resp = app.post("$mainUrl/ajax/player",
+                    data = mapOf("link" to dataHash, "id" to filmId),
+                    headers = ajaxH(epUrl),
+                    interceptor = cf
+                ).text
+
+                // Tìm URL trong response
+                Regex("""https?://[^\s"'<>]+?\.(?:m3u8|mp4)(?:[^\s"'<>]*)?""")
+                    .findAll(resp ?: "")
+                    .forEach { foundUrls.add(it.value) }
+
+                // Parse JSON response
+                if (resp?.trimStart()?.startsWith("{") == true) {
+                    @Suppress("UNCHECKED_CAST")
+                    val json = mapper.readValue(resp, Map::class.java) as Map<String, Any?>
+                    (json["link"] as? List<*>)?.let { links ->
+                        for (item in links.filterIsInstance<Map<String, Any?>>()) {
+                            item["file"]?.toString()?.let { file ->
+                                // Tìm URL trong file string (có thể là encrypted nhưng chứa URL)
+                                Regex("""https?://[^\s"']+""")
+                                    .find(file)
+                                    ?.let { foundUrls.add(it.value) }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+
+        // ===== PHƯƠNG ÁN 3: Load trang episode và scrape =====
+        if (foundUrls.isEmpty()) {
+            try {
+                val pageHtml = app.get(epUrl, interceptor = cf, headers = pageH).text
+                
+                // Tìm trong script tags
+                Regex("""https?://[^\s"'<>]+?(?:\.m3u8|\.mp4|hls)[^\s"'<>]*""")
+                    .findAll(pageHtml ?: "")
+                    .forEach { foundUrls.add(it.value) }
+
+                // Tìm iframe embed
+                Jsoup.parse(pageHtml).select("iframe[src]").forEach { iframe ->
+                    val src = fix(iframe.attr("src")) ?: return@forEach
+                    try {
+                        loadExtractor(src, epUrl, subtitleCallback, callback)
+                    } catch (_: Exception) {}
+                }
+            } catch (_: Exception) {}
+        }
+
+        // ===== EMIT ALL FOUND URLS =====
+        for (url in foundUrls) {
+            if (url.contains("googleads", ignoreCase = true)) continue
+            if (url.contains("/ads/", ignoreCase = true)) continue
+            
+            val isHls = url.contains(".m3u8", ignoreCase = true) || url.contains("/hls/", ignoreCase = true)
+            
+            callback(newExtractorLink(name, name, url) {
+                referer = epUrl
+                quality = Qualities.Unknown.value
+                type = if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                headers = mapOf("User-Agent" to ua)
+            })
+        }
+
+        return foundUrls.isNotEmpty()
+    }
+
+    private suspend fun withMainwork(block: () -> Unit) {
+        return suspendCoroutine { cont ->
+            android.os.Handler(android.os.Looper.getMainLooper()).post {
+                try {
+                    block()
+                } catch (_: Exception) {}
+                cont.resume(Unit)
+            }
+        }
+    }
+}

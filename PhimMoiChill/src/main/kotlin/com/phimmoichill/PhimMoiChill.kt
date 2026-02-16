@@ -27,7 +27,7 @@ class PhimMoiChillProvider : MainAPI() {
     )
 
     override val mainPage = mainPageOf(
-        "list/phim-moi" to "Phim Mới",
+        "list/phim-nam-2026" to "Phim Mới",
         "list/phim-le" to "Phim Lẻ",
         "list/phim-bo" to "Phim Bộ"
     )

@@ -35,9 +35,7 @@ object Crypto {
             val decoded = Base64.decode(safeEnc, Base64.DEFAULT)
             val decrypted = cipher.doFinal(decoded)
             String(decrypted, StandardCharsets.UTF_8).trim()
-        } catch (e: Exception) {
-            null
-        }
+        } catch (e: Exception) { null }
     }
 }
 
@@ -48,7 +46,7 @@ class AnimeVietSub : MainAPI() {
     override val hasMainPage = true
     override val hasChromecastSupport = true
     override val hasDownloadSupport = true
-    override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA)
+    override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie)
 
     companion object {
         private const val ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -57,40 +55,33 @@ class AnimeVietSub : MainAPI() {
     private val cf = CloudflareKiller()
     private val mapper = jacksonObjectMapper()
     private val pageH = mapOf("User-Agent" to ua)
-    
-    private fun ajaxH(ref: String) = mapOf(
-        "User-Agent" to ua,
-        "X-Requested-With" to "XMLHttpRequest",
-        "Referer" to ref,
-        "Origin" to mainUrl
-    )
 
     private fun fix(u: String?): String? {
         if (u.isNullOrBlank()) return null
-        if (u.startsWith("http")) return u
-        return "$mainUrl/${u.removePrefix("/")}"
+        return if (u.startsWith("http")) u else "$mainUrl/${u.removePrefix("/")}"
     }
 
+    // Cập nhật đúng các đường dẫn như bạn đã chỉ dẫn
     override val mainPage = mainPageOf(
-        "$mainUrl/" to "Trang Chủ",
-        "$mainUrl/danh-sach/list-dang-chieu/" to "Đang Chiếu",
-        "$mainUrl/danh-sach/list-tron-bo/" to "Trọn Bộ",
+        "$mainUrl/anime-moi/" to "Anime Mới",
+        "$mainUrl/anime-bo/" to "Anime Bộ",
         "$mainUrl/anime-le/" to "Anime Lẻ",
-        "$mainUrl/anime-bo/" to "Anime Bộ"
+        "$mainUrl/anime-hoan-thanh/" to "Hoàn Thành"
     )
 
     override suspend fun getMainPage(page: Int, req: MainPageRequest): HomePageResponse {
-        val baseUrl = if (req.data.isBlank()) mainUrl else req.data
-        val url = if (page == 1) baseUrl else "${baseUrl.removeSuffix("/")}/trang-$page.html"
+        val url = if (page == 1) req.data else "${req.data.removeSuffix("/")}/trang-$page.html"
         val doc = app.get(url, interceptor = cf, headers = pageH).document
-        val items = doc.select("article.TPostMv, .list-film li").mapNotNull { it.toSR() }
-        return newHomePageResponse(req.name, items)
+        
+        // Selector cho danh sách phim (thường nằm trong div.item hoặc ul.list-annime li)
+        val items = doc.select("div.item, ul.list-annime li, article.TPostMv").mapNotNull { it.toSR() }
+        return newHomePageResponse(req.name, items, hasNext = items.isNotEmpty())
     }
 
     private fun Element.toSR(): SearchResponse? {
         val a = selectFirst("a") ?: return null
         val url = fix(a.attr("href")) ?: return null
-        val ttl = selectFirst("h2, h3, .title")?.text() ?: a.attr("title")
+        val ttl = selectFirst("h3, h2, .title, .name")?.text() ?: a.attr("title") ?: ""
         val poster = fix(selectFirst("img")?.attr("data-src") ?: selectFirst("img")?.attr("src"))
         return newAnimeSearchResponse(ttl, url, TvType.Anime) { posterUrl = poster }
     }
@@ -98,21 +89,22 @@ class AnimeVietSub : MainAPI() {
     override suspend fun search(q: String): List<SearchResponse> {
         val url = "$mainUrl/tim-kiem/${URLEncoder.encode(q, "utf-8")}/"
         return app.get(url, interceptor = cf, headers = pageH).document
-            .select("article.TPostMv").mapNotNull { it.toSR() }
+            .select("div.item, article.TPostMv").mapNotNull { it.toSR() }
     }
 
     override suspend fun load(url: String): LoadResponse {
         val doc = app.get(url, interceptor = cf, headers = pageH).document
-        val title = doc.selectFirst("h1.Title")?.text()?.trim() ?: ""
-        val poster = fix(doc.selectFirst(".Image img")?.attr("src"))
+        val title = doc.selectFirst("h1.Title, h1.entry-title")?.text()?.trim() ?: ""
+        val poster = fix(doc.selectFirst(".Image img, .thumb img")?.attr("src"))
         
-        val watchUrl = fix(doc.selectFirst("a.btn-see")?.attr("href")) ?: url
-        val watchDoc = if (watchUrl != url) app.get(watchUrl, interceptor = cf, headers = pageH).document else doc
+        // Tìm ID phim từ URL (ví dụ: ...-a1234.html -> ID là 1234)
+        val filmId = Regex("""-a(\d+)\.html""").find(url)?.groupValues?.get(1) ?: ""
 
-        val episodes = watchDoc.select(".list-episode li a").mapNotNull { ep ->
+        // Lấy danh sách tập phim
+        val episodes = doc.select("ul.list-episode li a").mapNotNull { ep ->
             val href = fix(ep.attr("href")) ?: return@mapNotNull null
             val name = ep.text().trim()
-            newEpisode(href) {
+            newEpisode("$href?id=$filmId") { // Đính kèm ID phim vào data để dùng ở loadLinks
                 this.name = "Tập $name"
                 this.episode = name.toIntOrNull()
             }
@@ -121,7 +113,7 @@ class AnimeVietSub : MainAPI() {
         return newAnimeLoadResponse(title, url, TvType.Anime) {
             posterUrl = poster
             this.episodes = mutableMapOf(DubStatus.Subbed to episodes)
-            plot = doc.selectFirst(".Description")?.text()
+            plot = doc.selectFirst(".Description, .entry-content")?.text()
         }
     }
 
@@ -131,8 +123,14 @@ class AnimeVietSub : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val doc = app.get(data, interceptor = cf, headers = pageH).document
-        val servers = doc.select("a.btn3dsv[data-play=api], a.btn3dsv[data-id]")
+        // Tách URL tập phim và ID phim
+        val epUrl = data.substringBefore("?id=")
+        val filmId = data.substringAfter("?id=", "")
+
+        val doc = app.get(epUrl, interceptor = cf, headers = pageH).document
+        
+        // Tìm các server (nút chọn server)
+        val servers = doc.select("a.btn3dsv[data-id]")
         
         servers.forEach { sv ->
             val id = sv.attr("data-id")
@@ -141,7 +139,11 @@ class AnimeVietSub : MainAPI() {
             val response = app.post(
                 "$mainUrl/ajax/player",
                 data = mapOf("id" to id, "link" to href),
-                headers = ajaxH(data),
+                headers = mapOf(
+                    "User-Agent" to ua,
+                    "X-Requested-With" to "XMLHttpRequest",
+                    "Referer" to epUrl
+                ),
                 interceptor = cf
             ).text
 
@@ -156,19 +158,23 @@ class AnimeVietSub : MainAPI() {
                             val decrypted = Crypto.decrypt(encryptedFile)
                             
                             if (!decrypted.isNullOrBlank()) {
+                                // decrypted là JSON: [{"file":"...","type":"hls","label":"Auto"}]
                                 val sources = mapper.readTree(decrypted)
                                 sources.forEach { src ->
                                     val fileUrl = src.get("file").asText()
                                     val label = src.get("label")?.asText() ?: "Auto"
                                     
-                                    // Sửa lỗi biên dịch: Sử dụng lambda block để set tham số
                                     callback(newExtractorLink(
                                         source = "AnimeVietSub",
                                         name = "Server DU - $label",
                                         url = fileUrl
                                     ) {
                                         this.referer = mainUrl
-                                        this.quality = getQuality(label)
+                                        this.quality = when {
+                                            label.contains("1080") -> 1080
+                                            label.contains("720") -> 720
+                                            else -> 480
+                                        }
                                         this.type = if (fileUrl.contains("m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                                     })
                                 }
@@ -179,15 +185,5 @@ class AnimeVietSub : MainAPI() {
             }
         }
         return true
-    }
-
-    private fun getQuality(label: String): Int {
-        return when {
-            label.contains("1080") -> 1080
-            label.contains("720") -> 720
-            label.contains("480") -> 480
-            label.contains("360") -> 360
-            else -> Qualities.Unknown.value
-        }
     }
 }

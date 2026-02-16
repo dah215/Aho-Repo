@@ -20,14 +20,12 @@ class AnimeVietSubPlugin : Plugin() {
 }
 
 object Crypto {
-    // Key và IV cố định như bạn đã cung cấp
     private const val AES_KEY = "dm_thang_suc_vat_get_link_an_dbt"
-    private const val AES_IV = "dm_thang_suc_vat" // 16 ký tự đầu của Key
+    private const val AES_IV = "dm_thang_suc_vat"
 
     fun decrypt(enc: String?): String? {
         if (enc.isNullOrBlank()) return null
         return try {
-            // Fix lỗi Base64 nếu web dùng định dạng URL Safe
             val safeEnc = enc.replace("-", "+").replace("_", "/")
             val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
             val keySpec = SecretKeySpec(AES_KEY.toByteArray(StandardCharsets.UTF_8), "AES")
@@ -38,7 +36,6 @@ object Crypto {
             val decrypted = cipher.doFinal(decoded)
             String(decrypted, StandardCharsets.UTF_8).trim()
         } catch (e: Exception) {
-            e.printStackTrace()
             null
         }
     }
@@ -53,10 +50,12 @@ class AnimeVietSub : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA)
 
+    companion object {
+        private const val ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    }
+
     private val cf = CloudflareKiller()
     private val mapper = jacksonObjectMapper()
-    private const val ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-
     private val pageH = mapOf("User-Agent" to ua)
     
     private fun ajaxH(ref: String) = mapOf(
@@ -81,7 +80,8 @@ class AnimeVietSub : MainAPI() {
     )
 
     override suspend fun getMainPage(page: Int, req: MainPageRequest): HomePageResponse {
-        val url = if (page == 1) req.data else "${req.data.removeSuffix("/")}/trang-$page.html"
+        val baseUrl = if (req.data.isBlank()) mainUrl else req.data
+        val url = if (page == 1) baseUrl else "${baseUrl.removeSuffix("/")}/trang-$page.html"
         val doc = app.get(url, interceptor = cf, headers = pageH).document
         val items = doc.select("article.TPostMv, .list-film li").mapNotNull { it.toSR() }
         return newHomePageResponse(req.name, items)
@@ -106,14 +106,12 @@ class AnimeVietSub : MainAPI() {
         val title = doc.selectFirst("h1.Title")?.text()?.trim() ?: ""
         val poster = fix(doc.selectFirst(".Image img")?.attr("src"))
         
-        // Tìm link tập phim (thường là nút "Xem ngay" hoặc danh sách tập)
         val watchUrl = fix(doc.selectFirst("a.btn-see")?.attr("href")) ?: url
         val watchDoc = if (watchUrl != url) app.get(watchUrl, interceptor = cf, headers = pageH).document else doc
 
         val episodes = watchDoc.select(".list-episode li a").mapNotNull { ep ->
             val href = fix(ep.attr("href")) ?: return@mapNotNull null
             val name = ep.text().trim()
-            // Lưu thông tin cần thiết để load link
             newEpisode(href) {
                 this.name = "Tập $name"
                 this.episode = name.toIntOrNull()
@@ -133,17 +131,13 @@ class AnimeVietSub : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // 1. Lấy trang xem phim để tìm data-id và data-href
         val doc = app.get(data, interceptor = cf, headers = pageH).document
-        
-        // Tìm tất cả các server có data-play="api"
         val servers = doc.select("a.btn3dsv[data-play=api], a.btn3dsv[data-id]")
         
         servers.forEach { sv ->
             val id = sv.attr("data-id")
-            val href = sv.attr("data-href") // Đây là chuỗi đã mã hóa lần 1
+            val href = sv.attr("data-href")
 
-            // 2. Gửi request AJAX để lấy chuỗi mã hóa lần 2 (chứa link file)
             val response = app.post(
                 "$mainUrl/ajax/player",
                 data = mapOf("id" to id, "link" to href),
@@ -159,30 +153,29 @@ class AnimeVietSub : MainAPI() {
                     if (linkArray != null && linkArray.isArray) {
                         linkArray.forEach { item ->
                             val encryptedFile = item.get("file").asText()
-                            
-                            // 3. Giải mã chuỗi "file" bằng Key/IV bạn đã cung cấp
                             val decrypted = Crypto.decrypt(encryptedFile)
                             
                             if (!decrypted.isNullOrBlank()) {
-                                // decrypted lúc này là JSON: [{"file":"...","type":"hls","label":"Auto"}]
                                 val sources = mapper.readTree(decrypted)
                                 sources.forEach { src ->
                                     val fileUrl = src.get("file").asText()
                                     val label = src.get("label")?.asText() ?: "Auto"
                                     
+                                    // Sửa lỗi biên dịch: Sử dụng lambda block để set tham số
                                     callback(newExtractorLink(
-                                        "AnimeVietSub",
-                                        "Server DU - $label",
-                                        fileUrl,
-                                        referer = mainUrl,
-                                        quality = getQuality(label),
-                                        isM3u8 = fileUrl.contains("m3u8")
-                                    ))
+                                        source = "AnimeVietSub",
+                                        name = "Server DU - $label",
+                                        url = fileUrl
+                                    ) {
+                                        this.referer = mainUrl
+                                        this.quality = getQuality(label)
+                                        this.type = if (fileUrl.contains("m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                                    })
                                 }
                             }
                         }
                     }
-                } catch (e: Exception) { e.printStackTrace() }
+                } catch (e: Exception) { }
             }
         }
         return true

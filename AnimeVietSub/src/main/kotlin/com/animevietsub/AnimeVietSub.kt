@@ -71,18 +71,17 @@ class AnimeVietSub : MainAPI() {
     override suspend fun getMainPage(page: Int, req: MainPageRequest): HomePageResponse {
         val url = if (page == 1) req.data else "${req.data.removeSuffix("/")}/trang-$page.html"
         val doc = app.get(url, interceptor = cf, headers = pageH).document
-        
-        // Selector sửa đổi để lấy đúng item phim và ảnh
-        val items = doc.select("div.item").mapNotNull { it.toSR() }
+        val items = doc.select("div.item, article.TPostMv").mapNotNull { it.toSR() }
         return newHomePageResponse(req.name, items, hasNext = items.isNotEmpty())
     }
 
     private fun Element.toSR(): SearchResponse? {
         val a = selectFirst("a") ?: return null
         val url = fix(a.attr("href")) ?: return null
-        val ttl = selectFirst(".title, h3")?.text()?.trim() ?: a.attr("title") ?: ""
-        // Ưu tiên lấy src, nếu không có thì lấy data-src
-        val img = selectFirst("img")
+        val ttl = selectFirst(".title, h3, h2")?.text()?.trim() ?: a.attr("title") ?: ""
+        
+        // Fix lỗi Poster: Lấy từ figure.Objf img như bạn cung cấp
+        val img = selectFirst("figure.Objf img, img")
         val poster = fix(img?.attr("src")?.ifBlank { img.attr("data-src") })
         
         return newAnimeSearchResponse(ttl, url, TvType.Anime) { posterUrl = poster }
@@ -96,27 +95,19 @@ class AnimeVietSub : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse {
         val doc = app.get(url, interceptor = cf, headers = pageH).document
-        val title = doc.selectFirst("h1.Title, .entry-title")?.text()?.trim() ?: ""
-        val poster = fix(doc.selectFirst(".Image img, .thumb img")?.attr("src"))
+        val title = doc.selectFirst("h1.Title")?.text()?.trim() ?: ""
+        val poster = fix(doc.selectFirst("figure.Objf img, .Image img")?.attr("src"))
         
-        // Lấy Film ID từ URL
         val filmId = Regex("""-a(\d+)\.html""").find(url)?.groupValues?.get(1) ?: ""
 
-        // Tìm nút "Xem ngay" để chuyển sang trang có danh sách tập
-        val watchBtn = doc.selectFirst("a.btn-see, a.btn-danger, a[href*='/tap-']")
-        val watchUrl = fix(watchBtn?.attr("href")) ?: url
-        
-        val watchDoc = if (watchUrl != url) {
-            app.get(watchUrl, interceptor = cf, headers = pageH).document
-        } else {
-            doc
-        }
-
-        // Selector tập phim đã được cập nhật để tránh lỗi "Không có tập nào"
-        val episodes = watchDoc.select("#list-episode li a, .list-episode li a").mapNotNull { ep ->
+        // Lấy danh sách tập phim và data-hash
+        val episodes = doc.select("ul.list-episode li a").mapNotNull { ep ->
             val href = fix(ep.attr("href")) ?: return@mapNotNull null
-            val name = ep.text().trim().replace("Tập ", "")
-            newEpisode("$href?id=$filmId") {
+            val name = ep.text().trim()
+            val hash = ep.attr("data-hash") // Lấy data-hash quan trọng
+            
+            // Lưu trữ theo định dạng: URL|FilmID|Hash
+            newEpisode("$href|$filmId|$hash") {
                 this.name = "Tập $name"
                 this.episode = name.toIntOrNull()
             }
@@ -125,7 +116,7 @@ class AnimeVietSub : MainAPI() {
         return newAnimeLoadResponse(title, url, TvType.Anime) {
             posterUrl = poster
             this.episodes = mutableMapOf(DubStatus.Subbed to episodes)
-            plot = doc.selectFirst(".Description, .entry-content")?.text()?.trim()
+            plot = doc.selectFirst(".Description")?.text()?.trim()
         }
     }
 
@@ -135,59 +126,60 @@ class AnimeVietSub : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val epUrl = data.substringBefore("?id=")
-        val filmId = data.substringAfter("?id=", "")
-
-        val doc = app.get(epUrl, interceptor = cf, headers = pageH).document
-        val servers = doc.select("a.btn3dsv[data-id]")
+        val parts = data.split("|")
+        if (parts.size < 3) return false
         
-        servers.forEach { sv ->
-            val id = sv.attr("data-id")
-            val href = sv.attr("data-href")
+        val epUrl = parts[0]
+        val filmId = parts[1]
+        val dataHash = parts[2]
 
-            val response = app.post(
-                "$mainUrl/ajax/player",
-                data = mapOf("id" to id, "link" to href),
-                headers = mapOf(
-                    "User-Agent" to ua,
-                    "X-Requested-With" to "XMLHttpRequest",
-                    "Referer" to epUrl,
-                    "Origin" to mainUrl
-                ),
-                interceptor = cf
-            ).text
+        // Gửi request AJAX với đúng Payload bạn đã cung cấp
+        val response = app.post(
+            "$mainUrl/ajax/player",
+            data = mapOf("id" to filmId, "link" to dataHash),
+            headers = mapOf(
+                "X-Requested-With" to "XMLHttpRequest",
+                "Referer" to epUrl,
+                "User-Agent" to ua,
+                "Content-Type" to "application/x-www-form-urlencoded"
+            ),
+            interceptor = cf
+        ).text
 
-            if (!response.isNullOrBlank()) {
-                try {
-                    val json = mapper.readTree(response)
-                    val linkArray = json.get("link")
+        if (!response.isNullOrBlank()) {
+            try {
+                val json = mapper.readTree(response)
+                val linkArray = json.get("link")
+                
+                linkArray?.forEach { item ->
+                    val encryptedFile = item.get("file").asText()
                     
-                    if (linkArray != null && linkArray.isArray) {
-                        linkArray.forEach { item ->
-                            val encryptedFile = item.get("file").asText()
-                            val decrypted = Crypto.decrypt(encryptedFile)
+                    // GIẢI MÃ trường "file" bằng Key/IV bạn cung cấp
+                    val decrypted = Crypto.decrypt(encryptedFile)
+                    
+                    if (!decrypted.isNullOrBlank()) {
+                        val sources = mapper.readTree(decrypted)
+                        sources.forEach { src ->
+                            val fileUrl = src.get("file").asText()
+                            val label = src.get("label")?.asText() ?: "Auto"
                             
-                            if (!decrypted.isNullOrBlank()) {
-                                val sources = mapper.readTree(decrypted)
-                                sources.forEach { src ->
-                                    val fileUrl = src.get("file").asText()
-                                    val label = src.get("label")?.asText() ?: "Auto"
-                                    
-                                    callback(newExtractorLink(
-                                        source = "AnimeVietSub",
-                                        name = "Server DU - $label",
-                                        url = fileUrl
-                                    ) {
-                                        this.referer = mainUrl
-                                        this.quality = if (label.contains("1080")) 1080 else if (label.contains("720")) 720 else 480
-                                        this.type = if (fileUrl.contains("m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                                    })
+                            callback(newExtractorLink(
+                                source = "AnimeVietSub",
+                                name = "Server DU - $label",
+                                url = fileUrl
+                            ) {
+                                this.referer = mainUrl
+                                this.quality = when {
+                                    label.contains("1080") -> 1080
+                                    label.contains("720") -> 720
+                                    else -> 480
                                 }
-                            }
+                                this.type = if (fileUrl.contains("m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                            })
                         }
                     }
-                } catch (e: Exception) { }
-            }
+                }
+            } catch (e: Exception) { }
         }
         return true
     }

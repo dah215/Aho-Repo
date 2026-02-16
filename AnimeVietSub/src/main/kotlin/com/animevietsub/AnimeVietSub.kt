@@ -43,18 +43,16 @@ class AnimeVietSub : MainAPI() {
         }
     }
 
-    // Chuyển URL trang chi tiết → trang xem phim
     private fun detailToWatch(detailUrl: String): String =
         detailUrl.replace("/thong-tin-phim/", "/xem-phim/")
 
     // ===== MAIN PAGE =====
-    // animevui.social phân trang dạng ?page=N
     override val mainPage = mainPageOf(
-        "$mainUrl/"                    to "Trang Chủ",
-        "$mainUrl/the-loai/anime-moi/" to "Anime Mới",
-        "$mainUrl/the-loai/anime-bo/"  to "Anime Bộ",
-        "$mainUrl/the-loai/anime-le/"  to "Anime Lẻ",
-        "$mainUrl/the-loai/hanh-dong/" to "Action",
+        "$mainUrl/"                     to "Trang Chủ",
+        "$mainUrl/the-loai/anime-moi/"  to "Anime Mới",
+        "$mainUrl/the-loai/anime-bo/"   to "Anime Bộ",
+        "$mainUrl/the-loai/anime-le/"   to "Anime Lẻ",
+        "$mainUrl/the-loai/hanh-dong/"  to "Action",
         "$mainUrl/the-loai/phep-thuat/" to "Fantasy"
     )
 
@@ -63,7 +61,6 @@ class AnimeVietSub : MainAPI() {
         val url  = if (page == 1) base else "${base.removeSuffix("/")}/?page=$page"
         val doc  = app.get(fix(url) ?: mainUrl, interceptor = cf, headers = pageH).document
 
-        // animevui dùng thẻ <a> bọc card, chỉ lấy những link có ảnh
         val items = doc.select("a[href*='/thong-tin-phim/']")
             .filter { it.selectFirst("img") != null }
             .mapNotNull { it.toSR() }
@@ -88,7 +85,6 @@ class AnimeVietSub : MainAPI() {
                 ?: img?.attr("data-lazy-src")?.ifBlank { null }
                 ?: img?.attr("src")
         )
-
         return newAnimeSearchResponse(ttl, href, TvType.Anime) { posterUrl = poster }
     }
 
@@ -97,8 +93,7 @@ class AnimeVietSub : MainAPI() {
         val encoded = URLEncoder.encode(q, "utf-8")
         val doc = app.get(
             "$mainUrl/tim-kiem/$encoded/",
-            interceptor = cf,
-            headers     = pageH
+            interceptor = cf, headers = pageH
         ).document
         return doc.select("a[href*='/thong-tin-phim/']")
             .filter { it.selectFirst("img") != null }
@@ -106,11 +101,10 @@ class AnimeVietSub : MainAPI() {
             .distinctBy { it.url }
     }
 
-    // ===== LOAD (chi tiết phim + danh sách tập) =====
+    // ===== LOAD =====
     override suspend fun load(url: String): LoadResponse {
         val detailUrl = fix(url) ?: throw ErrorLoadingException("Invalid URL")
 
-        // 1. Trang chi tiết → thông tin phim
         val detailDoc = app.get(detailUrl, interceptor = cf, headers = pageH).document
 
         val title = (
@@ -120,20 +114,16 @@ class AnimeVietSub : MainAPI() {
 
         val poster = detailDoc.selectFirst(
             ".img-film img, figure img, .thumb img, img[itemprop=image], .poster img"
-        )?.let { el ->
-            fix(el.attr("data-src").ifBlank { el.attr("src") })
-        }
+        )?.let { el -> fix(el.attr("data-src").ifBlank { el.attr("src") }) }
 
         val plot = detailDoc.selectFirst(
             ".description, .desc, [itemprop=description], .film-content, .content-film"
         )?.text()?.trim()
 
-        // 2. Trang xem phim → danh sách tập
-        // animevui.social: /thong-tin-phim/{slug} → /xem-phim/{slug}
+        // Lấy danh sách tập từ trang xem phim
         val watchUrl = detailToWatch(detailUrl)
         val watchDoc = app.get(watchUrl, interceptor = cf, headers = pageH).document
 
-        // Danh sách tập: tất cả link /xem-phim/{slug}/tap-{N}
         val episodes = watchDoc
             .select("a[href*='/xem-phim/'][href*='/tap-']")
             .distinctBy { it.attr("href") }
@@ -159,6 +149,7 @@ class AnimeVietSub : MainAPI() {
     }
 
     // ===== LOAD LINKS =====
+    // Flow: Episode page → iframe streamfree.casa → m3u8 trên video.twimg.com
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -168,73 +159,95 @@ class AnimeVietSub : MainAPI() {
         val epUrl = fix(data) ?: return false
         val foundUrls = mutableSetOf<String>()
 
-        try {
-            val doc     = app.get(epUrl, interceptor = cf, headers = pageH).document
-            val rawHtml = doc.html()
+        // ===== BƯỚC 1: Fetch trang tập, lấy iframe src =====
+        val epDoc = try {
+            app.get(epUrl, interceptor = cf, headers = pageH).document
+        } catch (_: Exception) { return false }
 
-            // === Bước 1: Tìm URL m3u8 / mp4 trực tiếp trong HTML ===
-            Regex("""https?://[^\s"'<>]+?(?:\.m3u8|\.mp4|/hls/)[^\s"'<>]*""")
-                .findAll(rawHtml)
-                .map { it.value }
-                .filter { v ->
-                    !v.contains("googleads", ignoreCase = true) &&
-                    !v.contains("/ads/",      ignoreCase = true)
+        // Tìm iframe streamfree.casa (hoặc iframe player khác)
+        val iframeSrc = epDoc.selectFirst(
+            "iframe#player, iframe.player-iframe, iframe[title=player], iframe[src*='streamfree'], iframe[src*='player']"
+        )?.attr("src")?.let { fix(it) }
+
+        if (iframeSrc != null) {
+            // ===== BƯỚC 2: Fetch trang streamfree.casa =====
+            val streamHeaders = mapOf(
+                "User-Agent" to ua,
+                "Referer"    to epUrl,
+                "Origin"     to mainUrl,
+                "Accept-Language" to "vi-VN,vi;q=0.9"
+            )
+
+            val streamHtml = try {
+                app.get(iframeSrc, headers = streamHeaders).text
+            } catch (_: Exception) { "" }
+
+            if (streamHtml.isNotBlank()) {
+                // Tìm m3u8 từ video.twimg.com hoặc bất kỳ CDN nào
+                Regex("""["'`](https://video\.twimg\.com/[^"'`\s]+\.m3u8[^"'`\s]*)["'`]""")
+                    .findAll(streamHtml)
+                    .forEach { foundUrls.add(it.groupValues[1]) }
+
+                // Tìm m3u8 chung
+                Regex("""["'`](https?://[^"'`\s]+\.m3u8[^"'`\s]*)["'`]""")
+                    .findAll(streamHtml)
+                    .forEach { foundUrls.add(it.groupValues[1]) }
+
+                // Tìm mp4 từ video.twimg.com
+                Regex("""["'`](https://video\.twimg\.com/[^"'`\s]+\.mp4[^"'`\s]*)["'`]""")
+                    .findAll(streamHtml)
+                    .forEach { foundUrls.add(it.groupValues[1]) }
+
+                // Tìm trong JSON (file:"...", src:"..., source:"...")
+                Regex("""(?:file|src|source|url)\s*[=:]\s*["'`](https?://[^"'`\s]+\.(?:m3u8|mp4)[^"'`\s]*)["'`]""")
+                    .findAll(streamHtml)
+                    .forEach { foundUrls.add(it.groupValues[1]) }
+
+                // Nếu vẫn không có → thử loadExtractor với iframe src
+                if (foundUrls.isEmpty()) {
+                    try { loadExtractor(iframeSrc, epUrl, subtitleCallback, callback) }
+                    catch (_: Exception) {}
                 }
-                .forEach { foundUrls.add(it) }
+            }
+        }
 
-            // === Bước 2: Xử lý iframe (dùng loadExtractor) ===
-            doc.select("iframe[src]").forEach { iframe ->
+        // ===== BƯỚC 3: Fallback – quét thẳng HTML trang tập =====
+        if (foundUrls.isEmpty()) {
+            val rawHtml = epDoc.html()
+
+            Regex("""["'`](https?://[^"'`\s]+\.m3u8[^"'`\s]*)["'`]""")
+                .findAll(rawHtml)
+                .forEach { foundUrls.add(it.groupValues[1]) }
+
+            Regex("""["'`](https?://[^"'`\s]+\.mp4[^"'`\s]*)["'`]""")
+                .findAll(rawHtml)
+                .forEach { foundUrls.add(it.groupValues[1]) }
+
+            // Thử tất cả iframe còn lại
+            epDoc.select("iframe[src]").forEach { iframe ->
                 val src = fix(iframe.attr("src")) ?: return@forEach
                 if (!src.contains("googleads") && !src.contains("/ads/")) {
-                    try {
-                        loadExtractor(src, epUrl, subtitleCallback, callback)
-                    } catch (_: Exception) {}
+                    try { loadExtractor(src, epUrl, subtitleCallback, callback) }
+                    catch (_: Exception) {}
                 }
             }
+        }
 
-            // === Bước 3: Tìm data-src / data-video / data-url trên player div ===
-            doc.select("[data-src],[data-video],[data-url],[data-file]").forEach { el ->
-                val raw = listOf(
-                    el.attr("data-src"),
-                    el.attr("data-video"),
-                    el.attr("data-url"),
-                    el.attr("data-file")
-                ).firstOrNull { it.isNotBlank() } ?: return@forEach
-
-                val fixed = fix(raw) ?: return@forEach
-                when {
-                    fixed.contains(".m3u8") || fixed.contains(".mp4") ->
-                        foundUrls.add(fixed)
-                    fixed.startsWith("http") -> {
-                        try {
-                            loadExtractor(fixed, epUrl, subtitleCallback, callback)
-                        } catch (_: Exception) {}
-                    }
-                }
-            }
-
-            // === Bước 4: Tìm URL trong các thẻ script ===
-            doc.select("script:not([src])").forEach { script ->
-                val txt = script.html()
-                Regex("""["'](https?://[^"']+?\.(?:m3u8|mp4)[^"']*)["']""")
-                    .findAll(txt)
-                    .forEach { mr ->
-                        val v = mr.groupValues[1]
-                        if (!v.contains("googleads") && !v.contains("/ads/"))
-                            foundUrls.add(v)
-                    }
-            }
-        } catch (_: Exception) {}
-
-        // === Emit tất cả URL tìm được ===
+        // ===== EMIT =====
         for (videoUrl in foundUrls) {
-            val isHls = videoUrl.contains(".m3u8", ignoreCase = true) ||
-                        videoUrl.contains("/hls/", ignoreCase = true)
+            if (videoUrl.contains("googleads", ignoreCase = true)) continue
+            if (videoUrl.contains("/ads/",      ignoreCase = true)) continue
+
+            val isHls = videoUrl.contains(".m3u8", ignoreCase = true)
+
             callback(newExtractorLink(name, name, videoUrl) {
-                referer = epUrl
+                referer = iframeSrc ?: epUrl
                 quality = Qualities.Unknown.value
                 type    = if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                headers = mapOf("User-Agent" to ua, "Referer" to epUrl)
+                headers = mapOf(
+                    "User-Agent" to ua,
+                    "Referer"    to (iframeSrc ?: epUrl)
+                )
             })
         }
 

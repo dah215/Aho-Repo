@@ -23,55 +23,83 @@ class AnimeVietSubPlugin : Plugin() {
     override fun load() { registerMainAPI(AnimeVietSub()) }
 }
 
-object AVSCrypto {
-    private const val PASSWORD = "dm_thang_suc_vat_get_link_an_dbt"
-
-    fun decrypt(encryptedBase64: String): String? {
-        if (encryptedBase64.isBlank()) return null
-        if (encryptedBase64.startsWith("http") || encryptedBase64.startsWith("#EXTM3U")) return encryptedBase64
-
-        return try {
-            val rawData = Base64.decode(encryptedBase64.trim(), Base64.DEFAULT)
-            if (rawData.size < 17) return null
-
-            val iv = rawData.copyOfRange(0, 16)
-            val ciphertext = rawData.copyOfRange(16, rawData.size)
-
-            val keyBytes = MessageDigest.getInstance("SHA-256")
-                .digest(PASSWORD.toByteArray(StandardCharsets.UTF_8))
-
-            val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
-            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(keyBytes, "AES"), IvParameterSpec(iv))
-            val decrypted = cipher.doFinal(ciphertext)
-
-            zlibDecompress(decrypted)
-        } catch (e: Exception) {
-            println("[AVS-Crypto] Decrypt failed: ${e.message}")
-            null
-        }
+/**
+ * AnimeVietSub Decryptor
+ * 
+ * Thuật toán: AES-256-CBC + Zlib (Pako inflate)
+ * Password: dm_thang_suc_vat_get_link_an_dbt
+ * 
+ * Flow: Base64 → AES Decrypt → Zlib Decompress → JSON/URL
+ */
+object Decryptor {
+    private val PASSWORD = "dm_thang_suc_vat_get_link_an_dbt".toByteArray(StandardCharsets.UTF_8)
+    private val SALTED = "Salted__".toByteArray(StandardCharsets.UTF_8)
+    private val SHA256_KEY by lazy {
+        MessageDigest.getInstance("SHA-256").digest(PASSWORD)
     }
 
-    private fun zlibDecompress(data: ByteArray): String? {
+    fun decrypt(enc: String): String? {
+        if (enc.startsWith("http") || enc.startsWith("#EXTM3U")) return enc
+        
         return try {
-            val inflater = Inflater(true)
-            inflater.setInput(data)
-            val output = ByteArrayOutputStream()
-            val buffer = ByteArray(8192)
-            while (!inflater.finished()) {
-                val count = inflater.inflate(buffer)
-                if (count == 0) break
-                output.write(buffer, 0, count)
+            val raw = Base64.decode(enc.trim(), Base64.NO_WRAP)
+            if (raw.size < 17) return null
+
+            // Check OpenSSL format
+            if (raw.copyOfRange(0, 8).contentEquals(SALTED)) {
+                // OpenSSL: "Salted__" + salt(8) + ciphertext
+                val salt = raw.copyOfRange(8, 16)
+                val ct = raw.copyOfRange(16, raw.size)
+                val (key, iv) = evpKDF(salt)
+                aesDecrypt(ct, key, iv)
+            } else {
+                // Simple: IV(16) + ciphertext, Key = SHA-256(password)
+                val iv = raw.copyOfRange(0, 16)
+                val ct = raw.copyOfRange(16, raw.size)
+                aesDecrypt(ct, SHA256_KEY, iv)
             }
-            inflater.end()
-            String(output.toByteArray(), StandardCharsets.UTF_8).trim()
-        } catch (e: Exception) {
-            println("[AVS-Crypto] Zlib failed: ${e.message}")
-            null
-        }
+        } catch (_: Exception) { null }
     }
 
-    fun extractHexId(content: String): String? {
-        return Regex("""/chunks/([0-9a-f]{24})/""").find(content)?.groupValues?.get(1)
+    private fun evpKDF(salt: ByteArray): Pair<ByteArray, ByteArray> {
+        val md = MessageDigest.getInstance("MD5")
+        val out = ByteArrayOutputStream()
+        var prev = ByteArray(0)
+        while (out.size() < 48) {
+            md.reset()
+            md.update(prev)
+            md.update(PASSWORD)
+            md.update(salt)
+            prev = md.digest()
+            out.write(prev)
+        }
+        val b = out.toByteArray()
+        return b.copyOfRange(0, 32) to b.copyOfRange(32, 48)
+    }
+
+    private fun aesDecrypt(ct: ByteArray, key: ByteArray, iv: ByteArray): String? {
+        return try {
+            val c = Cipher.getInstance("AES/CBC/PKCS5Padding")
+            c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
+            val plain = c.doFinal(ct)
+            inflate(plain) ?: String(plain, StandardCharsets.UTF_8).trim()
+        } catch (_: Exception) { null }
+    }
+
+    private fun inflate(data: ByteArray): String? {
+        return try {
+            val inf = Inflater(true)
+            inf.setInput(data)
+            val out = ByteArrayOutputStream()
+            val buf = ByteArray(8192)
+            while (!inf.finished()) {
+                val n = inf.inflate(buf)
+                if (n == 0) break
+                out.write(buf, 0, n)
+            }
+            inf.end()
+            String(out.toByteArray(), StandardCharsets.UTF_8).trim()
+        } catch (_: Exception) { null }
     }
 }
 
@@ -86,21 +114,18 @@ class AnimeVietSub : MainAPI() {
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA)
 
     private val cf = CloudflareKiller()
-    private val mapper = jacksonObjectMapper()
-
-    private val ua = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36"
-    private val pageHeaders = mapOf("User-Agent" to ua, "Accept" to "text/html", "Accept-Language" to "vi-VN")
-    
-    private fun ajaxHeaders(ref: String) = mapOf(
+    private val json = jacksonObjectMapper()
+    private val ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    private val hPage = mapOf("User-Agent" to ua, "Accept" to "text/html")
+    private fun hAjax(ref: String) = mapOf(
         "User-Agent" to ua,
         "X-Requested-With" to "XMLHttpRequest",
         "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
         "Referer" to ref,
-        "Origin" to mainUrl,
-        "Accept" to "application/json, text/javascript, */*"
+        "Origin" to mainUrl
     )
 
-    private fun fix(u: String?): String? = when {
+    private fun fix(u: String?) = when {
         u.isNullOrBlank() || u == "#" -> null
         u.startsWith("http") -> u
         u.startsWith("//") -> "https:$u"
@@ -111,7 +136,6 @@ class AnimeVietSub : MainAPI() {
     override val mainPage = mainPageOf(
         "$mainUrl/" to "Trang Chủ",
         "$mainUrl/danh-sach/list-dang-chieu/" to "Đang Chiếu",
-        "$mainUrl/danh-sach/list-tron-bo/" to "Trọn Bộ",
         "$mainUrl/anime-le/" to "Anime Lẻ",
         "$mainUrl/anime-bo/" to "Anime Bộ"
     )
@@ -119,9 +143,8 @@ class AnimeVietSub : MainAPI() {
     override suspend fun getMainPage(page: Int, req: MainPageRequest): HomePageResponse {
         val base = req.data.ifBlank { mainUrl }
         val url = if (page == 1) base else "${base.removeSuffix("/")}/trang-$page.html"
-        val doc = app.get(fix(url)!!, interceptor = cf, headers = pageHeaders).document
-        val items = doc.select("article, .TPostMv, .item, .list-film li, .TPost")
-            .mapNotNull { it.toSR() }.distinctBy { it.url }
+        val doc = app.get(fix(url)!!, interceptor = cf, headers = hPage).document
+        val items = doc.select("article, .TPostMv, .item, .TPost").mapNotNull { it.toSR() }.distinctBy { it.url }
         return newHomePageResponse(req.name, items, items.isNotEmpty())
     }
 
@@ -129,27 +152,24 @@ class AnimeVietSub : MainAPI() {
         val a = selectFirst("a") ?: return null
         val url = fix(a.attr("href")) ?: return null
         val title = (selectFirst(".Title, h2, h3")?.text() ?: a.attr("title")).trim().ifBlank { return null }
-        val img = selectFirst("img")
-        val poster = fix(img?.attr("data-src")?.ifBlank { null } ?: img?.attr("src"))
+        val poster = selectFirst("img")?.let { fix(it.attr("data-src").ifBlank { it.attr("src") }) }
         return newAnimeSearchResponse(title, url, TvType.Anime) { posterUrl = poster }
     }
 
-    override suspend fun search(query: String): List<SearchResponse> {
-        val doc = app.get("$mainUrl/tim-kiem/${URLEncoder.encode(query, "UTF-8")}/", interceptor = cf, headers = pageHeaders).document
+    override suspend fun search(q: String): List<SearchResponse> {
+        val doc = app.get("$mainUrl/tim-kiem/${URLEncoder.encode(q, "UTF-8")}/", interceptor = cf, headers = hPage).document
         return doc.select("article, .TPostMv, .item").mapNotNull { it.toSR() }
     }
 
     override suspend fun load(url: String): LoadResponse {
         val fUrl = fix(url) ?: throw ErrorLoadingException("Invalid URL")
-        var doc = app.get(fUrl, interceptor = cf, headers = pageHeaders).document
+        var doc = app.get(fUrl, interceptor = cf, headers = hPage).document
         
-        val sel = "ul.list-episode li a, .list-eps a, .server-list a, .episodes a, #list_episodes a"
-        var epNodes = doc.select(sel)
-        
+        var epNodes = doc.select("ul.list-episode li a, .list-eps a, .server-list a, .episodes a")
         if (epNodes.isEmpty()) {
             doc.selectFirst("a.btn-see, a[href*='/tap-']")?.attr("href")?.let { fix(it) }?.let {
-                doc = app.get(it, interceptor = cf, headers = pageHeaders).document
-                epNodes = doc.select(sel)
+                doc = app.get(it, interceptor = cf, headers = hPage).document
+                epNodes = doc.select("ul.list-episode li a, .list-eps a, .server-list a, .episodes a")
             }
         }
 
@@ -157,17 +177,16 @@ class AnimeVietSub : MainAPI() {
         val eps = epNodes.mapNotNull { ep ->
             val href = fix(ep.attr("href")) ?: return@mapNotNull null
             val epId = listOf(ep.attr("data-id"), ep.attr("data-episodeid")).firstOrNull { it.matches(Regex("\\d+")) } ?: ""
-            val hash = ep.attr("data-hash").ifBlank { "" }
-            val epName = ep.text().trim().ifBlank { ep.attr("title") }
-            newEpisode("$href@@$filmId@@$epId@@$hash") {
-                name = epName
-                episode = Regex("\\d+").find(epName.orEmpty())?.value?.toIntOrNull()
+            val h = ep.attr("data-hash").ifBlank { "" }
+            newEpisode("$href@@$filmId@@$epId@@$h") {
+                name = ep.text().trim().ifBlank { ep.attr("title") }
+                episode = Regex("\\d+").find(name.orEmpty())?.value?.toIntOrNull()
             }
         }
 
         return newAnimeLoadResponse(doc.selectFirst("h1")?.text() ?: "Anime", fUrl, TvType.Anime) {
-            posterUrl = doc.selectFirst(".Image img, img[itemprop=image]")?.let { fix(it.attr("data-src").ifBlank { it.attr("src") }) }
-            plot = doc.selectFirst(".Description, #film-content")?.text()
+            posterUrl = doc.selectFirst(".Image img")?.let { fix(it.attr("data-src").ifBlank { it.attr("src") }) }
+            plot = doc.selectFirst(".Description")?.text()
             this.episodes = mutableMapOf(DubStatus.Subbed to eps)
         }
     }
@@ -178,158 +197,108 @@ class AnimeVietSub : MainAPI() {
     ): Boolean {
         val parts = data.split("@@")
         val epUrl = parts[0]
-        val filmId = parts[1]
-        val epId = parts[2]
-        val hash = parts[3]
+        val filmId = parts.getOrElse(1) { "" }
+        val epId = parts.getOrElse(2) { "" }
+        val savedHash = parts.getOrElse(3) { "" }
 
-        println("[AVS] === START ===")
-        println("[AVS] epUrl=$epUrl filmId=$filmId epId=$epId hash=${hash.take(30)}")
-
-        val page = try { app.get(epUrl, interceptor = cf, headers = pageHeaders) }
-            catch (e: Exception) { println("[AVS] GET page failed: ${e.message}"); return false }
+        val page = app.get(epUrl, interceptor = cf, headers = hPage)
         val cookies = page.cookies.toMutableMap()
         val html = page.text ?: return false
 
-        if (hash.isNotBlank()) {
-            println("[AVS] Trying direct hash...")
-            if (fetchAndEmit(hash, filmId, epUrl, cookies, callback)) return true
+        // Thu thập tất cả hash có thể
+        val hashes = mutableListOf<String>()
+        if (savedHash.isNotBlank()) hashes.add(savedHash)
+
+        // Parse page tìm data-href
+        Jsoup.parse(html).select("a[data-href], a[data-hash]").forEach { el ->
+            val h = el.attr("data-href").ifBlank { el.attr("data-hash") }.trim()
+            if (h.isNotBlank() && h != "#" && !h.startsWith("http")) hashes.add(h)
         }
 
-        val doc = Jsoup.parse(html)
-        for (el in doc.select("a[data-hash], a[data-href]")) {
-            val h = el.attr("data-hash").ifBlank { el.attr("data-href") }.trim()
-            if (h.isNotBlank() && h != "#" && !h.startsWith("http")) {
-                println("[AVS] Found hash: ${h.take(30)}")
-                if (fetchAndEmit(h, filmId, epUrl, cookies, callback)) return true
-            }
-        }
-
+        // AJAX để lấy thêm hash
         if (epId.isNotBlank()) {
-            println("[AVS] Trying AJAX with epId=$epId")
             try {
                 val r = app.post("$mainUrl/ajax/player",
                     data = mapOf("episodeId" to epId, "backup" to "1"),
-                    headers = ajaxHeaders(epUrl), cookies = cookies, interceptor = cf)
+                    headers = hAjax(epUrl), cookies = cookies, interceptor = cf)
                 
-                val body = r.text ?: return false
-                println("[AVS] AJAX response: ${body.take(200)}")
-
                 @Suppress("UNCHECKED_CAST")
-                val json = mapper.readValue(body, Map::class.java) as Map<String, Any?>
+                val obj = json.readValue(r.text, Map::class.java) as Map<String, Any?>
                 
-                (json["link"] as? List<*>)?.let { links ->
-                    for (item in links) {
-                        (item as? Map<*, *>)?.get("file")?.toString()?.let { file ->
-                            println("[AVS] Found file in JSON")
-                            if (processEncrypted(file, epUrl, callback)) return true
-                        }
-                    }
-                }
-
-                json["html"]?.toString()?.let { htmlResp ->
-                    val btns = Jsoup.parse(htmlResp).select("a[data-href], a.btn3dsv")
-                    for (btn in btns) {
-                        btn.attr("data-href").trim().takeIf { it.isNotBlank() && it != "#" }?.let { h ->
-                            println("[AVS] Button hash: ${h.take(30)}")
-                            if (fetchAndEmit(h, filmId, epUrl, cookies, callback)) return true
-                        }
-                    }
-                }
-            } catch (e: Exception) { println("[AVS] AJAX error: ${e.message}") }
-        }
-
-        println("[AVS] === FAILED ===")
-        return false
-    }
-
-    private suspend fun fetchAndEmit(
-        hash: String, filmId: String, referer: String,
-        cookies: MutableMap<String, String>, callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        val ids = mutableListOf<String>().apply { if (filmId.isNotBlank()) add(filmId); add("0") }
-
-        for (id in ids) {
-            println("[AVS] POST /ajax/player link=${hash.take(20)}... id=$id")
-            try {
-                val r = app.post("$mainUrl/ajax/player",
-                    data = mapOf("link" to hash, "id" to id),
-                    headers = ajaxHeaders(referer), cookies = cookies, interceptor = cf)
-                
-                println("[AVS] Response: code=${r.code}, len=${r.text?.length ?: 0}")
-                
-                r.text?.let { body ->
-                    @Suppress("UNCHECKED_CAST")
-                    val json = mapper.readValue(body, Map::class.java) as Map<String, Any?>
-                    
-                    (json["link"] as? List<*>)?.let { links ->
-                        for (item in links) {
-                            (item as? Map<*, *>)?.get("file")?.toString()?.let { file ->
-                                println("[AVS] Got encrypted file")
-                                if (processEncrypted(file, referer, callback)) return true
-                            }
-                        }
-                    }
-                }
-            } catch (e: Exception) { println("[AVS] POST error: ${e.message}") }
-        }
-        return false
-    }
-
-    private suspend fun processEncrypted(enc: String, referer: String, callback: (ExtractorLink) -> Unit): Boolean {
-        if (enc.isBlank()) return false
-        if (enc.startsWith("http")) return emit(enc, referer, callback)
-
-        println("[AVS] Decrypting...")
-        val dec = AVSCrypto.decrypt(enc) ?: run { println("[AVS] Decrypt failed"); return false }
-        println("[AVS] Decrypted: ${dec.take(100)}...")
-
-        return emitFromContent(dec, referer, callback)
-    }
-
-    private suspend fun emitFromContent(content: String, referer: String, callback: (ExtractorLink) -> Unit): Boolean {
-        if (content.startsWith("http")) return emit(content, referer, callback)
-
-        if (content.contains("#EXTM3U")) {
-            val hexId = AVSCrypto.extractHexId(content)
-            if (hexId != null) {
-                val url = "https://$CDN/chunks/$hexId/original/index.m3u8"
-                println("[AVS] CDN URL: $url")
-                return emit(url, referer, callback)
-            }
-            Regex("""https?://[^\s"']+\.m3u8[^\s"']*""").find(content)?.value?.let {
-                return emit(it, referer, callback)
-            }
-        }
-
-        if (content.startsWith("{") || content.startsWith("[")) {
-            try {
-                @Suppress("UNCHECKED_CAST")
-                val json = mapper.readValue(content, Map::class.java) as Map<String, Any?>
-                (json["link"] as? List<*>)?.let { links ->
-                    for (item in links) {
-                        (item as? Map<*, *>)?.get("file")?.toString()?.let { file ->
-                            if (file.startsWith("http")) return emit(file, referer, callback)
-                        }
+                // Parse html chứa buttons
+                obj["html"]?.toString()?.let { htmlStr ->
+                    Jsoup.parse(htmlStr).select("a[data-href], a.btn3dsv").forEach { btn ->
+                        val h = btn.attr("data-href").trim()
+                        if (h.isNotBlank() && h != "#") hashes.add(h)
                     }
                 }
             } catch (_: Exception) {}
         }
 
+        // Thử từng hash với filmId
+        hashes.distinct().forEach { hash ->
+            if (getPlayer(hash, filmId, epUrl, cookies, callback)) return true
+        }
+
         return false
     }
 
-    private suspend fun emit(url: String, referer: String, callback: (ExtractorLink) -> Unit): Boolean {
-        if (!url.startsWith("http")) return false
+    private suspend fun getPlayer(
+        hash: String, filmId: String, referer: String,
+        cookies: MutableMap<String, String>, callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val ids = if (filmId.isNotBlank()) listOf(filmId, "0") else listOf("0")
+        
+        for (id in ids) {
+            try {
+                val r = app.post("$mainUrl/ajax/player",
+                    data = mapOf("link" to hash, "id" to id),
+                    headers = hAjax(referer), cookies = cookies, interceptor = cf)
+                
+                @Suppress("UNCHECKED_CAST")
+                val obj = json.readValue(r.text, Map::class.java) as Map<String, Any?>
+                
+                val links = obj["link"] as? List<*>
+                links?.forEach { item ->
+                    if (item is Map<*, *>) {
+                        val file = item["file"]?.toString() ?: return@forEach
+                        val dec = Decryptor.decrypt(file) ?: return@forEach
+                        if (extractUrl(dec, callback)) return true
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        return false
+    }
 
+    private fun extractUrl(content: String, callback: (ExtractorLink) -> Unit): Boolean {
+        // Direct URL
+        if (content.startsWith("http")) return emit(content, callback)
+        
+        // M3U8 content - extract hexId
+        if (content.contains("#EXTM3U")) {
+            val hexId = Regex("""/chunks/([0-9a-f]{24})/""").find(content)?.groupValues?.get(1)
+            if (hexId != null) {
+                return emit("https://$CDN/chunks/$hexId/original/index.m3u8", callback)
+            }
+            // Extract URL from content
+            Regex("""https?://[^\s"']+""").find(content)?.value?.let { return emit(it, callback) }
+        }
+        
+        return false
+    }
+
+    private fun emit(url: String, callback: (ExtractorLink) -> Unit): Boolean {
+        if (!url.startsWith("http")) return false
+        
         val finalUrl = if (url.contains(CDN)) {
-            val hexId = Regex("""/chunks/([0-9a-f]{24})/""").find(url)?.groupValues?.get(1)
-            if (hexId != null) "https://$CDN/chunks/$hexId/original/index.m3u8" else url
+            Regex("""/chunks/([0-9a-f]{24})/""").find(url)?.groupValues?.get(1)?.let {
+                "https://$CDN/chunks/$it/original/index.m3u8"
+            } ?: url
         } else url
 
-        println("[AVS] Emitting: $finalUrl")
-
         callback(newExtractorLink(name, name, finalUrl) {
-            this.referer = referer
+            referer = mainUrl
             quality = Qualities.Unknown.value
             type = ExtractorLinkType.M3U8
             headers = mapOf("User-Agent" to ua)

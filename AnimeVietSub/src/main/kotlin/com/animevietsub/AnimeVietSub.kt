@@ -154,7 +154,7 @@ class AnimeVietSubV2 : MainAPI() {
         var epNodes = doc.select(sel)
 
         if (epNodes.isEmpty()) {
-            val watchBtn = doc.selectFirst("a.btn-see,a[href*=\"/tap-"],.watch-btn a,.play-btn a")
+            val watchBtn = doc.selectFirst("a.btn-see,a[href*='/tap-'],.watch-btn a,.play-btn a")
             watchBtn?.attr("href")?.let { href ->
                 fix(href)?.let { wUrl ->
                     doc = app.get(wUrl, interceptor = cf, headers = pageH).document

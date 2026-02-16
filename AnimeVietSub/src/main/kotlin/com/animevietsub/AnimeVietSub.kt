@@ -18,6 +18,7 @@ import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.*
+import java.net.URLEncoder
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.random.Random
@@ -42,8 +43,6 @@ class AnimeVietSubV2 : MainAPI() {
     private val mapper = jacksonObjectMapper()
     private val ua = "Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
 
-    // ==================== SIÊU MẠNH: CHỈ DÙNG WEBVIEW ====================
-
     override val mainPage = mainPageOf(
         "$mainUrl/" to "Trang Chủ",
         "$mainUrl/danh-sach/list-dang-chieu/" to "Đang Chiếu",
@@ -52,52 +51,28 @@ class AnimeVietSubV2 : MainAPI() {
         "$mainUrl/anime-bo/" to "Anime Bộ"
     )
 
+
     override suspend fun getMainPage(page: Int, req: MainPageRequest): HomePageResponse {
         val base = req.data.ifBlank { mainUrl }
         val url = if (page == 1) base else "${base.removeSuffix("/")}/trang-$page.html"
 
-        val items = extractViaWebView(url) { webView, latch, results ->
-            webView.webViewClient = object : WebViewClient() {
-                override fun onPageFinished(view: WebView?, loadedUrl: String?) {
-                    view?.evaluateJavascript("""
-                        (function() {
-                            var items = [];
-                            document.querySelectorAll('article, .TPost, .TPostMv, .item, .anime-item, .movie-item').forEach(function(el) {
-                                var a = el.querySelector('a');
-                                if (a && a.href) {
-                                    items.push({
-                                        title: el.querySelector('.Title, .title, h3')?.textContent?.trim() || a.title || a.textContent?.trim(),
-                                        url: a.href,
-                                        poster: el.querySelector('img')?.dataset?.src || el.querySelector('img')?.src
-                                    });
-                                }
-                            });
-                            return JSON.stringify(items);
-                        })();
-                    """) { result ->
-                        parseJsonResults(result, results)
-                        latch.countDown()
-                    }
-                }
-            }
-        }
-
+        val items = extractViaWebView(url)
         return newHomePageResponse(req.name, items, hasNext = items.isNotEmpty())
     }
 
+
     override suspend fun search(query: String): List<SearchResponse> {
-        val url = "$mainUrl/tim-kiem/${URLEncoder.encode(query, "utf-8")}/"
-        return getMainPage(1, MainPageRequest("Search", url)).list
+        val searchUrl = "$mainUrl/tim-kiem/${URLEncoder.encode(query, "utf-8")}/"
+        return extractViaWebView(searchUrl)
     }
+
 
     override suspend fun load(url: String): LoadResponse {
         val fixedUrl = fixUrl(url) ?: throw ErrorLoadingException("Invalid URL")
-
-        val result = extractLoadResponseViaWebView(fixedUrl)
-            ?: throw ErrorLoadingException("Failed to load via WebView")
-
-        return result
+        return extractLoadResponseViaWebView(fixedUrl) 
+            ?: throw ErrorLoadingException("Failed to load")
     }
+
 
     @SuppressLint("SetJavaScriptEnabled")
     override suspend fun loadLinks(
@@ -135,56 +110,12 @@ class AnimeVietSubV2 : MainAPI() {
                 }
 
                 override fun onPageFinished(view: WebView?, url: String?) {
-                    view?.evaluateJavascript("""
-                        (function() {
-                            // Hook all players
-                            var checkPlayers = setInterval(function() {
-                                // jwplayer
-                                if (typeof jwplayer !== 'undefined') {
-                                    var p = jwplayer();
-                                    if (p && p.getPlaylist) {
-                                        p.getPlaylist().forEach(function(item) {
-                                            if (item.file) StreamHook.onStream(item.file);
-                                            (item.sources || []).forEach(function(s) {
-                                                if (s.file) StreamHook.onStream(s.file);
-                                            });
-                                        });
-                                    }
-                                }
-
-                                // Video tags
-                                document.querySelectorAll('video').forEach(function(v) {
-                                    if (v.src) StreamHook.onStream(v.src);
-                                    v.querySelectorAll('source').forEach(function(s) {
-                                        if (s.src) StreamHook.onStream(s.src);
-                                    });
-                                });
-                            }, 1000);
-
-                            setTimeout(function() {
-                                clearInterval(checkPlayers);
-                                StreamHook.onStream('done');
-                            }, 10000);
-                        })();
-                    """) {}
-
+                    view?.evaluateJavascript(getPlayerHookJs()) {}
                     Handler(Looper.getMainLooper()).postDelayed({ latch.countDown() }, 12000)
                 }
             }
 
-            // Load player
-            val html = """
-                <!DOCTYPE html>
-                <html>
-                <body>
-                    <form id="f" method="POST" action="$mainUrl/ajax/player">
-                        <input type="hidden" name="link" value="$dataHash">
-                        <input type="hidden" name="id" value="$filmId">
-                    </form>
-                    <script>document.getElementById('f').submit();</script>
-                </body>
-                </html>
-            """
+            val html = getPlayerHtml(filmId, dataHash)
             webView.loadDataWithBaseURL(mainUrl, html, "text/html", "UTF-8", null)
 
             Handler(Looper.getMainLooper()).postDelayed({ latch.countDown() }, 15000)
@@ -209,13 +140,52 @@ class AnimeVietSubV2 : MainAPI() {
         return success
     }
 
-    // ==================== WEBVIEW UTILITIES ====================
+
+    private fun getPlayerHookJs(): String {
+        return """
+            (function() {
+                var checkPlayers = setInterval(function() {
+                    if (typeof jwplayer !== 'undefined') {
+                        var p = jwplayer();
+                        if (p && p.getPlaylist) {
+                            p.getPlaylist().forEach(function(item) {
+                                if (item.file) StreamHook.onStream(item.file);
+                                (item.sources || []).forEach(function(s) {
+                                    if (s.file) StreamHook.onStream(s.file);
+                                });
+                            });
+                        }
+                    }
+                    document.querySelectorAll('video').forEach(function(v) {
+                        if (v.src) StreamHook.onStream(v.src);
+                        v.querySelectorAll('source').forEach(function(s) {
+                            if (s.src) StreamHook.onStream(s.src);
+                        });
+                    });
+                }, 1000);
+                setTimeout(function() { clearInterval(checkPlayers); }, 10000);
+            })();
+        """.trimIndent()
+    }
+
+    private fun getPlayerHtml(filmId: String, dataHash: String): String {
+        return """
+            <!DOCTYPE html>
+            <html>
+            <body>
+                <form id="f" method="POST" action="$mainUrl/ajax/player">
+                    <input type="hidden" name="link" value="$dataHash">
+                    <input type="hidden" name="id" value="$filmId">
+                </form>
+                <script>document.getElementById('f').submit();</script>
+            </body>
+            </html>
+        """.trimIndent()
+    }
+
 
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun extractViaWebView(
-        url: String,
-        setup: (WebView, CountDownLatch, MutableList<SearchResponse>) -> Unit
-    ): List<SearchResponse> = withContext(Dispatchers.Main) {
+    private suspend fun extractViaWebView(url: String): List<SearchResponse> = withContext(Dispatchers.Main) {
         val results = mutableListOf<SearchResponse>()
         val latch = CountDownLatch(1)
 
@@ -223,10 +193,31 @@ class AnimeVietSubV2 : MainAPI() {
             val ctx = getContext() ?: return@withContext emptyList()
             val webView = createWebView(ctx)
 
-            setup(webView, latch, results)
+            webView.webViewClient = object : WebViewClient() {
+                override fun onPageFinished(view: WebView?, loadedUrl: String?) {
+                    view?.evaluateJavascript("""
+                        (function() {
+                            var items = [];
+                            document.querySelectorAll('article, .TPost, .TPostMv, .item, .anime-item, .movie-item').forEach(function(el) {
+                                var a = el.querySelector('a');
+                                if (a && a.href) {
+                                    items.push({
+                                        title: el.querySelector('.Title, .title, h3')?.textContent?.trim() || a.title || a.textContent?.trim(),
+                                        url: a.href,
+                                        poster: el.querySelector('img')?.dataset?.src || el.querySelector('img')?.src
+                                    });
+                                }
+                            });
+                            return JSON.stringify(items);
+                        })();
+                    """) { result ->
+                        parseResults(result, results)
+                        latch.countDown()
+                    }
+                }
+            }
 
             webView.loadUrl(fixUrl(url) ?: mainUrl)
-
             Handler(Looper.getMainLooper()).postDelayed({ latch.countDown() }, 10000)
             latch.await(10, TimeUnit.SECONDS)
             webView.destroy()
@@ -235,6 +226,28 @@ class AnimeVietSubV2 : MainAPI() {
         results
     }
 
+    private fun parseResults(result: String, results: MutableList<SearchResponse>) {
+        try {
+            val cleanJson = result.trim('"').replace("\"", """)
+            val json = mapper.readValue(cleanJson, List::class.java) as List<Map<String, String>>
+            json.forEach { item ->
+                val title = item["title"] ?: return@forEach
+                val url = item["url"] ?: return@forEach
+                val poster = item["poster"]
+
+                if (title.isNotBlank() && url.isNotBlank()) {
+                    fixUrl(url)?.let { fixed ->
+                        results.add(newAnimeSearchResponse(title, fixed, TvType.Anime) {
+                            posterUrl = fixUrl(poster)
+                        })
+                    }
+                }
+            }
+        } catch (e: Exception) {}
+    }
+
+
+    @SuppressLint("SetJavaScriptEnabled")
     private suspend fun extractLoadResponseViaWebView(url: String): LoadResponse? = withContext(Dispatchers.Main) {
         var result: LoadResponse? = null
         val latch = CountDownLatch(1)
@@ -264,7 +277,8 @@ class AnimeVietSubV2 : MainAPI() {
                         })();
                     """) { jsonResult ->
                         try {
-                            val data = mapper.readValue(jsonResult.replace("\\"", """).trim('"'), Map::class.java)
+                            val cleanJson = jsonResult.trim('"').replace("\"", """)
+                            val data = mapper.readValue(cleanJson, Map::class.java)
                             val title = data["title"] as? String
                             if (!title.isNullOrBlank()) {
                                 val episodes = (data["episodes"] as? List<Map<String, String>>)?.mapNotNull { ep ->
@@ -299,24 +313,6 @@ class AnimeVietSubV2 : MainAPI() {
         result
     }
 
-    private fun parseJsonResults(result: String, results: MutableList<SearchResponse>) {
-        try {
-            val json = mapper.readValue(result.replace("\\"", """).trim('"'), List::class.java) as List<Map<String, String>>
-            json.forEach { item ->
-                val title = item["title"] ?: return@forEach
-                val url = item["url"] ?: return@forEach
-                val poster = item["poster"]
-
-                if (title.isNotBlank() && url.isNotBlank()) {
-                    fixUrl(url)?.let { fixed ->
-                        results.add(newAnimeSearchResponse(title, fixed, TvType.Anime) {
-                            posterUrl = fixUrl(poster)
-                        })
-                    }
-                }
-            }
-        } catch (e: Exception) {}
-    }
 
     @SuppressLint("SetJavaScriptEnabled")
     private fun createWebView(ctx: Context): WebView {

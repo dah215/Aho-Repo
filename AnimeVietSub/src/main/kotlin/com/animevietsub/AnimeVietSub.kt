@@ -26,6 +26,7 @@ object Crypto {
     fun decrypt(enc: String?): String? {
         if (enc.isNullOrBlank()) return null
         return try {
+            // Xử lý chuỗi Base64 URL Safe
             val safeEnc = enc.replace("-", "+").replace("_", "/")
             val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
             val keySpec = SecretKeySpec(AES_KEY.toByteArray(StandardCharsets.UTF_8), "AES")
@@ -61,27 +62,28 @@ class AnimeVietSub : MainAPI() {
         return if (u.startsWith("http")) u else "$mainUrl/${u.removePrefix("/")}"
     }
 
-    // Cập nhật đúng các đường dẫn như bạn đã chỉ dẫn
+    // Cập nhật danh mục theo đúng thực tế trang web
     override val mainPage = mainPageOf(
         "$mainUrl/anime-moi/" to "Anime Mới",
         "$mainUrl/anime-bo/" to "Anime Bộ",
         "$mainUrl/anime-le/" to "Anime Lẻ",
-        "$mainUrl/anime-hoan-thanh/" to "Hoàn Thành"
+        "$mainUrl/anime-hoan-thanh/" to "Hoàn Thành",
+        "$mainUrl/anime-sap-chieu/" to "Sắp Chiếu"
     )
 
     override suspend fun getMainPage(page: Int, req: MainPageRequest): HomePageResponse {
         val url = if (page == 1) req.data else "${req.data.removeSuffix("/")}/trang-$page.html"
         val doc = app.get(url, interceptor = cf, headers = pageH).document
         
-        // Selector cho danh sách phim (thường nằm trong div.item hoặc ul.list-annime li)
-        val items = doc.select("div.item, ul.list-annime li, article.TPostMv").mapNotNull { it.toSR() }
+        // Selector chuẩn cho các item phim
+        val items = doc.select("div.item article, div.TPostMv").mapNotNull { it.toSR() }
         return newHomePageResponse(req.name, items, hasNext = items.isNotEmpty())
     }
 
     private fun Element.toSR(): SearchResponse? {
         val a = selectFirst("a") ?: return null
         val url = fix(a.attr("href")) ?: return null
-        val ttl = selectFirst("h3, h2, .title, .name")?.text() ?: a.attr("title") ?: ""
+        val ttl = selectFirst("h2, h3, .Title")?.text()?.trim() ?: a.attr("title") ?: ""
         val poster = fix(selectFirst("img")?.attr("data-src") ?: selectFirst("img")?.attr("src"))
         return newAnimeSearchResponse(ttl, url, TvType.Anime) { posterUrl = poster }
     }
@@ -89,22 +91,26 @@ class AnimeVietSub : MainAPI() {
     override suspend fun search(q: String): List<SearchResponse> {
         val url = "$mainUrl/tim-kiem/${URLEncoder.encode(q, "utf-8")}/"
         return app.get(url, interceptor = cf, headers = pageH).document
-            .select("div.item, article.TPostMv").mapNotNull { it.toSR() }
+            .select("div.item article").mapNotNull { it.toSR() }
     }
 
     override suspend fun load(url: String): LoadResponse {
         val doc = app.get(url, interceptor = cf, headers = pageH).document
-        val title = doc.selectFirst("h1.Title, h1.entry-title")?.text()?.trim() ?: ""
-        val poster = fix(doc.selectFirst(".Image img, .thumb img")?.attr("src"))
+        val title = doc.selectFirst("h1.Title")?.text()?.trim() ?: ""
+        val poster = fix(doc.selectFirst(".Image img")?.attr("src"))
         
-        // Tìm ID phim từ URL (ví dụ: ...-a1234.html -> ID là 1234)
+        // Lấy Film ID từ URL (ví dụ: phim-a1234.html)
         val filmId = Regex("""-a(\d+)\.html""").find(url)?.groupValues?.get(1) ?: ""
 
-        // Lấy danh sách tập phim
-        val episodes = doc.select("ul.list-episode li a").mapNotNull { ep ->
+        // Tìm link xem phim để lấy danh sách tập
+        val watchUrl = fix(doc.selectFirst("a.btn-see")?.attr("href")) ?: url
+        val watchDoc = if (watchUrl != url) app.get(watchUrl, interceptor = cf, headers = pageH).document else doc
+
+        val episodes = watchDoc.select("ul.list-episode li a").mapNotNull { ep ->
             val href = fix(ep.attr("href")) ?: return@mapNotNull null
             val name = ep.text().trim()
-            newEpisode("$href?id=$filmId") { // Đính kèm ID phim vào data để dùng ở loadLinks
+            // Truyền cả URL tập và Film ID vào data
+            newEpisode("$href?id=$filmId") {
                 this.name = "Tập $name"
                 this.episode = name.toIntOrNull()
             }
@@ -113,7 +119,7 @@ class AnimeVietSub : MainAPI() {
         return newAnimeLoadResponse(title, url, TvType.Anime) {
             posterUrl = poster
             this.episodes = mutableMapOf(DubStatus.Subbed to episodes)
-            plot = doc.selectFirst(".Description, .entry-content")?.text()
+            plot = doc.selectFirst(".Description")?.text()?.trim()
         }
     }
 
@@ -123,18 +129,16 @@ class AnimeVietSub : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // Tách URL tập phim và ID phim
         val epUrl = data.substringBefore("?id=")
         val filmId = data.substringAfter("?id=", "")
 
+        // Load trang xem phim để lấy danh sách server
         val doc = app.get(epUrl, interceptor = cf, headers = pageH).document
-        
-        // Tìm các server (nút chọn server)
         val servers = doc.select("a.btn3dsv[data-id]")
         
         servers.forEach { sv ->
             val id = sv.attr("data-id")
-            val href = sv.attr("data-href")
+            val href = sv.attr("data-href") // Chuỗi mã hóa link
 
             val response = app.post(
                 "$mainUrl/ajax/player",
@@ -142,7 +146,8 @@ class AnimeVietSub : MainAPI() {
                 headers = mapOf(
                     "User-Agent" to ua,
                     "X-Requested-With" to "XMLHttpRequest",
-                    "Referer" to epUrl
+                    "Referer" to epUrl,
+                    "Origin" to mainUrl
                 ),
                 interceptor = cf
             ).text
@@ -158,7 +163,7 @@ class AnimeVietSub : MainAPI() {
                             val decrypted = Crypto.decrypt(encryptedFile)
                             
                             if (!decrypted.isNullOrBlank()) {
-                                // decrypted là JSON: [{"file":"...","type":"hls","label":"Auto"}]
+                                // decrypted: [{"file":"...","type":"hls","label":"Auto"}]
                                 val sources = mapper.readTree(decrypted)
                                 sources.forEach { src ->
                                     val fileUrl = src.get("file").asText()

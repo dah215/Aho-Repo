@@ -61,9 +61,7 @@ class AnimeVietSub : MainAPI() {
         return if (u.startsWith("http")) u else "$mainUrl/${u.removePrefix("/")}"
     }
 
-    // Cập nhật danh mục theo đúng thực tế trang web và screenshot của bạn
     override val mainPage = mainPageOf(
-        "$mainUrl/" to "Trang Chủ",
         "$mainUrl/anime-moi/" to "Đang Chiếu",
         "$mainUrl/anime-hoan-thanh/" to "Trọn Bộ",
         "$mainUrl/anime-le/" to "Anime Lẻ",
@@ -74,41 +72,50 @@ class AnimeVietSub : MainAPI() {
         val url = if (page == 1) req.data else "${req.data.removeSuffix("/")}/trang-$page.html"
         val doc = app.get(url, interceptor = cf, headers = pageH).document
         
-        // Selector cực kỳ quan trọng: div.item article là cấu trúc chuẩn của AnimeVietSub
-        val items = doc.select("div.item article, div.TPostMv, .list-annime li").mapNotNull { it.toSR() }
+        // Selector sửa đổi để lấy đúng item phim và ảnh
+        val items = doc.select("div.item").mapNotNull { it.toSR() }
         return newHomePageResponse(req.name, items, hasNext = items.isNotEmpty())
     }
 
     private fun Element.toSR(): SearchResponse? {
         val a = selectFirst("a") ?: return null
         val url = fix(a.attr("href")) ?: return null
-        val ttl = selectFirst("h2, h3, .Title, .title")?.text()?.trim() ?: a.attr("title") ?: ""
-        val poster = fix(selectFirst("img")?.attr("data-src") ?: selectFirst("img")?.attr("src"))
+        val ttl = selectFirst(".title, h3")?.text()?.trim() ?: a.attr("title") ?: ""
+        // Ưu tiên lấy src, nếu không có thì lấy data-src
+        val img = selectFirst("img")
+        val poster = fix(img?.attr("src")?.ifBlank { img.attr("data-src") })
+        
         return newAnimeSearchResponse(ttl, url, TvType.Anime) { posterUrl = poster }
     }
 
     override suspend fun search(q: String): List<SearchResponse> {
         val url = "$mainUrl/tim-kiem/${URLEncoder.encode(q, "utf-8")}/"
         return app.get(url, interceptor = cf, headers = pageH).document
-            .select("div.item article").mapNotNull { it.toSR() }
+            .select("div.item").mapNotNull { it.toSR() }
     }
 
     override suspend fun load(url: String): LoadResponse {
         val doc = app.get(url, interceptor = cf, headers = pageH).document
-        val title = doc.selectFirst("h1.Title")?.text()?.trim() ?: ""
-        val poster = fix(doc.selectFirst(".Image img")?.attr("src"))
+        val title = doc.selectFirst("h1.Title, .entry-title")?.text()?.trim() ?: ""
+        val poster = fix(doc.selectFirst(".Image img, .thumb img")?.attr("src"))
         
-        // Lấy Film ID từ URL (ví dụ: phim-a1234.html)
+        // Lấy Film ID từ URL
         val filmId = Regex("""-a(\d+)\.html""").find(url)?.groupValues?.get(1) ?: ""
 
-        // Tìm link xem phim để lấy danh sách tập
-        val watchUrl = fix(doc.selectFirst("a.btn-see")?.attr("href")) ?: url
-        val watchDoc = if (watchUrl != url) app.get(watchUrl, interceptor = cf, headers = pageH).document else doc
+        // Tìm nút "Xem ngay" để chuyển sang trang có danh sách tập
+        val watchBtn = doc.selectFirst("a.btn-see, a.btn-danger, a[href*='/tap-']")
+        val watchUrl = fix(watchBtn?.attr("href")) ?: url
+        
+        val watchDoc = if (watchUrl != url) {
+            app.get(watchUrl, interceptor = cf, headers = pageH).document
+        } else {
+            doc
+        }
 
-        val episodes = watchDoc.select("ul.list-episode li a").mapNotNull { ep ->
+        // Selector tập phim đã được cập nhật để tránh lỗi "Không có tập nào"
+        val episodes = watchDoc.select("#list-episode li a, .list-episode li a").mapNotNull { ep ->
             val href = fix(ep.attr("href")) ?: return@mapNotNull null
-            val name = ep.text().trim()
-            // Lưu URL tập phim và Film ID
+            val name = ep.text().trim().replace("Tập ", "")
             newEpisode("$href?id=$filmId") {
                 this.name = "Tập $name"
                 this.episode = name.toIntOrNull()
@@ -118,7 +125,7 @@ class AnimeVietSub : MainAPI() {
         return newAnimeLoadResponse(title, url, TvType.Anime) {
             posterUrl = poster
             this.episodes = mutableMapOf(DubStatus.Subbed to episodes)
-            plot = doc.selectFirst(".Description")?.text()?.trim()
+            plot = doc.selectFirst(".Description, .entry-content")?.text()?.trim()
         }
     }
 
@@ -132,15 +139,11 @@ class AnimeVietSub : MainAPI() {
         val filmId = data.substringAfter("?id=", "")
 
         val doc = app.get(epUrl, interceptor = cf, headers = pageH).document
-        
-        // Tìm các server (nút chọn server)
         val servers = doc.select("a.btn3dsv[data-id]")
         
-        if (servers.isEmpty()) return false
-
         servers.forEach { sv ->
             val id = sv.attr("data-id")
-            val href = sv.attr("data-href") // Đây là chuỗi mã hóa lần 1
+            val href = sv.attr("data-href")
 
             val response = app.post(
                 "$mainUrl/ajax/player",
@@ -149,8 +152,7 @@ class AnimeVietSub : MainAPI() {
                     "User-Agent" to ua,
                     "X-Requested-With" to "XMLHttpRequest",
                     "Referer" to epUrl,
-                    "Origin" to mainUrl,
-                    "Content-Type" to "application/x-www-form-urlencoded"
+                    "Origin" to mainUrl
                 ),
                 interceptor = cf
             ).text
@@ -162,16 +164,12 @@ class AnimeVietSub : MainAPI() {
                     
                     if (linkArray != null && linkArray.isArray) {
                         linkArray.forEach { item ->
-                            // link[0].file là chuỗi mã hóa lần 2
                             val encryptedFile = item.get("file").asText()
+                            val decrypted = Crypto.decrypt(encryptedFile)
                             
-                            // GIẢI MÃ LẦN 2: Để lấy link video thật
-                            val decryptedFileJson = Crypto.decrypt(encryptedFile)
-                            
-                            if (!decryptedFileJson.isNullOrBlank()) {
-                                // decryptedFileJson: [{"file":"URL_M3U8","type":"hls","label":"Auto"}]
-                                val finalSources = mapper.readTree(decryptedFileJson)
-                                finalSources.forEach { src ->
+                            if (!decrypted.isNullOrBlank()) {
+                                val sources = mapper.readTree(decrypted)
+                                sources.forEach { src ->
                                     val fileUrl = src.get("file").asText()
                                     val label = src.get("label")?.asText() ?: "Auto"
                                     
@@ -181,11 +179,7 @@ class AnimeVietSub : MainAPI() {
                                         url = fileUrl
                                     ) {
                                         this.referer = mainUrl
-                                        this.quality = when {
-                                            label.contains("1080") -> 1080
-                                            label.contains("720") -> 720
-                                            else -> 480
-                                        }
+                                        this.quality = if (label.contains("1080")) 1080 else if (label.contains("720")) 720 else 480
                                         this.type = if (fileUrl.contains("m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                                     })
                                 }

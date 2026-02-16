@@ -22,7 +22,7 @@ import javax.crypto.spec.SecretKeySpec
 class AnimeVietSubPlugin : Plugin() {
     override fun load() { registerMainAPI(AnimeVietSub()) }
 }
-
+ 
 /**
  * AnimeVietSub Decryptor
  * 

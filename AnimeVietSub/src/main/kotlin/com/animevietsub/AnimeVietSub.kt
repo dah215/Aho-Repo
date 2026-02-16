@@ -11,7 +11,6 @@ import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import java.io.ByteArrayOutputStream
 import java.net.URLEncoder
-import java.nio.charset.StandardCharsets
 import java.util.zip.Inflater
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
@@ -86,40 +85,71 @@ class AnimeVietSub : MainAPI() {
     }
 
     override val mainPage = mainPageOf(
-        "$mainUrl/" to "Trang Chủ",
-        "$mainUrl/danh-sach/list-dang-chieu/" to "Đang Chiếu",
-        "$mainUrl/danh-sach/list-tron-bo/" to "Trọn Bộ"
+        "$mainUrl/anime-moi/" to "Anime Mới",
+        "$mainUrl/anime-le/" to "Anime Lẻ",
+        "$mainUrl/anime-bo/" to "Anime Bộ"
     )
 
     override suspend fun getMainPage(page: Int, req: MainPageRequest): HomePageResponse {
         val url = if (page == 1) req.data else "${req.data.removeSuffix("/")}/trang-$page.html"
         val doc = app.get(fix(url) ?: mainUrl, interceptor = cf, headers = pageH).document
-        return newHomePageResponse(req.name, doc.select("article,.TPostMv,.item,.list-film li").mapNotNull { it.toSR() })
+        return newHomePageResponse(req.name, doc.select("article,.TPostMv,.item,.list-film li,.TPost").mapNotNull { it.toSR() })
     }
 
     private fun Element.toSR(): SearchResponse? {
         val a = selectFirst("a") ?: return null
         val url = fix(a.attr("href")) ?: return null
-        val title = selectFirst(".Title,h3,h2")?.text()?.trim()?.ifBlank { a.attr("title").trim() } ?: return null
+        val title = selectFirst(".Title,h3,h2,.title")?.text()?.trim()?.ifBlank { a.attr("title").trim() } ?: return null
         val img = selectFirst("img")
         return newAnimeSearchResponse(title, url, TvType.Anime) { posterUrl = fix(img?.attr("data-src") ?: img?.attr("src")) }
     }
 
     override suspend fun search(q: String) = app.get("$mainUrl/tim-kiem/${URLEncoder.encode(q, "utf-8")}/", interceptor = cf, headers = pageH).document
-        .select("article,.TPostMv,.item").mapNotNull { it.toSR() }
+        .select("article,.TPostMv,.item,.list-film li").mapNotNull { it.toSR() }
 
     override suspend fun load(url: String): LoadResponse {
         val fUrl = fix(url) ?: throw ErrorLoadingException("Invalid URL")
-        val doc = app.get(fUrl, interceptor = cf, headers = pageH).document
-        val filmId = Regex("""[/-]a(\d+)""").find(fUrl)?.groupValues?.get(1) ?: ""
-        val eps = doc.select("ul.list-episode li a,.list-eps a,.episodes a").mapNotNull { ep ->
+        var doc = app.get(fUrl, interceptor = cf, headers = pageH).document
+        
+        var filmId = Regex("""[/-]a(\d+)""").find(fUrl)?.groupValues?.get(1) ?: ""
+        
+        val epSelector = ".btn-episode,.episode-link,a[data-hash],ul.list-episode li a,.list-eps a,.episodes a"
+        var epNodes = doc.select(epSelector)
+        
+        if (epNodes.isEmpty()) {
+            val watchLink = doc.selectFirst("a.btn-see,a[href*='/xem/'],.btn-watch a")?.attr("href")?.let { fix(it) }
+            if (watchLink != null) {
+                doc = app.get(watchLink, interceptor = cf, headers = pageH).document
+                epNodes = doc.select(epSelector)
+            }
+        }
+        
+        if (filmId.isBlank()) {
+            filmId = doc.selectFirst("[data-filmid]")?.attr("data-filmid") 
+                ?: doc.selectFirst("[data-movie]")?.attr("data-movie")?.filter { it.isDigit() }
+                ?: ""
+        }
+        
+        val eps = epNodes.mapNotNull { ep ->
             val href = fix(ep.attr("href")) ?: return@mapNotNull null
             val epId = ep.attr("data-id").ifBlank { ep.attr("data-episodeid") }
-            newEpisode("$href@@$filmId@@$epId") { name = ep.text().trim() }
+            val name = ep.text().trim().ifBlank { ep.attr("title") }
+            val hash = ep.attr("data-hash")
+            newEpisode("$href@@$filmId@@$epId@@$hash") { 
+                this.name = name 
+                episode = Regex("\\d+").find(name)?.value?.toIntOrNull()
+            }
         }
-        return newAnimeLoadResponse(doc.selectFirst("h1.Title,h1")?.text() ?: "Anime", fUrl, TvType.Anime) {
-            posterUrl = doc.selectFirst(".Image img")?.let { fix(it.attr("data-src").ifBlank { it.attr("src") }) }
-            plot = doc.selectFirst(".Description")?.text()
+        
+        val title = doc.selectFirst("h1.Title,h1,.Title")?.text()?.trim() ?: "Anime"
+        val poster = doc.selectFirst(".Image img,.InfoImg img,img[itemprop=image]")?.let {
+            fix(it.attr("data-src").ifBlank { it.attr("src") })
+        }
+        val plot = doc.selectFirst(".Description,.InfoDesc,#film-content")?.text()?.trim()
+        
+        return newAnimeLoadResponse(title, fUrl, TvType.Anime) {
+            posterUrl = poster
+            this.plot = plot
             episodes = mutableMapOf(DubStatus.Subbed to eps)
         }
     }
@@ -129,31 +159,69 @@ class AnimeVietSub : MainAPI() {
         val epUrl = parts[0]
         val filmId = parts.getOrNull(1) ?: ""
         val epId = parts.getOrNull(2) ?: ""
+        val savedHash = parts.getOrNull(3) ?: ""
         
         val res = app.get(epUrl, interceptor = cf, headers = pageH)
         val body = res.text ?: return false
         val cookies = res.cookies.toMutableMap()
+        val aH = ajaxH(epUrl)
+        
+        if (savedHash.isNotBlank() && savedHash != "null") {
+            val params = mapOf("link" to savedHash, "id" to (filmId.ifBlank { epId }))
+            try {
+                val r = app.post("$mainUrl/ajax/player", data = params, headers = aH, cookies = cookies, interceptor = cf)
+                val json = mapper.readValue(r.text ?: return@try, Map::class.java) as Map<*, *>
+                for (item in (json["link"] as? List<*> ?: return@try).filterIsInstance<Map<*, *>>()) {
+                    val enc = item["file"]?.toString() ?: continue
+                    val dec = AVSDecrypt.decrypt(enc) ?: continue
+                    if (emit(dec, epUrl, callback)) return true
+                }
+            } catch (_: Exception) {}
+        }
         
         val ids = mutableSetOf<String>()
-        if (epId.isNotBlank()) ids.add(epId)
-        Jsoup.parse(body).select("[data-id]").forEach { it.attr("data-id").filter { c -> c.isDigit() }.takeIf { it.isNotEmpty() }?.let { ids.add(it) } }
+        if (epId.isNotBlank() && epId.any { it.isDigit() }) ids.add(epId.filter { it.isDigit() })
         
-        val aH = ajaxH(epUrl)
+        val doc = Jsoup.parse(body)
+        doc.select("[data-id],[data-episodeid],.btn-episode,.episode-link").forEach {
+            it.attr("data-id").filter { c -> c.isDigit() }.takeIf { it.isNotEmpty() }?.let { ids.add(it) }
+        }
+        
+        doc.select("a[data-hash],.btn-episode,.episode-link").forEach { btn ->
+            val hash = btn.attr("data-hash").trim()
+            if (hash.isNotBlank() && hash != "null") {
+                val params = mapOf("link" to hash, "id" to (filmId.ifBlank { epId }))
+                try {
+                    val r = app.post("$mainUrl/ajax/player", data = params, headers = aH, cookies = cookies, interceptor = cf)
+                    val json = mapper.readValue(r.text ?: return@try, Map::class.java) as Map<*, *>
+                    for (item in (json["link"] as? List<*> ?: return@try).filterIsInstance<Map<*, *>>()) {
+                        val enc = item["file"]?.toString() ?: continue
+                        val dec = AVSDecrypt.decrypt(enc) ?: continue
+                        if (emit(dec, epUrl, callback)) return true
+                    }
+                } catch (_: Exception) {}
+            }
+        }
+        
         for (id in ids.take(5)) {
             try {
-                val r1 = app.post("$mainUrl/ajax/player", data = mapOf("episodeId" to id, "backup" to "1"), headers = aH, cookies = cookies, interceptor = cf)
-                cookies.putAll(r1.cookies)
-                val html = (try { (mapper.readValue(r1.text ?: continue, Map::class.java) as Map<*, *>)["html"]?.toString() } catch (_: Exception) { null }) ?: r1.text
+                val r1 = app.post("$mainUrl/ajax/player", 
+                    data = mapOf("episodeId" to id, "backup" to "1"), 
+                    headers = aH, cookies = cookies, interceptor = cf)
                 
-                for (btn in Jsoup.parse(html).select("a[data-href]")) {
-                    val hash = btn.attr("data-href").trim()
-                    if (hash.isBlank()) continue
+                val html = try { 
+                    (mapper.readValue(r1.text ?: continue, Map::class.java) as Map<*, *>)["html"]?.toString() 
+                } catch (_: Exception) { r1.text } ?: continue
+                
+                for (btn in Jsoup.parse(html).select("a[data-href],a[data-hash],.btn3dsv")) {
+                    val hash = btn.attr("data-hash").ifBlank { btn.attr("data-href") }.trim()
+                    if (hash.isBlank() || hash == "#") continue
                     if (hash.startsWith("http") && emit(hash, epUrl, callback)) return true
                     
                     val params = mapOf("link" to hash, "id" to (filmId.ifBlank { id }))
                     val r2 = app.post("$mainUrl/ajax/player", data = params, headers = aH, cookies = cookies, interceptor = cf)
-                    val json = try { mapper.readValue(r2.text ?: continue, Map::class.java) as Map<*, *> } catch (_: Exception) { continue }
                     
+                    val json = try { mapper.readValue(r2.text ?: continue, Map::class.java) as Map<*, *> } catch (_: Exception) { continue }
                     for (item in (json["link"] as? List<*> ?: continue).filterIsInstance<Map<*, *>>()) {
                         val enc = item["file"]?.toString() ?: continue
                         val dec = AVSDecrypt.decrypt(enc) ?: continue
@@ -163,7 +231,7 @@ class AnimeVietSub : MainAPI() {
             } catch (_: Exception) {}
         }
         
-        for (ifr in Jsoup.parse(body).select("iframe[src],iframe[data-src]")) {
+        for (ifr in doc.select("iframe[src],iframe[data-src]")) {
             val src = fix(ifr.attr("src").ifBlank { ifr.attr("data-src") }) ?: continue
             try { loadExtractor(src, epUrl, subtitleCallback, callback); return true } catch (_: Exception) {}
         }

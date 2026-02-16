@@ -17,6 +17,8 @@ import java.net.URLEncoder
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.coroutines.resume
+import kotlin.coroutines.suspendCoroutine
 
 @CloudstreamPlugin
 class AnimeVietSubPlugin : Plugin() {
@@ -34,7 +36,8 @@ class AnimeVietSub : MainAPI() {
 
     private val cf = CloudflareKiller()
     private val mapper = jacksonObjectMapper()
-    private const val ua = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36"
+
+    private val ua = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36"
 
     private val pageH = mapOf("User-Agent" to ua, "Accept-Language" to "vi-VN,vi;q=0.9")
 
@@ -144,101 +147,99 @@ class AnimeVietSub : MainAPI() {
             val latch = CountDownLatch(1)
             val videoUrlRef = AtomicReference<String?>(null)
 
-            withMainwork {
-                val webView = WebView(app.context).apply {
-                    settings.javaScriptEnabled = true
-                    settings.domStorageEnabled = true
-                    settings.mediaPlaybackRequiresUserGesture = false
-                    settings.userAgentString = ua
+            runOnMainThread {
+                try {
+                    val webView = WebView(context).apply {
+                        settings.javaScriptEnabled = true
+                        settings.domStorageEnabled = true
+                        settings.mediaPlaybackRequiresUserGesture = false
+                        settings.userAgentString = ua
 
-                    webViewClient = object : WebViewClient() {
-                        override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
-                            val url = request?.url.toString()
-                            
-                            // Intercept M3U8 và MP4
-                            if (url.contains(".m3u8", ignoreCase = true) || 
-                                url.contains("/hls/", ignoreCase = true) ||
-                                url.contains("m3u8.animevietsub", ignoreCase = true) ||
-                                url.contains(".mp4", ignoreCase = true)) {
-                                
-                                if (!url.contains("googleads") && !url.contains("ads")) {
-                                    videoUrlRef.set(url)
-                                    latch.countDown()
+                        webViewClient = object : WebViewClient() {
+                            override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                                val url = request?.url.toString()
+
+                                if (url.contains(".m3u8", ignoreCase = true) ||
+                                    url.contains("/hls/", ignoreCase = true) ||
+                                    url.contains("m3u8.animevietsub", ignoreCase = true) ||
+                                    url.contains(".mp4", ignoreCase = true)) {
+
+                                    if (!url.contains("googleads") && !url.contains("ads") && !url.contains("tracking")) {
+                                        videoUrlRef.set(url)
+                                        latch.countDown()
+                                    }
                                 }
+                                return super.shouldInterceptRequest(view, request)
                             }
-                            return super.shouldInterceptRequest(view, request)
-                        }
 
-                        override fun onPageFinished(view: WebView?, url: String?) {
-                            // Inject JS để lấy video URL từ jwplayer
-                            evaluateJavascript("""
-                                (function() {
-                                    try {
-                                        if (typeof jwplayer !== 'undefined') {
-                                            var p = jwplayer('mediaplayer') || jwplayer();
-                                            if (p && p.getPlaylist) {
-                                                var pl = p.getPlaylist();
-                                                if (pl && pl.length > 0) {
-                                                    for (var i = 0; i < pl.length; i++) {
-                                                        if (pl[i].file) return pl[i].file;
-                                                        if (pl[i].sources && pl[i].sources.length > 0) {
-                                                            return pl[i].sources[0].file;
+                            override fun onPageFinished(view: WebView?, url: String?) {
+                                evaluateJavascript("""
+                                    (function() {
+                                        try {
+                                            if (typeof jwplayer !== 'undefined') {
+                                                var p = jwplayer('mediaplayer') || jwplayer();
+                                                if (p && p.getPlaylist) {
+                                                    var pl = p.getPlaylist();
+                                                    if (pl && pl.length > 0) {
+                                                        for (var i = 0; i < pl.length; i++) {
+                                                            if (pl[i].file) return pl[i].file;
+                                                            if (pl[i].sources && pl[i].sources.length > 0) {
+                                                                return pl[i].sources[0].file;
+                                                            }
                                                         }
                                                     }
                                                 }
                                             }
-                                        }
-                                        var videos = document.querySelectorAll('video');
-                                        for (var i = 0; i < videos.length; i++) {
-                                            if (videos[i].src && !videos[i].src.startsWith('blob:')) {
-                                                return videos[i].src;
+                                            var videos = document.querySelectorAll('video');
+                                            for (var i = 0; i < videos.length; i++) {
+                                                if (videos[i].src && !videos[i].src.startsWith('blob:')) {
+                                                    return videos[i].src;
+                                                }
+                                                var sources = videos[i].querySelectorAll('source');
+                                                for (var j = 0; j < sources.length; j++) {
+                                                    if (sources[j].src) return sources[j].src;
+                                                }
                                             }
-                                            var sources = videos[i].querySelectorAll('source');
-                                            for (var j = 0; j < sources.length; j++) {
-                                                if (sources[j].src) return sources[j].src;
-                                            }
-                                        }
-                                    } catch(e) {}
-                                    return null;
-                                })();
-                            """) { result ->
-                                val url = result?.trim('"')?.takeIf { it.startsWith("http") }
-                                if (url != null) {
-                                    videoUrlRef.set(url)
-                                    latch.countDown()
+                                        } catch(e) {}
+                                        return null;
+                                    })();
+                                """) { result ->
+                                    val foundUrl = result?.trim('"')?.takeIf { it.startsWith("http") }
+                                    if (foundUrl != null) {
+                                        videoUrlRef.set(foundUrl)
+                                        latch.countDown()
+                                    }
                                 }
                             }
                         }
+
+                        val html = """
+                            <!DOCTYPE html>
+                            <html>
+                            <head><meta charset="UTF-8"></head>
+                            <body>
+                            <form id="f" method="POST" action="$mainUrl/ajax/player">
+                                <input type="hidden" name="link" value="$dataHash">
+                                <input type="hidden" name="id" value="$filmId">
+                            </form>
+                            <script>document.getElementById('f').submit();</script>
+                            </body>
+                            </html>
+                        """
+                        loadDataWithBaseURL(mainUrl, html, "text/html", "UTF-8", null)
                     }
 
-                    // Tạo form và POST
-                    val html = """
-                        <!DOCTYPE html>
-                        <html>
-                        <head><meta charset="UTF-8"></head>
-                        <body>
-                        <form id="f" method="POST" action="$mainUrl/ajax/player">
-                            <input type="hidden" name="link" value="$dataHash">
-                            <input type="hidden" name="id" value="$filmId">
-                        </form>
-                        <script>document.getElementById('f').submit();</script>
-                        </body>
-                        </html>
-                    """
-                    loadDataWithBaseURL(mainUrl, html, "text/html", "UTF-8", null)
-                }
-
-                // Timeout cleanup
-                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                    try { latch.countDown() } catch (_: Exception) {}
-                }, 15000)
+                    android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                        try { latch.countDown() } catch (_: Exception) {}
+                    }, 15000)
+                } catch (_: Exception) {}
             }
 
             latch.await(15, TimeUnit.SECONDS)
             videoUrlRef.get()?.let { foundUrls.add(it) }
         } catch (_: Exception) {}
 
-        // ===== PHƯƠNG ÁN 2: Direct POST + Parse HTML Response =====
+        // ===== PHƯƠNG ÁN 2: Direct POST =====
         if (foundUrls.isEmpty()) {
             try {
                 val resp = app.post("$mainUrl/ajax/player",
@@ -247,19 +248,16 @@ class AnimeVietSub : MainAPI() {
                     interceptor = cf
                 ).text
 
-                // Tìm URL trong response
                 Regex("""https?://[^\s"'<>]+?\.(?:m3u8|mp4)(?:[^\s"'<>]*)?""")
                     .findAll(resp ?: "")
                     .forEach { foundUrls.add(it.value) }
 
-                // Parse JSON response
                 if (resp?.trimStart()?.startsWith("{") == true) {
                     @Suppress("UNCHECKED_CAST")
                     val json = mapper.readValue(resp, Map::class.java) as Map<String, Any?>
                     (json["link"] as? List<*>)?.let { links ->
                         for (item in links.filterIsInstance<Map<String, Any?>>()) {
                             item["file"]?.toString()?.let { file ->
-                                // Tìm URL trong file string (có thể là encrypted nhưng chứa URL)
                                 Regex("""https?://[^\s"']+""")
                                     .find(file)
                                     ?.let { foundUrls.add(it.value) }
@@ -270,17 +268,15 @@ class AnimeVietSub : MainAPI() {
             } catch (_: Exception) {}
         }
 
-        // ===== PHƯƠNG ÁN 3: Load trang episode và scrape =====
+        // ===== PHƯƠNG ÁN 3: Scrape episode page =====
         if (foundUrls.isEmpty()) {
             try {
                 val pageHtml = app.get(epUrl, interceptor = cf, headers = pageH).text
-                
-                // Tìm trong script tags
+
                 Regex("""https?://[^\s"'<>]+?(?:\.m3u8|\.mp4|hls)[^\s"'<>]*""")
                     .findAll(pageHtml ?: "")
                     .forEach { foundUrls.add(it.value) }
 
-                // Tìm iframe embed
                 Jsoup.parse(pageHtml).select("iframe[src]").forEach { iframe ->
                     val src = fix(iframe.attr("src")) ?: return@forEach
                     try {
@@ -290,13 +286,13 @@ class AnimeVietSub : MainAPI() {
             } catch (_: Exception) {}
         }
 
-        // ===== EMIT ALL FOUND URLS =====
+        // ===== EMIT URLS =====
         for (url in foundUrls) {
             if (url.contains("googleads", ignoreCase = true)) continue
             if (url.contains("/ads/", ignoreCase = true)) continue
-            
+
             val isHls = url.contains(".m3u8", ignoreCase = true) || url.contains("/hls/", ignoreCase = true)
-            
+
             callback(newExtractorLink(name, name, url) {
                 referer = epUrl
                 quality = Qualities.Unknown.value
@@ -308,14 +304,10 @@ class AnimeVietSub : MainAPI() {
         return foundUrls.isNotEmpty()
     }
 
-    private suspend fun withMainwork(block: () -> Unit) {
-        return suspendCoroutine { cont ->
-            android.os.Handler(android.os.Looper.getMainLooper()).post {
-                try {
-                    block()
-                } catch (_: Exception) {}
-                cont.resume(Unit)
-            }
+    private suspend fun runOnMainThread(block: () -> Unit) = suspendCoroutine<Unit> { cont ->
+        android.os.Handler(android.os.Looper.getMainLooper()).post {
+            try { block() } catch (_: Exception) {}
+            cont.resume(Unit)
         }
     }
 }

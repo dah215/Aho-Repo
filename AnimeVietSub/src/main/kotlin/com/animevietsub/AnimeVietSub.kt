@@ -181,7 +181,7 @@ class AnimeVietSubV2 : MainAPI() {
 
         // Tìm year
         val year = selectFirst(".Year, .year, .date, [itemprop=datePublished]")?.text()?.toIntOrNull()
-            ?: Regex("\((\d{4})\)").find(ttl)?.groupValues?.get(1)?.toIntOrNull()
+            ?: Regex("""\((\d{4})\)""").find(ttl)?.groupValues?.get(1)?.toIntOrNull()
 
         return newAnimeSearchResponse(ttl, url, TvType.Anime) { 
             posterUrl = poster

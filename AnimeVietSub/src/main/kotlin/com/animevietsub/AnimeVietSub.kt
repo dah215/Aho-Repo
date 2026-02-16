@@ -68,20 +68,24 @@ class AnimeVietSub : MainAPI() {
     private val cf = CloudflareKiller()
     private val mapper = jacksonObjectMapper()
     private val pageH = mapOf("User-Agent" to UA, "Accept-Language" to "vi-VN,vi;q=0.9")
+    
     private fun ajaxH(ref: String) = mapOf(
         "User-Agent" to UA, "X-Requested-With" to "XMLHttpRequest",
         "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
         "Referer" to ref, "Origin" to mainUrl,
         "Accept" to "application/json, text/javascript, */*; q=0.01"
     )
+    
     private val cdnH = mapOf("User-Agent" to UA)
 
-    private fun fix(u: String?) = when {
-        u.isNullOrBlank() || u == "#" -> null
-        u.startsWith("http") -> u.trim()
-        u.startsWith("//") -> "https:$u"
-        u.startsWith("/") -> "$mainUrl$u"
-        else -> "$mainUrl/$u"
+    private fun fix(u: String?): String? {
+        if (u.isNullOrBlank() || u == "#") return null
+        return when {
+            u.startsWith("http") -> u.trim()
+            u.startsWith("//") -> "https:$u"
+            u.startsWith("/") -> "$mainUrl$u"
+            else -> "$mainUrl/$u"
+        }
     }
 
     override val mainPage = mainPageOf(
@@ -93,19 +97,26 @@ class AnimeVietSub : MainAPI() {
     override suspend fun getMainPage(page: Int, req: MainPageRequest): HomePageResponse {
         val url = if (page == 1) req.data else "${req.data.removeSuffix("/")}/trang-$page.html"
         val doc = app.get(fix(url) ?: mainUrl, interceptor = cf, headers = pageH).document
-        return newHomePageResponse(req.name, doc.select("article,.TPostMv,.item,.list-film li,.TPost").mapNotNull { it.toSR() })
+        val items = doc.select("article,.TPostMv,.item,.list-film li,.TPost").mapNotNull { it.toSR() }
+        return newHomePageResponse(req.name, items)
     }
 
     private fun Element.toSR(): SearchResponse? {
         val a = selectFirst("a") ?: return null
         val url = fix(a.attr("href")) ?: return null
-        val title = selectFirst(".Title,h3,h2,.title")?.text()?.trim()?.ifBlank { a.attr("title").trim() } ?: return null
+        val title = selectFirst(".Title,h3,h2,.title")?.text()?.trim()
+            ?.ifBlank { a.attr("title").trim() } ?: return null
         val img = selectFirst("img")
-        return newAnimeSearchResponse(title, url, TvType.Anime) { posterUrl = fix(img?.attr("data-src") ?: img?.attr("src")) }
+        return newAnimeSearchResponse(title, url, TvType.Anime) { 
+            posterUrl = fix(img?.attr("data-src") ?: img?.attr("src"))
+        }
     }
 
-    override suspend fun search(q: String) = app.get("$mainUrl/tim-kiem/${URLEncoder.encode(q, "utf-8")}/", interceptor = cf, headers = pageH).document
-        .select("article,.TPostMv,.item,.list-film li").mapNotNull { it.toSR() }
+    override suspend fun search(q: String): List<SearchResponse> {
+        val doc = app.get("$mainUrl/tim-kiem/${URLEncoder.encode(q, "utf-8")}/", 
+            interceptor = cf, headers = pageH).document
+        return doc.select("article,.TPostMv,.item,.list-film li").mapNotNull { it.toSR() }
+    }
 
     override suspend fun load(url: String): LoadResponse {
         val fUrl = fix(url) ?: throw ErrorLoadingException("Invalid URL")
@@ -117,7 +128,8 @@ class AnimeVietSub : MainAPI() {
         var epNodes = doc.select(epSelector)
         
         if (epNodes.isEmpty()) {
-            val watchLink = doc.selectFirst("a.btn-see,a[href*='/xem/'],.btn-watch a")?.attr("href")?.let { fix(it) }
+            val watchLink = doc.selectFirst("a.btn-see,a[href*='/xem/'],.btn-watch a")
+                ?.attr("href")?.let { fix(it) }
             if (watchLink != null) {
                 doc = app.get(watchLink, interceptor = cf, headers = pageH).document
                 epNodes = doc.select(epSelector)
@@ -154,7 +166,12 @@ class AnimeVietSub : MainAPI() {
         }
     }
 
-    override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
+    override suspend fun loadLinks(
+        data: String, 
+        isCasting: Boolean, 
+        subtitleCallback: (SubtitleFile) -> Unit, 
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
         val parts = data.split("@@")
         val epUrl = parts[0]
         val filmId = parts.getOrNull(1) ?: ""
@@ -166,102 +183,168 @@ class AnimeVietSub : MainAPI() {
         val cookies = res.cookies.toMutableMap()
         val aH = ajaxH(epUrl)
         
+        // Nếu đã có hash, dùng luôn
         if (savedHash.isNotBlank() && savedHash != "null") {
-            val params = mapOf("link" to savedHash, "id" to (filmId.ifBlank { epId }))
-            try {
-                val r = app.post("$mainUrl/ajax/player", data = params, headers = aH, cookies = cookies, interceptor = cf)
-                val json = mapper.readValue(r.text ?: return@try, Map::class.java) as Map<*, *>
-                for (item in (json["link"] as? List<*> ?: return@try).filterIsInstance<Map<*, *>>()) {
-                    val enc = item["file"]?.toString() ?: continue
-                    val dec = AVSDecrypt.decrypt(enc) ?: continue
-                    if (emit(dec, epUrl, callback)) return true
-                }
-            } catch (_: Exception) {}
+            val result = tryDecrypt(savedHash, filmId.ifBlank { epId }, aH, cookies, epUrl, callback)
+            if (result) return true
         }
         
         val ids = mutableSetOf<String>()
-        if (epId.isNotBlank() && epId.any { it.isDigit() }) ids.add(epId.filter { it.isDigit() })
+        if (epId.isNotBlank() && epId.any { it.isDigit() }) {
+            ids.add(epId.filter { it.isDigit() })
+        }
         
         val doc = Jsoup.parse(body)
         doc.select("[data-id],[data-episodeid],.btn-episode,.episode-link").forEach {
-            it.attr("data-id").filter { c -> c.isDigit() }.takeIf { it.isNotEmpty() }?.let { ids.add(it) }
+            val id = it.attr("data-id").filter { c -> c.isDigit() }
+            if (id.isNotEmpty()) ids.add(id)
         }
         
+        // Tìm hash từ page
         doc.select("a[data-hash],.btn-episode,.episode-link").forEach { btn ->
             val hash = btn.attr("data-hash").trim()
             if (hash.isNotBlank() && hash != "null") {
-                val params = mapOf("link" to hash, "id" to (filmId.ifBlank { epId }))
-                try {
-                    val r = app.post("$mainUrl/ajax/player", data = params, headers = aH, cookies = cookies, interceptor = cf)
-                    val json = mapper.readValue(r.text ?: return@try, Map::class.java) as Map<*, *>
-                    for (item in (json["link"] as? List<*> ?: return@try).filterIsInstance<Map<*, *>>()) {
-                        val enc = item["file"]?.toString() ?: continue
-                        val dec = AVSDecrypt.decrypt(enc) ?: continue
-                        if (emit(dec, epUrl, callback)) return true
-                    }
-                } catch (_: Exception) {}
+                val result = tryDecrypt(hash, filmId.ifBlank { epId }, aH, cookies, epUrl, callback)
+                if (result) return true
             }
         }
         
+        // Thử với episodeId
         for (id in ids.take(5)) {
-            try {
-                val r1 = app.post("$mainUrl/ajax/player", 
-                    data = mapOf("episodeId" to id, "backup" to "1"), 
-                    headers = aH, cookies = cookies, interceptor = cf)
-                
-                val html = try { 
-                    (mapper.readValue(r1.text ?: continue, Map::class.java) as Map<*, *>)["html"]?.toString() 
-                } catch (_: Exception) { r1.text } ?: continue
-                
-                for (btn in Jsoup.parse(html).select("a[data-href],a[data-hash],.btn3dsv")) {
-                    val hash = btn.attr("data-hash").ifBlank { btn.attr("data-href") }.trim()
-                    if (hash.isBlank() || hash == "#") continue
-                    if (hash.startsWith("http") && emit(hash, epUrl, callback)) return true
-                    
-                    val params = mapOf("link" to hash, "id" to (filmId.ifBlank { id }))
-                    val r2 = app.post("$mainUrl/ajax/player", data = params, headers = aH, cookies = cookies, interceptor = cf)
-                    
-                    val json = try { mapper.readValue(r2.text ?: continue, Map::class.java) as Map<*, *> } catch (_: Exception) { continue }
-                    for (item in (json["link"] as? List<*> ?: continue).filterIsInstance<Map<*, *>>()) {
-                        val enc = item["file"]?.toString() ?: continue
-                        val dec = AVSDecrypt.decrypt(enc) ?: continue
-                        if (emit(dec, epUrl, callback)) return true
-                    }
-                }
+            val result = tryWithEpisodeId(id, filmId, aH, cookies, epUrl, callback)
+            if (result) return true
+        }
+        
+        // Fallback iframe
+        for (ifr in doc.select("iframe[src],iframe[data-src]")) {
+            val src = fix(ifr.attr("src").ifBlank { ifr.attr("data-src") }) ?: continue
+            try { 
+                loadExtractor(src, epUrl, subtitleCallback, callback)
+                return true 
             } catch (_: Exception) {}
         }
         
-        for (ifr in doc.select("iframe[src],iframe[data-src]")) {
-            val src = fix(ifr.attr("src").ifBlank { ifr.attr("data-src") }) ?: continue
-            try { loadExtractor(src, epUrl, subtitleCallback, callback); return true } catch (_: Exception) {}
-        }
         return false
     }
+    
+    private suspend fun tryDecrypt(
+        hash: String, 
+        id: String, 
+        headers: Map<String, String>, 
+        cookies: MutableMap<String, String>,
+        ref: String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        return try {
+            val r = app.post("$mainUrl/ajax/player", 
+                data = mapOf("link" to hash, "id" to id), 
+                headers = headers, 
+                cookies = cookies, 
+                interceptor = cf)
+            
+            @Suppress("UNCHECKED_CAST")
+            val json = mapper.readValue(r.text, Map::class.java) as Map<String, Any?>
+            val links = json["link"] as? List<Map<String, Any?>> ?: return false
+            
+            for (item in links) {
+                val enc = item["file"]?.toString() ?: continue
+                val dec = AVSDecrypt.decrypt(enc) ?: continue
+                if (emitStream(dec, ref, callback)) return true
+            }
+            false
+        } catch (_: Exception) { 
+            false 
+        }
+    }
+    
+    private suspend fun tryWithEpisodeId(
+        epId: String,
+        filmId: String,
+        headers: Map<String, String>,
+        cookies: MutableMap<String, String>,
+        ref: String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        return try {
+            val r1 = app.post("$mainUrl/ajax/player", 
+                data = mapOf("episodeId" to epId, "backup" to "1"), 
+                headers = headers, 
+                cookies = cookies, 
+                interceptor = cf)
+            
+            val html = try {
+                @Suppress("UNCHECKED_CAST")
+                val json = mapper.readValue(r1.text, Map::class.java) as Map<String, Any?>
+                json["html"]?.toString()
+            } catch (_: Exception) { 
+                r1.text 
+            } ?: return false
+            
+            for (btn in Jsoup.parse(html).select("a[data-href],a[data-hash],.btn3dsv")) {
+                val hash = btn.attr("data-hash").ifBlank { btn.attr("data-href") }.trim()
+                if (hash.isBlank() || hash == "#") continue
+                if (hash.startsWith("http") && emitStream(hash, ref, callback)) return true
+                
+                val result = tryDecrypt(hash, filmId.ifBlank { epId }, headers, cookies, ref, callback)
+                if (result) return true
+            }
+            false
+        } catch (_: Exception) { 
+            false 
+        }
+    }
 
-    private suspend fun emit(url: String, ref: String, cb: (ExtractorLink) -> Unit): Boolean {
+    private suspend fun emitStream(url: String, ref: String, cb: (ExtractorLink) -> Unit): Boolean {
         if (!url.startsWith("http")) return false
         
+        // Google URLs
         if (url.contains("googleusercontent.com") || url.contains("drive.google") || url.contains("docs.google")) {
-            return try { loadExtractor(url, ref, { }, cb); true } catch (_: Exception) { false }
+            return try { 
+                loadExtractor(url, ref, { }, cb)
+                true 
+            } catch (_: Exception) { 
+                false 
+            }
         }
         
+        // M3U8
         if (url.contains(".m3u8") || url.contains("/hls/")) {
-            cb(newExtractorLink(name, name, url) { referer = ref; type = ExtractorLinkType.M3U8; headers = cdnH })
+            cb(newExtractorLink(name, name, url) { 
+                referer = ref
+                type = ExtractorLinkType.M3U8
+                headers = cdnH
+            })
             return true
         }
         
+        // MP4
         if (url.contains(".mp4")) {
-            cb(newExtractorLink(name, name, url) { referer = ref; type = ExtractorLinkType.VIDEO; headers = cdnH })
+            cb(newExtractorLink(name, name, url) { 
+                referer = ref
+                type = ExtractorLinkType.VIDEO
+                headers = cdnH
+            })
             return true
         }
         
+        // CDN
         if (url.contains("googleapiscdn.com")) {
             val hex = Regex("""/chunks/([0-9a-f]{24})/""").find(url)?.groupValues?.get(1)
             val m3u8 = if (hex != null) "https://storage.googleapiscdn.com/chunks/$hex/original/index.m3u8" else url
-            cb(newExtractorLink(name, name, m3u8) { referer = ref; type = ExtractorLinkType.M3U8; headers = cdnH })
+            cb(newExtractorLink(name, name, m3u8) { 
+                referer = ref
+                type = ExtractorLinkType.M3U8
+                headers = cdnH
+            })
             return true
         }
         
-        return try { loadExtractor(url, ref, { }, cb); true } catch (_: Exception) { false }
+        // Try loadExtractor for other URLs
+        return try { 
+            loadExtractor(url, ref, { }, cb)
+            true 
+        } catch (_: Exception) { 
+            false 
+        }
     }
 }

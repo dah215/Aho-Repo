@@ -115,21 +115,73 @@ class AnimeVietSubV2 : MainAPI() {
             siteAnalyzer.analyzeSiteStructure(url, pageH, cf)
         }
 
-        val doc = app.get(fix(url) ?: mainUrl, interceptor = cf, headers = pageH).document
-        val items = doc.select("article,.TPostMv,.TPost,.item,.list-film li,figure.Objf,.movie-item,.film-item")
-            .mapNotNull { it.toSR() }.distinctBy { it.url }
+        return try {
+            val response = app.get(fix(url) ?: mainUrl, interceptor = cf, headers = pageH)
+            val doc = response.document
 
-        return newHomePageResponse(req.name, items, hasNext = items.isNotEmpty())
+            // Thử nhiều selectors khác nhau
+            val selectors = listOf(
+                "article.TPost",
+                ".TPostMv", 
+                ".TPost",
+                ".item",
+                ".list-film li",
+                "figure.Objf",
+                ".movie-item",
+                ".film-item",
+                ".owl-item",
+                ".slide-item",
+                ".anime-item"
+            )
+
+            var items = emptyList<SearchResponse>()
+
+            for (selector in selectors) {
+                val elements = doc.select(selector)
+                if (elements.isNotEmpty()) {
+                    items = elements.mapNotNull { it.toSR() }.distinctBy { it.url }
+                    if (items.isNotEmpty()) break
+                }
+            }
+
+            // Nếu vẫn empty, thử select tất cả articles
+            if (items.isEmpty()) {
+                items = doc.select("article").mapNotNull { it.toSR() }.distinctBy { it.url }
+            }
+
+            newHomePageResponse(req.name, items, hasNext = items.isNotEmpty())
+        } catch (e: Exception) {
+            newHomePageResponse(req.name, emptyList(), hasNext = false)
+        }
     }
 
     private fun Element.toSR(): SearchResponse? {
+        // Tìm link
         val a = selectFirst("a") ?: return null
         val url = fix(a.attr("href")) ?: return null
-        val ttl = (selectFirst(".Title,h3,h2,.title,.name,.film-name")?.text() ?: a.attr("title")).trim().ifBlank { return null }
+
+        // Tìm title với nhiều selectors
+        val title = selectFirst(".Title, .title, h3, h2, .name, .film-name, .anime-name, [itemprop=name]")?.text()
+            ?: a.attr("title")
+            ?: return null
+
+        val ttl = title.trim().ifBlank { return null }
+
+        // Tìm poster với nhiều thuộc tính
         val img = selectFirst("img")
-        val poster = fix(img?.attr("data-src")?.ifBlank { null } ?: img?.attr("data-original")?.ifBlank { null } ?: img?.attr("src"))
-        val quality = selectFirst(".Qlty,.quality,.badge")?.text()
-        val year = selectFirst(".Year,.year")?.text()?.toIntOrNull()
+        val poster = fix(
+            img?.attr("data-src")?.ifBlank { null } 
+            ?: img?.attr("data-original")?.ifBlank { null }
+            ?: img?.attr("src")?.ifBlank { null }
+            ?: img?.attr("data-lazy-src")?.ifBlank { null }
+        )
+
+        // Tìm quality
+        val quality = selectFirst(".Qlty, .quality, .badge, .resolution, .hd")?.text()
+
+        // Tìm year
+        val year = selectFirst(".Year, .year, .date, [itemprop=datePublished]")?.text()?.toIntOrNull()
+            ?: Regex("\((\d{4})\)").find(ttl)?.groupValues?.get(1)?.toIntOrNull()
 
         return newAnimeSearchResponse(ttl, url, TvType.Anime) { 
             posterUrl = poster

@@ -23,28 +23,23 @@ class AnimeVietSubPlugin : Plugin() {
 }
 
 object AVSDecrypt {
-    // Key = atob("ZG1fdGhhbmdfc3VjX3ZhdF9nZXRfbGlua19hbl9kYnQ=") = 32 bytes
     private val KEY = Base64.decode("ZG1fdGhhbmdfc3VjX3ZhdF9nZXRfbGlua19hbl9kYnQ=", Base64.DEFAULT)
     
     fun decrypt(enc: String): String? {
         if (enc.isBlank() || enc.startsWith("http")) return enc
         return try {
-            // 1. URL-safe base64 to standard
             var b64 = enc.trim().replace("-", "+").replace("_", "/")
             while (b64.length % 4 != 0) b64 += "="
             val raw = Base64.decode(b64, Base64.DEFAULT)
             if (raw.size < 17) return null
             
-            // 2. IV = first 16 bytes, cipher = rest
             val iv = raw.copyOfRange(0, 16)
             val cipher = raw.copyOfRange(16, raw.size)
             
-            // 3. AES-256-CBC decrypt
             val c = Cipher.getInstance("AES/CBC/PKCS5Padding")
             c.init(Cipher.DECRYPT_MODE, SecretKeySpec(KEY, "AES"), IvParameterSpec(iv))
             val decrypted = c.doFinal(cipher)
             
-            // 4. Pako inflate (raw deflate)
             val inf = Inflater(true)
             inf.setInput(decrypted)
             val out = ByteArrayOutputStream()
@@ -60,6 +55,8 @@ object AVSDecrypt {
     }
 }
 
+private const val UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36"
+
 class AnimeVietSub : MainAPI() {
     override var mainUrl = "https://animevietsub.ee"
     override var name = "AnimeVietSub"
@@ -71,15 +68,14 @@ class AnimeVietSub : MainAPI() {
 
     private val cf = CloudflareKiller()
     private val mapper = jacksonObjectMapper()
-    private const val ua = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36"
-    private val pageH = mapOf("User-Agent" to ua, "Accept-Language" to "vi-VN,vi;q=0.9")
+    private val pageH = mapOf("User-Agent" to UA, "Accept-Language" to "vi-VN,vi;q=0.9")
     private fun ajaxH(ref: String) = mapOf(
-        "User-Agent" to ua, "X-Requested-With" to "XMLHttpRequest",
+        "User-Agent" to UA, "X-Requested-With" to "XMLHttpRequest",
         "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
         "Referer" to ref, "Origin" to mainUrl,
         "Accept" to "application/json, text/javascript, */*; q=0.01"
     )
-    private val cdnH = mapOf("User-Agent" to ua)
+    private val cdnH = mapOf("User-Agent" to UA)
 
     private fun fix(u: String?) = when {
         u.isNullOrBlank() || u == "#" -> null
@@ -167,7 +163,6 @@ class AnimeVietSub : MainAPI() {
             } catch (_: Exception) {}
         }
         
-        // Fallback iframe
         for (ifr in Jsoup.parse(body).select("iframe[src],iframe[data-src]")) {
             val src = fix(ifr.attr("src").ifBlank { ifr.attr("data-src") }) ?: continue
             try { loadExtractor(src, epUrl, subtitleCallback, callback); return true } catch (_: Exception) {}
@@ -178,24 +173,20 @@ class AnimeVietSub : MainAPI() {
     private suspend fun emit(url: String, ref: String, cb: (ExtractorLink) -> Unit): Boolean {
         if (!url.startsWith("http")) return false
         
-        // Google URLs -> use built-in extractor
         if (url.contains("googleusercontent.com") || url.contains("drive.google") || url.contains("docs.google")) {
             return try { loadExtractor(url, ref, { }, cb); true } catch (_: Exception) { false }
         }
         
-        // M3U8
         if (url.contains(".m3u8") || url.contains("/hls/")) {
             cb(newExtractorLink(name, name, url) { referer = ref; type = ExtractorLinkType.M3U8; headers = cdnH })
             return true
         }
         
-        // MP4
         if (url.contains(".mp4")) {
             cb(newExtractorLink(name, name, url) { referer = ref; type = ExtractorLinkType.VIDEO; headers = cdnH })
             return true
         }
         
-        // CDN
         if (url.contains("googleapiscdn.com")) {
             val hex = Regex("""/chunks/([0-9a-f]{24})/""").find(url)?.groupValues?.get(1)
             val m3u8 = if (hex != null) "https://storage.googleapiscdn.com/chunks/$hex/original/index.m3u8" else url

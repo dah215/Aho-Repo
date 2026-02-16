@@ -7,7 +7,6 @@ import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
-import kotlinx.coroutines.withTimeoutOrNull
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import java.io.ByteArrayInputStream
@@ -37,14 +36,11 @@ object Crypto {
     fun decrypt(enc: String?): String? {
         if (enc.isNullOrBlank()) return null
         val s = enc.trim()
-        // Already decrypted or plain URL/JSON
         if (s.startsWith("http") || s.startsWith("#EXTM3U") || s.startsWith("{") || s.startsWith("[")) return s
-        // Try base64 decode first
         try {
             val plain = String(Base64.decode(s, Base64.DEFAULT), StandardCharsets.UTF_8).trim()
             if (plain.startsWith("http") || plain.startsWith("#EXTM3U") || plain.startsWith("{") || plain.startsWith("[")) return plain
         } catch (_: Exception) {}
-        // Try OpenSSL decrypt with each password
         for (pass in PASSES) {
             val r = openSSL(s, pass) ?: continue
             if (r.startsWith("http") || r.startsWith("#EXTM3U") || r.startsWith("{") || r.startsWith("[")) {
@@ -93,7 +89,6 @@ object Crypto {
     }
 
     private fun decompress(d: ByteArray): String? {
-        // Try GZIP
         try {
             GZIPInputStream(ByteArrayInputStream(d)).use { g ->
                 val o = ByteArrayOutputStream()
@@ -101,7 +96,6 @@ object Crypto {
                 return String(o.toByteArray(), StandardCharsets.UTF_8).trim()
             }
         } catch (_: Exception) {}
-        // Try raw deflate
         try {
             val inf = Inflater(true)
             inf.setInput(d)
@@ -133,7 +127,7 @@ class AnimeVietSub : MainAPI() {
 
     private val ua = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 " +
                      "(KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36"
-    
+
     private val pageH = mapOf(
         "User-Agent" to ua,
         "Accept" to "text/html,*/*;q=0.8",
@@ -142,7 +136,7 @@ class AnimeVietSub : MainAPI() {
         "Sec-Fetch-Mode" to "navigate",
         "Sec-Fetch-Site" to "none"
     )
-    
+
     private fun ajaxH(ref: String) = mapOf(
         "User-Agent" to ua,
         "X-Requested-With" to "XMLHttpRequest",
@@ -155,7 +149,7 @@ class AnimeVietSub : MainAPI() {
         "Sec-Fetch-Mode" to "cors",
         "Sec-Fetch-Site" to "same-origin"
     )
-    
+
     private val streamH = mapOf("User-Agent" to ua)
 
     private fun fix(u: String?): String? {
@@ -167,7 +161,7 @@ class AnimeVietSub : MainAPI() {
             else                 -> "$mainUrl/$u"
         }
     }
-    
+
     private fun log(t: String, m: String) = println("AVS[$t] ${m.take(300)}")
 
     // ==================== MAIN PAGE ====================
@@ -178,7 +172,7 @@ class AnimeVietSub : MainAPI() {
         "$mainUrl/anime-le/"                  to "Anime Lẻ",
         "$mainUrl/anime-bo/"                  to "Anime Bộ"
     )
-    
+
     override suspend fun getMainPage(page: Int, req: MainPageRequest): HomePageResponse {
         val base = req.data.ifBlank { mainUrl }
         val url  = if (page == 1) base else "${base.removeSuffix("/")}/trang-$page.html"
@@ -187,7 +181,7 @@ class AnimeVietSub : MainAPI() {
             .mapNotNull { it.toSR() }.distinctBy { it.url }
         return newHomePageResponse(req.name, items, hasNext = items.isNotEmpty())
     }
-    
+
     private fun Element.toSR(): SearchResponse? {
         val a   = selectFirst("a") ?: return null
         val url = fix(a.attr("href")) ?: return null
@@ -197,7 +191,7 @@ class AnimeVietSub : MainAPI() {
         val poster = fix(img?.attr("data-src")?.ifBlank { null } ?: img?.attr("src"))
         return newAnimeSearchResponse(ttl, url, TvType.Anime) { posterUrl = poster }
     }
-    
+
     // ==================== SEARCH ====================
     override suspend fun search(q: String): List<SearchResponse> =
         app.get("$mainUrl/tim-kiem/${URLEncoder.encode(q, "utf-8")}/",
@@ -209,12 +203,10 @@ class AnimeVietSub : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         val fUrl = fix(url) ?: throw ErrorLoadingException("Invalid URL")
         var doc  = app.get(fUrl, interceptor = cf, headers = pageH).document
-        
-        // Episode selector - matches actual HTML structure
+
         val sel  = ".btn-episode,.episode-link,a[data-id][data-hash],ul.list-episode li a,.list-eps a,.server-list a,.list-episode a,.episodes a,#list_episodes a"
         var epNodes = doc.select(sel)
-        
-        // Fallback: try to find watch page
+
         if (epNodes.isEmpty()) {
             doc.selectFirst("a.btn-see,a[href*='/tap-'],a[href*='/episode-'],.btn-watch a")
                 ?.attr("href")?.let { fix(it) }?.let { wUrl ->
@@ -222,12 +214,11 @@ class AnimeVietSub : MainAPI() {
                     epNodes = doc.select(sel)
                 }
         }
-        
-        // Extract film ID from URL: /phim/xxx-a1234/ or /xxx-a1234.html
+
         val filmId = Regex("""[/-]a(\d+)(?:[/-]|\.html)?""").find(fUrl)?.groupValues?.get(1)
                   ?: Regex("""[/-]a(\d+)""").find(fUrl)?.groupValues?.get(1)
                   ?: Regex("""-(\d+)(?:\.html|/)?$""").find(fUrl)?.groupValues?.get(1) ?: ""
-        
+
         val episodes = epNodes.mapNotNull { ep ->
             val href   = fix(ep.attr("href")) ?: return@mapNotNull null
             val dataId = listOf(
@@ -236,23 +227,19 @@ class AnimeVietSub : MainAPI() {
                 ep.parent()?.attr("data-id") ?: "",
                 ep.parent()?.attr("data-episodeid") ?: ""
             ).firstOrNull { it.matches(Regex("\\d+")) } ?: ""
-            
-            // data-hash is the hash for POST request (most important!)
             val dataHash = ep.attr("data-hash").trim().takeIf { it.isNotBlank() } ?: ""
             val nm = ep.text().trim().ifBlank { ep.attr("title").trim() }
-            
-            // Format: href@@filmId@@dataId@@dataHash
             newEpisode("$href@@$filmId@@$dataId@@$dataHash") {
                 name = nm
                 episode = Regex("\\d+").find(nm)?.value?.toIntOrNull()
             }
         }
-        
+
         val title  = doc.selectFirst("h1.Title,h1,.Title")?.text()?.trim() ?: "Anime"
         val poster = doc.selectFirst(".Image img,.InfoImg img,img[itemprop=image],.MovieThumb img,.poster img,figure.Objf img,.wp-post-image")?.let {
             fix(it.attr("data-src").ifBlank { it.attr("src") })
         }
-        
+
         return newAnimeLoadResponse(title, fUrl, TvType.Anime) {
             posterUrl = poster
             plot = doc.selectFirst(".Description,.InfoDesc,#film-content")?.text()?.trim()
@@ -272,10 +259,10 @@ class AnimeVietSub : MainAPI() {
         val filmId    = parts.getOrNull(1) ?: ""
         val savedId   = parts.getOrNull(2) ?: ""
         val savedHash = parts.getOrNull(3) ?: ""
-        
+
         log("START", "url=$epUrl film=$filmId savedId=$savedId savedHash=${savedHash.take(40)}...")
 
-        // PRIORITY: If has data-hash, POST directly to get link (skip episodeId step)
+        // PRIORITY: Direct hash POST
         if (savedHash.isNotBlank() && filmId.isNotBlank()) {
             log("DIRECT_HASH", "POST link=$savedHash&id=$filmId")
             val aH = ajaxH(epUrl)
@@ -296,7 +283,7 @@ class AnimeVietSub : MainAPI() {
             }
         }
 
-        // FALLBACK: Old flow with episodeId
+        // FALLBACK: Old flow
         val pageRes = try {
             app.get(epUrl, interceptor = cf, headers = pageH)
         } catch (e: Exception) {
@@ -306,7 +293,6 @@ class AnimeVietSub : MainAPI() {
         val body = pageRes.text ?: return false
         val cookies = pageRes.cookies.toMutableMap()
 
-        // Collect all possible episode IDs
         val ids = linkedSetOf<String>()
         if (savedId.isNotBlank()) ids.add(savedId)
         Jsoup.parse(body).select("[data-id]").forEach { el ->
@@ -317,21 +303,17 @@ class AnimeVietSub : MainAPI() {
         Regex("""tap-(\d+)""").find(epUrl)?.groupValues?.get(1)?.let { ids.add(it) }
         log("IDS", ids.joinToString(","))
 
-        var found = withTimeoutOrNull(25_000L) {
-            ajaxFlow(epUrl, filmId, ids.toList(), cookies, callback)
-        } ?: false
+        val found = ajaxFlow(epUrl, filmId, ids.toList(), cookies, callback)
         log("AJAX", "found=$found")
 
-        if (!found) found = withTimeoutOrNull(10_000L) {
+        if (!found) {
             scrapeStrategy(body, epUrl, subtitleCallback, callback)
-        } ?: false
-        log("DONE", "found=$found")
+        }
+        log("DONE", "done")
         return found
     }
 
     // ==================== AJAX FLOW ====================
-    // Step 1: POST episodeId=X&backup=1 → HTML with server buttons
-    // Step 2: POST link=HASH&id=FILM_ID → JSON {"link":[{"file":"ENCRYPTED"}]}
     private suspend fun ajaxFlow(
         epUrl: String,
         filmId: String,
@@ -340,10 +322,9 @@ class AnimeVietSub : MainAPI() {
         cb: (ExtractorLink) -> Unit
     ): Boolean {
         val aH = ajaxH(epUrl)
-        
+
         for (epId in ids.take(6)) {
             try {
-                // Step 1: POST episodeId=X&backup=1 → HTML with server buttons
                 val r1 = app.post("$mainUrl/ajax/player",
                     data = mapOf("episodeId" to epId, "backup" to "1"),
                     headers = aH,
@@ -354,7 +335,6 @@ class AnimeVietSub : MainAPI() {
                 val body1 = r1.text ?: continue
                 log("S1", "id=$epId code=${r1.code} len=${body1.length}")
 
-                // Try to parse as JSON
                 val j1 = try {
                     @Suppress("UNCHECKED_CAST")
                     mapper.readValue(body1, Map::class.java) as Map<String, Any?>
@@ -363,7 +343,6 @@ class AnimeVietSub : MainAPI() {
                     continue
                 }
 
-                // Check for direct link in response
                 val lnk = j1["link"] ?: j1["url"] ?: j1["stream"]
                 if (lnk is String && lnk.isNotBlank()) {
                     if (resolveAndEmit(lnk, epUrl, cb)) return true
@@ -375,7 +354,6 @@ class AnimeVietSub : MainAPI() {
                     }
                 }
 
-                // Parse HTML from "html" field
                 val htmlStr = j1["html"]?.toString()
                     ?: if (!body1.trimStart().startsWith("{")) body1 else ""
                 if (htmlStr.isBlank()) continue
@@ -385,13 +363,12 @@ class AnimeVietSub : MainAPI() {
                     ".server-item a,.btn-server,li[data-id] a,.episodes-btn a,button[data-href]"
                 )
                 log("S1_BTNS", "${buttons.size} buttons")
-                
+
                 if (buttons.isEmpty()) {
                     if (handleApiResponse(htmlStr, epUrl, cb)) return true
                     continue
                 }
 
-                // Step 2: For each button, POST link=HASH&id=FILM_ID
                 for (btn in buttons) {
                     val hash = listOf("data-href", "data-link", "data-url")
                         .firstNotNullOfOrNull { btn.attr(it).trim().takeIf { v -> v.isNotBlank() && v != "#" } }
@@ -409,7 +386,6 @@ class AnimeVietSub : MainAPI() {
                     val btnId = btn.attr("data-id").filter { it.isDigit() }.ifBlank { "0" }
                     log("S2", "hash=${hash.take(50)} btnId=$btnId filmId=$filmId")
 
-                    // Priority: filmId first (confirmed from network capture)
                     val paramSets = buildList {
                         if (filmId.isNotBlank()) add(mapOf("link" to hash, "id" to filmId))
                         add(mapOf("link" to hash, "id" to epId))
@@ -442,22 +418,18 @@ class AnimeVietSub : MainAPI() {
     }
 
     // ==================== HANDLE API RESPONSE ====================
-    // Format: {"link":[{"file":"ENCRYPTED"}]}
     private fun handleApiResponse(body: String, ref: String, cb: (ExtractorLink) -> Unit): Boolean {
         if (body.isBlank()) return false
 
-        // Try direct URL extraction first
         for (u in extractDirectUrls(body)) {
             if (emitStream(u, ref, cb)) return true
         }
 
-        // Parse JSON
         val j = try {
             @Suppress("UNCHECKED_CAST")
             mapper.readValue(body, Map::class.java) as Map<String, Any?>
         } catch (_: Exception) { return false }
 
-        // Check for "link" array
         val linkArray = j["link"] as? List<*>
         if (linkArray != null) {
             for (item in linkArray.filterIsInstance<Map<String, Any?>>()) {
@@ -467,7 +439,6 @@ class AnimeVietSub : MainAPI() {
             }
         }
 
-        // Check other keys
         for (key in listOf("url", "stream", "src", "file", "m3u8")) {
             val v = j[key] ?: continue
             when {
@@ -489,7 +460,6 @@ class AnimeVietSub : MainAPI() {
         return when {
             dec.startsWith("http") -> emitStream(dec, ref, cb)
 
-            // JSON object format: {"sources":[...]}
             dec.trimStart().startsWith("{") -> {
                 try {
                     @Suppress("UNCHECKED_CAST")
@@ -507,7 +477,6 @@ class AnimeVietSub : MainAPI() {
                 } catch (_: Exception) { false }
             }
 
-            // JSON array format: [{"file":"URL","label":"720p"}]
             dec.trimStart().startsWith("[") -> {
                 try {
                     @Suppress("UNCHECKED_CAST")
@@ -522,28 +491,25 @@ class AnimeVietSub : MainAPI() {
                 } catch (_: Exception) { false }
             }
 
-            // M3U8 content
             dec.contains("#EXTM3U") -> {
                 val urlMatch = Regex("""https?://[^\s#"']+""").find(dec)
                 if (urlMatch != null && emitStream(urlMatch.value, ref, cb)) return true
                 false
             }
-            
+
             else -> false
         }
     }
 
-    // ==================== EMIT STREAM ====================
-    private suspend fun emitStream(url: String, ref: String, cb: (ExtractorLink) -> Unit, label: String = ""): Boolean {
+    // ==================== EMIT STREAM (NON-SUSPEND) ====================
+    private fun emitStream(url: String, ref: String, cb: (ExtractorLink) -> Unit, label: String = ""): Boolean {
         if (!url.startsWith("http")) return false
         log("EMIT", "url=${url.take(100)} label=$label")
 
-        // Determine type
         val isHls = url.contains(".m3u8", ignoreCase = true) ||
                     url.contains("/hls/", ignoreCase = true) ||
                     url.contains("m3u8.", ignoreCase = true)
 
-        // Determine quality from label
         val quality = when {
             label.contains("1080", ignoreCase = true) -> 1080
             label.contains("720", ignoreCase = true) -> 720
@@ -555,44 +521,14 @@ class AnimeVietSub : MainAPI() {
         val linkType = if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
         val displayName = if (label.isNotBlank()) "$name $label" else name
 
-        // Known working domains - emit directly without verification
-        val directDomains = listOf(
-            "m3u8.animevietsub.moe",
-            "animevietsub.moe",
-            "googleapiscdn.com",
-            "googleusercontent.com",
-            "lh3.google"
-        )
-
-        if (directDomains.any { url.contains(it, ignoreCase = true) }) {
-            log("EMIT_DIRECT", "Direct emit for: ${url.take(80)}")
-            cb(newExtractorLink(name, displayName, url) {
-                referer = ref
-                this.quality = quality
-                type = linkType
-                headers = streamH
-            })
-            return true
-        }
-
-        // For other URLs, try to verify
-        return try {
-            val r = withTimeoutOrNull(4_000L) { app.get(url, headers = streamH) }
-            if (r != null && r.code == 200) {
-                val text = r.text ?: ""
-                val valid = if (isHls) text.contains("#EXTM3U") else true
-
-                if (valid) {
-                    cb(newExtractorLink(name, displayName, url) {
-                        referer = ref
-                        this.quality = quality
-                        type = linkType
-                        headers = streamH
-                    })
-                    true
-                } else false
-            } else false
-        } catch (_: Exception) { false }
+        // Emit directly - let player handle it
+        cb(newExtractorLink(name, displayName, url) {
+            referer = ref
+            this.quality = quality
+            type = linkType
+            headers = streamH
+        })
+        return true
     }
 
     // ==================== SCRAPE STRATEGY ====================
@@ -604,7 +540,6 @@ class AnimeVietSub : MainAPI() {
     ): Boolean {
         val doc = try { Jsoup.parse(body) } catch (_: Exception) { return false }
 
-        // Try iframes
         for (el in doc.select("iframe[src],iframe[data-src]")) {
             val src = fix(el.attr("src").ifBlank { el.attr("data-src") }) ?: continue
             if (!src.startsWith("http")) continue
@@ -618,7 +553,6 @@ class AnimeVietSub : MainAPI() {
             } catch (_: Exception) {}
         }
 
-        // Try video sources
         for (el in doc.select("video source[src],video[src]")) {
             val src = fix(el.attr("src")) ?: continue
             if (emitStream(src, epUrl, cb)) return true

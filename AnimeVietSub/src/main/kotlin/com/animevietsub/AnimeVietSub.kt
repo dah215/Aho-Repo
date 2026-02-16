@@ -9,7 +9,6 @@ import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
-import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
@@ -30,44 +29,29 @@ class AnimeVietSubPlugin : Plugin() {
  * Algorithm: AES-256-CBC + Zlib (Pako)
  * Password: dm_thang_suc_vat_get_link_an_dbt
  * 
- * Flow: Base64 → AES Decrypt → Zlib Decompress → JSON → Link
+ * Flow: Base64 → IV(16) + Ciphertext → AES Decrypt → Zlib Decompress → JSON/Link
  */
 object AVSCrypto {
     private const val PASSWORD = "dm_thang_suc_vat_get_link_an_dbt"
 
-    /**
-     * Decrypt AES-256-CBC then decompress Zlib
-     * 
-     * Format: Base64( IV(16 bytes) + Ciphertext )
-     * Key = SHA-256(password)
-     */
     fun decrypt(encryptedBase64: String): String? {
         if (encryptedBase64.isBlank()) return null
-        
-        // Already a URL or M3U8?
-        if (encryptedBase64.startsWith("http") || encryptedBase64.startsWith("#EXTM3U")) {
-            return encryptedBase64
-        }
+        if (encryptedBase64.startsWith("http") || encryptedBase64.startsWith("#EXTM3U")) return encryptedBase64
 
         return try {
-            // Step 1: Base64 decode
             val rawData = Base64.decode(encryptedBase64.trim(), Base64.DEFAULT)
             if (rawData.size < 17) return null
 
-            // Step 2: Extract IV (first 16 bytes) and Ciphertext
             val iv = rawData.copyOfRange(0, 16)
             val ciphertext = rawData.copyOfRange(16, rawData.size)
 
-            // Step 3: Generate Key = SHA-256(password)
             val keyBytes = MessageDigest.getInstance("SHA-256")
                 .digest(PASSWORD.toByteArray(StandardCharsets.UTF_8))
 
-            // Step 4: AES-256-CBC Decrypt
             val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
             cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(keyBytes, "AES"), IvParameterSpec(iv))
             val decrypted = cipher.doFinal(ciphertext)
 
-            // Step 5: Zlib Decompress (Pako inflate)
             zlibDecompress(decrypted)
         } catch (e: Exception) {
             println("[AVS-Crypto] Decrypt failed: ${e.message}")
@@ -75,38 +59,31 @@ object AVSCrypto {
         }
     }
 
-    /**
-     * Zlib decompress (like Pako inflate)
-     */
     private fun zlibDecompress(data: ByteArray): String? {
         return try {
-            // Raw deflate (nowrap = true, like Pako)
             val inflater = Inflater(true)
             inflater.setInput(data)
             val output = ByteArrayOutputStream()
             val buffer = ByteArray(8192)
-            
             while (!inflater.finished()) {
                 val count = inflater.inflate(buffer)
                 if (count == 0) break
                 output.write(buffer, 0, count)
             }
             inflater.end()
-            
             String(output.toByteArray(), StandardCharsets.UTF_8).trim()
         } catch (e: Exception) {
-            println("[AVS-Crypto] Zlib decompress failed: ${e.message}")
+            println("[AVS-Crypto] Zlib failed: ${e.message}")
             null
         }
     }
 
-    /**
-     * Extract hexId from M3U8 content
-     */
     fun extractHexId(content: String): String? {
         return Regex("""/chunks/([0-9a-f]{24})/""").find(content)?.groupValues?.get(1)
     }
 }
+
+private const val CDN = "storage.googleapiscdn.com"
 
 class AnimeVietSub : MainAPI() {
     override var mainUrl = "https://animevietsub.ee"
@@ -118,7 +95,6 @@ class AnimeVietSub : MainAPI() {
 
     private val cf = CloudflareKiller()
     private val mapper = jacksonObjectMapper()
-    private const val CDN = "storage.googleapiscdn.com"
 
     private val ua = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36"
     private val pageHeaders = mapOf("User-Agent" to ua, "Accept" to "text/html", "Accept-Language" to "vi-VN")
@@ -214,8 +190,7 @@ class AnimeVietSub : MainAPI() {
         val hash = parts[3]
 
         println("[AVS] === START ===")
-        println("[AVS] epUrl=$epUrl")
-        println("[AVS] filmId=$filmId, epId=$epId, hash=${hash.take(30)}")
+        println("[AVS] epUrl=$epUrl filmId=$filmId epId=$epId hash=${hash.take(30)}")
 
         val page = try { app.get(epUrl, interceptor = cf, headers = pageHeaders) }
             catch (e: Exception) { println("[AVS] GET page failed: ${e.message}"); return false }
@@ -249,20 +224,9 @@ class AnimeVietSub : MainAPI() {
                 val body = r.text ?: return false
                 println("[AVS] AJAX response: ${body.take(200)}")
 
-                // Try direct decrypt if response is encrypted
-                if (body.startsWith("{").not()) {
-                    val dec = AVSCrypto.decrypt(body)
-                    if (dec != null && dec.contains("http")) {
-                        println("[AVS] Direct decrypt success!")
-                        return emitFromContent(dec, epUrl, callback)
-                    }
-                }
-
-                // Parse JSON
                 @Suppress("UNCHECKED_CAST")
                 val json = mapper.readValue(body, Map::class.java) as Map<String, Any?>
                 
-                // Check link field
                 (json["link"] as? List<*>)?.let { links ->
                     for (item in links) {
                         (item as? Map<*, *>)?.get("file")?.toString()?.let { file ->
@@ -272,7 +236,6 @@ class AnimeVietSub : MainAPI() {
                     }
                 }
 
-                // Check html field for server buttons
                 json["html"]?.toString()?.let { htmlResp ->
                     val btns = Jsoup.parse(htmlResp).select("a[data-href], a.btn3dsv")
                     for (btn in btns) {
@@ -305,7 +268,6 @@ class AnimeVietSub : MainAPI() {
                 println("[AVS] Response: code=${r.code}, len=${r.text?.length ?: 0}")
                 
                 r.text?.let { body ->
-                    // Parse JSON
                     @Suppress("UNCHECKED_CAST")
                     val json = mapper.readValue(body, Map::class.java) as Map<String, Any?>
                     
@@ -335,10 +297,8 @@ class AnimeVietSub : MainAPI() {
     }
 
     private suspend fun emitFromContent(content: String, referer: String, callback: (ExtractorLink) -> Unit): Boolean {
-        // Direct URL
         if (content.startsWith("http")) return emit(content, referer, callback)
 
-        // M3U8 content - extract hexId
         if (content.contains("#EXTM3U")) {
             val hexId = AVSCrypto.extractHexId(content)
             if (hexId != null) {
@@ -346,13 +306,11 @@ class AnimeVietSub : MainAPI() {
                 println("[AVS] CDN URL: $url")
                 return emit(url, referer, callback)
             }
-            // Fallback: extract URLs from content
             Regex("""https?://[^\s"']+\.m3u8[^\s"']*""").find(content)?.value?.let {
                 return emit(it, referer, callback)
             }
         }
 
-        // JSON content
         if (content.startsWith("{") || content.startsWith("[")) {
             try {
                 @Suppress("UNCHECKED_CAST")
@@ -373,11 +331,9 @@ class AnimeVietSub : MainAPI() {
     private suspend fun emit(url: String, referer: String, callback: (ExtractorLink) -> Unit): Boolean {
         if (!url.startsWith("http")) return false
 
-        // Normalize CDN URL
         val finalUrl = if (url.contains(CDN)) {
             val hexId = Regex("""/chunks/([0-9a-f]{24})/""").find(url)?.groupValues?.get(1)
-            if (hexId != null) "https://$CDN/chunks/$hexId/original/index.m3u8"
-            else url
+            if (hexId != null) "https://$CDN/chunks/$hexId/original/index.m3u8" else url
         } else url
 
         println("[AVS] Emitting: $finalUrl")

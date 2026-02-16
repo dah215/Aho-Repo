@@ -26,7 +26,6 @@ object Crypto {
     fun decrypt(enc: String?): String? {
         if (enc.isNullOrBlank()) return null
         return try {
-            // Xử lý chuỗi Base64 URL Safe
             val safeEnc = enc.replace("-", "+").replace("_", "/")
             val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
             val keySpec = SecretKeySpec(AES_KEY.toByteArray(StandardCharsets.UTF_8), "AES")
@@ -62,28 +61,28 @@ class AnimeVietSub : MainAPI() {
         return if (u.startsWith("http")) u else "$mainUrl/${u.removePrefix("/")}"
     }
 
-    // Cập nhật danh mục theo đúng thực tế trang web
+    // Cập nhật danh mục theo đúng thực tế trang web và screenshot của bạn
     override val mainPage = mainPageOf(
-        "$mainUrl/anime-moi/" to "Anime Mới",
-        "$mainUrl/anime-bo/" to "Anime Bộ",
+        "$mainUrl/" to "Trang Chủ",
+        "$mainUrl/anime-moi/" to "Đang Chiếu",
+        "$mainUrl/anime-hoan-thanh/" to "Trọn Bộ",
         "$mainUrl/anime-le/" to "Anime Lẻ",
-        "$mainUrl/anime-hoan-thanh/" to "Hoàn Thành",
-        "$mainUrl/anime-sap-chieu/" to "Sắp Chiếu"
+        "$mainUrl/anime-bo/" to "Anime Bộ"
     )
 
     override suspend fun getMainPage(page: Int, req: MainPageRequest): HomePageResponse {
         val url = if (page == 1) req.data else "${req.data.removeSuffix("/")}/trang-$page.html"
         val doc = app.get(url, interceptor = cf, headers = pageH).document
         
-        // Selector chuẩn cho các item phim
-        val items = doc.select("div.item article, div.TPostMv").mapNotNull { it.toSR() }
+        // Selector cực kỳ quan trọng: div.item article là cấu trúc chuẩn của AnimeVietSub
+        val items = doc.select("div.item article, div.TPostMv, .list-annime li").mapNotNull { it.toSR() }
         return newHomePageResponse(req.name, items, hasNext = items.isNotEmpty())
     }
 
     private fun Element.toSR(): SearchResponse? {
         val a = selectFirst("a") ?: return null
         val url = fix(a.attr("href")) ?: return null
-        val ttl = selectFirst("h2, h3, .Title")?.text()?.trim() ?: a.attr("title") ?: ""
+        val ttl = selectFirst("h2, h3, .Title, .title")?.text()?.trim() ?: a.attr("title") ?: ""
         val poster = fix(selectFirst("img")?.attr("data-src") ?: selectFirst("img")?.attr("src"))
         return newAnimeSearchResponse(ttl, url, TvType.Anime) { posterUrl = poster }
     }
@@ -109,7 +108,7 @@ class AnimeVietSub : MainAPI() {
         val episodes = watchDoc.select("ul.list-episode li a").mapNotNull { ep ->
             val href = fix(ep.attr("href")) ?: return@mapNotNull null
             val name = ep.text().trim()
-            // Truyền cả URL tập và Film ID vào data
+            // Lưu URL tập phim và Film ID
             newEpisode("$href?id=$filmId") {
                 this.name = "Tập $name"
                 this.episode = name.toIntOrNull()
@@ -132,13 +131,16 @@ class AnimeVietSub : MainAPI() {
         val epUrl = data.substringBefore("?id=")
         val filmId = data.substringAfter("?id=", "")
 
-        // Load trang xem phim để lấy danh sách server
         val doc = app.get(epUrl, interceptor = cf, headers = pageH).document
+        
+        // Tìm các server (nút chọn server)
         val servers = doc.select("a.btn3dsv[data-id]")
         
+        if (servers.isEmpty()) return false
+
         servers.forEach { sv ->
             val id = sv.attr("data-id")
-            val href = sv.attr("data-href") // Chuỗi mã hóa link
+            val href = sv.attr("data-href") // Đây là chuỗi mã hóa lần 1
 
             val response = app.post(
                 "$mainUrl/ajax/player",
@@ -147,7 +149,8 @@ class AnimeVietSub : MainAPI() {
                     "User-Agent" to ua,
                     "X-Requested-With" to "XMLHttpRequest",
                     "Referer" to epUrl,
-                    "Origin" to mainUrl
+                    "Origin" to mainUrl,
+                    "Content-Type" to "application/x-www-form-urlencoded"
                 ),
                 interceptor = cf
             ).text
@@ -159,13 +162,16 @@ class AnimeVietSub : MainAPI() {
                     
                     if (linkArray != null && linkArray.isArray) {
                         linkArray.forEach { item ->
+                            // link[0].file là chuỗi mã hóa lần 2
                             val encryptedFile = item.get("file").asText()
-                            val decrypted = Crypto.decrypt(encryptedFile)
                             
-                            if (!decrypted.isNullOrBlank()) {
-                                // decrypted: [{"file":"...","type":"hls","label":"Auto"}]
-                                val sources = mapper.readTree(decrypted)
-                                sources.forEach { src ->
+                            // GIẢI MÃ LẦN 2: Để lấy link video thật
+                            val decryptedFileJson = Crypto.decrypt(encryptedFile)
+                            
+                            if (!decryptedFileJson.isNullOrBlank()) {
+                                // decryptedFileJson: [{"file":"URL_M3U8","type":"hls","label":"Auto"}]
+                                val finalSources = mapper.readTree(decryptedFileJson)
+                                finalSources.forEach { src ->
                                     val fileUrl = src.get("file").asText()
                                     val label = src.get("label")?.asText() ?: "Auto"
                                     

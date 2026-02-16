@@ -23,14 +23,6 @@ class AnimeVietSubPlugin : Plugin() {
     override fun load() { registerMainAPI(AnimeVietSub()) }
 }
 
-/**
- * AnimeVietSub Crypto
- * 
- * Algorithm: AES-256-CBC + Zlib (Pako)
- * Password: dm_thang_suc_vat_get_link_an_dbt
- * 
- * Flow: Base64 → IV(16) + Ciphertext → AES Decrypt → Zlib Decompress → JSON/Link
- */
 object AVSCrypto {
     private const val PASSWORD = "dm_thang_suc_vat_get_link_an_dbt"
 
@@ -166,9 +158,10 @@ class AnimeVietSub : MainAPI() {
             val href = fix(ep.attr("href")) ?: return@mapNotNull null
             val epId = listOf(ep.attr("data-id"), ep.attr("data-episodeid")).firstOrNull { it.matches(Regex("\\d+")) } ?: ""
             val hash = ep.attr("data-hash").ifBlank { "" }
+            val epName = ep.text().trim().ifBlank { ep.attr("title") }
             newEpisode("$href@@$filmId@@$epId@@$hash") {
-                name = ep.text().trim().ifBlank { ep.attr("title") }
-                episode = Regex("\\d+").find(name)?.value?.toIntOrNull()
+                name = epName
+                episode = Regex("\\d+").find(epName.orEmpty())?.value?.toIntOrNull()
             }
         }
 
@@ -197,13 +190,11 @@ class AnimeVietSub : MainAPI() {
         val cookies = page.cookies.toMutableMap()
         val html = page.text ?: return false
 
-        // 1. Try direct hash first
         if (hash.isNotBlank()) {
             println("[AVS] Trying direct hash...")
             if (fetchAndEmit(hash, filmId, epUrl, cookies, callback)) return true
         }
 
-        // 2. Find hash in page HTML
         val doc = Jsoup.parse(html)
         for (el in doc.select("a[data-hash], a[data-href]")) {
             val h = el.attr("data-hash").ifBlank { el.attr("data-href") }.trim()
@@ -213,7 +204,6 @@ class AnimeVietSub : MainAPI() {
             }
         }
 
-        // 3. AJAX request to get server buttons
         if (epId.isNotBlank()) {
             println("[AVS] Trying AJAX with epId=$epId")
             try {

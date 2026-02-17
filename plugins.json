@@ -3,7 +3,7 @@
         "iconUrl": "https://animevietsub.vip/favicon.ico",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/dah215/Aho-Repo",
-        "fileSize": 22748,
+        "fileSize": 22750,
         "status": 1,
         "language": "vi",
         "authors": [
@@ -18,26 +18,6 @@
         "description": "AnimeVietSub",
         "url": "https://raw.githubusercontent.com/dah215/Aho-Repo/builds/AnimeVietSub.cs3",
         "name": "AnimeVietSub"
-    },
-    {
-        "iconUrl": "https://boctem.com/favicon.ico",
-        "apiVersion": 1,
-        "repositoryUrl": "https://github.com/dah215/Aho-Repo",
-        "fileSize": 29338,
-        "status": 1,
-        "language": "vi",
-        "authors": [
-            "BocTem"
-        ],
-        "tvTypes": [
-            "Anime",
-            "AnimeMovie"
-        ],
-        "version": 1,
-        "internalName": "Boctem",
-        "description": "Vietnamese anime streaming site",
-        "url": "https://raw.githubusercontent.com/dah215/Aho-Repo/builds/Boctem.cs3",
-        "name": "Boctem"
     },
     {
         "iconUrl": "https://phimmoichill.now/favicon.ico",

@@ -4,6 +4,7 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3 ExtractorLinkType
 import org.jsoup.nodes.Element
 
 @CloudstreamPlugin
@@ -99,7 +100,6 @@ class NangCucProvider : MainAPI() {
                 ?: return@forEach
             val iframeUrl = fixUrl(src)
             if (iframeUrl.contains("dfplayer.net")) {
-                // Đặc biệt cho dfplayer: fetch iframe với referer đúng
                 val iframeDoc = app.get(iframeUrl, headers = headers, referer = data).document
                 iframeDoc.select("script").forEach { script ->
                     val content = script.html()
@@ -107,13 +107,11 @@ class NangCucProvider : MainAPI() {
                     m3u8Regex.find(content)?.groupValues?.get(1)?.let { m3u8 ->
                         val link = fixUrl(m3u8)
                         callback(
-                            newExtractorLink(
-                                name = name,
-                                url = link,
-                                referer = data,
-                                quality = Qualities.Unknown.value,
-                                isM3u8 = true
-                            )
+                            newExtractorLink(name, name, link) {
+                                referer = data
+                                quality = Qualities.Unknown.value
+                                type = ExtractorLinkType.M3U8
+                            }
                         )
                     }
                 }
@@ -130,13 +128,11 @@ class NangCucProvider : MainAPI() {
                 m3u8Regex.findAll(content).forEach { match ->
                     val link = fixUrl(match.groupValues[1])
                     callback(
-                        newExtractorLink(
-                            name = name,
-                            url = link,
-                            referer = data,
-                            quality = Qualities.Unknown.value,
-                            isM3u8 = true
-                        )
+                        newExtractorLink(name, name, link) {
+                            referer = data
+                            quality = Qualities.Unknown.value
+                            type = ExtractorLinkType.M3U8
+                        }
                     )
                 }
             }

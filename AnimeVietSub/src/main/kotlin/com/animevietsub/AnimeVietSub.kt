@@ -148,20 +148,19 @@ class AnimeVietSub : MainAPI() {
                             val quality = when {
                                 height >= 720 || width >= 1280 -> Qualities.P720.value
                                 height >= 480 || width >= 640  -> Qualities.P480.value
-                                height >= 360                  -> Qualities.P360.value
-                                else                           -> Qualities.P270.value
+                                else                           -> Qualities.P360.value
                             }
                             
                             val qualityLabel = "${height}p"
                             
-                            callback(ExtractorLink(
+                            callback(newExtractorLink(
                                 name,
                                 "$name $qualityLabel",
-                                streamUrl,
-                                "",
-                                quality,
+                                streamUrl
+                            ) {
+                                this.quality = quality
                                 type = ExtractorLinkType.M3U8
-                            ))
+                            })
                             foundAny = true
                         }
                     
@@ -169,28 +168,28 @@ class AnimeVietSub : MainAPI() {
                 }
                 
                 // Fallback: Emit master URL trực tiếp
-                callback(ExtractorLink(
+                callback(newExtractorLink(
                     name,
                     name,
-                    masterUrl,
-                    "",
-                    Qualities.Unknown.value,
+                    masterUrl
+                ) {
+                    quality = Qualities.Unknown.value
                     type = ExtractorLinkType.M3U8
-                ))
+                })
                 return true
             }
             
             // Fallback 2: Tìm trực tiếp URL trong HTML
             Regex("""https://video\.twimg\.com/amplify_video/[^"'\s]+\.m3u8""")
                 .findAll(html).forEach { match ->
-                    callback(ExtractorLink(
+                    callback(newExtractorLink(
                         name,
                         name,
-                        match.value,
-                        "",
-                        Qualities.Unknown.value,
+                        match.value
+                    ) {
+                        quality = Qualities.Unknown.value
                         type = ExtractorLinkType.M3U8
-                    ))
+                    })
                     return true
                 }
             

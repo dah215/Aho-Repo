@@ -2,6 +2,7 @@ package com.animevietsub
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.network.CloudflareKiller
+import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
@@ -82,9 +83,8 @@ class AnimeVietSub : MainAPI() {
 
         val title = (detailDoc.selectFirst("h1")?.text()
             ?: detailDoc.title().substringBefore(" - ")).trim().ifBlank { "Anime" }
-        val poster = detailDoc.selectFirst(
-            ".img-film img, figure img, img[itemprop=image]"
-        )?.let { fix(it.attr("data-src").ifBlank { it.attr("src") }) }
+        val poster = detailDoc.selectFirst(".img-film img, figure img, img[itemprop=image]")
+            ?.let { fix(it.attr("data-src").ifBlank { it.attr("src") }) }
         val plot = detailDoc.selectFirst(".description, .desc, .film-content")?.text()?.trim()
 
         val watchUrl = detailToWatch(detailUrl)
@@ -107,8 +107,7 @@ class AnimeVietSub : MainAPI() {
         }
     }
 
-    // ===== LOAD LINKS =====
-    // Giải pháp: Dùng loadExtractor() để CloudStream3 tự động handle iframe
+    // ===== LOAD LINKS với WebViewResolver =====
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -120,37 +119,83 @@ class AnimeVietSub : MainAPI() {
             app.get(epUrl, interceptor = cf, headers = pageH).document
         } catch (_: Exception) { return false }
 
-        // Lấy tất cả iframe (VIP, VIP 2, HY server...)
-        val iframes = doc.select(
-            "iframe#player, iframe.player-iframe, iframe[src*='streamfree'], " +
-            "iframe[src*='player'], iframe[src*='embed']"
-        )
+        // Lấy iframe streamfree.casa
+        val iframeSrc = doc.selectFirst(
+            "iframe#player, iframe.player-iframe, iframe[src*='streamfree']"
+        )?.attr("src")?.let { fix(it) } ?: return false
 
         var foundAny = false
-        for (iframe in iframes) {
-            val src = fix(iframe.attr("src")) ?: continue
-            if (src.contains("googleads") || src.contains("/ads/")) continue
 
-            try {
-                // CloudStream3 sẽ tự động handle iframe (bao gồm streamfree.casa)
-                val extracted = loadExtractor(src, epUrl, subtitleCallback, callback)
-                if (extracted) foundAny = true
-            } catch (_: Exception) {}
-        }
+        // === Dùng WebViewResolver để load iframe và intercept requests ===
+        try {
+            val interceptedUrls = mutableSetOf<String>()
+            
+            app.get(
+                iframeSrc,
+                interceptor = WebViewResolver(
+                    Regex("""https://video\.twimg\.com/[^\s]+\.m3u8"""),
+                    additionalUrls = listOf(Regex("""https://video\.twimg\.com/[^\s]+\.mp4"""))
+                ),
+                headers = mapOf(
+                    "User-Agent" to ua,
+                    "Referer" to epUrl
+                )
+            ).also { response ->
+                // Parse response text tìm video.twimg.com URLs
+                Regex("""https://video\.twimg\.com/amplify_video/\d+/pl/[A-Za-z0-9_\-]+\.m3u8""")
+                    .findAll(response.text)
+                    .forEach { interceptedUrls.add(it.value) }
+            }
 
-        // Fallback: tìm video URL trực tiếp trong HTML
-        if (!foundAny) {
-            val html = doc.html()
-            Regex("""https://video\.twimg\.com/[^\s"'<>]+\.m3u8""")
-                .findAll(html).forEach { mr ->
-                    callback(newExtractorLink(name, name, mr.value) {
-                        referer = ""
-                        quality = Qualities.Unknown.value
+            // Emit tất cả URLs tìm được
+            for (videoUrl in interceptedUrls) {
+                // Fetch master playlist để lấy các chất lượng
+                val masterText = try {
+                    app.get(videoUrl, headers = mapOf("User-Agent" to ua)).text
+                } catch (_: Exception) { "" }
+
+                if (masterText.contains("#EXTM3U")) {
+                    val baseUrl = "https://video.twimg.com"
+                    Regex("""#EXT-X-STREAM-INF:.*?RESOLUTION=(\d+x\d+).*?\n(/[^\s]+\.m3u8)""")
+                        .findAll(masterText).forEach { mr ->
+                            val resolution = mr.groupValues[1]
+                            val path = mr.groupValues[2]
+                            val streamUrl = "$baseUrl$path"
+                            val quality = when {
+                                resolution.contains("1280") -> Qualities.P720.value
+                                resolution.contains("640")  -> Qualities.P480.value
+                                else -> Qualities.P360.value
+                            }
+                            callback(newExtractorLink(name, "$name $resolution", streamUrl) {
+                                referer = ""; this.quality = quality
+                                type = ExtractorLinkType.M3U8
+                                headers = mapOf("User-Agent" to ua)
+                            })
+                            foundAny = true
+                        }
+                } else {
+                    // Nếu không parse được master → emit trực tiếp
+                    callback(newExtractorLink(name, name, videoUrl) {
+                        referer = ""; quality = Qualities.Unknown.value
                         type = ExtractorLinkType.M3U8
                         headers = mapOf("User-Agent" to ua)
                     })
                     foundAny = true
                 }
+            }
+        } catch (_: Exception) {}
+
+        // Fallback: loadExtractor cho các iframe khác
+        if (!foundAny) {
+            doc.select("iframe[src]").forEach { iframe ->
+                val src = fix(iframe.attr("src")) ?: return@forEach
+                if (!src.contains("googleads") && !src.contains("/ads/")) {
+                    try {
+                        if (loadExtractor(src, epUrl, subtitleCallback, callback))
+                            foundAny = true
+                    } catch (_: Exception) {}
+                }
+            }
         }
 
         return foundAny

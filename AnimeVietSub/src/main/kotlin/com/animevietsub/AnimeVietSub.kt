@@ -50,10 +50,9 @@ class AnimeVietSub : MainAPI() {
     }
 
     override val mainPage = mainPageOf(
-        "$mainUrl/"                    to "Trang Chủ",
         "$mainUrl/the-loai/anime-moi/" to "Anime Mới",
-        "$mainUrl/the-loai/anime-bo/"  to "Anime Bộ",
-        "$mainUrl/the-loai/hanh-dong/" to "Action"
+        "$mainUrl/the-loai/anime-le/"  to "Anime Lẻ",
+        "$mainUrl/the-loai/anime-bo/" to "Anime Bộ"
     )
 
     override suspend fun getMainPage(page: Int, req: MainPageRequest): HomePageResponse {
@@ -74,7 +73,16 @@ class AnimeVietSub : MainAPI() {
             a.selectFirst("h2,h3,.title,.name,p")?.text()
         } ?: "").trim().ifBlank { return null }
         val poster = imgOf(a.selectFirst("img"))
-        return newAnimeSearchResponse(ttl, href, TvType.Anime) { posterUrl = poster }
+        val text = a.text() + a.attr("class") + (a.selectFirst(".quality,.badge,.label")?.text() ?: "")
+        val dubStatus = if (text.contains("Lồng tiếng", ignoreCase = true) ||
+                            text.contains("Thuyet minh", ignoreCase = true) ||
+                            text.contains("Thuyết minh", ignoreCase = true))
+            DubStatus.Dubbed else DubStatus.Subbed
+        return newAnimeSearchResponse(ttl, href, TvType.Anime) {
+            posterUrl = poster
+            addDubStatus(dubStatus, -1)
+            quality = SearchQuality.HD
+        }
     }
 
     override suspend fun search(q: String): List<SearchResponse> {
@@ -137,14 +145,19 @@ class AnimeVietSub : MainAPI() {
             }
             .sortedBy { it.episode ?: 0 }
 
+        val fullText = doc.text()
+        val isCompleted = fullText.contains("Hoàn Tất", ignoreCase = true) ||
+                          fullText.contains("Full", ignoreCase = true)
+        val isDubbed = fullText.contains("Lồng tiếng", ignoreCase = true) ||
+                       fullText.contains("Thuyết minh", ignoreCase = true)
+
         return newAnimeLoadResponse(title, detailUrl, TvType.Anime) {
             posterUrl   = poster
             this.plot   = plot
             this.tags   = tags
             this.year   = year
-            this.showStatus = if (doc.text().contains("Hoàn", ignoreCase = true))
-                ShowStatus.Completed else ShowStatus.Ongoing
-            this.episodes = mutableMapOf(DubStatus.Subbed to episodes)
+            this.showStatus = if (isCompleted) ShowStatus.Completed else ShowStatus.Ongoing
+            addEpisodes(if (isDubbed) DubStatus.Dubbed else DubStatus.Subbed, episodes)
         }
     }
 

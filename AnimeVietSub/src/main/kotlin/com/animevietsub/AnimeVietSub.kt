@@ -40,10 +40,9 @@ class AnimeVietSub : MainAPI() {
     private fun detailToWatch(url: String) = url.replace("/thong-tin-phim/", "/xem-phim/")
 
     override val mainPage = mainPageOf(
-        "$mainUrl/" to "Trang Chủ",
         "$mainUrl/the-loai/anime-moi/" to "Anime Mới",
         "$mainUrl/the-loai/anime-bo/" to "Anime Bộ",
-        "$mainUrl/the-loai/hanh-dong/" to "Action"
+        "$mainUrl/the-loai/anime-le/" to "Anime Lẻ"
     )
 
     override suspend fun getMainPage(page: Int, req: MainPageRequest): HomePageResponse {
@@ -178,6 +177,7 @@ class AnimeVietSub : MainAPI() {
                     }
                     callback(newExtractorLink(name, "$name ${height}p", streamUrl) {
                         this.quality = quality
+                        this.referer = "https://streamfree.casa/"
                         type = ExtractorLinkType.M3U8
                     })
                     foundAny = true
@@ -189,6 +189,7 @@ class AnimeVietSub : MainAPI() {
         // Fallback: emit master trực tiếp
         callback(newExtractorLink(name, name, masterUrl) {
             quality = Qualities.Unknown.value
+            this.referer = "https://streamfree.casa/"
             type = ExtractorLinkType.M3U8
         })
         return true

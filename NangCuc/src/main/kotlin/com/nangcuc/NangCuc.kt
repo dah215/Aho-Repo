@@ -38,7 +38,8 @@ class NangCucProvider : MainAPI() {
         if (url.isBlank()) return ""
         if (url.startsWith("http")) return url
         if (url.startsWith("//")) return "https:$url"
-        return "$mainUrl/${url.removePrefix("/")}"
+        val base = mainUrl.removeSuffix("/")
+        return if (url.startsWith("/")) "$base$url" else "$base/$url"
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -87,18 +88,14 @@ class NangCucProvider : MainAPI() {
     ): Boolean {
         val doc = app.get(data, headers = headers).document
 
-        // 1. Tìm tất cả các nguồn video từ thuộc tính data-source (Server 1, Server 2...)
+        // 1. Tìm tất cả các nguồn video từ thuộc tính data-source và iframe
         val sources = doc.select("[data-source]").map { it.attr("data-source") }.toMutableList()
-        
-        // 2. Tìm thêm trong iframe nếu có
         doc.select("iframe").forEach { sources.add(it.attr("src")) }
 
         sources.distinct().forEach { sourceUrl ->
             val fullSourceUrl = fixUrl(sourceUrl)
             
             if (fullSourceUrl.contains("dfplayer.net")) {
-                // Xử lý đặc biệt cho DFPlayer dựa trên ID 'did'
-                // Ví dụ: https://v.dfplayer.net/bf.html?did=14724 -> https://v.dfplayer.net/v2/s/14724.m3u8
                 val did = Regex("""did=(\d+)""").find(fullSourceUrl)?.groupValues?.get(1)
                 if (did != null) {
                     val m3u8Link = "https://v.dfplayer.net/v2/s/$did.m3u8"
@@ -107,24 +104,33 @@ class NangCucProvider : MainAPI() {
                             "DFPlayer", 
                             "DFPlayer", 
                             m3u8Link, 
-                            referer = "https://v.dfplayer.net/", 
-                            quality = Qualities.P1080.value, // Thường là FHD
                             type = ExtractorLinkType.M3U8
-                        )
+                        ) {
+                            this.referer = "https://v.dfplayer.net/"
+                            this.quality = Qualities.P1080.value
+                        }
                     )
                 }
             } else if (fullSourceUrl.isNotEmpty()) {
-                // Thử dùng các Extractor mặc định cho các server khác (nếu có)
                 loadExtractor(fullSourceUrl, data, subtitleCallback, callback)
             }
         }
 
-        // 3. Quét thêm link m3u8 trực tiếp trong script (phòng hờ)
+        // 2. Quét thêm link m3u8 trực tiếp trong script
         doc.select("script").forEach { script ->
             val content = script.html()
             Regex("""["'](https?://[^"']+\.m3u8[^"']*)["']""").findAll(content).forEach { match ->
+                val link = match.groupValues[1]
                 callback(
-                    newExtractorLink(name, name, match.groupValues[1], data, Qualities.Unknown.value, true)
+                    newExtractorLink(
+                        name, 
+                        name, 
+                        link, 
+                        type = ExtractorLinkType.M3U8
+                    ) {
+                        this.referer = data
+                        this.quality = Qualities.Unknown.value
+                    }
                 )
             }
         }

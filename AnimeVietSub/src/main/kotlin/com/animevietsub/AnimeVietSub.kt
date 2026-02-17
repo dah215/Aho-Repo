@@ -258,15 +258,17 @@ class AnimeVietSub : MainAPI() {
 
     private suspend fun emitFromMaster(masterUrl: String, callback: (ExtractorLink) -> Unit): Boolean {
         return try {
-            val masterText = app.get(masterUrl, headers = mapOf(
-                "User-Agent" to ua,
-                "Origin"     to "https://streamfree.casa"
-            )).text
+            val fetchHeaders = if (masterUrl.contains("twimg.com")) {
+                mapOf("User-Agent" to ua)
+            } else {
+                mapOf("User-Agent" to ua, "Referer" to "https://streamfree.casa/", "Origin" to "https://streamfree.casa")
+            }
+            val masterText = app.get(masterUrl, headers = fetchHeaders).text
 
             if (!masterText.contains("#EXTM3U")) {
                 callback(newExtractorLink(name, "$name Auto", masterUrl) {
                     quality = Qualities.P720.value
-                    referer = "https://streamfree.casa/"
+                    referer = if (masterUrl.contains("twimg.com")) "" else "https://streamfree.casa/"
                     type    = ExtractorLinkType.M3U8
                 })
                 return true
@@ -309,7 +311,7 @@ class AnimeVietSub : MainAPI() {
                     }
                     callback(newExtractorLink(name, "$name $label", streamUrl) {
                         this.quality = quality
-                        this.referer = "https://streamfree.casa/"
+                        this.referer = if (streamUrl.contains("twimg.com")) "" else "https://streamfree.casa/"
                         type = ExtractorLinkType.M3U8
                     })
                     foundAny = true
@@ -322,7 +324,7 @@ class AnimeVietSub : MainAPI() {
             if (!foundAny) {
                 callback(newExtractorLink(name, "$name HD", masterUrl) {
                     quality = Qualities.P720.value
-                    referer = "https://streamfree.casa/"
+                    referer = if (masterUrl.contains("twimg.com")) "" else "https://streamfree.casa/"
                     type    = ExtractorLinkType.M3U8
                 })
             }
@@ -330,7 +332,7 @@ class AnimeVietSub : MainAPI() {
         } catch (_: Exception) {
             callback(newExtractorLink(name, "$name HD", masterUrl) {
                 quality = Qualities.P720.value
-                referer = "https://streamfree.casa/"
+                referer = if (masterUrl.contains("twimg.com")) "" else "https://streamfree.casa/"
                 type    = ExtractorLinkType.M3U8
             })
             true

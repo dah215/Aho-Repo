@@ -27,7 +27,7 @@ class NangCucProvider : MainAPI() {
     )
 
     override val mainPage = mainPageOf(
-        "" to "Mới Cập Nhật",
+        "/" to "Mới Cập Nhật",
         "the-loai/vietsub/" to "Vietsub",
         "the-loai/jav-hd/" to "JAV HD",
         "the-loai/chau-au/" to "Âu Mỹ",

@@ -20,6 +20,24 @@
         "name": "AnimeVietSub"
     },
     {
+        "iconUrl": "https://nangcuc.cv/favicon.ico",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/dah215/Aho-Repo",
+        "status": 1,
+        "language": "vi",
+        "authors": [
+            "NangCuc"
+        ],
+        "tvTypes": [
+            "NSFW"
+        ],
+        "version": 1,
+        "internalName": "NangCuc",
+        "description": "Vietnamese anime streaming site",
+        "url": "https://raw.githubusercontent.com/dah215/Aho-Repo/builds/NangCuc.cs3",
+        "name": "NangCuc"
+    },
+    {
         "iconUrl": "https://phimmoichill.now/favicon.ico",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/dah215/Aho-Repo",

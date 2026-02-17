@@ -15,7 +15,7 @@ class AnimeVietSubPlugin : Plugin() {
 
 class AnimeVietSub : MainAPI() {
     override var mainUrl  = "https://animevui.social"
-    override var name     = "AnimeVui"
+    override var name     = "AnimeVietSub(Fake)"
     override var lang     = "vi"
     override val hasMainPage          = true
     override val hasChromecastSupport = true

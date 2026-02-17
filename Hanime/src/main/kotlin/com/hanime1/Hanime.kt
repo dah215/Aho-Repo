@@ -26,13 +26,13 @@ class Hanime1Provider : MainAPI() {
         "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7"
     )
 
-    // Sử dụng URL đã được mã hóa (URL Encoded) để đảm bảo server nhận diện đúng category
     override val mainPage = mainPageOf(
+        "" to "Trang Chủ (Xu Hướng)",
         "search?sort=created_at" to "Mới Cập Nhật",
         "search?sort=views_count" to "Xem Nhiều Nhất",
-        "search?genre=%E7%84%A1%E4%BF%AE%E6%AD%A3" to "Không Che (Uncensored)",
-        "search?genre=%E8%A3%8F%E7%95%AA" to "Series Hentai (裏番)",
-        "search?genre=%E4%B8%AD%E6%96%87%E5%AD%97%E5%B9%95" to "Có Phụ Đề (Dễ xem)",
+        "search?genre=無修正" to "Không Che (Uncensored)",
+        "search?genre=裏番" to "Series Hentai",
+        "search?genre=中文字幕" to "Phụ đề (Chinese Sub)",
         "search?genre=3DCG" to "Phim 3D"
     )
 
@@ -44,14 +44,15 @@ class Hanime1Provider : MainAPI() {
     }
 
     private fun parseItem(el: Element): SearchResponse? {
-        val linkEl = el.selectFirst("a.video-link") ?: return null
+        // Selector linh hoạt cho cả trang chủ (.hentai-item) và trang tìm kiếm (.video-item-container)
+        val linkEl = el.selectFirst("a.video-link, a[href*='watch?v=']") ?: return null
         val href = fixUrl(linkEl.attr("href"))
         
-        // Bỏ qua quảng cáo
-        if (!href.contains("watch?v=")) return null
-        
-        val title = el.selectFirst(".title")?.text()?.trim() ?: return null
-        val poster = el.selectFirst("img.main-thumb")?.attr("src")
+        val title = el.selectFirst(".title, .hentai-item-title, .search-display-item-title")?.text()?.trim() 
+            ?: linkEl.attr("title") 
+            ?: return null
+            
+        val poster = el.selectFirst("img.main-thumb, img")?.attr("src")
         
         return newMovieSearchResponse(title, href, TvType.NSFW) {
             this.posterUrl = poster
@@ -59,23 +60,27 @@ class Hanime1Provider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = if (request.data.contains("?")) {
-            "$mainUrl/${request.data}${if (page > 1) "&page=$page" else ""}"
+        val url = if (request.data.isBlank()) {
+            mainUrl // Trang chủ
         } else {
-            "$mainUrl/${request.data}${if (page > 1) "?page=$page" else ""}"
+            // Trang tìm kiếm/thể loại
+            val separator = if (request.data.contains("?")) "&" else "?"
+            "$mainUrl/${request.data}${if (page > 1) "${separator}page=$page" else ""}"
         }
         
         val doc = app.get(url, headers = headers).document
-        val items = doc.select(".video-item-container").mapNotNull { 
+        // Quét cả 2 loại cấu trúc thẻ phim
+        val items = doc.select(".video-item-container, .hentai-item, .search-display-item-column").mapNotNull { 
             parseItem(it) 
-        }
+        }.distinctBy { it.url }
+
         return newHomePageResponse(request.name, items, items.isNotEmpty())
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/search?query=$query"
         val doc = app.get(url, headers = headers).document
-        return doc.select(".video-item-container").mapNotNull { parseItem(it) }
+        return doc.select(".video-item-container, .hentai-item").mapNotNull { parseItem(it) }.distinctBy { it.url }
     }
 
     override suspend fun load(url: String): LoadResponse {

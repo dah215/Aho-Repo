@@ -27,11 +27,11 @@ class Hanime1Provider : MainAPI() {
     )
 
     override val mainPage = mainPageOf(
-        "" to "Trang Chủ (Xu Hướng)",
         "search?sort=created_at" to "Mới Cập Nhật",
         "search?sort=views_count" to "Xem Nhiều Nhất",
         "search?type=hentai&genre=無修正" to "Không Che (Uncensored)",
-        "search?type=hentai&genre=裏番" to "Series Hentai"
+        "search?type=hentai&genre=裏番" to "Series Hentai",
+        "search?type=hentai&genre=日本語字幕" to "Vietsub/Phụ đề"
     )
 
     private fun fixUrl(url: String): String {
@@ -42,46 +42,53 @@ class Hanime1Provider : MainAPI() {
     }
 
     private fun parseItem(el: Element): SearchResponse? {
-        val title = el.selectFirst(".hentai-item-title")?.text() ?: return null
-        val href = fixUrl(el.selectFirst("a")?.attr("href") ?: return null)
-        val poster = el.selectFirst("img")?.attr("src")
+        // Selector tiêu đề linh hoạt cho cả trang chủ và trang tìm kiếm
+        val title = el.selectFirst(".hentai-item-title, .search-display-item-title, h5, .video-title")?.text() ?: return null
+        val linkEl = el.selectFirst("a") ?: return null
+        val href = fixUrl(linkEl.attr("href"))
         
-        return newMovieSearchResponse(title, href, TvType.NSFW) {
+        // Lấy ảnh từ img hoặc từ style background-image
+        var poster = el.selectFirst("img")?.attr("src")
+        if (poster.isNullOrBlank()) {
+            val style = el.selectFirst("[style*='background-image']")?.attr("style") ?: ""
+            poster = Regex("""url\(['"]?([^'"]+)['"]?\)""").find(style)?.groupValues?.get(1)
+        }
+        
+        return newMovieSearchResponse(title.trim(), href, TvType.NSFW) {
             this.posterUrl = poster
         }
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = if (request.data.isEmpty()) {
-            mainUrl
-        } else {
-            "$mainUrl/${request.data}${if (page > 1) "&page=$page" else ""}"
-        }
-        
+        val url = "$mainUrl/${request.data}${if (page > 1) "&page=$page" else ""}"
         val doc = app.get(url, headers = headers).document
-        val items = doc.select(".hentai-item, .search-display-item-column").mapNotNull { parseItem(it) }
-        return newHomePageResponse(request.name, items, true)
+        
+        // Quét tất cả các khối có khả năng chứa phim
+        val items = doc.select(".hentai-item, .search-display-item-column, [class*='col-xs-'], .video-item").mapNotNull { 
+            parseItem(it) 
+        }
+        return newHomePageResponse(request.name, items, items.isNotEmpty())
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/search?query=$query"
         val doc = app.get(url, headers = headers).document
-        return doc.select(".hentai-item, .search-display-item-column").mapNotNull { parseItem(it) }
+        return doc.select(".hentai-item, .search-display-item-column, [class*='col-xs-']").mapNotNull { parseItem(it) }
     }
 
     override suspend fun load(url: String): LoadResponse {
         val doc = app.get(url, headers = headers).document
-        val title = doc.selectFirst("h1#hentai-video-title")?.text() 
-            ?: doc.selectFirst("meta[property=og:title]")?.attr("content") 
+        val title = doc.selectFirst("h1#hentai-video-title, .video-title-width, h1")?.text()?.trim() 
+            ?: doc.selectFirst("meta[property='og:title']")?.attr("content") 
             ?: "Untitled"
         
-        val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
-        val desc = doc.selectFirst(".hentai-video-description")?.text()
+        val poster = doc.selectFirst("meta[property='og:image']")?.attr("content")
+        val desc = doc.selectFirst(".hentai-video-description, #video-description, .video-details p")?.text()?.trim()
         
         return newMovieLoadResponse(title, url, TvType.NSFW, url) {
             this.posterUrl = poster
             this.plot = desc
-            this.tags = doc.select("a.hentai-video-tag").map { it.text() }
+            this.tags = doc.select("a.hentai-video-tag, .video-tags a").map { it.text() }
         }
     }
 
@@ -91,25 +98,26 @@ class Hanime1Provider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val doc = app.get(data, headers = headers).document
+        val res = app.get(data, headers = headers)
+        val doc = res.document
+        val html = res.text
 
-        // Hanime1 thường để link trực tiếp trong thẻ <source> của <video>
+        // 1. Lấy link từ thẻ <video> <source> (Cách chuẩn nhất)
         doc.select("video source").forEach { source ->
             val videoUrl = source.attr("src")
             if (videoUrl.isNotBlank()) {
-                val qualityStr = source.attr("size")
-                val quality = when (qualityStr) {
-                    "1080" -> Qualities.P1080.value
-                    "720" -> Qualities.P720.value
-                    "480" -> Qualities.P480.value
-                    "360" -> Qualities.P360.value
+                val qualityStr = source.attr("size") ?: ""
+                val quality = when {
+                    qualityStr.contains("1080") -> Qualities.P1080.value
+                    qualityStr.contains("720") -> Qualities.P720.value
+                    qualityStr.contains("480") -> Qualities.P480.value
                     else -> Qualities.Unknown.value
                 }
 
                 callback(
                     newExtractorLink(
                         name,
-                        "$name ${qualityStr}p",
+                        if (qualityStr.isNotBlank()) "$name ${qualityStr}p" else name,
                         videoUrl,
                         type = ExtractorLinkType.VIDEO
                     ) {
@@ -120,22 +128,24 @@ class Hanime1Provider : MainAPI() {
             }
         }
 
-        // Dự phòng: Tìm link mp4 trong script nếu không có thẻ source
-        if (doc.select("video source").isEmpty()) {
-            val html = doc.html()
-            Regex("""https?://[^\s"'<>]+?\.mp4[^\s"'<>]*""").findAll(html).forEach { match ->
-                val link = match.value
-                callback(
-                    newExtractorLink(
-                        name,
-                        name,
-                        link,
-                        type = ExtractorLinkType.VIDEO
-                    ) {
-                        this.referer = data
-                        this.quality = Qualities.Unknown.value
-                    }
-                )
+        // 2. Quét link MP4 trực tiếp từ script (Dành cho server hembed)
+        if (html.contains(".mp4")) {
+            // Regex tìm link mp4 có kèm token bảo mật
+            val mp4Regex = Regex("""https?://[^\s"'<>]+?\.mp4[^\s"'<>]*""")
+            mp4Regex.findAll(html).forEach { match ->
+                val link = match.value.replace("\\/", "/")
+                if (!link.contains("thumbnail")) { // Loại bỏ link ảnh thumbnail
+                    callback(
+                        newExtractorLink(
+                            "Server VIP",
+                            "Direct MP4",
+                            link,
+                            type = ExtractorLinkType.VIDEO
+                        ) {
+                            this.referer = data
+                        }
+                    )
+                }
             }
         }
 

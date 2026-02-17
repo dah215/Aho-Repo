@@ -260,7 +260,7 @@ class AnimeVietSub : MainAPI() {
         return null
     }
 
-    private fun emitMaster(masterUrl: String, callback: (ExtractorLink) -> Unit): Boolean {
+    private suspend fun emitMaster(masterUrl: String, callback: (ExtractorLink) -> Unit): Boolean {
         // Emit master playlist trực tiếp - ExoPlayer tự xử lý HLS quality selection
         callback(newExtractorLink(name, name, masterUrl) {
             quality = Qualities.P1080.value

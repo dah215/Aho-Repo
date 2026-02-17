@@ -22,12 +22,11 @@ class NangCucProvider : MainAPI() {
 
     private val headers = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
-        "Referer" to mainUrl,
-        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
     )
 
     override val mainPage = mainPageOf(
-        "/" to "Mới Cập Nhật",
+        "" to "Mới Cập Nhật",
         "the-loai/vietsub/" to "Vietsub",
         "the-loai/jav-hd/" to "JAV HD",
         "the-loai/chau-au/" to "Âu Mỹ",
@@ -91,12 +90,14 @@ class NangCucProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val doc = app.get(data, headers = headers).document
-        doc.select("iframe[src], iframe[data-src], iframe[data-lazy-src]").forEach {
-            val src = it.attr("data-lazy-src").takeIf { it.isNotEmpty() }
-                ?: it.attr("data-src").takeIf { it.isNotEmpty() }
-                ?: it.attr("src")
-            if (src.isNotEmpty()) {
-                loadExtractor(fixUrl(src), mainUrl, subtitleCallback, callback)
+        doc.select("iframe[src], iframe[data-src], iframe[data-lazy-src], iframe[srcdoc]").forEach {
+            val src = it.attr("data-lazy-src").takeIf { s -> s.isNotEmpty() }
+                ?: it.attr("data-src").takeIf { s -> s.isNotEmpty() }
+                ?: it.attr("src").takeIf { s -> s.isNotEmpty() }
+                ?: return@forEach
+            val iframeUrl = fixUrl(src)
+            if (iframeUrl.isNotEmpty()) {
+                loadExtractor(iframeUrl, data, subtitleCallback, callback)  // Referer = trang phim (data)
             }
         }
         return true

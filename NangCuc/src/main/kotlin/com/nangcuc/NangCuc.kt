@@ -22,7 +22,7 @@ class NangCucProvider : MainAPI() {
 
     private val headers = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
-        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
+        "Referer" to "$mainUrl/"
     )
 
     override val mainPage = mainPageOf(
@@ -34,52 +34,48 @@ class NangCucProvider : MainAPI() {
         "the-loai/xvideos/" to "Xvideos"
     )
 
-    private fun fixUrl(url: String): String = when {
-        url.startsWith("http") -> url
-        url.startsWith("//") -> "https:$url"
-        else -> "$mainUrl/$url"
-    }
-
-    private fun getPoster(el: Element?): String? {
-        return el?.selectFirst("img")?.attr("abs:src")?.takeIf { it.isNotEmpty() && !it.contains("blank") }
-    }
-
-    private fun parseItem(el: Element): SearchResponse? {
-        val linkEl = el.selectFirst("a.item-box__image") ?: return null
-        val href = fixUrl(linkEl.attr("href"))
-        val title = linkEl.attr("title").ifBlank { el.selectFirst("p.item-box__title")?.text() ?: return null }
-        val poster = getPoster(el)
-        return newMovieSearchResponse(title.trim(), href, TvType.Movie) {
-            this.posterUrl = poster
-        }
+    private fun fixUrl(url: String): String {
+        if (url.isBlank()) return ""
+        if (url.startsWith("http")) return url
+        if (url.startsWith("//")) return "https:$url"
+        return "$mainUrl/${url.removePrefix("/")}"
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = "$mainUrl/${request.data}${if (page > 1) "page/$page/" else ""}"
         val doc = app.get(url, headers = headers).document
-        val items = doc.select("div.item-box").mapNotNull { parseItem(it) }
-        val hasNext = doc.selectFirst("a.pagination-next, link[rel=next]") != null
-        return newHomePageResponse(request.name, items, hasNext)
+        val items = doc.select("div.item-box").mapNotNull { el ->
+            val linkEl = el.selectFirst("a.item-box__image") ?: return@mapNotNull null
+            val href = fixUrl(linkEl.attr("href"))
+            val title = linkEl.attr("title").ifBlank { el.selectFirst("p.item-box__title")?.text() ?: "" }
+            newMovieSearchResponse(title.trim(), href, TvType.Movie) {
+                this.posterUrl = el.selectFirst("img")?.attr("abs:src")
+            }
+        }
+        return newHomePageResponse(request.name, items, true)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/?s=$query&post_type=movie"
         val doc = app.get(url, headers = headers).document
-        return doc.select("div.item-box").mapNotNull { parseItem(it) }
+        return doc.select("div.item-box").mapNotNull { el ->
+            val linkEl = el.selectFirst("a.item-box__image") ?: return@mapNotNull null
+            newMovieSearchResponse(linkEl.attr("title"), fixUrl(linkEl.attr("href")), TvType.Movie) {
+                this.posterUrl = el.selectFirst("img")?.attr("abs:src")
+            }
+        }
     }
 
     override suspend fun load(url: String): LoadResponse {
         val doc = app.get(url, headers = headers).document
-        val title = doc.selectFirst("h1.entry-title, h1")?.text()?.trim() ?: "Untitled"
+        val title = doc.selectFirst("h1")?.text()?.trim() ?: "Untitled"
         val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
-            ?: getPoster(doc.selectFirst("div.thumb, div.entry-thumb"))
-        val desc = doc.selectFirst(".entry-content, .single-content, .description")?.text()?.trim()
-        val tags = doc.select("a[rel=tag], .genres a, .tags a").map { it.text().trim() }
+        val desc = doc.selectFirst("article p")?.text()?.trim()
 
         return newMovieLoadResponse(title, url, TvType.Movie, url) {
             this.posterUrl = poster
             this.plot = desc
-            this.tags = tags
+            this.tags = doc.select(".categories a").map { it.text() }
         }
     }
 
@@ -91,49 +87,45 @@ class NangCucProvider : MainAPI() {
     ): Boolean {
         val doc = app.get(data, headers = headers).document
 
-        // Xử lý iframe
-        doc.select("iframe[src], iframe[data-src], iframe[data-lazy-src], iframe[srcdoc]").forEach {
-            val src = it.attr("data-lazy-src").takeIf { s -> s.isNotEmpty() }
-                ?: it.attr("data-src").takeIf { s -> s.isNotEmpty() }
-                ?: it.attr("src").takeIf { s -> s.isNotEmpty() }
-                ?: return@forEach
-            val iframeUrl = fixUrl(src)
-            if (iframeUrl.contains("dfplayer.net")) {
-                val iframeDoc = app.get(iframeUrl, headers = headers, referer = data).document
-                iframeDoc.select("script").forEach { script ->
-                    val content = script.html()
-                    val m3u8Regex = Regex("""["']?file["']?\s*:\s*["']([^"']+\.m3u8[^"']*)["']""")
-                    m3u8Regex.find(content)?.groupValues?.get(1)?.let { m3u8 ->
-                        val link = fixUrl(m3u8)
-                        callback(
-                            newExtractorLink(name, name, link) {
-                                referer = data
-                                quality = Qualities.Unknown.value
-                                type = ExtractorLinkType.M3U8
-                            }
+        // 1. Tìm tất cả các nguồn video từ thuộc tính data-source (Server 1, Server 2...)
+        val sources = doc.select("[data-source]").map { it.attr("data-source") }.toMutableList()
+        
+        // 2. Tìm thêm trong iframe nếu có
+        doc.select("iframe").forEach { sources.add(it.attr("src")) }
+
+        sources.distinct().forEach { sourceUrl ->
+            val fullSourceUrl = fixUrl(sourceUrl)
+            
+            if (fullSourceUrl.contains("dfplayer.net")) {
+                // Xử lý đặc biệt cho DFPlayer dựa trên ID 'did'
+                // Ví dụ: https://v.dfplayer.net/bf.html?did=14724 -> https://v.dfplayer.net/v2/s/14724.m3u8
+                val did = Regex("""did=(\d+)""").find(fullSourceUrl)?.groupValues?.get(1)
+                if (did != null) {
+                    val m3u8Link = "https://v.dfplayer.net/v2/s/$did.m3u8"
+                    callback(
+                        newExtractorLink(
+                            "DFPlayer", 
+                            "DFPlayer", 
+                            m3u8Link, 
+                            referer = "https://v.dfplayer.net/", 
+                            quality = Qualities.P1080.value, // Thường là FHD
+                            type = ExtractorLinkType.M3U8
                         )
-                    }
+                    )
                 }
-            } else if (iframeUrl.isNotEmpty()) {
-                loadExtractor(iframeUrl, data, subtitleCallback, callback)
+            } else if (fullSourceUrl.isNotEmpty()) {
+                // Thử dùng các Extractor mặc định cho các server khác (nếu có)
+                loadExtractor(fullSourceUrl, data, subtitleCallback, callback)
             }
         }
 
-        // Parse m3u8 trực tiếp từ script trên trang chính (Playerjs)
+        // 3. Quét thêm link m3u8 trực tiếp trong script (phòng hờ)
         doc.select("script").forEach { script ->
             val content = script.html()
-            if (content.contains(".m3u8")) {
-                val m3u8Regex = Regex("""["']?file["']?\s*:\s*["']([^"']+\.m3u8[^"']*)["']""")
-                m3u8Regex.findAll(content).forEach { match ->
-                    val link = fixUrl(match.groupValues[1])
-                    callback(
-                        newExtractorLink(name, name, link) {
-                            referer = data
-                            quality = Qualities.Unknown.value
-                            type = ExtractorLinkType.M3U8
-                        }
-                    )
-                }
+            Regex("""["'](https?://[^"']+\.m3u8[^"']*)["']""").findAll(content).forEach { match ->
+                callback(
+                    newExtractorLink(name, name, match.groupValues[1], data, Qualities.Unknown.value, true)
+                )
             }
         }
 

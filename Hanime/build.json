@@ -1,0 +1,13 @@
+{
+  "name": "Hanime",
+  "pluginClassName": "com.hanime1.Hanime",
+  "version": 1,
+  "requiresResources": false,
+  "description": "Hanime",
+  "authors": ["Hanime"],
+  "repositoryUrl": "https://github.com/dah215/Aho-Repo",
+  "status": 1,
+  "tvTypes": ["Anime", "AnimeMovie"],
+  "language": "vi",
+  "iconUrl": "https://hanime1.me/favicon.ico"
+}

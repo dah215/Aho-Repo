@@ -21,16 +21,19 @@ class Hanime1Provider : MainAPI() {
     override val supportedTypes = setOf(TvType.NSFW)
 
     private val headers = mapOf(
-        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         "Referer" to "$mainUrl/",
         "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7"
     )
 
+    // Sử dụng mã Unicode để tránh lỗi font/encoding khi build
     override val mainPage = mainPageOf(
-        "" to "Trang Chủ (Xu Hướng)",
-        "search?query=&type=&genre=%E8%A3%8F%E7%95%AA&sort=&date=&duration=" to "裏番",
-        "search?query=&type=&genre=%E6%B3%A1%E9%BA%B5%E7%95%AA&sort=&date=&duration=" to "泡麵番t",
-        "search?genre=3DCG" to "Phim 3D"
+        "search?sort=created_at" to "Mới Cập Nhật",
+        "search?sort=views_count" to "Xem Nhiều Nhất",
+        "search?type=hentai&genre=\u7121\u4fee\u6b63" to "Không Che (Uncensored)", // 無修正
+        "search?type=hentai&genre=\u88cf\u756a" to "Series Hentai (\u88cf\u756a)", // 裏番
+        "search?type=hentai&genre=\u4e2d\u6587\u5b57\u5e55" to "Phụ Đề (Chinese Sub)", // 中文字幕
+        "search?type=hentai&genre=3DCG" to "Phim 3D (3DCG)"
     )
 
     private fun fixUrl(url: String): String {
@@ -41,13 +44,16 @@ class Hanime1Provider : MainAPI() {
     }
 
     private fun parseItem(el: Element): SearchResponse? {
-        // Tìm link có chứa watch?v= (Dựa trên HTML bạn gửi)
-        val linkEl = el.selectFirst("a[href*='watch?v=']") ?: return null
+        // Selector chính xác dựa trên HTML bạn gửi: thẻ a có class video-link
+        val linkEl = el.selectFirst("a.video-link, a[href*='watch?v=']") ?: return null
         val href = fixUrl(linkEl.attr("href"))
         
-        // Lấy tiêu đề từ class .title hoặc .hentai-item-title
+        // Chỉ lấy link xem phim thực sự
+        if (!href.contains("watch?v=")) return null
+        
+        // Lấy tiêu đề từ class .title (như trong HTML bạn gửi)
         val title = el.selectFirst(".title, .hentai-item-title, .search-display-item-title")?.text()?.trim() 
-            ?: el.attr("title")
+            ?: el.attr("title") 
             ?: return null
             
         // Lấy ảnh bìa từ img.main-thumb
@@ -62,7 +68,6 @@ class Hanime1Provider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        // Logic nối URL chuẩn: Nếu có data thì nối vào mainUrl, nếu không thì dùng mainUrl gốc
         val url = if (request.data.isEmpty()) {
             mainUrl
         } else {
@@ -72,7 +77,7 @@ class Hanime1Provider : MainAPI() {
         
         val doc = app.get(url, headers = headers).document
         
-        // Quét cả cấu trúc trang chủ (.hentai-item) và trang tìm kiếm (.video-item-container)
+        // Quét tất cả các khối chứa phim theo cấu trúc HTML bạn gửi
         val items = doc.select(".video-item-container, .hentai-item, .search-display-item-column").mapNotNull { 
             parseItem(it) 
         }.distinctBy { it.url }
@@ -130,7 +135,7 @@ class Hanime1Provider : MainAPI() {
             }
         }
 
-        // 2. Quét link MP4 trực tiếp từ script
+        // 2. Quét link MP4 trực tiếp từ script (Dành cho server hembed)
         val mp4Regex = Regex("""https?[:\\]+[/\\/]+[^\s"'<>]+?\.mp4[^\s"'<>]*""")
         mp4Regex.findAll(html).forEach { match ->
             val link = match.value.replace("\\/", "/")

@@ -144,13 +144,15 @@ class AnimeVietSub : MainAPI() {
         }
     }
 
+    // Patterns tìm video URL - ưu tiên từ cao đến thấp
     private val streamPatterns = listOf(
         Regex("""var\s+streamUrl\s*=\s*["']([^"']+)["']"""),
         Regex("""streamUrl\s*=\s*["']([^"']+)["']"""),
         Regex("""["'](https://video\.twimg\.com/amplify_video/[^"'\s]+\.m3u8)["']"""),
         Regex("""source\s*:\s*["'](https://[^"']+\.m3u8)["']"""),
         Regex("""file\s*:\s*["'](https://[^"']+\.m3u8)["']"""),
-        Regex("""["'](https://[^"'\s]+\.m3u8)["']""")
+        Regex("""src\s*:\s*["'](https://[^"']+\.m3u8)["']"""),
+        Regex("""["'](https://[^"'\s]+\.m3u8[^"'\s]*)["']""")
     )
 
     private fun searchInHtml(html: String): String? {
@@ -162,38 +164,92 @@ class AnimeVietSub : MainAPI() {
         return null
     }
 
-    private suspend fun findStreamUrl(
-        html: String,
-        epUrl: String,
-        epCookies: Map<String, String>
-    ): String? {
-        // Tìm trong HTML chính trước
+    private suspend fun fetchIframe(iframeSrc: String, referer: String, cookies: Map<String, String>): String? {
+        // Thử 1: Không CF, nhanh hơn
+        try {
+            val resp = app.get(iframeSrc, headers = mapOf(
+                "User-Agent"      to ua,
+                "Referer"         to referer,
+                "Accept"          to "text/html,application/xhtml+xml,*/*",
+                "Accept-Language" to "vi-VN,vi;q=0.9",
+                "Sec-Fetch-Dest"  to "iframe",
+                "Sec-Fetch-Mode"  to "navigate",
+                "Sec-Fetch-Site"  to "cross-site"
+            ), cookies = cookies)
+            val html = resp.text
+            // Nếu bị CF challenge thì HTML rất ngắn hoặc chứa "challenge"
+            if (html.length > 1000 && !html.contains("cf-browser-verification")) {
+                return html
+            }
+        } catch (_: Exception) {}
+
+        // Thử 2: Với CF interceptor
+        return try {
+            app.get(iframeSrc, interceptor = cf, headers = mapOf(
+                "User-Agent"      to ua,
+                "Referer"         to referer,
+                "Accept"          to "text/html,application/xhtml+xml,*/*",
+                "Accept-Language" to "vi-VN,vi;q=0.9"
+            ), cookies = cookies).text
+        } catch (_: Exception) { null }
+    }
+
+    private fun unescapeHtml(s: String) = s
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+
+    private suspend fun findStreamUrl(html: String, epUrl: String, cookies: Map<String, String>): String? {
+        // Tìm trong HTML chính
         searchInHtml(html)?.let { return it }
 
-        // Lấy tất cả iframe src
-        val doc = org.jsoup.Jsoup.parse(html)
-        val iframes = doc.select("iframe[src]")
-            .map { it.attr("src") }
-            .filter { it.isNotBlank() && !it.contains("googleads") && !it.contains("ads.") }
+        // Tìm tất cả URL streamfree bằng regex trong raw HTML
+        // (iframe src có thể rỗng hoặc bị &amp; encode)
+        val iframeUrls = mutableListOf<String>()
+
+        // Pattern 1: src="..." hoặc data-src="..."
+        Regex("""(?:src|data-src)=["']([^"']*streamfree\.casa[^"']*)["']""")
+            .findAll(html)
+            .forEach { iframeUrls.add(unescapeHtml(it.groupValues[1])) }
+
+        // Pattern 2: URL nằm trong JavaScript string hoặc attribute khác
+        Regex("""["']((?:https?:)?//streamfree\.casa/\?[^"'\s<>]+)["']""")
+            .findAll(html)
+            .forEach { iframeUrls.add(unescapeHtml(it.groupValues[1])) }
+
+        // Pattern 3: Tìm mọi nơi có streamfree.casa (kể cả &amp; encoded)
+        Regex("""((?:https?:)?//streamfree\.casa/\?url=[A-Za-z0-9+/=]+(?:&(?:amp;)?csrftoken=[a-f0-9]+)?(?:&(?:amp;)?exp=\d+)?)""")
+            .findAll(html)
+            .forEach { iframeUrls.add(unescapeHtml(it.groupValues[1])) }
+
+        val uniqueUrls = iframeUrls
             .map { if (it.startsWith("//")) "https:$it" else it }
+            .filter { it.startsWith("http") && it.contains("streamfree.casa") }
+            .distinct()
+
+        for (iframeSrc in uniqueUrls) {
+            val iframeHtml = fetchIframe(iframeSrc, epUrl, cookies) ?: continue
+            searchInHtml(iframeHtml)?.let { return it }
+        }
+
+        // Fallback: tất cả iframe src/data-src
+        val doc = org.jsoup.Jsoup.parse(html)
+        val jsoupIframes = doc.select("iframe")
+            .mapNotNull { el ->
+                (el.attr("src").ifBlank { null } ?: el.attr("data-src").ifBlank { null })
+            }
+            .filter { !it.contains("googleads") }
+            .map { when {
+                it.startsWith("//") -> "https:$it"
+                it.startsWith("/")  -> "$mainUrl$it"
+                else                -> it
+            }}
             .filter { it.startsWith("http") }
 
-        for (iframeSrc in iframes) {
-            // Dùng CF + truyền cookies từ episode page để bypass csrftoken check
-            val iframeHtml = try {
-                app.get(
-                    iframeSrc,
-                    interceptor = cf,
-                    headers = mapOf(
-                        "User-Agent"      to ua,
-                        "Referer"         to epUrl,
-                        "Accept"          to "text/html,application/xhtml+xml,*/*",
-                        "Accept-Language" to "vi-VN,vi;q=0.9"
-                    ),
-                    cookies = epCookies
-                ).text
-            } catch (_: Exception) { continue }
-
+        for (iframeSrc in jsoupIframes) {
+            val iframeHtml = fetchIframe(iframeSrc, epUrl, cookies) ?: continue
             searchInHtml(iframeHtml)?.let { return it }
         }
 
@@ -202,11 +258,15 @@ class AnimeVietSub : MainAPI() {
 
     private suspend fun emitFromMaster(masterUrl: String, callback: (ExtractorLink) -> Unit): Boolean {
         return try {
-            val masterText = app.get(masterUrl, headers = mapOf("User-Agent" to ua)).text
+            val masterText = app.get(masterUrl, headers = mapOf(
+                "User-Agent" to ua,
+                "Origin"     to "https://streamfree.casa"
+            )).text
+
             if (!masterText.contains("#EXTM3U")) {
                 callback(newExtractorLink(name, "$name Auto", masterUrl) {
                     quality = Qualities.P720.value
-                    referer = ""
+                    referer = "https://streamfree.casa/"
                     type    = ExtractorLinkType.M3U8
                 })
                 return true
@@ -219,31 +279,42 @@ class AnimeVietSub : MainAPI() {
                 val line = lines[i].trim()
                 if (line.startsWith("#EXT-X-STREAM-INF")) {
                     val nextLine = lines.getOrNull(i + 1)?.trim() ?: ""
-                    if (nextLine.startsWith("http")) {
-                        val height = Regex("""RESOLUTION=\d+x(\d+)""")
-                            .find(line)?.groupValues?.get(1)?.toIntOrNull() ?: 0
-                        val quality = when {
-                            height >= 1080 -> Qualities.P1080.value
-                            height >= 720  -> Qualities.P720.value
-                            height >= 480  -> Qualities.P480.value
-                            else           -> Qualities.P360.value
+                    // Hỗ trợ cả absolute URL (http) và relative path
+                    val streamUrl = when {
+                        nextLine.startsWith("http") -> nextLine
+                        nextLine.startsWith("/") -> {
+                            val base = Regex("""^(https?://[^/]+)""").find(masterUrl)?.value ?: ""
+                            "$base$nextLine"
                         }
-                        val label = when {
-                            height >= 1080 -> "FHD 1080p"
-                            height >= 720  -> "HD 720p"
-                            height >= 480  -> "SD 480p"
-                            height > 0     -> "${height}p"
-                            else           -> "Auto"
+                        nextLine.isNotBlank() -> {
+                            val base = masterUrl.substringBeforeLast("/")
+                            "$base/$nextLine"
                         }
-                        callback(newExtractorLink(name, "$name $label", nextLine) {
-                            this.quality = quality
-                            this.referer = ""
-                            type = ExtractorLinkType.M3U8
-                        })
-                        foundAny = true
-                        i += 2
-                        continue
+                        else -> { i++; continue }
                     }
+                    val height = Regex("""RESOLUTION=\d+x(\d+)""")
+                        .find(line)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+                    val quality = when {
+                        height >= 1080 -> Qualities.P1080.value
+                        height >= 720  -> Qualities.P720.value
+                        height >= 480  -> Qualities.P480.value
+                        else           -> Qualities.P360.value
+                    }
+                    val label = when {
+                        height >= 1080 -> "FHD 1080p"
+                        height >= 720  -> "HD 720p"
+                        height >= 480  -> "SD 480p"
+                        height > 0     -> "${height}p"
+                        else           -> "Auto"
+                    }
+                    callback(newExtractorLink(name, "$name $label", streamUrl) {
+                        this.quality = quality
+                        this.referer = "https://streamfree.casa/"
+                        type = ExtractorLinkType.M3U8
+                    })
+                    foundAny = true
+                    i += 2
+                    continue
                 }
                 i++
             }
@@ -251,7 +322,7 @@ class AnimeVietSub : MainAPI() {
             if (!foundAny) {
                 callback(newExtractorLink(name, "$name HD", masterUrl) {
                     quality = Qualities.P720.value
-                    referer = ""
+                    referer = "https://streamfree.casa/"
                     type    = ExtractorLinkType.M3U8
                 })
             }
@@ -259,7 +330,7 @@ class AnimeVietSub : MainAPI() {
         } catch (_: Exception) {
             callback(newExtractorLink(name, "$name HD", masterUrl) {
                 quality = Qualities.P720.value
-                referer = ""
+                referer = "https://streamfree.casa/"
                 type    = ExtractorLinkType.M3U8
             })
             true
@@ -273,14 +344,12 @@ class AnimeVietSub : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val epUrl = fix(data) ?: return false
-
-        // Fetch episode page - lấy cả cookies
         val epResponse = try {
             app.get(epUrl, interceptor = cf, headers = hdrs)
         } catch (_: Exception) { return false }
 
-        val html      = epResponse.text
-        val cookies   = epResponse.cookies
+        val html    = epResponse.text
+        val cookies = epResponse.cookies
 
         val masterUrl = findStreamUrl(html, epUrl, cookies) ?: return false
         return emitFromMaster(masterUrl, callback)

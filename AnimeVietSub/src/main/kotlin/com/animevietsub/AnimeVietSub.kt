@@ -134,7 +134,7 @@ class AnimeVietSub : MainAPI() {
             for ((index, pattern) in patterns.withIndex()) {
                 val match = pattern.find(html)
                 if (match != null) {
-                    foundUrl = if (match.groupCount > 0) match.groupValues[1] else match.value
+                    foundUrl = if (match.groupValues.size > 1) match.groupValues[1] else match.value
                     Log.d("AnimeVui", "Pattern $index matched: $foundUrl")
                     break
                 }
@@ -169,7 +169,7 @@ class AnimeVietSub : MainAPI() {
                         patterns.forEach { pattern ->
                             val match = pattern.find(iframeHtml)
                             if (match != null) {
-                                foundUrl = if (match.groupCount > 0) match.groupValues[1] else match.value
+                                foundUrl = if (match.groupValues.size > 1) match.groupValues[1] else match.value
                                 Log.d("AnimeVui", "Found in iframe: $foundUrl")
                                 return@forEach
                             }

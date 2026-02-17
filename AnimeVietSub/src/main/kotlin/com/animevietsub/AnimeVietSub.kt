@@ -1,6 +1,5 @@
 package com.animevietsub
 
-import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
@@ -107,6 +106,42 @@ class AnimeVietSub : MainAPI() {
         }
     }
 
+    private suspend fun extractFromHtml(html: String, referer: String): String? {
+        // Pattern 1: var streamUrl = "..."
+        Regex("""var\s+streamUrl\s*=\s*["']([^"']+)["']""").find(html)?.let {
+            return it.groupValues[1]
+        }
+        // Pattern 2: streamUrl = "..."
+        Regex("""streamUrl\s*=\s*["']([^"']+)["']""").find(html)?.let {
+            return it.groupValues[1]
+        }
+        // Pattern 3: twimg URL trực tiếp
+        Regex("""(https://video\.twimg\.com/amplify_video/\d+/pl/[A-Za-z0-9_\-]+\.m3u8)""")
+            .find(html)?.let { return it.groupValues[1] }
+
+        // Không tìm thấy trong HTML chính → thử fetch iframe
+        val doc = org.jsoup.Jsoup.parse(html)
+        val iframeSrc = doc.select("iframe[src]").firstNotNullOfOrNull { f ->
+            val s = f.attr("src")
+            if (s.isNotBlank() && !s.contains("googleads")) fix(s) else null
+        } ?: return null
+
+        return try {
+            val iframeHtml = app.get(iframeSrc, interceptor = cf, headers = mapOf(
+                "User-Agent" to ua,
+                "Referer" to referer,
+                "Origin" to mainUrl,
+                "Accept" to "text/html,application/xhtml+xml,*/*",
+                "Accept-Language" to "vi-VN,vi;q=0.9"
+            )).text
+
+            Regex("""var\s+streamUrl\s*=\s*["']([^"']+)["']""").find(iframeHtml)?.groupValues?.get(1)
+                ?: Regex("""streamUrl\s*=\s*["']([^"']+)["']""").find(iframeHtml)?.groupValues?.get(1)
+                ?: Regex("""(https://video\.twimg\.com/amplify_video/\d+/pl/[A-Za-z0-9_\-]+\.m3u8)""")
+                    .find(iframeHtml)?.groupValues?.get(1)
+        } catch (_: Exception) { null }
+    }
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -114,131 +149,48 @@ class AnimeVietSub : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val epUrl = fix(data) ?: return false
-        Log.d("AnimeVui", "Loading: $epUrl")
-        
-        try {
-            val response = app.get(epUrl, interceptor = cf, headers = pageH)
-            val html = response.text
-            
-            Log.d("AnimeVui", "HTML length: ${html.length}")
-            
-            // Thử nhiều pattern khác nhau
-            val patterns = listOf(
-                Regex("""var\s+streamUrl\s*=\s*["']([^"']+)["']"""),
-                Regex("""streamUrl\s*=\s*["']([^"']+)["']"""),
-                Regex("""https://video\.twimg\.com/amplify_video/\d+/pl/[A-Za-z0-9_\-]+\.m3u8""")
-            )
-            
-            var foundUrl: String? = null
-            
-            for ((index, pattern) in patterns.withIndex()) {
-                val match = pattern.find(html)
-                if (match != null) {
-                    foundUrl = if (match.groupValues.size > 1) match.groupValues[1] else match.value
-                    Log.d("AnimeVui", "Pattern $index matched: $foundUrl")
-                    break
-                }
-            }
-            
-            if (foundUrl == null) {
-                Log.d("AnimeVui", "No streamUrl found. Checking HTML snippet:")
-                // Log một đoạn HTML để debug
-                val scriptSnippet = html.indexOf("<script").let { start ->
-                    if (start > 0) html.substring(start, minOf(start + 500, html.length))
-                    else "No script tag found"
-                }
-                Log.d("AnimeVui", "Script snippet: $scriptSnippet")
-                
-                // Thử fetch iframe streamfree.casa
-                val doc = org.jsoup.Jsoup.parse(html)
-                val iframe = doc.selectFirst("iframe[src*='streamfree']")
-                if (iframe != null) {
-                    val iframeSrc = iframe.attr("src")
-                    Log.d("AnimeVui", "Found iframe: $iframeSrc")
-                    
-                    // Fetch iframe content
-                    try {
-                        val iframeHtml = app.get(iframeSrc, headers = mapOf(
-                            "User-Agent" to ua,
-                            "Referer" to epUrl
-                        )).text
-                        
-                        Log.d("AnimeVui", "Iframe HTML length: ${iframeHtml.length}")
-                        
-                        // Tìm streamUrl trong iframe
-                        patterns.forEach { pattern ->
-                            val match = pattern.find(iframeHtml)
-                            if (match != null) {
-                                foundUrl = if (match.groupValues.size > 1) match.groupValues[1] else match.value
-                                Log.d("AnimeVui", "Found in iframe: $foundUrl")
-                                return@forEach
-                            }
-                        }
-                    } catch (e: Exception) {
-                        Log.d("AnimeVui", "Iframe fetch error: ${e.message}")
+
+        val html = try {
+            app.get(epUrl, interceptor = cf, headers = pageH).text
+        } catch (_: Exception) { return false }
+
+        val masterUrl = extractFromHtml(html, epUrl) ?: return false
+
+        // Fetch master playlist
+        val masterText = try {
+            app.get(masterUrl, headers = mapOf("User-Agent" to ua)).text
+        } catch (_: Exception) { "" }
+
+        if (masterText.contains("#EXTM3U")) {
+            val baseUrl = masterUrl.substringBeforeLast("/")
+            var foundAny = false
+
+            Regex("""#EXT-X-STREAM-INF:.*?RESOLUTION=(\d+)x(\d+).*?\n([^\s]+)""")
+                .findAll(masterText).forEach { match ->
+                    val width  = match.groupValues[1].toIntOrNull() ?: 0
+                    val height = match.groupValues[2].toIntOrNull() ?: 0
+                    val path   = match.groupValues[3]
+                    val streamUrl = if (path.startsWith("http")) path else "$baseUrl/$path"
+                    val quality = when {
+                        height >= 720 || width >= 1280 -> Qualities.P720.value
+                        height >= 480 || width >= 640  -> Qualities.P480.value
+                        else                           -> Qualities.P360.value
                     }
+                    callback(newExtractorLink(name, "$name ${height}p", streamUrl) {
+                        this.quality = quality
+                        type = ExtractorLinkType.M3U8
+                    })
+                    foundAny = true
                 }
-                
-                if (foundUrl == null) return false
-            }
-            
-            // Emit video URL
-            val masterUrl = foundUrl!!
-            Log.d("AnimeVui", "Final master URL: $masterUrl")
-            
-            // Fetch master playlist
-            val masterText = try {
-                app.get(masterUrl, headers = mapOf("User-Agent" to ua)).text
-            } catch (e: Exception) {
-                Log.d("AnimeVui", "Master fetch error: ${e.message}")
-                ""
-            }
-            
-            if (masterText.contains("#EXTM3U")) {
-                val baseUrl = masterUrl.substringBeforeLast("/")
-                var foundAny = false
-                
-                Regex("""#EXT-X-STREAM-INF:.*?RESOLUTION=(\d+)x(\d+).*?\n([^\s]+)""")
-                    .findAll(masterText).forEach { match ->
-                        val width = match.groupValues[1].toIntOrNull() ?: 0
-                        val height = match.groupValues[2].toIntOrNull() ?: 0
-                        val path = match.groupValues[3]
-                        
-                        val streamUrl = if (path.startsWith("http")) path else "$baseUrl/$path"
-                        
-                        val quality = when {
-                            height >= 720 || width >= 1280 -> Qualities.P720.value
-                            height >= 480 || width >= 640  -> Qualities.P480.value
-                            else                           -> Qualities.P360.value
-                        }
-                        
-                        Log.d("AnimeVui", "Emitting: ${height}p - $streamUrl")
-                        
-                        callback(newExtractorLink(
-                            name,
-                            "$name ${height}p",
-                            streamUrl
-                        ) {
-                            this.quality = quality
-                            type = ExtractorLinkType.M3U8
-                        })
-                        foundAny = true
-                    }
-                
-                return foundAny
-            }
-            
-            // Fallback: emit master
-            Log.d("AnimeVui", "Emitting master fallback")
-            callback(newExtractorLink(name, name, masterUrl) {
-                quality = Qualities.Unknown.value
-                type = ExtractorLinkType.M3U8
-            })
-            return true
-            
-        } catch (e: Exception) {
-            Log.e("AnimeVui", "Error: ${e.message}", e)
-            return false
+
+            if (foundAny) return true
         }
+
+        // Fallback: emit master trực tiếp
+        callback(newExtractorLink(name, name, masterUrl) {
+            quality = Qualities.Unknown.value
+            type = ExtractorLinkType.M3U8
+        })
+        return true
     }
 }

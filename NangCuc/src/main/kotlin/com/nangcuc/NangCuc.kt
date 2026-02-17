@@ -90,16 +90,60 @@ class NangCucProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val doc = app.get(data, headers = headers).document
+
+        // Xử lý iframe
         doc.select("iframe[src], iframe[data-src], iframe[data-lazy-src], iframe[srcdoc]").forEach {
             val src = it.attr("data-lazy-src").takeIf { s -> s.isNotEmpty() }
                 ?: it.attr("data-src").takeIf { s -> s.isNotEmpty() }
                 ?: it.attr("src").takeIf { s -> s.isNotEmpty() }
                 ?: return@forEach
             val iframeUrl = fixUrl(src)
-            if (iframeUrl.isNotEmpty()) {
-                loadExtractor(iframeUrl, data, subtitleCallback, callback)  // Referer = trang phim (data)
+            if (iframeUrl.contains("dfplayer.net")) {
+                // Đặc biệt cho dfplayer: fetch iframe với referer đúng
+                val iframeDoc = app.get(iframeUrl, headers = headers, referer = data).document
+                iframeDoc.select("script").forEach { script ->
+                    val content = script.html()
+                    val m3u8Regex = Regex("""["']?file["']?\s*:\s*["']([^"']+\.m3u8[^"']*)["']""")
+                    m3u8Regex.find(content)?.groupValues?.get(1)?.let { m3u8 ->
+                        val link = fixUrl(m3u8)
+                        callback(
+                            ExtractorLink(
+                                name,
+                                name,
+                                link,
+                                referer = data,
+                                quality = Qualities.Unknown.value,
+                                isM3u8 = true
+                            )
+                        )
+                    }
+                }
+            } else if (iframeUrl.isNotEmpty()) {
+                loadExtractor(iframeUrl, data, subtitleCallback, callback)
             }
         }
+
+        // Parse m3u8 trực tiếp từ script trên trang chính (Playerjs)
+        doc.select("script").forEach { script ->
+            val content = script.html()
+            if (content.contains(".m3u8")) {
+                val m3u8Regex = Regex("""["']?file["']?\s*:\s*["']([^"']+\.m3u8[^"']*)["']""")
+                m3u8Regex.findAll(content).forEach { match ->
+                    val link = fixUrl(match.groupValues[1])
+                    callback(
+                        ExtractorLink(
+                            name,
+                            name,
+                            link,
+                            referer = data,
+                            quality = Qualities.Unknown.value,
+                            isM3u8 = true
+                        )
+                    )
+                }
+            }
+        }
+
         return true
     }
 }

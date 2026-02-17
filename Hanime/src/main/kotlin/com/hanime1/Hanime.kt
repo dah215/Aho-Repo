@@ -28,11 +28,8 @@ class Hanime1Provider : MainAPI() {
 
     override val mainPage = mainPageOf(
         "" to "Trang Chủ (Xu Hướng)",
-        "search?sort=created_at" to "Mới Cập Nhật",
-        "search?sort=views_count" to "Xem Nhiều Nhất",
-        "search?genre=無修正" to "Không Che (Uncensored)",
-        "search?genre=裏番" to "Series Hentai",
-        "search?genre=中文字幕" to "Phụ đề (Chinese Sub)",
+        "search?query=&type=&genre=%E8%A3%8F%E7%95%AA&sort=&date=&duration=" to "裏番",
+        "search?query=&type=&genre=%E6%B3%A1%E9%BA%B5%E7%95%AA&sort=&date=&duration=" to "泡麵番t",
         "search?genre=3DCG" to "Phim 3D"
     )
 

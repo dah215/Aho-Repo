@@ -18,7 +18,8 @@ class NangCucProvider : MainAPI() {
     override var name = "Nắng Cực"
     override var lang = "vi"
     override val hasMainPage = true
-    override val supportedTypes = setOf(TvType.Movie)
+    // Đổi từ TvType.Movie sang TvType.NSFW để đánh dấu nội dung người lớn
+    override val supportedTypes = setOf(TvType.NSFW)
 
     private val headers = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
@@ -49,7 +50,8 @@ class NangCucProvider : MainAPI() {
             val linkEl = el.selectFirst("a.item-box__image") ?: return@mapNotNull null
             val href = fixUrl(linkEl.attr("href"))
             val title = linkEl.attr("title").ifBlank { el.selectFirst("p.item-box__title")?.text() ?: "" }
-            newMovieSearchResponse(title.trim(), href, TvType.Movie) {
+            // Sử dụng TvType.NSFW ở đây
+            newSearchResponse(title.trim(), href, TvType.NSFW) {
                 this.posterUrl = el.selectFirst("img")?.attr("abs:src")
             }
         }
@@ -61,7 +63,8 @@ class NangCucProvider : MainAPI() {
         val doc = app.get(url, headers = headers).document
         return doc.select("div.item-box").mapNotNull { el ->
             val linkEl = el.selectFirst("a.item-box__image") ?: return@mapNotNull null
-            newMovieSearchResponse(linkEl.attr("title"), fixUrl(linkEl.attr("href")), TvType.Movie) {
+            // Sử dụng TvType.NSFW ở đây
+            newSearchResponse(linkEl.attr("title"), fixUrl(linkEl.attr("href")), TvType.NSFW) {
                 this.posterUrl = el.selectFirst("img")?.attr("abs:src")
             }
         }
@@ -73,10 +76,13 @@ class NangCucProvider : MainAPI() {
         val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
         val desc = doc.selectFirst("article p")?.text()?.trim()
 
-        return newMovieLoadResponse(title, url, TvType.Movie, url) {
+        // Sử dụng TvType.NSFW ở đây
+        return newAnimeLoadResponse(title, url, TvType.NSFW) {
             this.posterUrl = poster
             this.plot = desc
             this.tags = doc.select(".categories a").map { it.text() }
+            // Thêm tập phim ảo vì NSFW thường coi như 1 tập
+            addEpisodes(TvType.NSFW, DefaultEpisode(url, title))
         }
     }
 
@@ -88,7 +94,6 @@ class NangCucProvider : MainAPI() {
     ): Boolean {
         val doc = app.get(data, headers = headers).document
 
-        // 1. Tìm tất cả các nguồn video từ thuộc tính data-source và iframe
         val sources = doc.select("[data-source]").map { it.attr("data-source") }.toMutableList()
         doc.select("iframe").forEach { sources.add(it.attr("src")) }
 
@@ -116,7 +121,6 @@ class NangCucProvider : MainAPI() {
             }
         }
 
-        // 2. Quét thêm link m3u8 trực tiếp trong script
         doc.select("script").forEach { script ->
             val content = script.html()
             Regex("""["'](https?://[^"']+\.m3u8[^"']*)["']""").findAll(content).forEach { match ->

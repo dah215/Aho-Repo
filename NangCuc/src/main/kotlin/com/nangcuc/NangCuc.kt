@@ -18,7 +18,7 @@ class NangCucProvider : MainAPI() {
     override var name = "Nắng Cực"
     override var lang = "vi"
     override val hasMainPage = true
-    // Đổi từ TvType.Movie sang TvType.NSFW để đánh dấu nội dung người lớn
+    // Đánh dấu toàn bộ plugin là nội dung người lớn
     override val supportedTypes = setOf(TvType.NSFW)
 
     private val headers = mapOf(
@@ -50,8 +50,8 @@ class NangCucProvider : MainAPI() {
             val linkEl = el.selectFirst("a.item-box__image") ?: return@mapNotNull null
             val href = fixUrl(linkEl.attr("href"))
             val title = linkEl.attr("title").ifBlank { el.selectFirst("p.item-box__title")?.text() ?: "" }
-            // Sử dụng TvType.NSFW ở đây
-            newSearchResponse(title.trim(), href, TvType.NSFW) {
+            // Sử dụng newMovieSearchResponse nhưng truyền TvType.NSFW
+            newMovieSearchResponse(title.trim(), href, TvType.NSFW) {
                 this.posterUrl = el.selectFirst("img")?.attr("abs:src")
             }
         }
@@ -63,8 +63,7 @@ class NangCucProvider : MainAPI() {
         val doc = app.get(url, headers = headers).document
         return doc.select("div.item-box").mapNotNull { el ->
             val linkEl = el.selectFirst("a.item-box__image") ?: return@mapNotNull null
-            // Sử dụng TvType.NSFW ở đây
-            newSearchResponse(linkEl.attr("title"), fixUrl(linkEl.attr("href")), TvType.NSFW) {
+            newMovieSearchResponse(linkEl.attr("title"), fixUrl(linkEl.attr("href")), TvType.NSFW) {
                 this.posterUrl = el.selectFirst("img")?.attr("abs:src")
             }
         }
@@ -76,13 +75,11 @@ class NangCucProvider : MainAPI() {
         val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
         val desc = doc.selectFirst("article p")?.text()?.trim()
 
-        // Sử dụng TvType.NSFW ở đây
-        return newAnimeLoadResponse(title, url, TvType.NSFW) {
+        // Sử dụng newMovieLoadResponse cho đơn giản, vẫn truyền TvType.NSFW
+        return newMovieLoadResponse(title, url, TvType.NSFW, url) {
             this.posterUrl = poster
             this.plot = desc
             this.tags = doc.select(".categories a").map { it.text() }
-            // Thêm tập phim ảo vì NSFW thường coi như 1 tập
-            addEpisodes(TvType.NSFW, DefaultEpisode(url, title))
         }
     }
 

@@ -26,12 +26,14 @@ class Hanime1Provider : MainAPI() {
         "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7"
     )
 
+    // Sử dụng URL đã được mã hóa (URL Encoded) để đảm bảo server nhận diện đúng category
     override val mainPage = mainPageOf(
         "search?sort=created_at" to "Mới Cập Nhật",
         "search?sort=views_count" to "Xem Nhiều Nhất",
-        "search?type=hentai&genre=無修正" to "Không Che (Uncensored)",
-        "search?type=hentai&genre=裏番" to "Series Hentai",
-        "search?type=hentai&genre=日本語字幕" to "Vietsub/Phụ đề"
+        "search?genre=%E7%84%A1%E4%BF%AE%E6%AD%A3" to "Không Che (Uncensored)",
+        "search?genre=%E8%A3%8F%E7%95%AA" to "Series Hentai (裏番)",
+        "search?genre=%E4%B8%AD%E6%96%87%E5%AD%97%E5%B9%95" to "Có Phụ Đề (Dễ xem)",
+        "search?genre=3DCG" to "Phim 3D"
     )
 
     private fun fixUrl(url: String): String {
@@ -45,7 +47,7 @@ class Hanime1Provider : MainAPI() {
         val linkEl = el.selectFirst("a.video-link") ?: return null
         val href = fixUrl(linkEl.attr("href"))
         
-        // Loại bỏ các mục quảng cáo (Sponsor)
+        // Bỏ qua quảng cáo
         if (!href.contains("watch?v=")) return null
         
         val title = el.selectFirst(".title")?.text()?.trim() ?: return null
@@ -57,11 +59,13 @@ class Hanime1Provider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        // Cấu trúc phân trang: search?sort=created_at&page=2
-        val url = "$mainUrl/${request.data}${if (page > 1) "&page=$page" else ""}"
-        val doc = app.get(url, headers = headers).document
+        val url = if (request.data.contains("?")) {
+            "$mainUrl/${request.data}${if (page > 1) "&page=$page" else ""}"
+        } else {
+            "$mainUrl/${request.data}${if (page > 1) "?page=$page" else ""}"
+        }
         
-        // Selector chính xác dựa trên HTML bạn gửi
+        val doc = app.get(url, headers = headers).document
         val items = doc.select(".video-item-container").mapNotNull { 
             parseItem(it) 
         }
@@ -99,7 +103,7 @@ class Hanime1Provider : MainAPI() {
         val res = app.get(data, headers = headers)
         val html = res.text
 
-        // 1. Lấy link từ thẻ video source (Plyr thường render ra đây)
+        // 1. Lấy link từ thẻ video source
         res.document.select("video source").forEach { source ->
             val videoUrl = source.attr("src")
             if (videoUrl.isNotBlank()) {
@@ -118,7 +122,7 @@ class Hanime1Provider : MainAPI() {
             }
         }
 
-        // 2. Quét link MP4 trực tiếp từ script (Dành cho server hembed)
+        // 2. Quét link MP4 trực tiếp từ script
         val mp4Regex = Regex("""https?[:\\]+[/\\/]+[^\s"'<>]+?\.mp4[^\s"'<>]*""")
         mp4Regex.findAll(html).forEach { match ->
             val link = match.value.replace("\\/", "/")

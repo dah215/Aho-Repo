@@ -16,7 +16,7 @@ class Hanime1Plugin : Plugin() {
 class Hanime1Provider : MainAPI() {
     override var mainUrl = "https://hanime1.me"
     override var name = "Hanime1"
-    override var lang = "zh" // Trang này gốc tiếng Trung nhưng nội dung trực quan
+    override var lang = "zh"
     override val hasMainPage = true
     override val supportedTypes = setOf(TvType.NSFW)
 
@@ -97,7 +97,6 @@ class Hanime1Provider : MainAPI() {
         doc.select("video source").forEach { source ->
             val videoUrl = source.attr("src")
             if (videoUrl.isNotBlank()) {
-                // Lấy chất lượng từ thuộc tính size (ví dụ: 720, 1080)
                 val qualityStr = source.attr("size")
                 val quality = when (qualityStr) {
                     "1080" -> Qualities.P1080.value
@@ -108,33 +107,34 @@ class Hanime1Provider : MainAPI() {
                 }
 
                 callback(
-                    ExtractorLink(
+                    newExtractorLink(
                         name,
-                        "$name $qualityStr" + "p",
+                        "$name ${qualityStr}p",
                         videoUrl,
-                        referer = data,
-                        quality = quality,
                         type = ExtractorLinkType.VIDEO
-                    )
+                    ) {
+                        this.referer = data
+                        this.quality = quality
+                    }
                 )
             }
         }
 
-        // Đôi khi link nằm trong script dưới dạng biến video_sources
+        // Dự phòng: Tìm link mp4 trong script nếu không có thẻ source
         if (doc.select("video source").isEmpty()) {
             val html = doc.html()
-            // Tìm các link mp4 trong script
             Regex("""https?://[^\s"'<>]+?\.mp4[^\s"'<>]*""").findAll(html).forEach { match ->
                 val link = match.value
                 callback(
-                    ExtractorLink(
+                    newExtractorLink(
                         name,
                         name,
                         link,
-                        referer = data,
-                        quality = Qualities.Unknown.value,
                         type = ExtractorLinkType.VIDEO
-                    )
+                    ) {
+                        this.referer = data
+                        this.quality = Qualities.Unknown.value
+                    }
                 )
             }
         }

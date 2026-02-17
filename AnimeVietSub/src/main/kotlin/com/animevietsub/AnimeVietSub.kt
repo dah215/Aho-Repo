@@ -118,16 +118,20 @@ class AnimeVietSub : MainAPI() {
             app.get(watchUrl, interceptor = cf, headers = hdrs).document
         } catch (_: Exception) { doc }
 
-        val episodes = watchDoc.select("a[href*='/tap-']")
+        // Tìm episode links - thử nhiều selector
+        val epLinks = watchDoc.select("a[href*='/tap-'], a[href*='/episode-'], a[href*='/ep-']")
+            .ifEmpty { watchDoc.select("a[href*='/xem-phim/']") }
             .distinctBy { it.attr("href") }
-            .mapNotNull { ep ->
+
+        val episodes = epLinks.mapNotNull { ep ->
                 val href = fix(ep.attr("href")) ?: return@mapNotNull null
-                if (!href.contains("/xem-phim/")) return@mapNotNull null
-                val raw   = ep.text().trim().ifBlank { ep.attr("title").trim() }
-                val epNum = Regex("""tap-0*(\d+)""").find(href)?.groupValues?.get(1)?.toIntOrNull()
+                val raw  = ep.text().trim().ifBlank { ep.attr("title").trim() }
+                val epNum = Regex("""(?:tap|ep|episode)-0*(\d+)""", RegexOption.IGNORE_CASE)
+                    .find(href)?.groupValues?.get(1)?.toIntOrNull()
                     ?: Regex("""(\d+)""").find(raw)?.groupValues?.get(1)?.toIntOrNull()
+                    ?: Regex("""(\d+)""").find(href)?.groupValues?.get(1)?.toIntOrNull()
                 newEpisode(href) {
-                    name    = raw.ifBlank { "Tập $epNum" }
+                    name    = raw.ifBlank { "Tập ${epNum ?: ""}" }.trim()
                     episode = epNum
                 }
             }
@@ -256,87 +260,14 @@ class AnimeVietSub : MainAPI() {
         return null
     }
 
-    private suspend fun emitFromMaster(masterUrl: String, callback: (ExtractorLink) -> Unit): Boolean {
-        return try {
-            val fetchHeaders = if (masterUrl.contains("twimg.com")) {
-                mapOf("User-Agent" to ua)
-            } else {
-                mapOf("User-Agent" to ua, "Referer" to "https://streamfree.casa/", "Origin" to "https://streamfree.casa")
-            }
-            val masterText = app.get(masterUrl, headers = fetchHeaders).text
-
-            if (!masterText.contains("#EXTM3U")) {
-                callback(newExtractorLink(name, "$name Auto", masterUrl) {
-                    quality = Qualities.P720.value
-                    referer = if (masterUrl.contains("twimg.com")) "" else "https://streamfree.casa/"
-                    type    = ExtractorLinkType.M3U8
-                })
-                return true
-            }
-
-            val lines = masterText.lines()
-            var foundAny = false
-            var i = 0
-            while (i < lines.size) {
-                val line = lines[i].trim()
-                if (line.startsWith("#EXT-X-STREAM-INF")) {
-                    val nextLine = lines.getOrNull(i + 1)?.trim() ?: ""
-                    // Hỗ trợ cả absolute URL (http) và relative path
-                    val streamUrl = when {
-                        nextLine.startsWith("http") -> nextLine
-                        nextLine.startsWith("/") -> {
-                            val base = Regex("""^(https?://[^/]+)""").find(masterUrl)?.value ?: ""
-                            "$base$nextLine"
-                        }
-                        nextLine.isNotBlank() -> {
-                            val base = masterUrl.substringBeforeLast("/")
-                            "$base/$nextLine"
-                        }
-                        else -> { i++; continue }
-                    }
-                    val height = Regex("""RESOLUTION=\d+x(\d+)""")
-                        .find(line)?.groupValues?.get(1)?.toIntOrNull() ?: 0
-                    val quality = when {
-                        height >= 1080 -> Qualities.P1080.value
-                        height >= 720  -> Qualities.P720.value
-                        height >= 480  -> Qualities.P480.value
-                        else           -> Qualities.P360.value
-                    }
-                    val label = when {
-                        height >= 1080 -> "FHD 1080p"
-                        height >= 720  -> "HD 720p"
-                        height >= 480  -> "SD 480p"
-                        height > 0     -> "${height}p"
-                        else           -> "Auto"
-                    }
-                    callback(newExtractorLink(name, "$name $label", streamUrl) {
-                        this.quality = quality
-                        this.referer = if (streamUrl.contains("twimg.com")) "" else "https://streamfree.casa/"
-                        type = ExtractorLinkType.M3U8
-                    })
-                    foundAny = true
-                    i += 2
-                    continue
-                }
-                i++
-            }
-
-            if (!foundAny) {
-                callback(newExtractorLink(name, "$name HD", masterUrl) {
-                    quality = Qualities.P720.value
-                    referer = if (masterUrl.contains("twimg.com")) "" else "https://streamfree.casa/"
-                    type    = ExtractorLinkType.M3U8
-                })
-            }
-            true
-        } catch (_: Exception) {
-            callback(newExtractorLink(name, "$name HD", masterUrl) {
-                quality = Qualities.P720.value
-                referer = if (masterUrl.contains("twimg.com")) "" else "https://streamfree.casa/"
-                type    = ExtractorLinkType.M3U8
-            })
-            true
-        }
+    private fun emitMaster(masterUrl: String, callback: (ExtractorLink) -> Unit): Boolean {
+        // Emit master playlist trực tiếp - ExoPlayer tự xử lý HLS quality selection
+        callback(newExtractorLink(name, name, masterUrl) {
+            quality = Qualities.P1080.value
+            referer = ""
+            type    = ExtractorLinkType.M3U8
+        })
+        return true
     }
 
     override suspend fun loadLinks(
@@ -354,6 +285,6 @@ class AnimeVietSub : MainAPI() {
         val cookies = epResponse.cookies
 
         val masterUrl = findStreamUrl(html, epUrl, cookies) ?: return false
-        return emitFromMaster(masterUrl, callback)
+        return emitMaster(masterUrl, callback)
     }
 }

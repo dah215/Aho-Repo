@@ -32,15 +32,17 @@ class NangCucProvider : MainAPI() {
         "the-loai/chau-au/" to "Âu Mỹ",
         "the-loai/han-quoc-18/" to "Hàn Quốc 18+",
         "the-loai/xvideos/" to "Xvideos",
-        "the-loai/nhat-ban/" to "Nhật Bản"
+        "the-loai/nhat-ban/" to "Nhật Bản",
+        "the-loai/khong-che/" to "AV Không che"
     )
 
     private fun fixUrl(url: String): String {
         if (url.isBlank()) return ""
-        if (url.startsWith("http")) return url
-        if (url.startsWith("//")) return "https:$url"
+        var cleanUrl = url.trim().replace("\\/", "/")
+        if (cleanUrl.startsWith("http")) return cleanUrl
+        if (cleanUrl.startsWith("//")) return "https:$cleanUrl"
         val base = mainUrl.removeSuffix("/")
-        return if (url.startsWith("/")) "$base$url" else "$base/$url"
+        return if (cleanUrl.startsWith("/")) "$base$cleanUrl" else "$base/$cleanUrl"
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -72,12 +74,12 @@ class NangCucProvider : MainAPI() {
         val doc = app.get(url, headers = headers).document
         val title = doc.selectFirst("h1")?.text()?.trim() ?: "Untitled"
         val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
-        val desc = doc.selectFirst("article p")?.text()?.trim()
+        val desc = doc.selectFirst("article p, .entry-content p")?.text()?.trim()
 
         return newMovieLoadResponse(title, url, TvType.NSFW, url) {
             this.posterUrl = poster
             this.plot = desc
-            this.tags = doc.select(".categories a").map { it.text() }
+            this.tags = doc.select(".categories a, .tags a").map { it.text() }
         }
     }
 
@@ -91,37 +93,34 @@ class NangCucProvider : MainAPI() {
         val doc = res.document
         val html = res.text
 
-        // 1. Thu thập tất cả các URL tiềm năng từ data-source, iframe và script
         val potentialUrls = mutableSetOf<String>()
         
-        // Lấy từ thuộc tính data-source (Server 1, 2...)
-        doc.select("[data-source]").forEach { potentialUrls.add(it.attr("data-source")) }
+        // 1. Quét tất cả thuộc tính để tìm link server
+        doc.allElements.forEach { el ->
+            el.attributes().forEach { attr ->
+                val value = attr.value
+                if (value.contains("dfplayer") || value.contains(".m3u8") || value.contains("bf.html")) {
+                    potentialUrls.add(value)
+                }
+            }
+        }
         
-        // Lấy từ iframe
-        doc.select("iframe").forEach { potentialUrls.add(it.attr("src")) }
-        
-        // Lấy từ script (Regex tìm các link dfplayer hoặc m3u8)
-        Regex("""https?://[^\s"'<>]+dfplayer\.net[^\s"'<>]+""").findAll(html).forEach { potentialUrls.add(it.value) }
-        Regex("""https?://[^\s"'<>]+\.m3u8[^\s"'<>]*""").findAll(html).forEach { potentialUrls.add(it.value) }
+        // 2. Quét link trong script
+        Regex("""https?[:\\]+[/\\/]+[^\s"'<>]+""").findAll(html).forEach { potentialUrls.add(it.value) }
 
         potentialUrls.filter { it.isNotBlank() }.distinct().forEach { rawUrl ->
             val fullUrl = fixUrl(rawUrl)
             
-            // Xử lý DFPlayer (Hỗ trợ nhiều subdomain: v, player, ...)
-            if (fullUrl.contains("dfplayer.net")) {
-                val did = Regex("""did=(\d+)""").find(fullUrl)?.groupValues?.get(1)
-                    ?: Regex("""/s/(\d+)""").find(fullUrl)?.groupValues?.get(1)
+            // Xử lý DFPlayer (Tự động nhận diện host và ID)
+            if (fullUrl.contains("dfplayer")) {
+                val id = Regex("""(?:did|id|v|s)[=/](\d+)""").find(fullUrl)?.groupValues?.get(1)
+                val host = Regex("""https?://([^/]+)""").find(fullUrl)?.groupValues?.get(1)
                 
-                if (did != null) {
-                    val m3u8Link = "https://v.dfplayer.net/v2/s/$did.m3u8"
+                if (id != null && host != null) {
+                    val m3u8Link = "https://$host/v2/s/$id.m3u8"
                     callback(
-                        newExtractorLink(
-                            "DFPlayer", 
-                            "DFPlayer", 
-                            m3u8Link, 
-                            type = ExtractorLinkType.M3U8
-                        ) {
-                            this.referer = "https://v.dfplayer.net/"
+                        newExtractorLink("DFPlayer", "DFPlayer", m3u8Link, type = ExtractorLinkType.M3U8) {
+                            this.referer = "https://$host/"
                             this.quality = Qualities.P1080.value
                         }
                     )
@@ -130,19 +129,14 @@ class NangCucProvider : MainAPI() {
             // Xử lý link m3u8 trực tiếp
             else if (fullUrl.contains(".m3u8")) {
                 callback(
-                    newExtractorLink(
-                        name, 
-                        "Server VIP", 
-                        fullUrl, 
-                        type = ExtractorLinkType.M3U8
-                    ) {
+                    newExtractorLink(name, "Server VIP", fullUrl, type = ExtractorLinkType.M3U8) {
                         this.referer = data
                         this.quality = Qualities.Unknown.value
                     }
                 )
             }
-            // Thử dùng Extractor mặc định cho các server khác (Doodstream, v.v.)
-            else {
+            // Các server khác
+            else if (fullUrl.contains("dood") || fullUrl.contains("tape") || fullUrl.contains("voe")) {
                 loadExtractor(fullUrl, data, subtitleCallback, callback)
             }
         }

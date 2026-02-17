@@ -107,10 +107,9 @@ class NangCucProvider : MainAPI() {
                     m3u8Regex.find(content)?.groupValues?.get(1)?.let { m3u8 ->
                         val link = fixUrl(m3u8)
                         callback(
-                            ExtractorLink(
-                                name,
-                                name,
-                                link,
+                            newExtractorLink(
+                                name = name,
+                                url = link,
                                 referer = data,
                                 quality = Qualities.Unknown.value,
                                 isM3u8 = true
@@ -131,10 +130,9 @@ class NangCucProvider : MainAPI() {
                 m3u8Regex.findAll(content).forEach { match ->
                     val link = fixUrl(match.groupValues[1])
                     callback(
-                        ExtractorLink(
-                            name,
-                            name,
-                            link,
+                        newExtractorLink(
+                            name = name,
+                            url = link,
                             referer = data,
                             quality = Qualities.Unknown.value,
                             isM3u8 = true

@@ -1,134 +1,19 @@
 package com.animevietsub
 
-import android.annotation.SuppressLint
-import android.webkit.WebResourceRequest
-import android.webkit.WebView
-import android.webkit.WebViewClient
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.extractors.Extractor
 import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
-import kotlinx.coroutines.delay
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
+import java.util.Base64
 
 @CloudstreamPlugin
 class AnimeVietSubPlugin : Plugin() {
-    override fun load() { 
-        registerMainAPI(AnimeVietSub())
-        registerExtractorAPI(StreamFreeCasa())
-    }
+    override fun load() { registerMainAPI(AnimeVietSub()) }
 }
 
-// ===== CUSTOM EXTRACTOR CHO STREAMFREE.CASA =====
-class StreamFreeCasa : Extractor() {
-    override val name = "StreamFree"
-    override val mainUrl = "https://streamfree.casa"
-    override val requiresReferer = true
-
-    @SuppressLint("SetJavaScriptEnabled")
-    override suspend fun getUrl(
-        url: String,
-        referer: String?,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ) {
-        val foundUrls = mutableSetOf<String>()
-        
-        try {
-            val latch = CountDownLatch(1)
-            val ua = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 " +
-                     "(KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36"
-
-            android.os.Handler(android.os.Looper.getMainLooper()).post {
-                try {
-                    val webView = WebView(app.applicationContext).apply {
-                        settings.apply {
-                            javaScriptEnabled = true
-                            domStorageEnabled = true
-                            databaseEnabled = true
-                            mediaPlaybackRequiresUserGesture = false
-                            userAgentString = ua
-                        }
-
-                        webViewClient = object : WebViewClient() {
-                            override fun shouldInterceptRequest(
-                                view: WebView?,
-                                request: WebResourceRequest?
-                            ): android.webkit.WebResourceResponse? {
-                                val reqUrl = request?.url?.toString() ?: ""
-                                
-                                // Bắt video.twimg.com m3u8/mp4
-                                if (reqUrl.contains("video.twimg.com") && 
-                                    (reqUrl.contains(".m3u8") || reqUrl.contains(".mp4"))) {
-                                    foundUrls.add(reqUrl)
-                                    android.os.Handler(android.os.Looper.getMainLooper())
-                                        .postDelayed({ latch.countDown() }, 500)
-                                }
-                                return null
-                            }
-                        }
-
-                        loadUrl(url, mapOf(
-                            "User-Agent" to ua,
-                            "Referer" to (referer ?: "")
-                        ))
-                    }
-
-                    // Timeout 12s
-                    android.os.Handler(android.os.Looper.getMainLooper())
-                        .postDelayed({ latch.countDown() }, 12000)
-                } catch (e: Exception) {
-                    latch.countDown()
-                }
-            }
-
-            latch.await(12, TimeUnit.SECONDS)
-        } catch (_: Exception) {}
-
-        // Emit tất cả video URLs
-        for (videoUrl in foundUrls) {
-            // Nếu là master m3u8 → fetch để lấy các chất lượng
-            if (videoUrl.contains("/pl/") && videoUrl.contains(".m3u8")) {
-                try {
-                    val masterText = app.get(videoUrl).text
-                    if (masterText.contains("#EXTM3U")) {
-                        val baseUrl = "https://video.twimg.com"
-                        Regex("""#EXT-X-STREAM-INF:.*?RESOLUTION=(\d+x\d+).*?\n(/[^\s]+)""")
-                            .findAll(masterText).forEach { mr ->
-                                val resolution = mr.groupValues[1]
-                                val path = mr.groupValues[2]
-                                val streamUrl = if (path.startsWith("http")) path else "$baseUrl$path"
-                                val quality = when {
-                                    resolution.contains("1280") || resolution.contains("1920") -> Qualities.P720.value
-                                    resolution.contains("640") -> Qualities.P480.value
-                                    else -> Qualities.P360.value
-                                }
-                                callback(ExtractorLink(
-                                    name, "$name $resolution", streamUrl, "", quality,
-                                    type = ExtractorLinkType.M3U8
-                                ))
-                            }
-                        return
-                    }
-                } catch (_: Exception) {}
-            }
-
-            // Fallback: emit URL trực tiếp
-            callback(ExtractorLink(
-                name, name, videoUrl, "", Qualities.Unknown.value,
-                type = if (videoUrl.contains(".m3u8")) ExtractorLinkType.M3U8 
-                      else ExtractorLinkType.VIDEO
-            ))
-        }
-    }
-}
-
-// ===== MAIN API =====
 class AnimeVietSub : MainAPI() {
     override var mainUrl  = "https://animevui.social"
     override var name     = "AnimeVui"
@@ -156,10 +41,10 @@ class AnimeVietSub : MainAPI() {
     private fun detailToWatch(url: String) = url.replace("/thong-tin-phim/", "/xem-phim/")
 
     override val mainPage = mainPageOf(
-        "$mainUrl/"                     to "Trang Chủ",
-        "$mainUrl/the-loai/anime-moi/"  to "Anime Mới",
-        "$mainUrl/the-loai/anime-bo/"   to "Anime Bộ",
-        "$mainUrl/the-loai/hanh-dong/"  to "Action"
+        "$mainUrl/" to "Trang Chủ",
+        "$mainUrl/the-loai/anime-moi/" to "Anime Mới",
+        "$mainUrl/the-loai/anime-bo/" to "Anime Bộ",
+        "$mainUrl/the-loai/hanh-dong/" to "Action"
     )
 
     override suspend fun getMainPage(page: Int, req: MainPageRequest): HomePageResponse {
@@ -222,6 +107,7 @@ class AnimeVietSub : MainAPI() {
         }
     }
 
+    // ===== GIẢI PHÁP ĐƠN GIẢN: Tìm video ID từ iframe base64 param =====
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -233,26 +119,76 @@ class AnimeVietSub : MainAPI() {
             app.get(epUrl, interceptor = cf, headers = pageH).document
         } catch (_: Exception) { return false }
 
-        var foundAny = false
+        val foundUrls = mutableSetOf<String>()
 
-        // Tìm tất cả iframe
-        doc.select("iframe[src]").forEach { iframe ->
-            val src = fix(iframe.attr("src")) ?: return@forEach
-            if (src.contains("googleads") || src.contains("/ads/")) return@forEach
-
-            try {
-                // Dùng custom extractor cho streamfree.casa
-                if (src.contains("streamfree.casa")) {
-                    val extracted = StreamFreeCasa().getUrl(src, epUrl, subtitleCallback, callback)
-                    foundAny = true
-                } else {
-                    // Các iframe khác dùng loadExtractor
-                    if (loadExtractor(src, epUrl, subtitleCallback, callback))
-                        foundAny = true
-                }
-            } catch (_: Exception) {}
+        // Tìm iframe streamfree.casa
+        doc.select("iframe[src*='streamfree']").forEach { iframe ->
+            val src = iframe.attr("src")
+            
+            // Lấy param ?url=BASE64
+            val urlParam = Regex("""[?&]url=([A-Za-z0-9+/=]+)""").find(src)?.groupValues?.get(1)
+            if (urlParam != null) {
+                try {
+                    // Decode base64
+                    val decoded = String(Base64.getDecoder().decode(urlParam))
+                    
+                    // Tìm video ID trong decoded string (19 digits)
+                    Regex("""\d{18,20}""").findAll(decoded).forEach { match ->
+                        val videoId = match.value
+                        // Tạo URL m3u8 từ ID
+                        val m3u8Url = "https://video.twimg.com/amplify_video/$videoId/pl/master.m3u8"
+                        foundUrls.add(m3u8Url)
+                    }
+                } catch (_: Exception) {}
+            }
         }
 
-        return foundAny
+        // Emit URLs
+        for (videoUrl in foundUrls) {
+            try {
+                // Fetch master playlist
+                val masterText = app.get(videoUrl, headers = mapOf("User-Agent" to ua)).text
+                
+                if (masterText.contains("#EXTM3U")) {
+                    val baseUrl = "https://video.twimg.com"
+                    Regex("""#EXT-X-STREAM-INF:.*?RESOLUTION=(\d+x\d+).*?\n(/[^\s]+)""")
+                        .findAll(masterText).forEach { mr ->
+                            val resolution = mr.groupValues[1]
+                            val path = mr.groupValues[2]
+                            val streamUrl = "$baseUrl$path"
+                            val quality = when {
+                                resolution.contains("1280") || resolution.contains("1920") -> Qualities.P720.value
+                                resolution.contains("640") -> Qualities.P480.value
+                                else -> Qualities.P360.value
+                            }
+                            callback(newExtractorLink(name, "$name $resolution", streamUrl) {
+                                referer = ""
+                                this.quality = quality
+                                type = ExtractorLinkType.M3U8
+                            })
+                        }
+                    return true
+                }
+            } catch (_: Exception) {}
+            
+            // Fallback: emit master trực tiếp
+            callback(newExtractorLink(name, name, videoUrl) {
+                referer = ""
+                quality = Qualities.Unknown.value
+                type = ExtractorLinkType.M3U8
+            })
+            return true
+        }
+
+        // Fallback cuối: loadExtractor các iframe khác
+        doc.select("iframe[src]").forEach { iframe ->
+            val src = fix(iframe.attr("src")) ?: return@forEach
+            if (!src.contains("googleads") && !src.contains("/ads/")) {
+                try { loadExtractor(src, epUrl, subtitleCallback, callback) }
+                catch (_: Exception) {}
+            }
+        }
+
+        return foundUrls.isNotEmpty()
     }
 }

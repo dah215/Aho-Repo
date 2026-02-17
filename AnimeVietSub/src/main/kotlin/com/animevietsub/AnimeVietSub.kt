@@ -7,7 +7,6 @@ import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
-import java.util.Base64
 
 @CloudstreamPlugin
 class AnimeVietSubPlugin : Plugin() {
@@ -107,7 +106,7 @@ class AnimeVietSub : MainAPI() {
         }
     }
 
-    // ===== GIẢI PHÁP ĐƠN GIẢN: Tìm video ID từ iframe base64 param =====
+    // ===== GIẢI PHÁP: Parse JavaScript variable từ HTML =====
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -115,80 +114,102 @@ class AnimeVietSub : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val epUrl = fix(data) ?: return false
-        val doc = try {
-            app.get(epUrl, interceptor = cf, headers = pageH).document
-        } catch (_: Exception) { return false }
-
-        val foundUrls = mutableSetOf<String>()
-
-        // Tìm iframe streamfree.casa
-        doc.select("iframe[src*='streamfree']").forEach { iframe ->
-            val src = iframe.attr("src")
+        
+        try {
+            // Fetch HTML của trang episode
+            val html = app.get(epUrl, interceptor = cf, headers = pageH).text
             
-            // Lấy param ?url=BASE64
-            val urlParam = Regex("""[?&]url=([A-Za-z0-9+/=]+)""").find(src)?.groupValues?.get(1)
-            if (urlParam != null) {
-                try {
-                    // Decode base64
-                    val decoded = String(Base64.getDecoder().decode(urlParam))
-                    
-                    // Tìm video ID trong decoded string (19 digits)
-                    Regex("""\d{18,20}""").findAll(decoded).forEach { match ->
-                        val videoId = match.value
-                        // Tạo URL m3u8 từ ID
-                        val m3u8Url = "https://video.twimg.com/amplify_video/$videoId/pl/master.m3u8"
-                        foundUrls.add(m3u8Url)
-                    }
-                } catch (_: Exception) {}
-            }
-        }
-
-        // Emit URLs
-        for (videoUrl in foundUrls) {
-            try {
+            // Tìm var streamUrl = "..."
+            val streamUrlMatch = Regex("""var\s+streamUrl\s*=\s*["']([^"']+)["']""")
+                .find(html)
+            
+            if (streamUrlMatch != null) {
+                val masterUrl = streamUrlMatch.groupValues[1]
+                
                 // Fetch master playlist
-                val masterText = app.get(videoUrl, headers = mapOf("User-Agent" to ua)).text
+                val masterText = try {
+                    app.get(masterUrl, headers = mapOf("User-Agent" to ua)).text
+                } catch (_: Exception) { "" }
                 
                 if (masterText.contains("#EXTM3U")) {
-                    val baseUrl = "https://video.twimg.com"
-                    Regex("""#EXT-X-STREAM-INF:.*?RESOLUTION=(\d+x\d+).*?\n(/[^\s]+)""")
-                        .findAll(masterText).forEach { mr ->
-                            val resolution = mr.groupValues[1]
-                            val path = mr.groupValues[2]
-                            val streamUrl = "$baseUrl$path"
+                    // Parse variants từ master playlist
+                    val baseUrl = masterUrl.substringBeforeLast("/")
+                    var foundAny = false
+                    
+                    Regex("""#EXT-X-STREAM-INF:.*?RESOLUTION=(\d+)x(\d+).*?\n([^\s]+)""")
+                        .findAll(masterText).forEach { match ->
+                            val width = match.groupValues[1].toIntOrNull() ?: 0
+                            val height = match.groupValues[2].toIntOrNull() ?: 0
+                            val path = match.groupValues[3]
+                            
+                            val streamUrl = if (path.startsWith("http")) path 
+                                          else "$baseUrl/$path"
+                            
                             val quality = when {
-                                resolution.contains("1280") || resolution.contains("1920") -> Qualities.P720.value
-                                resolution.contains("640") -> Qualities.P480.value
-                                else -> Qualities.P360.value
+                                height >= 720 || width >= 1280 -> Qualities.P720.value
+                                height >= 480 || width >= 640  -> Qualities.P480.value
+                                height >= 360                  -> Qualities.P360.value
+                                else                           -> Qualities.P270.value
                             }
-                            callback(newExtractorLink(name, "$name $resolution", streamUrl) {
-                                referer = ""
-                                this.quality = quality
+                            
+                            val qualityLabel = "${height}p"
+                            
+                            callback(ExtractorLink(
+                                name,
+                                "$name $qualityLabel",
+                                streamUrl,
+                                "",
+                                quality,
                                 type = ExtractorLinkType.M3U8
-                            })
+                            ))
+                            foundAny = true
                         }
+                    
+                    return foundAny
+                }
+                
+                // Fallback: Emit master URL trực tiếp
+                callback(ExtractorLink(
+                    name,
+                    name,
+                    masterUrl,
+                    "",
+                    Qualities.Unknown.value,
+                    type = ExtractorLinkType.M3U8
+                ))
+                return true
+            }
+            
+            // Fallback 2: Tìm trực tiếp URL trong HTML
+            Regex("""https://video\.twimg\.com/amplify_video/[^"'\s]+\.m3u8""")
+                .findAll(html).forEach { match ->
+                    callback(ExtractorLink(
+                        name,
+                        name,
+                        match.value,
+                        "",
+                        Qualities.Unknown.value,
+                        type = ExtractorLinkType.M3U8
+                    ))
                     return true
                 }
-            } catch (_: Exception) {}
             
-            // Fallback: emit master trực tiếp
-            callback(newExtractorLink(name, name, videoUrl) {
-                referer = ""
-                quality = Qualities.Unknown.value
-                type = ExtractorLinkType.M3U8
-            })
-            return true
-        }
-
-        // Fallback cuối: loadExtractor các iframe khác
-        doc.select("iframe[src]").forEach { iframe ->
-            val src = fix(iframe.attr("src")) ?: return@forEach
-            if (!src.contains("googleads") && !src.contains("/ads/")) {
-                try { loadExtractor(src, epUrl, subtitleCallback, callback) }
-                catch (_: Exception) {}
+            // Fallback 3: loadExtractor cho các iframe khác
+            val doc = org.jsoup.Jsoup.parse(html)
+            doc.select("iframe[src]").forEach { iframe ->
+                val src = fix(iframe.attr("src")) ?: return@forEach
+                if (!src.contains("googleads") && !src.contains("/ads/")) {
+                    try {
+                        if (loadExtractor(src, epUrl, subtitleCallback, callback))
+                            return true
+                    } catch (_: Exception) {}
+                }
             }
+            
+        } catch (e: Exception) {
+            return false
         }
-
-        return foundUrls.isNotEmpty()
+        
+        return false
     }
 }

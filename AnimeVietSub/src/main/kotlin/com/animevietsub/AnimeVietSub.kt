@@ -28,7 +28,8 @@ class AnimeVietSub : MainAPI() {
     private val hdrs = mapOf(
         "User-Agent"      to ua,
         "Accept-Language" to "vi-VN,vi;q=0.9",
-        "Accept"          to "text/html,application/xhtml+xml,*/*"
+        "Accept"          to "text/html,application/xhtml+xml,*/*",
+        "Referer"         to "$mainUrl/"
     )
 
     private fun fix(u: String?): String? {
@@ -56,46 +57,50 @@ class AnimeVietSub : MainAPI() {
     )
 
     override suspend fun getMainPage(page: Int, req: MainPageRequest): HomePageResponse {
-        // FIX 1: Sửa logic phân trang thành .../trang-2
-        val url = if (page == 1) req.data else "${req.data.removeSuffix("/")}/trang-$page"
+        // FIX 1: Sửa cấu trúc phân trang chuẩn /trang-2
+        val url = if (page == 1) req.data else "${req.data.trimEnd('/')}/trang-$page"
         
-        val doc  = app.get(fix(url) ?: mainUrl, interceptor = cf, headers = hdrs).document
-        val items = doc.select("a[href*='/thong-tin-phim/']")
-            .filter { it.selectFirst("img") != null }
+        val res = app.get(fix(url) ?: mainUrl, interceptor = cf, headers = hdrs)
+        val doc = res.document
+        
+        // FIX 2: Sử dụng bộ chọn cụ thể hơn để lấy danh sách phim chính, tránh lấy nhầm sidebar/featured
+        val items = doc.select(".list-films .item, .items .item, .list-anime .item, div.item")
             .mapNotNull { it.toSR() }
             .distinctBy { it.url }
+            
         return newHomePageResponse(req.name, items, hasNext = items.isNotEmpty())
     }
 
     private fun Element.toSR(): SearchResponse? {
-        val a    = if (tagName() == "a") this else selectFirst("a") ?: return null
+        // Tìm link thông tin phim
+        val a = selectFirst("a[href*='/thong-tin-phim/']") ?: return null
         val href = fix(a.attr("href")) ?: return null
-        if (!href.contains("/thong-tin-phim/")) return null
-        val ttl  = (a.attr("title").ifBlank {
-            a.selectFirst("h2,h3,.title,.name,p")?.text()
+        
+        // Tìm tiêu đề
+        val ttl = (a.attr("title").ifBlank {
+            selectFirst("h2, h3, .title, .name")?.text()
         } ?: "").trim().ifBlank { return null }
-        val poster = imgOf(a.selectFirst("img"))
         
-        // Lấy text từ các thẻ nhãn để tìm số tập
-        val labelElement = a.selectFirst(".quality, .badge, .label, .tray-item-quality")
-        val labelText = labelElement?.text() ?: ""
+        // Tìm ảnh poster
+        val poster = imgOf(selectFirst("img"))
         
-        val text = a.text() + a.attr("class") + labelText
-        val dubStatus = if (text.contains("Lồng tiếng", ignoreCase = true) ||
-                            text.contains("Thuyet minh", ignoreCase = true) ||
-                            text.contains("Thuyết minh", ignoreCase = true))
+        // Lấy nhãn số tập (ví dụ: "Tập 20", "Full")
+        val labelText = selectFirst(".quality, .badge, .label, .status, .ep-status")?.text() ?: ""
+        
+        // Xác định Dub/Sub
+        val dubStatus = if (labelText.contains("Lồng tiếng", true) || labelText.contains("Thuyết minh", true))
             DubStatus.Dubbed else DubStatus.Subbed
             
         return newAnimeSearchResponse(ttl, href, TvType.Anime) {
-            posterUrl = poster
+            this.posterUrl = poster
             
-            // FIX 2: Tách số tập và hiển thị bằng addSub(Int)
+            // FIX 3: Tách lấy số tập để hiện lên Card
             val epNum = Regex("""\d+""").find(labelText)?.value?.toIntOrNull()
             if (epNum != null) {
                 addSub(epNum)
             }
             
-            addDubStatus(dubStatus, epNum ?: -1)
+            addDubStatus(dubStatus, epNum)
             quality = SearchQuality.HD
         }
     }
@@ -103,8 +108,7 @@ class AnimeVietSub : MainAPI() {
     override suspend fun search(q: String): List<SearchResponse> {
         val doc = app.get("$mainUrl/tim-kiem/${URLEncoder.encode(q, "utf-8")}/",
             interceptor = cf, headers = hdrs).document
-        return doc.select("a[href*='/thong-tin-phim/']")
-            .filter { it.selectFirst("img") != null }
+        return doc.select(".item, a[href*='/thong-tin-phim/']")
             .mapNotNull { it.toSR() }
             .distinctBy { it.url }
     }
@@ -141,7 +145,7 @@ class AnimeVietSub : MainAPI() {
             app.get(watchUrl, interceptor = cf, headers = hdrs).document
         } catch (_: Exception) { doc }
 
-        // Tìm episode links - thử nhiều selector
+        // Tìm episode links
         val epLinks = watchDoc.select("a[href*='/tap-'], a[href*='/episode-'], a[href*='/ep-']")
             .ifEmpty { watchDoc.select("a[href*='/xem-phim/']") }
             .distinctBy { it.attr("href") }
@@ -176,7 +180,6 @@ class AnimeVietSub : MainAPI() {
         }
     }
 
-    // Patterns tìm video URL - ưu tiên từ cao đến thấp
     private val streamPatterns = listOf(
         Regex("""var\s+streamUrl\s*=\s*["']([^"']+)["']"""),
         Regex("""streamUrl\s*=\s*["']([^"']+)["']"""),
@@ -197,25 +200,19 @@ class AnimeVietSub : MainAPI() {
     }
 
     private suspend fun fetchIframe(iframeSrc: String, referer: String, cookies: Map<String, String>): String? {
-        // Thử 1: Không CF, nhanh hơn
         try {
             val resp = app.get(iframeSrc, headers = mapOf(
                 "User-Agent"      to ua,
                 "Referer"         to referer,
                 "Accept"          to "text/html,application/xhtml+xml,*/*",
-                "Accept-Language" to "vi-VN,vi;q=0.9",
-                "Sec-Fetch-Dest"  to "iframe",
-                "Sec-Fetch-Mode"  to "navigate",
-                "Sec-Fetch-Site"  to "cross-site"
+                "Accept-Language" to "vi-VN,vi;q=0.9"
             ), cookies = cookies)
             val html = resp.text
-            // Nếu bị CF challenge thì HTML rất ngắn hoặc chứa "challenge"
             if (html.length > 1000 && !html.contains("cf-browser-verification")) {
                 return html
             }
         } catch (_: Exception) {}
 
-        // Thử 2: Với CF interceptor
         return try {
             app.get(iframeSrc, interceptor = cf, headers = mapOf(
                 "User-Agent"      to ua,
@@ -234,24 +231,14 @@ class AnimeVietSub : MainAPI() {
         .replace("&#39;", "'")
 
     private suspend fun findStreamUrl(html: String, epUrl: String, cookies: Map<String, String>): String? {
-        // Tìm trong HTML chính
         searchInHtml(html)?.let { return it }
 
-        // Tìm tất cả URL streamfree bằng regex trong raw HTML
         val iframeUrls = mutableListOf<String>()
-
-        // Pattern 1: src="..." hoặc data-src="..."
         Regex("""(?:src|data-src)=["']([^"']*streamfree\.casa[^"']*)["']""")
             .findAll(html)
             .forEach { iframeUrls.add(unescapeHtml(it.groupValues[1])) }
 
-        // Pattern 2: URL nằm trong JavaScript string hoặc attribute khác
         Regex("""["']((?:https?:)?//streamfree\.casa/\?[^"'\s<>]+)["']""")
-            .findAll(html)
-            .forEach { iframeUrls.add(unescapeHtml(it.groupValues[1])) }
-
-        // Pattern 3: Tìm mọi nơi có streamfree.casa (kể cả &amp; encoded)
-        Regex("""((?:https?:)?//streamfree\.casa/\?url=[A-Za-z0-9+/=]+(?:&(?:amp;)?csrftoken=[a-f0-9]+)?(?:&(?:amp;)?exp=\d+)?)""")
             .findAll(html)
             .forEach { iframeUrls.add(unescapeHtml(it.groupValues[1])) }
 
@@ -265,7 +252,6 @@ class AnimeVietSub : MainAPI() {
             searchInHtml(iframeHtml)?.let { return it }
         }
 
-        // Fallback: tất cả iframe src/data-src
         val doc = org.jsoup.Jsoup.parse(html)
         val jsoupIframes = doc.select("iframe")
             .mapNotNull { el ->
@@ -288,7 +274,6 @@ class AnimeVietSub : MainAPI() {
     }
 
     private suspend fun emitMaster(masterUrl: String, callback: (ExtractorLink) -> Unit): Boolean {
-        // Emit master playlist trực tiếp - ExoPlayer tự xử lý HLS quality selection
         callback(newExtractorLink(name, name, masterUrl) {
             quality = Qualities.P1080.value
             referer = ""

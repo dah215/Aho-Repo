@@ -20,13 +20,14 @@ class OneHaniProvider : MainAPI() {
     override val hasMainPage = true
     override val supportedTypes = setOf(TvType.NSFW)
 
+    // Thêm Cookie h_m_enter=1 để vượt qua trang xác nhận /enter
     private val headers = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         "Referer" to "$mainUrl/",
+        "Cookie" to "h_m_enter=1",
         "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7"
     )
 
-    // Giữ nguyên ký tự chữ Trung theo yêu cầu của bạn
     override val mainPage = mainPageOf(
         "search?sort=created_at" to "Mới Cập Nhật",
         "search?sort=views_count" to "Xem Nhiều Nhất",
@@ -44,14 +45,12 @@ class OneHaniProvider : MainAPI() {
     }
 
     private fun parseItem(el: Element): SearchResponse? {
-        // Dựa trên HTML bạn gửi: link nằm ở thẻ <a> bao quanh div phim
-        val linkEl = if (el.tagName() == "a") el else el.selectFirst("a") ?: return null
+        // Dựa trên HTML bạn gửi: tìm thẻ <a> bao quanh hoặc chứa link watch?v=
+        val linkEl = el.selectFirst("a[href*='watch?v=']") ?: (if (el.tagName() == "a") el else null) ?: return null
         val href = fixUrl(linkEl.attr("href"))
         
-        if (!href.contains("watch?v=")) return null
-        
-        // Tiêu đề nằm trong class .home-rows-videos-title
-        val title = el.selectFirst(".home-rows-videos-title, .title, h5")?.text()?.trim() 
+        // Tiêu đề nằm trong class .home-rows-videos-title (đúng như HTML bạn gửi)
+        val title = el.selectFirst(".home-rows-videos-title, .title")?.text()?.trim() 
             ?: linkEl.attr("title")
             ?: return null
             
@@ -73,9 +72,11 @@ class OneHaniProvider : MainAPI() {
         
         val doc = app.get(url, headers = headers).document
         
-        // Selector dựa trên HTML bạn gửi: tìm các thẻ <a> chứa class .home-rows-videos-div
-        val items = doc.select("a:has(.home-rows-videos-div), .video-item-container, .hentai-item").mapNotNull { 
-            parseItem(it) 
+        // Selector rộng hơn để bắt được các ô phim theo cấu trúc mới
+        val items = doc.select("div.home-rows-videos-div, .video-item-container, .hentai-item").mapNotNull { 
+            // Lấy thẻ <a> cha của div nếu div không phải là <a>
+            val elementToParse = if (it.tagName() == "div") it.parent() ?: it else it
+            parseItem(elementToParse) 
         }.distinctBy { it.url }
 
         return newHomePageResponse(request.name, items, items.isNotEmpty())
@@ -84,7 +85,10 @@ class OneHaniProvider : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/search?query=$query"
         val doc = app.get(url, headers = headers).document
-        return doc.select("a:has(.home-rows-videos-div), .video-item-container").mapNotNull { parseItem(it) }.distinctBy { it.url }
+        return doc.select("div.home-rows-videos-div, .video-item-container").mapNotNull { 
+            val elementToParse = if (it.tagName() == "div") it.parent() ?: it else it
+            parseItem(elementToParse) 
+        }.distinctBy { it.url }
     }
 
     override suspend fun load(url: String): LoadResponse {
@@ -131,7 +135,7 @@ class OneHaniProvider : MainAPI() {
             }
         }
 
-        // 2. Quét link MP4 trực tiếp từ script (Dành cho server hembed/imgcdn)
+        // 2. Quét link MP4 trực tiếp từ script
         val mp4Regex = Regex("""https?[:\\]+[/\\/]+[^\s"'<>]+?\.mp4[^\s"'<>]*""")
         mp4Regex.findAll(html).forEach { match ->
             val link = match.value.replace("\\/", "/")

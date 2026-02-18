@@ -77,10 +77,9 @@ class PhimMoiChillProvider : MainAPI() {
             this.posterUrl = poster
             
             // --- FIX LỖI TẠI ĐÂY ---
-            // Tách lấy số từ chuỗi (ví dụ "Tập 6" -> lấy số 6)
-            val epNum = Regex("""\d+""").find(label)?.value?.toIntOrNull()
-            if (epNum != null) {
-                this.numberOfEpisodes = epNum
+            // Sử dụng addText để hiển thị chữ (Tập 6, Full...) lên thẻ
+            if (label.isNotEmpty()) {
+                addText(label)
             }
             // -----------------------
 

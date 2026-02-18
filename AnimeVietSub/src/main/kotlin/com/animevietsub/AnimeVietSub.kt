@@ -15,7 +15,7 @@ class AnimeVietSubPlugin : Plugin() {
 
 class AnimeVietSub : MainAPI() {
     override var mainUrl  = "https://animevui.social"
-    override var name     = "AnimeVietSub(Fake)"
+    override var name     = "AnimeVietSub"
     override var lang     = "vi"
     override val hasMainPage          = true
     override val hasChromecastSupport = true
@@ -56,7 +56,9 @@ class AnimeVietSub : MainAPI() {
     )
 
     override suspend fun getMainPage(page: Int, req: MainPageRequest): HomePageResponse {
-        val url  = if (page == 1) req.data else "${req.data.removeSuffix("/")}/?page=$page"
+        // FIX 1: Sửa logic phân trang thành .../trang-2
+        val url = if (page == 1) req.data else "${req.data.removeSuffix("/")}/trang-$page"
+        
         val doc  = app.get(fix(url) ?: mainUrl, interceptor = cf, headers = hdrs).document
         val items = doc.select("a[href*='/thong-tin-phim/']")
             .filter { it.selectFirst("img") != null }
@@ -73,14 +75,27 @@ class AnimeVietSub : MainAPI() {
             a.selectFirst("h2,h3,.title,.name,p")?.text()
         } ?: "").trim().ifBlank { return null }
         val poster = imgOf(a.selectFirst("img"))
-        val text = a.text() + a.attr("class") + (a.selectFirst(".quality,.badge,.label")?.text() ?: "")
+        
+        // Lấy text từ các thẻ nhãn để tìm số tập
+        val labelElement = a.selectFirst(".quality, .badge, .label, .tray-item-quality")
+        val labelText = labelElement?.text() ?: ""
+        
+        val text = a.text() + a.attr("class") + labelText
         val dubStatus = if (text.contains("Lồng tiếng", ignoreCase = true) ||
                             text.contains("Thuyet minh", ignoreCase = true) ||
                             text.contains("Thuyết minh", ignoreCase = true))
             DubStatus.Dubbed else DubStatus.Subbed
+            
         return newAnimeSearchResponse(ttl, href, TvType.Anime) {
             posterUrl = poster
-            addDubStatus(dubStatus, -1)
+            
+            // FIX 2: Tách số tập và hiển thị bằng addSub(Int)
+            val epNum = Regex("""\d+""").find(labelText)?.value?.toIntOrNull()
+            if (epNum != null) {
+                addSub(epNum)
+            }
+            
+            addDubStatus(dubStatus, epNum ?: -1)
             quality = SearchQuality.HD
         }
     }
@@ -223,7 +238,6 @@ class AnimeVietSub : MainAPI() {
         searchInHtml(html)?.let { return it }
 
         // Tìm tất cả URL streamfree bằng regex trong raw HTML
-        // (iframe src có thể rỗng hoặc bị &amp; encode)
         val iframeUrls = mutableListOf<String>()
 
         // Pattern 1: src="..." hoặc data-src="..."

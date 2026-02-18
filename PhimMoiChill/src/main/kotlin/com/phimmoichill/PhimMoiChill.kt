@@ -23,7 +23,8 @@ class PhimMoiChillProvider : MainAPI() {
 
     private val headers = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-        "Accept" to "text/html,application/xhtml+xml,*/*"
+        "Accept" to "text/html,application/xhtml+xml,*/*",
+        "Referer" to "$mainUrl/"
     )
 
     override val mainPage = mainPageOf(
@@ -52,19 +53,34 @@ class PhimMoiChillProvider : MainAPI() {
         val href = fixUrl(a.attr("href"))
         val title = a.attr("title").trim().ifEmpty { el.selectFirst("h3, p")?.text() ?: return null }
         val poster = imgUrl(el.selectFirst("img"))
-        val label = el.selectFirst("span.label")?.text()?.uppercase() ?: ""
-        val isSeries = label.contains("TẬP") || label.contains("HOÀN TẤT") || Regex("""\d+/\d+""").containsMatchIn(label)
-        val has4k = el.selectFirst("span.film-badge.badge-4k") != null
-        val hasTM = el.selectFirst("span.film-badge.badge-tm") != null
+        
+        // FIX 1: Lấy tất cả các nhãn (Label/Badge/Status) để tìm số tập
+        // Web thường dùng .label hoặc .badge hoặc .status
+        val labelElement = el.selectFirst(".label, .badge, .status, .film-status")
+        val label = labelElement?.text()?.trim() ?: ""
+        
+        // Kiểm tra xem có phải phim bộ không dựa trên Title hoặc Label
+        val isSeries = label.contains("Tập", true) || 
+                       label.contains("Hoàn Tất", true) || 
+                       title.contains("Phần", true) || 
+                       title.contains("Season", true) ||
+                       Regex("""\d+/\d+""").containsMatchIn(label)
+
+        val has4k = el.selectFirst("span.film-badge.badge-4k") != null || label.contains("4K", true)
+        val hasTM = el.selectFirst("span.film-badge.badge-tm") != null || label.contains("Thuyết Minh", true)
+        
         val dubs = java.util.EnumSet.noneOf(DubStatus::class.java).apply {
-            if (!label.contains("RAW")) add(DubStatus.Subbed)
-            if (label.contains("THUYẾT MINH") || hasTM) add(DubStatus.Dubbed)
+            if (!label.contains("RAW", true)) add(DubStatus.Subbed)
+            if (hasTM) add(DubStatus.Dubbed)
         }
+
         return newAnimeSearchResponse(title, href, if (isSeries) TvType.TvSeries else TvType.Movie) {
             this.posterUrl = poster
+            // Hiển thị số tập hoặc trạng thái lên Card
+            this.addSub = label
             this.quality = when {
-                has4k || label.contains("4K") -> SearchQuality.UHD
-                label.contains("CAM") -> SearchQuality.Cam
+                has4k -> SearchQuality.UHD
+                label.contains("CAM", true) -> SearchQuality.Cam
                 else -> SearchQuality.HD
             }
             this.dubStatus = dubs
@@ -72,7 +88,13 @@ class PhimMoiChillProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = if (page <= 1) "$mainUrl/${request.data}" else "$mainUrl/${request.data}?page=$page"
+        // FIX 2: Cấu trúc phân trang chuẩn theo link bạn gửi: .../page-2/
+        val url = if (page <= 1) {
+            "$mainUrl/${request.data}"
+        } else {
+            "$mainUrl/${request.data}/page-$page"
+        }
+        
         val items = app.get(url, headers = headers).document.select("li.item").mapNotNull { parseCard(it) }
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
@@ -90,19 +112,37 @@ class PhimMoiChillProvider : MainAPI() {
         val year = doc.selectFirst("a[href*='phim-nam-']")?.text()?.let { Regex("""\b(20\d{2})\b""").find(it)?.value?.toIntOrNull() }
         val genres = doc.select("a[href*='/genre/']").map { it.text().trim() }
         val watchUrl = doc.selectFirst("a.btn-see[href*='/xem/']")?.attr("href")?.let { fixUrl(it) }
-        val hasEps = doc.select("div.latest-episode a[data-id]").isNotEmpty()
+        
+        // Kiểm tra danh sách tập phim
+        val hasEps = doc.select("div.latest-episode a[data-id], ul.episodes li a").isNotEmpty()
 
-        if (!hasEps) return newMovieLoadResponse(title, url, TvType.Movie, watchUrl ?: url) {
+        if (!hasEps && watchUrl == null) return newMovieLoadResponse(title, url, TvType.Movie, url) {
             this.posterUrl = poster; this.plot = plot; this.year = year; this.tags = genres
         }
 
+        // Lấy danh sách tập
         val eps = (watchUrl?.let { wu ->
-            try { app.get(wu, headers = headers).document.select("ul.episodes li a[data-id]").mapNotNull { a ->
-                newEpisode(fixUrl(a.attr("href"))) { name = a.text(); episode = Regex("""\d+""").find(a.text())?.value?.toIntOrNull() }
-            }} catch (_: Exception) { emptyList() }
+            try { 
+                val watchDoc = app.get(wu, headers = headers).document
+                // Lấy tập từ trang xem (dựa trên HTML bạn cung cấp: a[data-id])
+                watchDoc.select("ul.episodes li a, div.list-episode a").mapNotNull { a ->
+                    val href = fixUrl(a.attr("href"))
+                    val name = a.text().trim()
+                    val epNum = Regex("""Tập\s*(\d+)""").find(name)?.groupValues?.get(1)?.toIntOrNull() 
+                                ?: Regex("""(\d+)""").find(name)?.groupValues?.get(1)?.toIntOrNull()
+                    newEpisode(href) { 
+                        this.name = name
+                        this.episode = epNum
+                    }
+                }
+            } catch (_: Exception) { emptyList() }
         } ?: emptyList()).ifEmpty {
+            // Fallback nếu không lấy được từ trang xem, thử lấy ở trang info (nếu có)
             doc.select("div.latest-episode a[data-id]").mapNotNull { a ->
-                newEpisode(fixUrl(a.attr("href"))) { name = a.text(); episode = Regex("""\d+""").find(a.text())?.value?.toIntOrNull() }
+                newEpisode(fixUrl(a.attr("href"))) { 
+                    this.name = a.text()
+                    this.episode = Regex("""\d+""").find(a.text())?.value?.toIntOrNull() 
+                }
             }
         }
 

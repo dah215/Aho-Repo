@@ -54,7 +54,7 @@ class PhimMoiChillProvider : MainAPI() {
         val title = a.attr("title").trim().ifEmpty { el.selectFirst("h3, p")?.text() ?: return null }
         val poster = imgUrl(el.selectFirst("img"))
         
-        // Lấy tất cả các nhãn (Label/Badge/Status) để tìm số tập
+        // Lấy tất cả các nhãn (Label/Badge/Status)
         val labelElement = el.selectFirst(".label, .badge, .status, .film-status")
         val label = labelElement?.text()?.trim() ?: ""
         
@@ -76,12 +76,13 @@ class PhimMoiChillProvider : MainAPI() {
         return newAnimeSearchResponse(title, href, if (isSeries) TvType.TvSeries else TvType.Movie) {
             this.posterUrl = poster
             
-            // --- ĐÃ SỬA LỖI TẠI ĐÂY ---
-            // Dùng hàm addSub() thay vì gán bằng dấu =
-            if (label.isNotEmpty()) {
-                addSub(label)
+            // --- FIX LỖI TẠI ĐÂY ---
+            // Tách lấy số từ chuỗi (ví dụ "Tập 6" -> lấy số 6)
+            val epNum = Regex("""\d+""").find(label)?.value?.toIntOrNull()
+            if (epNum != null) {
+                this.numberOfEpisodes = epNum
             }
-            // --------------------------
+            // -----------------------
 
             this.quality = when {
                 has4k -> SearchQuality.UHD
@@ -129,7 +130,7 @@ class PhimMoiChillProvider : MainAPI() {
         val eps = (watchUrl?.let { wu ->
             try { 
                 val watchDoc = app.get(wu, headers = headers).document
-                // Lấy tập từ trang xem (dựa trên HTML bạn cung cấp: a[data-id])
+                // Lấy tập từ trang xem
                 watchDoc.select("ul.episodes li a, div.list-episode a").mapNotNull { a ->
                     val href = fixUrl(a.attr("href"))
                     val name = a.text().trim()
@@ -142,7 +143,7 @@ class PhimMoiChillProvider : MainAPI() {
                 }
             } catch (_: Exception) { emptyList() }
         } ?: emptyList()).ifEmpty {
-            // Fallback nếu không lấy được từ trang xem, thử lấy ở trang info (nếu có)
+            // Fallback nếu không lấy được từ trang xem
             doc.select("div.latest-episode a[data-id]").mapNotNull { a ->
                 newEpisode(fixUrl(a.attr("href"))) { 
                     this.name = a.text()
@@ -182,7 +183,7 @@ class PhimMoiChillProvider : MainAPI() {
             )
 
             // ============================================
-            // BƯỚC 1: LẤY KEY VIETSUB (không có quality_index)
+            // BƯỚC 1: LẤY KEY VIETSUB
             // ============================================
             var vietsubKey: String? = null
             
@@ -204,7 +205,7 @@ class PhimMoiChillProvider : MainAPI() {
             }
 
             // ============================================
-            // BƯỚC 2: LẤY KEY THUYẾT MINH (có quality_index=1)
+            // BƯỚC 2: LẤY KEY THUYẾT MINH
             // ============================================
             var tmKey: String? = null
             
@@ -229,7 +230,6 @@ class PhimMoiChillProvider : MainAPI() {
             // BƯỚC 3: THÊM LINKS
             // ============================================
             
-            // Thêm Vietsub
             if (!vietsubKey.isNullOrEmpty()) {
                 callback(
                     newExtractorLink(
@@ -255,7 +255,6 @@ class PhimMoiChillProvider : MainAPI() {
                 )
             }
 
-            // Thêm Thuyết Minh (chỉ nếu key khác với Vietsub)
             if (!tmKey.isNullOrEmpty() && tmKey != vietsubKey) {
                 callback(
                     newExtractorLink(

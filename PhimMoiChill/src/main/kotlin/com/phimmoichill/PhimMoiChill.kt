@@ -54,12 +54,11 @@ class PhimMoiChillProvider : MainAPI() {
         val title = a.attr("title").trim().ifEmpty { el.selectFirst("h3, p")?.text() ?: return null }
         val poster = imgUrl(el.selectFirst("img"))
         
-        // FIX 1: Lấy tất cả các nhãn (Label/Badge/Status) để tìm số tập
-        // Web thường dùng .label hoặc .badge hoặc .status
+        // Lấy tất cả các nhãn (Label/Badge/Status) để tìm số tập
         val labelElement = el.selectFirst(".label, .badge, .status, .film-status")
         val label = labelElement?.text()?.trim() ?: ""
         
-        // Kiểm tra xem có phải phim bộ không dựa trên Title hoặc Label
+        // Kiểm tra xem có phải phim bộ không
         val isSeries = label.contains("Tập", true) || 
                        label.contains("Hoàn Tất", true) || 
                        title.contains("Phần", true) || 
@@ -76,8 +75,14 @@ class PhimMoiChillProvider : MainAPI() {
 
         return newAnimeSearchResponse(title, href, if (isSeries) TvType.TvSeries else TvType.Movie) {
             this.posterUrl = poster
-            // Hiển thị số tập hoặc trạng thái lên Card
-            this.addSub = label
+            
+            // --- ĐÃ SỬA LỖI TẠI ĐÂY ---
+            // Dùng hàm addSub() thay vì gán bằng dấu =
+            if (label.isNotEmpty()) {
+                addSub(label)
+            }
+            // --------------------------
+
             this.quality = when {
                 has4k -> SearchQuality.UHD
                 label.contains("CAM", true) -> SearchQuality.Cam
@@ -88,7 +93,7 @@ class PhimMoiChillProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        // FIX 2: Cấu trúc phân trang chuẩn theo link bạn gửi: .../page-2/
+        // Cấu trúc phân trang: .../page-2/
         val url = if (page <= 1) {
             "$mainUrl/${request.data}"
         } else {

@@ -9,13 +9,13 @@ import org.jsoup.nodes.Element
 @CloudstreamPlugin
 class Hanime1Plugin : Plugin() {
     override fun load() {
-        registerMainAPI(Hanime1Provider())
+        registerMainAPI(OneHaniProvider())
     }
 }
 
-class Hanime1Provider : MainAPI() {
-    override var mainUrl = "https://hanime1.me"
-    override var name = "Hanime1"
+class OneHaniProvider : MainAPI() {
+    override var mainUrl = "https://1hani.me"
+    override var name = "1Hani"
     override var lang = "zh"
     override val hasMainPage = true
     override val supportedTypes = setOf(TvType.NSFW)
@@ -26,14 +26,14 @@ class Hanime1Provider : MainAPI() {
         "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7"
     )
 
-    // Sử dụng mã Unicode để tránh lỗi font/encoding khi build
+    // Giữ nguyên ký tự chữ Trung theo yêu cầu của bạn
     override val mainPage = mainPageOf(
         "search?sort=created_at" to "Mới Cập Nhật",
         "search?sort=views_count" to "Xem Nhiều Nhất",
-        "search?type=hentai&genre=\u7121\u4fee\u6b63" to "Không Che (Uncensored)", // 無修正
-        "search?type=hentai&genre=\u88cf\u756a" to "Series Hentai (\u88cf\u756a)", // 裏番
-        "search?type=hentai&genre=\u4e2d\u6587\u5b57\u5e55" to "Phụ Đề (Chinese Sub)", // 中文字幕
-        "search?type=hentai&genre=3DCG" to "Phim 3D (3DCG)"
+        "search?genre=無修正" to "Không Che (Uncensored)",
+        "search?genre=裏番" to "Series Hentai (里番)",
+        "search?genre=中文字幕" to "Phụ Đề (Chinese Sub)",
+        "search?genre=3DCG" to "Phim 3D (3DCG)"
     )
 
     private fun fixUrl(url: String): String {
@@ -44,23 +44,19 @@ class Hanime1Provider : MainAPI() {
     }
 
     private fun parseItem(el: Element): SearchResponse? {
-        // Selector chính xác dựa trên HTML bạn gửi: thẻ a có class video-link
-        val linkEl = el.selectFirst("a.video-link, a[href*='watch?v=']") ?: return null
+        // Dựa trên HTML bạn gửi: link nằm ở thẻ <a> bao quanh div phim
+        val linkEl = if (el.tagName() == "a") el else el.selectFirst("a") ?: return null
         val href = fixUrl(linkEl.attr("href"))
         
-        // Chỉ lấy link xem phim thực sự
         if (!href.contains("watch?v=")) return null
         
-        // Lấy tiêu đề từ class .title (như trong HTML bạn gửi)
-        val title = el.selectFirst(".title, .hentai-item-title, .search-display-item-title")?.text()?.trim() 
-            ?: el.attr("title") 
+        // Tiêu đề nằm trong class .home-rows-videos-title
+        val title = el.selectFirst(".home-rows-videos-title, .title, h5")?.text()?.trim() 
+            ?: linkEl.attr("title")
             ?: return null
             
-        // Lấy ảnh bìa từ img.main-thumb
-        val poster = el.selectFirst("img.main-thumb, img")?.let { 
-            val src = it.attr("src")
-            if (src.isBlank() || src.contains("data:image")) it.attr("data-src") else src
-        }
+        // Ảnh nằm trong thẻ img
+        val poster = el.selectFirst("img")?.attr("src")
         
         return newMovieSearchResponse(title, href, TvType.NSFW) {
             this.posterUrl = poster
@@ -69,16 +65,16 @@ class Hanime1Provider : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (request.data.isEmpty()) {
-            mainUrl
+            "$mainUrl/search?sort=created_at"
         } else {
-            val baseUrl = "$mainUrl/${request.data}"
-            if (page > 1) "$baseUrl&page=$page" else baseUrl
+            val separator = if (request.data.contains("?")) "&" else "?"
+            "$mainUrl/${request.data}${if (page > 1) "${separator}page=$page" else ""}"
         }
         
         val doc = app.get(url, headers = headers).document
         
-        // Quét tất cả các khối chứa phim theo cấu trúc HTML bạn gửi
-        val items = doc.select(".video-item-container, .hentai-item, .search-display-item-column").mapNotNull { 
+        // Selector dựa trên HTML bạn gửi: tìm các thẻ <a> chứa class .home-rows-videos-div
+        val items = doc.select("a:has(.home-rows-videos-div), .video-item-container, .hentai-item").mapNotNull { 
             parseItem(it) 
         }.distinctBy { it.url }
 
@@ -88,7 +84,7 @@ class Hanime1Provider : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/search?query=$query"
         val doc = app.get(url, headers = headers).document
-        return doc.select(".video-item-container, .hentai-item").mapNotNull { parseItem(it) }.distinctBy { it.url }
+        return doc.select("a:has(.home-rows-videos-div), .video-item-container").mapNotNull { parseItem(it) }.distinctBy { it.url }
     }
 
     override suspend fun load(url: String): LoadResponse {
@@ -103,7 +99,7 @@ class Hanime1Provider : MainAPI() {
         return newMovieLoadResponse(title, url, TvType.NSFW, url) {
             this.posterUrl = poster
             this.plot = desc
-            this.tags = doc.select("a.hentai-video-tag").map { it.text() }
+            this.tags = doc.select("a.hentai-video-tag, .video-tags a").map { it.text() }
         }
     }
 
@@ -135,7 +131,7 @@ class Hanime1Provider : MainAPI() {
             }
         }
 
-        // 2. Quét link MP4 trực tiếp từ script (Dành cho server hembed)
+        // 2. Quét link MP4 trực tiếp từ script (Dành cho server hembed/imgcdn)
         val mp4Regex = Regex("""https?[:\\]+[/\\/]+[^\s"'<>]+?\.mp4[^\s"'<>]*""")
         mp4Regex.findAll(html).forEach { match ->
             val link = match.value.replace("\\/", "/")

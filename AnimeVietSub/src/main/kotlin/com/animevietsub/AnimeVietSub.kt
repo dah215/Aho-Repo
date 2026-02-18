@@ -8,18 +8,6 @@ import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
 
-/**
- * AnimeVietSub CloudStream Plugin - Fixed Version
- * 
- * BUGS FIXED:
- * 1. So tap phim khong hien thi cho phim bo
- *    - Fix: Lay numberOfEpisodes tu JSON-LD schema trong trang chi tiết
- *    - Cache so tap de khong can fetch lai khi quay ve trang danh sach
- * 
- * 2. Danh muc phim le/bo chi hien vai phim, khong load them khi scroll
- *    - Fix: Sua logic hasNextPage va xu ly phan trang dung cach
- *    - Website su dung JSON-LD voi danh sach phim, can xu ly dung
- */
 
 @CloudstreamPlugin
 class AnimeVietSubPlugin : Plugin() {
@@ -43,9 +31,6 @@ class AnimeVietSub : MainAPI() {
         "Accept-Language" to "vi-VN,vi;q=0.9",
         "Accept"          to "text/html,application/xhtml+xml,*/*"
     )
-
-    // Cache cho so tap phim - tranh phai fetch lai
-    private val episodeCountCache = mutableMapOf<String, Int>()
 
     private fun fix(u: String?): String? {
         if (u.isNullOrBlank() || u.startsWith("javascript") || u == "#") return null
@@ -72,20 +57,23 @@ class AnimeVietSub : MainAPI() {
     )
 
     override suspend fun getMainPage(page: Int, req: MainPageRequest): HomePageResponse {
-        val url  = if (page == 1) req.data else "${req.data.removeSuffix("/")}?page=$page"
+        // ===== FIX: Dung URL phan trang dung /trang-X =====
+        val url = if (page == 1) {
+            req.data
+        } else {
+            // /the-loai/anime-moi/ -> /the-loai/anime-moi/trang-2
+            "${req.data.removeSuffix("/")}trang-$page"
+        }
+        
         val doc  = app.get(fix(url) ?: mainUrl, interceptor = cf, headers = hdrs).document
         
-        // Lay danh sach items tu HTML
         val items = doc.select("a[href*='/thong-tin-phim/']")
             .filter { it.selectFirst("img") != null }
             .mapNotNull { it.toSR() }
             .distinctBy { it.url }
         
-        // ===== FIX: Logic phan trang dung hon =====
-        // Website co the khong ho tro phan trang that su
-        // Kiem tra xem co item moi tren page tiep theo hay khong
-        // Neu page > 1 va items rong hoac giam, khong con trang tiep theo
-        val hasNext = items.isNotEmpty() && page < 10 // Gioi han 10 trang de tranh loop vo tan
+        // Kiem tra xem con trang tiep theo hay khong
+        val hasNext = items.isNotEmpty() && page < 50
         
         return newHomePageResponse(req.name, items, hasNext = hasNext)
     }
@@ -104,8 +92,13 @@ class AnimeVietSub : MainAPI() {
                             text.contains("Thuyết minh", ignoreCase = true))
             DubStatus.Dubbed else DubStatus.Subbed
         
-        // ===== FIX: Lay so tap tu cache (neu da fetch truoc do) =====
-        val episodeCount = episodeCountCache[href] ?: -1
+        // Lay so tap tu <span class="ep">TẬP<i>XX</i></span>
+        val episodeCount = a.selectFirst("span.ep i")?.text()?.toIntOrNull()
+            ?: a.selectFirst(".ep i")?.text()?.toIntOrNull()
+            ?: a.selectFirst("span.ep")?.text()?.let { 
+                Regex("""(\d+)""").find(it)?.groupValues?.get(1)?.toIntOrNull() 
+            }
+            ?: -1
         
         return newAnimeSearchResponse(ttl, href, TvType.Anime) {
             posterUrl = poster
@@ -152,31 +145,28 @@ class AnimeVietSub : MainAPI() {
         val year = doc.select("a, span, td, li")
             .firstNotNullOfOrNull { Regex("""\b(20\d{2})\b""").find(it.text())?.value?.toIntOrNull() }
 
-        // ===== FIX: Lay so tap tu JSON-LD schema =====
-        val numberOfEpisodes = extractEpisodeCountFromJsonLD(html)
-        
-        // Luu vao cache de dung khi hien thi o trang danh sach
-        if (numberOfEpisodes > 0) {
-            episodeCountCache[detailUrl] = numberOfEpisodes
-        }
-
         val watchUrl = detailUrl.replace("/thong-tin-phim/", "/xem-phim/")
         val watchDoc = try {
             app.get(watchUrl, interceptor = cf, headers = hdrs).document
         } catch (_: Exception) { doc }
 
-        // Tìm episode links - thử nhiều selector
-        val epLinks = watchDoc.select("a[href*='/tap-'], a[href*='/episode-'], a[href*='/ep-']")
+        // ===== FIX: Tim episode links voi format /tap-XX =====
+        // Format: /xem-phim/{slug}/tap-07
+        val epLinks = watchDoc.select("a[href*='/tap-']")
+            .ifEmpty { watchDoc.select("a[href*='/episode-']") }
+            .ifEmpty { watchDoc.select("a[href*='/ep-']") }
             .ifEmpty { watchDoc.select("a[href*='/xem-phim/']") }
             .distinctBy { it.attr("href") }
 
         val episodes = epLinks.mapNotNull { ep ->
                 val href = fix(ep.attr("href")) ?: return@mapNotNull null
                 val raw  = ep.text().trim().ifBlank { ep.attr("title").trim() }
-                val epNum = Regex("""(?:tap|ep|episode)-0*(\d+)""", RegexOption.IGNORE_CASE)
+                // Lay so tap tu URL /tap-07 hoac tu text
+                val epNum = Regex("""/tap-0*(\d+)""", RegexOption.IGNORE_CASE)
                     .find(href)?.groupValues?.get(1)?.toIntOrNull()
+                    ?: Regex("""(?:tap|ep|episode)[-_]?0*(\d+)""", RegexOption.IGNORE_CASE)
+                        .find(href)?.groupValues?.get(1)?.toIntOrNull()
                     ?: Regex("""(\d+)""").find(raw)?.groupValues?.get(1)?.toIntOrNull()
-                    ?: Regex("""(\d+)""").find(href)?.groupValues?.get(1)?.toIntOrNull()
                 newEpisode(href) {
                     name    = raw.ifBlank { "Tập ${epNum ?: ""}" }.trim()
                     episode = epNum
@@ -190,7 +180,6 @@ class AnimeVietSub : MainAPI() {
         val isDubbed = fullText.contains("Lồng tiếng", ignoreCase = true) ||
                        fullText.contains("Thuyết minh", ignoreCase = true)
 
-        // ===== FIX: Tra ve so tap thuc te thay vi -1 =====
         return newAnimeLoadResponse(title, detailUrl, TvType.Anime) {
             posterUrl   = poster
             this.plot   = plot
@@ -200,31 +189,8 @@ class AnimeVietSub : MainAPI() {
             addEpisodes(if (isDubbed) DubStatus.Dubbed else DubStatus.Subbed, episodes)
         }
     }
-    
-    // ===== FIX: Ham lay so tap tu JSON-LD schema =====
-    // Website animevui.social luu so tap trong JSON-LD voi key "numberOfEpisodes"
-    private fun extractEpisodeCountFromJsonLD(html: String): Int {
-        return try {
-            // Pattern tim numberOfEpisodes trong JSON-LD
-            val patterns = listOf(
-                Regex(""""numberOfEpisodes"\s*:\s*(\d+)"""),
-                Regex(""""episodeCount"\s*:\s*(\d+)"""),
-                Regex(""""totalEpisodes"\s*:\s*(\d+)""")
-            )
-            
-            for (pattern in patterns) {
-                val match = pattern.find(html)
-                if (match != null) {
-                    return match.groupValues[1].toIntOrNull() ?: -1
-                }
-            }
-            -1
-        } catch (_: Exception) {
-            -1
-        }
-    }
 
-    // Patterns tìm video URL - ưu tiên từ cao đến thấp
+    // Patterns tìm video URL
     private val streamPatterns = listOf(
         Regex("""var\s+streamUrl\s*=\s*["']([^"']+)["']"""),
         Regex("""streamUrl\s*=\s*["']([^"']+)["']"""),
@@ -245,7 +211,6 @@ class AnimeVietSub : MainAPI() {
     }
 
     private suspend fun fetchIframe(iframeSrc: String, referer: String, cookies: Map<String, String>): String? {
-        // Thử 1: Không CF, nhanh hơn
         try {
             val resp = app.get(iframeSrc, headers = mapOf(
                 "User-Agent"      to ua,
@@ -257,13 +222,11 @@ class AnimeVietSub : MainAPI() {
                 "Sec-Fetch-Site"  to "cross-site"
             ), cookies = cookies)
             val html = resp.text
-            // Nếu bị CF challenge thì HTML rất ngắn hoặc chứa "challenge"
             if (html.length > 1000 && !html.contains("cf-browser-verification")) {
                 return html
             }
         } catch (_: Exception) {}
 
-        // Thử 2: Với CF interceptor
         return try {
             app.get(iframeSrc, interceptor = cf, headers = mapOf(
                 "User-Agent"      to ua,
@@ -282,24 +245,18 @@ class AnimeVietSub : MainAPI() {
         .replace("&#39;", "'")
 
     private suspend fun findStreamUrl(html: String, epUrl: String, cookies: Map<String, String>): String? {
-        // Tìm trong HTML chính
         searchInHtml(html)?.let { return it }
 
-        // Tìm tất cả URL streamfree bằng regex trong raw HTML
-        // (iframe src có thể rỗng hoặc bị &amp; encode)
         val iframeUrls = mutableListOf<String>()
 
-        // Pattern 1: src="..." hoặc data-src="..."
         Regex("""(?:src|data-src)=["']([^"']*streamfree\.casa[^"']*)["']""")
             .findAll(html)
             .forEach { iframeUrls.add(unescapeHtml(it.groupValues[1])) }
 
-        // Pattern 2: URL nằm trong JavaScript string hoặc attribute khác
         Regex("""["']((?:https?:)?//streamfree\.casa/\?[^"'\s<>]+)["']""")
             .findAll(html)
             .forEach { iframeUrls.add(unescapeHtml(it.groupValues[1])) }
 
-        // Pattern 3: Tìm mọi nơi có streamfree.casa (kể cả &amp; encoded)
         Regex("""((?:https?:)?//streamfree\.casa/\?url=[A-Za-z0-9+/=]+(?:&(?:amp;)?csrftoken=[a-f0-9]+)?(?:&(?:amp;)?exp=\d+)?)""")
             .findAll(html)
             .forEach { iframeUrls.add(unescapeHtml(it.groupValues[1])) }
@@ -314,7 +271,6 @@ class AnimeVietSub : MainAPI() {
             searchInHtml(iframeHtml)?.let { return it }
         }
 
-        // Fallback: tất cả iframe src/data-src
         val doc = org.jsoup.Jsoup.parse(html)
         val jsoupIframes = doc.select("iframe")
             .mapNotNull { el ->
@@ -337,7 +293,6 @@ class AnimeVietSub : MainAPI() {
     }
 
     private suspend fun emitMaster(masterUrl: String, callback: (ExtractorLink) -> Unit): Boolean {
-        // Emit master playlist trực tiếp - ExoPlayer tự xử lý HLS quality selection
         callback(newExtractorLink(name, name, masterUrl) {
             quality = Qualities.P1080.value
             referer = ""

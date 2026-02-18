@@ -20,7 +20,7 @@ class OneHaniProvider : MainAPI() {
     override val hasMainPage = true
     override val supportedTypes = setOf(TvType.NSFW)
 
-    // Header giả lập trình duyệt và vượt qua trang /enter
+    // Header giả lập trình duyệt và vượt qua trang xác nhận tuổi
     private val headers = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         "Referer" to "$mainUrl/enter",
@@ -29,13 +29,13 @@ class OneHaniProvider : MainAPI() {
         "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7"
     )
 
-    // Sử dụng đúng cấu trúc URL mã hóa mà bạn đã cung cấp
+    // Sử dụng cấu trúc URL đầy đủ tham số và mã Unicode để tránh lỗi build
     override val mainPage = mainPageOf(
         "search?query=&type=&genre=&sort=created_at&date=&duration=" to "Mới Cập Nhật",
         "search?query=&type=&genre=&sort=views_count&date=&duration=" to "Xem Nhiều Nhất",
-        "search?query=&type=&genre=%E7%84%A1%E4%BF%AE%E6%AD%A3&sort=&date=&duration=" to "Không Che (Uncensored)",
-        "search?query=&type=&genre=%E8%A3%8F%E7%95%AA&sort=&date=&duration=" to "Series Hentai (里番)",
-        "search?query=&type=&genre=%E4%B8%AD%E6%96%87%E5%AD%97%E5%B9%95&sort=&date=&duration=" to "Phụ Đề (Chinese Sub)",
+        "search?query=&type=&genre=\u7121\u4fee\u6b63&sort=&date=&duration=" to "Không Che (Uncensored)", // 無修正
+        "search?query=&type=&genre=\u88cf\u756a&sort=&date=&duration=" to "Series Hentai (\u91cc\u756a)", // 裏番
+        "search?query=&type=&genre=\u4e2d\u6587\u5b57\u5e55&sort=&date=&duration=" to "Phụ Đề (Chinese Sub)", // 中文字幕
         "search?query=&type=&genre=3DCG&sort=&date=&duration=" to "Phim 3D (3DCG)"
     )
 
@@ -47,7 +47,7 @@ class OneHaniProvider : MainAPI() {
     }
 
     private fun parseItem(el: Element): SearchResponse? {
-        // Dựa trên HTML bạn gửi: link nằm ở thẻ <a> bao quanh div phim
+        // Dựa trên HTML bạn gửi: el là thẻ <a> bao quanh phim
         val href = el.attr("href")
         if (!href.contains("watch?v=")) return null
         
@@ -65,14 +65,12 @@ class OneHaniProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        // Nối tham số page vào cuối URL đầy đủ tham số
-        val url = "$mainUrl/${request.data}${if (page > 1) "&page=$page" else ""}"
+        // Nối tham số page vào cuối URL đầy đủ
+        val url = "$mainUrl/${request.data}&page=$page"
         
-        // Gửi request kèm Cookie h_m_enter=1
-        val res = app.get(url, headers = headers)
-        val doc = res.document
+        val doc = app.get(url, headers = headers).document
         
-        // Selector chính xác cho 1hani: tìm các thẻ <a> chứa div phim
+        // Selector "vét sạch": Tìm tất cả thẻ <a> có link watch?v= (đúng cấu trúc HTML bạn gửi)
         val items = doc.select("a[href*='watch?v=']").mapNotNull { 
             parseItem(it) 
         }.distinctBy { it.url }
@@ -81,11 +79,10 @@ class OneHaniProvider : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
+        // Giả lập URL tìm kiếm đầy đủ tham số như trình duyệt
         val url = "$mainUrl/search?query=$query&type=&genre=&sort=&date=&duration="
         val doc = app.get(url, headers = headers).document
-        return doc.select("a[href*='watch?v=']").mapNotNull { 
-            parseItem(it) 
-        }.distinctBy { it.url }
+        return doc.select("a[href*='watch?v=']").mapNotNull { parseItem(it) }.distinctBy { it.url }
     }
 
     override suspend fun load(url: String): LoadResponse {
@@ -132,7 +129,7 @@ class OneHaniProvider : MainAPI() {
             }
         }
 
-        // 2. Quét link MP4 trực tiếp từ script
+        // 2. Quét link MP4 trực tiếp từ script (Dành cho server hembed/imgcdn)
         val mp4Regex = Regex("""https?[:\\]+[/\\/]+[^\s"'<>]+?\.mp4[^\s"'<>]*""")
         mp4Regex.findAll(html).forEach { match ->
             val link = match.value.replace("\\/", "/")

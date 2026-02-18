@@ -76,12 +76,13 @@ class PhimMoiChillProvider : MainAPI() {
         return newAnimeSearchResponse(title, href, if (isSeries) TvType.TvSeries else TvType.Movie) {
             this.posterUrl = poster
             
-            // --- FIX LỖI TẠI ĐÂY ---
-            // Sử dụng addText để hiển thị chữ (Tập 6, Full...) lên thẻ
-            if (label.isNotEmpty()) {
-                addText(label)
+            // --- FIX LỖI BIÊN DỊCH TẠI ĐÂY ---
+            // Tách lấy số từ chuỗi (ví dụ "Tập 6" -> lấy số 6) và truyền vào addSub(Int)
+            val epNum = Regex("""\d+""").find(label)?.value?.toIntOrNull()
+            if (epNum != null) {
+                addSub(epNum)
             }
-            // -----------------------
+            // ---------------------------------
 
             this.quality = when {
                 has4k -> SearchQuality.UHD

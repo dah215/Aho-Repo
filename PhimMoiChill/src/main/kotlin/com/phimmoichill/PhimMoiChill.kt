@@ -104,87 +104,73 @@ class PhimMoiChillProvider : MainAPI() {
         return doc.select("li.item").mapNotNull { parseCard(it) }
     }
 
-    // ============================================
-    // FIX: Hàm load() đã được sửa để lấy đúng thông tin
-    // ============================================
     override suspend fun load(url: String): LoadResponse {
         val doc = app.get(url, headers = headers).document
         
-        // Lấy tiêu đề từ nhiều nguồn khác nhau
         val title = doc.selectFirst("h1[itemprop=name]")?.text()?.trim()
             ?: doc.selectFirst("h1")?.text()?.trim()
             ?: "Phim"
         
-        // Lấy poster từ nhiều nguồn
         val poster = doc.selectFirst(".film-poster img")?.let { imgUrl(it) }
             ?: doc.selectFirst("img[itemprop=image]")?.let { imgUrl(it) }
             ?: doc.selectFirst(".image img")?.let { imgUrl(it) }
             ?: doc.selectFirst(".image")?.attr("style")?.let { style ->
-                // Extract url from background-image: url(...)
                 Regex("""url\(['"]?(.*?)['"]?\)""").find(style)?.groupValues?.get(1)?.let { fixUrl(it) }
             }
         
-        // ============================================
-        // FIX: Lấy miêu tả từ đúng selector
-        // ============================================
         val plot = doc.selectFirst("#film-content")?.text()?.trim()
             ?: doc.selectFirst("[itemprop=description]")?.text()?.trim()
             ?: doc.selectFirst(".film-content")?.text()?.trim()
             ?: doc.selectFirst(".entry-content")?.text()?.trim()
         
-        // Lấy năm từ link
         val year = doc.selectFirst("a[href*='phim-nam-']")?.text()?.let { 
             Regex("""\b(20\d{2})\b""").find(it)?.value?.toIntOrNull() 
         } ?: doc.selectFirst("a[href*='/list/phim-nam-']")?.text()?.let {
             Regex("""\b(20\d{2})\b""").find(it)?.value?.toIntOrNull()
         }
         
-        // Lấy thể loại
         val genres = doc.select("a[href*='/genre/']").map { it.text().trim() }.filter { it.isNotEmpty() }
         
-        // Lấy link xem phim
         val watchUrl = doc.selectFirst("a.btn-see[href*='/xem/']")?.attr("href")?.let { fixUrl(it) }
             ?: doc.selectFirst("a[href*='/xem/']")?.attr("href")?.let { fixUrl(it) }
         
-        // Lấy thông tin rating
-        val rating = doc.selectFirst("[itemprop=ratingValue]")?.text()?.toRatingInt()
-            ?: doc.selectFirst(".average")?.text()?.toDoubleOrNull()?.times(10)?.toInt()
+        // FIX: Sử dụng score thay vì rating (deprecated)
+        val ratingText = doc.selectFirst("[itemprop=ratingValue]")?.text()
+            ?: doc.selectFirst(".average")?.text()
+        val score = ratingText?.toDoubleOrNull()
         
-        // Lấy duration
         val duration = doc.selectFirst("li:contains(Thời lượng:)")?.text()?.let {
             Regex("""(\d+)\s*giờ\s*(\d+)\s*phút""").find(it)?.let { match ->
                 match.groupValues[1].toInt() * 60 + match.groupValues[2].toInt()
             } ?: Regex("""(\d+)\s*phút""").find(it)?.groupValues?.get(1)?.toIntOrNull()
         }
         
-        // Lấy actors
-        val actors = doc.select("a[href*='/dien-vien/']").map { it.text().trim() }.filter { it.isNotEmpty() }
+        // FIX: Chuyển từ List<String> sang List<ActorData>
+        val actors = doc.select("a[href*='/dien-vien/']").map { 
+            ActorData(Actor(it.text().trim()), roleString = null)
+        }.filter { it.actor.name.isNotEmpty() }
         
-        // Lấy directors
-        val directors = doc.select("a[href*='/dao-dien/']").map { it.text().trim() }.filter { it.isNotEmpty() }
+        // FIX: Sử dụng addActors thay vì directors (không tồn tại)
+        // Hoặc có thể bỏ qua nếu không có support
 
-        // Kiểm tra danh sách tập phim
-        val episodeElements = doc.select("div.latest-episode a[data-id], ul.episodes li a, .list-episode a, a[href*='/xem/'][href*='-tap-']")
-        val hasEps = episodeElements.isNotEmpty()
+        val hasEps = doc.select("div.latest-episode a[data-id], ul.episodes li a, .list-episode a, a[href*='/xem/'][href*='-tap-']").isNotEmpty()
 
-        // Nếu không có tập và không có link xem -> Movie
         if (!hasEps && watchUrl == null) {
             return newMovieLoadResponse(title, url, TvType.Movie, url) {
                 this.posterUrl = poster
-                this.plot = plot  // Đảm bảo plot được gán
+                this.plot = plot
                 this.year = year
                 this.tags = genres
-                this.rating = rating
+                // FIX: Dùng score thay vì rating
+                this.score = score
                 this.duration = duration
-                this.actors = actors
-                this.directors = directors
+                // FIX: Dùng addActors với List<ActorData>
+                addActors(actors.map { it.actor })
             }
         }
 
-        // Lấy danh sách tập
         val eps = mutableListOf<Episode>()
         
-        // Thử lấy từ trang xem trước
         if (watchUrl != null) {
             try {
                 val watchDoc = app.get(watchUrl, headers = headers).document
@@ -204,11 +190,10 @@ class PhimMoiChillProvider : MainAPI() {
                     }
                 }
             } catch (e: Exception) {
-                // Ignore error, fallback to main page
+                // Ignore
             }
         }
         
-        // Fallback: lấy từ trang chính nếu không có từ trang xem
         if (eps.isEmpty()) {
             val mainPageEps = doc.select("div.latest-episode a[data-id], ul.episodes li a, .list-episode a, a[href*='/xem/'][href*='-tap-']")
             mainPageEps.forEach { a ->
@@ -225,7 +210,6 @@ class PhimMoiChillProvider : MainAPI() {
             }
         }
 
-        // Nếu vẫn không có tập nhưng có link xem -> coi như movie 1 tập
         val finalEps = if (eps.isEmpty() && watchUrl != null) {
             listOf(newEpisode(watchUrl) {
                 name = "Tập Full"
@@ -237,13 +221,14 @@ class PhimMoiChillProvider : MainAPI() {
 
         return newTvSeriesLoadResponse(title, url, TvType.TvSeries, finalEps) {
             this.posterUrl = poster
-            this.plot = plot  // Đảm bảo plot được gán
+            this.plot = plot
             this.year = year
             this.tags = genres
-            this.rating = rating
+            // FIX: Dùng score thay vì rating
+            this.score = score
             this.duration = duration
-            this.actors = actors
-            this.directors = directors
+            // FIX: Dùng addActors với List<ActorData>
+            addActors(actors.map { it.actor })
         }
     }
 

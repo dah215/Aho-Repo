@@ -76,13 +76,10 @@ class PhimMoiChillProvider : MainAPI() {
         return newAnimeSearchResponse(title, href, if (isSeries) TvType.TvSeries else TvType.Movie) {
             this.posterUrl = poster
             
-            // --- FIX LỖI BIÊN DỊCH TẠI ĐÂY ---
-            // Tách lấy số từ chuỗi (ví dụ "Tập 6" -> lấy số 6) và truyền vào addSub(Int)
             val epNum = Regex("""\d+""").find(label)?.value?.toIntOrNull()
             if (epNum != null) {
                 addSub(epNum)
             }
-            // ---------------------------------
 
             this.quality = when {
                 has4k -> SearchQuality.UHD
@@ -94,7 +91,6 @@ class PhimMoiChillProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        // Cấu trúc phân trang: .../page-2/
         val url = if (page <= 1) {
             "$mainUrl/${request.data}"
         } else {
@@ -114,23 +110,27 @@ class PhimMoiChillProvider : MainAPI() {
         val doc = app.get(url, headers = headers).document
         val title = doc.selectFirst("h1")?.text()?.trim() ?: "Phim"
         val poster = imgUrl(doc.selectFirst(".film-poster img, img[itemprop=image]"))
-        val plot = doc.selectFirst("#film-content, [itemprop=description]")?.text()?.trim()
+        
+        // ===== FIX: LẤY MÔ TẢ PHIM - QUAN TRỌNG =====
+        val plot = getPlot(doc)
+        // =============================================
+        
         val year = doc.selectFirst("a[href*='phim-nam-']")?.text()?.let { Regex("""\b(20\d{2})\b""").find(it)?.value?.toIntOrNull() }
         val genres = doc.select("a[href*='/genre/']").map { it.text().trim() }
         val watchUrl = doc.selectFirst("a.btn-see[href*='/xem/']")?.attr("href")?.let { fixUrl(it) }
         
-        // Kiểm tra danh sách tập phim
         val hasEps = doc.select("div.latest-episode a[data-id], ul.episodes li a").isNotEmpty()
 
         if (!hasEps && watchUrl == null) return newMovieLoadResponse(title, url, TvType.Movie, url) {
-            this.posterUrl = poster; this.plot = plot; this.year = year; this.tags = genres
+            this.posterUrl = poster
+            this.plot = plot
+            this.year = year
+            this.tags = genres
         }
 
-        // Lấy danh sách tập
         val eps = (watchUrl?.let { wu ->
             try { 
                 val watchDoc = app.get(wu, headers = headers).document
-                // Lấy tập từ trang xem
                 watchDoc.select("ul.episodes li a, div.list-episode a").mapNotNull { a ->
                     val href = fixUrl(a.attr("href"))
                     val name = a.text().trim()
@@ -143,7 +143,6 @@ class PhimMoiChillProvider : MainAPI() {
                 }
             } catch (_: Exception) { emptyList() }
         } ?: emptyList()).ifEmpty {
-            // Fallback nếu không lấy được từ trang xem
             doc.select("div.latest-episode a[data-id]").mapNotNull { a ->
                 newEpisode(fixUrl(a.attr("href"))) { 
                     this.name = a.text()
@@ -153,8 +152,83 @@ class PhimMoiChillProvider : MainAPI() {
         }
 
         return newTvSeriesLoadResponse(title, url, TvType.TvSeries, eps.ifEmpty { watchUrl?.let { listOf(newEpisode(it) { name = "Tập 1" }) } ?: emptyList() }) {
-            this.posterUrl = poster; this.plot = plot; this.year = year; this.tags = genres
+            this.posterUrl = poster
+            this.plot = plot
+            this.year = year
+            this.tags = genres
         }
+    }
+
+    /**
+     * Lấy mô tả phim từ nhiều nguồn
+     */
+    private fun getPlot(doc: org.jsoup.nodes.Document): String? {
+        // Phương pháp 1: meta[name="description"] - phổ biến nhất
+        val metaDesc = doc.selectFirst("meta[name=description]")
+        if (metaDesc != null) {
+            val content = metaDesc.attr("content")?.trim()
+            if (!content.isNullOrEmpty() && content.length > 20) {
+                return content
+            }
+        }
+        
+        // Phương pháp 2: meta[itemprop="description"]
+        val metaItemprop = doc.selectFirst("meta[itemprop=description]")
+        if (metaItemprop != null) {
+            val content = metaItemprop.attr("content")?.trim()
+            if (!content.isNullOrEmpty() && content.length > 20) {
+                return content
+            }
+        }
+        
+        // Phương pháp 3: og:description meta tag
+        val ogDesc = doc.selectFirst("meta[property=og:description]")
+        if (ogDesc != null) {
+            val content = ogDesc.attr("content")?.trim()
+            if (!content.isNullOrEmpty() && content.length > 20) {
+                return content
+            }
+        }
+        
+        // Phương pháp 4: div#film-content - lấy text trực tiếp, bỏ qua thẻ a đầu tiên
+        val filmContentDiv = doc.selectFirst("div#film-content")
+        if (filmContentDiv != null) {
+            // Lấy text và loại bỏ phần title link
+            var text = filmContentDiv.text()?.trim() ?: ""
+            // Tìm và xóa text từ thẻ a đầu tiên nếu có
+            val firstLink = filmContentDiv.selectFirst("a")
+            if (firstLink != null) {
+                val linkText = firstLink.text() ?: ""
+                if (linkText.isNotEmpty() && text.startsWith(linkText)) {
+                    text = text.substring(linkText.length).trim()
+                }
+            }
+            if (text.length > 20) {
+                return text
+            }
+        }
+        
+        // Phương pháp 5: Parse JSON-LD
+        val jsonLdScripts = doc.select("script[type=application/ld+json]")
+        for (script in jsonLdScripts) {
+            try {
+                val json = script.data() ?: continue
+                // Tìm description trong JSON
+                val descMatch = Regex(""""description"\s*:\s*"((?:[^"\\]|\\.)*)"""").find(json)
+                if (descMatch != null) {
+                    val desc = descMatch.groupValues[1]
+                        .replace("\\\"", "\"")
+                        .replace("\\n", "\n")
+                        .replace("\\/", "/")
+                        .trim()
+                    if (desc.length > 20) {
+                        return desc
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        
+        return null
     }
 
     override suspend fun loadLinks(
@@ -168,7 +242,6 @@ class PhimMoiChillProvider : MainAPI() {
             val html = res.text
             val cookies = res.cookies
 
-            // Extract episode ID
             val epId = Regex("""[/-]pm(\d+)""").find(data)?.groupValues?.get(1)
                 ?: Regex("""data-id="(\d+)"""").find(html)?.groupValues?.get(1)
                 ?: return false
@@ -182,9 +255,6 @@ class PhimMoiChillProvider : MainAPI() {
                 "Origin" to mainUrl
             )
 
-            // ============================================
-            // BƯỚC 1: LẤY KEY VIETSUB
-            // ============================================
             var vietsubKey: String? = null
             
             for (sv in 0..3) {
@@ -204,9 +274,6 @@ class PhimMoiChillProvider : MainAPI() {
                 } catch (e: Exception) { continue }
             }
 
-            // ============================================
-            // BƯỚC 2: LẤY KEY THUYẾT MINH
-            // ============================================
             var tmKey: String? = null
             
             for (sv in 0..3) {
@@ -226,10 +293,6 @@ class PhimMoiChillProvider : MainAPI() {
                 } catch (e: Exception) { continue }
             }
 
-            // ============================================
-            // BƯỚC 3: THÊM LINKS
-            // ============================================
-            
             if (!vietsubKey.isNullOrEmpty()) {
                 callback(
                     newExtractorLink(

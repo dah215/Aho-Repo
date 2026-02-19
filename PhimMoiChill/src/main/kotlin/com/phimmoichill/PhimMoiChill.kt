@@ -54,11 +54,9 @@ class PhimMoiChillProvider : MainAPI() {
         val title = a.attr("title").trim().ifEmpty { el.selectFirst("h3, p")?.text() ?: return null }
         val poster = imgUrl(el.selectFirst("img"))
         
-        // Lấy tất cả các nhãn (Label/Badge/Status)
         val labelElement = el.selectFirst(".label, .badge, .status, .film-status")
         val label = labelElement?.text()?.trim() ?: ""
         
-        // Kiểm tra xem có phải phim bộ không
         val isSeries = label.contains("Tập", true) || 
                        label.contains("Hoàn Tất", true) || 
                        title.contains("Phần", true) || 
@@ -76,13 +74,10 @@ class PhimMoiChillProvider : MainAPI() {
         return newAnimeSearchResponse(title, href, if (isSeries) TvType.TvSeries else TvType.Movie) {
             this.posterUrl = poster
             
-            // --- FIX LỖI BIÊN DỊCH TẠI ĐÂY ---
-            // Tách lấy số từ chuỗi (ví dụ "Tập 6" -> lấy số 6) và truyền vào addSub(Int)
             val epNum = Regex("""\d+""").find(label)?.value?.toIntOrNull()
             if (epNum != null) {
                 addSub(epNum)
             }
-            // ---------------------------------
 
             this.quality = when {
                 has4k -> SearchQuality.UHD
@@ -94,7 +89,6 @@ class PhimMoiChillProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        // Cấu trúc phân trang: .../page-2/
         val url = if (page <= 1) {
             "$mainUrl/${request.data}"
         } else {
@@ -110,50 +104,146 @@ class PhimMoiChillProvider : MainAPI() {
         return doc.select("li.item").mapNotNull { parseCard(it) }
     }
 
+    // ============================================
+    // FIX: Hàm load() đã được sửa để lấy đúng thông tin
+    // ============================================
     override suspend fun load(url: String): LoadResponse {
         val doc = app.get(url, headers = headers).document
-        val title = doc.selectFirst("h1")?.text()?.trim() ?: "Phim"
-        val poster = imgUrl(doc.selectFirst(".film-poster img, img[itemprop=image]"))
-        val plot = doc.selectFirst("#film-content, [itemprop=description]")?.text()?.trim()
-        val year = doc.selectFirst("a[href*='phim-nam-']")?.text()?.let { Regex("""\b(20\d{2})\b""").find(it)?.value?.toIntOrNull() }
-        val genres = doc.select("a[href*='/genre/']").map { it.text().trim() }
-        val watchUrl = doc.selectFirst("a.btn-see[href*='/xem/']")?.attr("href")?.let { fixUrl(it) }
         
-        // Kiểm tra danh sách tập phim
-        val hasEps = doc.select("div.latest-episode a[data-id], ul.episodes li a").isNotEmpty()
-
-        if (!hasEps && watchUrl == null) return newMovieLoadResponse(title, url, TvType.Movie, url) {
-            this.posterUrl = poster; this.plot = plot; this.year = year; this.tags = genres
+        // Lấy tiêu đề từ nhiều nguồn khác nhau
+        val title = doc.selectFirst("h1[itemprop=name]")?.text()?.trim()
+            ?: doc.selectFirst("h1")?.text()?.trim()
+            ?: "Phim"
+        
+        // Lấy poster từ nhiều nguồn
+        val poster = doc.selectFirst(".film-poster img")?.let { imgUrl(it) }
+            ?: doc.selectFirst("img[itemprop=image]")?.let { imgUrl(it) }
+            ?: doc.selectFirst(".image img")?.let { imgUrl(it) }
+            ?: doc.selectFirst(".image")?.attr("style")?.let { style ->
+                // Extract url from background-image: url(...)
+                Regex("""url\(['"]?(.*?)['"]?\)""").find(style)?.groupValues?.get(1)?.let { fixUrl(it) }
+            }
+        
+        // ============================================
+        // FIX: Lấy miêu tả từ đúng selector
+        // ============================================
+        val plot = doc.selectFirst("#film-content")?.text()?.trim()
+            ?: doc.selectFirst("[itemprop=description]")?.text()?.trim()
+            ?: doc.selectFirst(".film-content")?.text()?.trim()
+            ?: doc.selectFirst(".entry-content")?.text()?.trim()
+        
+        // Lấy năm từ link
+        val year = doc.selectFirst("a[href*='phim-nam-']")?.text()?.let { 
+            Regex("""\b(20\d{2})\b""").find(it)?.value?.toIntOrNull() 
+        } ?: doc.selectFirst("a[href*='/list/phim-nam-']")?.text()?.let {
+            Regex("""\b(20\d{2})\b""").find(it)?.value?.toIntOrNull()
         }
+        
+        // Lấy thể loại
+        val genres = doc.select("a[href*='/genre/']").map { it.text().trim() }.filter { it.isNotEmpty() }
+        
+        // Lấy link xem phim
+        val watchUrl = doc.selectFirst("a.btn-see[href*='/xem/']")?.attr("href")?.let { fixUrl(it) }
+            ?: doc.selectFirst("a[href*='/xem/']")?.attr("href")?.let { fixUrl(it) }
+        
+        // Lấy thông tin rating
+        val rating = doc.selectFirst("[itemprop=ratingValue]")?.text()?.toRatingInt()
+            ?: doc.selectFirst(".average")?.text()?.toDoubleOrNull()?.times(10)?.toInt()
+        
+        // Lấy duration
+        val duration = doc.selectFirst("li:contains(Thời lượng:)")?.text()?.let {
+            Regex("""(\d+)\s*giờ\s*(\d+)\s*phút""").find(it)?.let { match ->
+                match.groupValues[1].toInt() * 60 + match.groupValues[2].toInt()
+            } ?: Regex("""(\d+)\s*phút""").find(it)?.groupValues?.get(1)?.toIntOrNull()
+        }
+        
+        // Lấy actors
+        val actors = doc.select("a[href*='/dien-vien/']").map { it.text().trim() }.filter { it.isNotEmpty() }
+        
+        // Lấy directors
+        val directors = doc.select("a[href*='/dao-dien/']").map { it.text().trim() }.filter { it.isNotEmpty() }
 
-        // Lấy danh sách tập
-        val eps = (watchUrl?.let { wu ->
-            try { 
-                val watchDoc = app.get(wu, headers = headers).document
-                // Lấy tập từ trang xem
-                watchDoc.select("ul.episodes li a, div.list-episode a").mapNotNull { a ->
-                    val href = fixUrl(a.attr("href"))
-                    val name = a.text().trim()
-                    val epNum = Regex("""Tập\s*(\d+)""").find(name)?.groupValues?.get(1)?.toIntOrNull() 
-                                ?: Regex("""(\d+)""").find(name)?.groupValues?.get(1)?.toIntOrNull()
-                    newEpisode(href) { 
-                        this.name = name
-                        this.episode = epNum
-                    }
-                }
-            } catch (_: Exception) { emptyList() }
-        } ?: emptyList()).ifEmpty {
-            // Fallback nếu không lấy được từ trang xem
-            doc.select("div.latest-episode a[data-id]").mapNotNull { a ->
-                newEpisode(fixUrl(a.attr("href"))) { 
-                    this.name = a.text()
-                    this.episode = Regex("""\d+""").find(a.text())?.value?.toIntOrNull() 
-                }
+        // Kiểm tra danh sách tập phim
+        val episodeElements = doc.select("div.latest-episode a[data-id], ul.episodes li a, .list-episode a, a[href*='/xem/'][href*='-tap-']")
+        val hasEps = episodeElements.isNotEmpty()
+
+        // Nếu không có tập và không có link xem -> Movie
+        if (!hasEps && watchUrl == null) {
+            return newMovieLoadResponse(title, url, TvType.Movie, url) {
+                this.posterUrl = poster
+                this.plot = plot  // Đảm bảo plot được gán
+                this.year = year
+                this.tags = genres
+                this.rating = rating
+                this.duration = duration
+                this.actors = actors
+                this.directors = directors
             }
         }
 
-        return newTvSeriesLoadResponse(title, url, TvType.TvSeries, eps.ifEmpty { watchUrl?.let { listOf(newEpisode(it) { name = "Tập 1" }) } ?: emptyList() }) {
-            this.posterUrl = poster; this.plot = plot; this.year = year; this.tags = genres
+        // Lấy danh sách tập
+        val eps = mutableListOf<Episode>()
+        
+        // Thử lấy từ trang xem trước
+        if (watchUrl != null) {
+            try {
+                val watchDoc = app.get(watchUrl, headers = headers).document
+                val episodeLinks = watchDoc.select("ul.episodes li a, div.list-episode a, .episode-list a")
+                
+                if (episodeLinks.isNotEmpty()) {
+                    episodeLinks.forEach { a ->
+                        val href = fixUrl(a.attr("href"))
+                        val name = a.text().trim()
+                        val epNum = Regex("""Tập\s*(\d+)""").find(name)?.groupValues?.get(1)?.toIntOrNull()
+                            ?: Regex("""(\d+)""").find(name)?.groupValues?.get(1)?.toIntOrNull()
+                        
+                        eps.add(newEpisode(href) {
+                            this.name = name
+                            this.episode = epNum
+                        })
+                    }
+                }
+            } catch (e: Exception) {
+                // Ignore error, fallback to main page
+            }
+        }
+        
+        // Fallback: lấy từ trang chính nếu không có từ trang xem
+        if (eps.isEmpty()) {
+            val mainPageEps = doc.select("div.latest-episode a[data-id], ul.episodes li a, .list-episode a, a[href*='/xem/'][href*='-tap-']")
+            mainPageEps.forEach { a ->
+                val href = fixUrl(a.attr("href"))
+                val name = a.text().trim().ifEmpty { "Tập ${a.attr("data-id")}" }
+                val epNum = Regex("""Tập\s*(\d+)""").find(name)?.groupValues?.get(1)?.toIntOrNull()
+                    ?: Regex("""tap-(\d+)""").find(href)?.groupValues?.get(1)?.toIntOrNull()
+                    ?: Regex("""(\d+)""").find(name)?.value?.toIntOrNull()
+                
+                eps.add(newEpisode(href) {
+                    this.name = name
+                    this.episode = epNum
+                })
+            }
+        }
+
+        // Nếu vẫn không có tập nhưng có link xem -> coi như movie 1 tập
+        val finalEps = if (eps.isEmpty() && watchUrl != null) {
+            listOf(newEpisode(watchUrl) {
+                name = "Tập Full"
+                episode = 1
+            })
+        } else {
+            eps.sortedBy { it.episode }
+        }
+
+        return newTvSeriesLoadResponse(title, url, TvType.TvSeries, finalEps) {
+            this.posterUrl = poster
+            this.plot = plot  // Đảm bảo plot được gán
+            this.year = year
+            this.tags = genres
+            this.rating = rating
+            this.duration = duration
+            this.actors = actors
+            this.directors = directors
         }
     }
 
@@ -168,7 +258,6 @@ class PhimMoiChillProvider : MainAPI() {
             val html = res.text
             val cookies = res.cookies
 
-            // Extract episode ID
             val epId = Regex("""[/-]pm(\d+)""").find(data)?.groupValues?.get(1)
                 ?: Regex("""data-id="(\d+)"""").find(html)?.groupValues?.get(1)
                 ?: return false
@@ -182,11 +271,7 @@ class PhimMoiChillProvider : MainAPI() {
                 "Origin" to mainUrl
             )
 
-            // ============================================
-            // BƯỚC 1: LẤY KEY VIETSUB
-            // ============================================
             var vietsubKey: String? = null
-            
             for (sv in 0..3) {
                 try {
                     val response = app.post(
@@ -204,11 +289,7 @@ class PhimMoiChillProvider : MainAPI() {
                 } catch (e: Exception) { continue }
             }
 
-            // ============================================
-            // BƯỚC 2: LẤY KEY THUYẾT MINH
-            // ============================================
             var tmKey: String? = null
-            
             for (sv in 0..3) {
                 try {
                     val response = app.post(
@@ -226,10 +307,6 @@ class PhimMoiChillProvider : MainAPI() {
                 } catch (e: Exception) { continue }
             }
 
-            // ============================================
-            // BƯỚC 3: THÊM LINKS
-            // ============================================
-            
             if (!vietsubKey.isNullOrEmpty()) {
                 callback(
                     newExtractorLink(

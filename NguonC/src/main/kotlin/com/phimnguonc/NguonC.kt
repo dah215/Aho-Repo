@@ -44,13 +44,20 @@ class PhimNguonCProvider : MainAPI() {
     )
 
     // Chuyển đổi string quality sang SearchQuality enum
+    // Các giá trị có thể: Cam, CamRip, HdCam, Telesync, WorkPrint, 
+    // SD, HD, FHD (FullHD), UHD (UltraHD), BlueRay, DVD
     private fun getSearchQuality(quality: String?): SearchQuality? {
-        return when (quality?.uppercase()) {
-            "4K" -> SearchQuality.UltraHD
-            "FHD", "FULL HD" -> SearchQuality.FullHD
-            "HD" -> SearchQuality.HD
+        return when (quality?.uppercase()?.replace(" ", "")?.replace("-", "")) {
+            "4K", "UHD", "ULTRAHD" -> SearchQuality.UHD
+            "FHD", "FULLHD", "FULL HD" -> SearchQuality.FHD
+            "HD", "HDTV" -> SearchQuality.HD
             "SD" -> SearchQuality.SD
             "CAM", "CAMRIP" -> SearchQuality.Cam
+            "HDCAM" -> SearchQuality.HdCam
+            "TELESYNC", "TS" -> SearchQuality.Telesync
+            "WORKPRINT", "WP" -> SearchQuality.WorkPrint
+            "BLURAY", "BLU-RAY", "BD" -> SearchQuality.BlueRay
+            "DVD" -> SearchQuality.DVD
             else -> null
         }
     }
@@ -76,13 +83,6 @@ class PhimNguonCProvider : MainAPI() {
             href.contains("/phim-le/") -> TvType.Movie
             href.contains("/hoat-hinh/") -> TvType.Anime
             else -> TvType.TvSeries
-        }
-
-        // Tạo label hiển thị: "HD | Tập 5/10" hoặc "HD"
-        val label = if (episodeNum.isNotBlank() && type != TvType.Movie) {
-            "$qualityText | Tập $episodeNum"
-        } else {
-            qualityText
         }
 
         return newMovieSearchResponse(title, href, type) {

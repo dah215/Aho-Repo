@@ -23,7 +23,6 @@ class PhimNguonCProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
 
-    // Thuật toán thông minh: Tự động cập nhật User-Agent và các headers để tránh bị Cloudflare chặn
     private val headers = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
         "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
@@ -88,7 +87,6 @@ class PhimNguonCProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        // Thuật toán thông minh: Ưu tiên API, nếu lỗi 2001 (Network) thì thử lại với timeout dài hơn hoặc fallback HTML
         try {
             val url = "$mainUrl/api/films/${request.data}?page=$page"
             val res = app.get(url, headers = headers, timeout = 15).parsedSafe<NguonCResponse>()
@@ -96,11 +94,8 @@ class PhimNguonCProvider : MainAPI() {
                 val items = res.items.mapNotNull { it.toSearchResponse() }
                 return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
             }
-        } catch (e: Exception) {
-            // Log lỗi để debug nếu cần
-        }
+        } catch (e: Exception) {}
 
-        // Fallback sang HTML nếu API lỗi
         val htmlUrl = if (page == 1) {
             "$mainUrl/${request.data}"
         } else {
@@ -150,7 +145,6 @@ class PhimNguonCProvider : MainAPI() {
                         val epName = ep.name ?: ""
                         val epNum = Regex("""\d+""").find(epName)?.value?.toIntOrNull()
                         
-                        // Thuật toán thông minh: Ưu tiên link m3u8 trực tiếp để tránh lỗi kết nối server trung gian
                         val link = if (!ep.m3u8.isNullOrBlank()) ep.m3u8 else ep.embed ?: ""
                         
                         if (link.isNotBlank()) {
@@ -170,7 +164,6 @@ class PhimNguonCProvider : MainAPI() {
             }
         } catch (e: Exception) {}
 
-        // Fallback HTML nếu API lỗi
         val doc = app.get(url, headers = headers).document
         val title = doc.selectFirst("h1, .title, .name")?.text()?.trim() ?: "Phim"
         val poster = imgUrl(doc.selectFirst(".film-poster img, .movie-thumb img, .poster img, img"))
@@ -200,11 +193,9 @@ class PhimNguonCProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // Thuật toán thông minh: Tự động sửa lỗi giao thức và xử lý link m3u8 chuẩn xác
         val fixedData = data.replace("^http://".toRegex(), "https://")
 
         if (fixedData.contains(".m3u8")) {
-            // Server 1: Không gửi Referer (Tốt nhất cho CDN Cloudflare)
             callback(
                 newExtractorLink(
                     "NguonC",
@@ -212,10 +203,9 @@ class PhimNguonCProvider : MainAPI() {
                     fixedData,
                     "",
                     Qualities.P1080.value,
-                    true
+                    isM3u8 = true
                 )
             )
-            // Server 2: Gửi Referer dự phòng
             callback(
                 newExtractorLink(
                     "NguonC",
@@ -223,17 +213,15 @@ class PhimNguonCProvider : MainAPI() {
                     fixedData,
                     "$mainUrl/",
                     Qualities.P1080.value,
-                    true
+                    isM3u8 = true
                 )
             )
             return true
         }
 
-        // Nếu là link embed, thực hiện cào link m3u8 từ iframe
         val doc = app.get(fixedData, headers = headers).document
         val html = doc.html()
         
-        // Thuật toán thông minh: Regex chuẩn xác hơn để bắt link m3u8 trong mã nguồn
         val m3u8Regex = Regex("""https?://[^\s"']+\.m3u8[^\s"']*""")
         val matches = m3u8Regex.findAll(html).map { it.value }.toList()
         
@@ -247,7 +235,7 @@ class PhimNguonCProvider : MainAPI() {
                     safeLink,
                     "",
                     Qualities.P1080.value,
-                    true
+                    isM3u8 = true
                 )
             )
             found = true
@@ -268,7 +256,7 @@ class PhimNguonCProvider : MainAPI() {
                             safeLink,
                             "",
                             Qualities.P1080.value,
-                            true
+                            isM3u8 = true
                         )
                     )
                     found = true
@@ -294,7 +282,6 @@ class PhimNguonCProvider : MainAPI() {
         }
     }
 
-    // Cập nhật cấu trúc Data Class theo API thực tế của NguonC
     data class NguonCResponse(
         @JsonProperty("items") val items: List<NguonCItem>? = null
     )

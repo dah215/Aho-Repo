@@ -25,7 +25,7 @@ class PhimNguonCProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
 
-    // User-Agent đồng nhất để giữ Session TLS Fingerprint
+    // User-Agent hiện đại để khớp với TLS Fingerprint của trình duyệt
     private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
     private val commonHeaders = mapOf(
@@ -117,14 +117,14 @@ class PhimNguonCProvider : MainAPI() {
         val m3u8Url = parts[0]
         val embedUrl = if (parts.size > 1) parts[1] else ""
 
-        // KỸ THUẬT 1: Session Warm-up
-        // Truy cập trang embed để lấy Cookie và kích hoạt phiên làm việc trên CDN
+        // THUẬT TOÁN MỚI 1: Khởi tạo phiên (Session Warm-up)
+        // Truy cập trang embed để lấy Cookie cần thiết cho việc tải file .png
         val embedRes = app.get(embedUrl, headers = commonHeaders, interceptor = cfInterceptor)
         val cookies = embedRes.cookies
         val cookieString = cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
 
-        // KỸ THUẬT 2: Manual Redirect Resolution
-        // Tự giải mã redirect để lấy link CDN thật (amass15.top), tránh trình phát làm mất Header
+        // THUẬT TOÁN MỚI 2: Giải mã Redirect thủ công
+        // Lấy link CDN thật (amass15.top) để trình phát không bị mất Header khi tự redirect
         val finalRes = app.get(
             m3u8Url, 
             headers = commonHeaders.plus("Referer" to embedUrl).plus("Cookie" to cookieString),
@@ -133,19 +133,20 @@ class PhimNguonCProvider : MainAPI() {
         )
         val finalVideoUrl = finalRes.url
 
-        // KỸ THUẬT 3: Header Injection cho Segments (.png)
-        // Ép trình phát gửi đúng Referer và Cookie cho từng phân đoạn ảnh ngụy trang
+        // THUẬT TOÁN MỚI 3: Header Injection "Siêu cấp"
+        // Ép trình phát gửi đúng Referer và Cookie cho TẤT CẢ các request tải ảnh ngụy trang (.png)
         val videoHeaders = mapOf(
             "User-Agent" to USER_AGENT,
             "Referer" to embedUrl,
             "Origin" to embedUrl.substringBefore("/embed.php"),
             "Cookie" to cookieString,
-            "Accept" to "*/*",
+            "Accept" to "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
             "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8",
+            "Connection" to "keep-alive",
             "Sec-Fetch-Dest" to "video",
             "Sec-Fetch-Mode" to "cors",
             "Sec-Fetch-Site" to "cross-site",
-            "Range" to "bytes=0-" // Ép CDN nhả luồng dữ liệu thay vì file tĩnh
+            "Range" to "bytes=0-" // Ép CDN nhả luồng dữ liệu video thay vì file ảnh tĩnh
         )
 
         callback(
@@ -156,7 +157,7 @@ class PhimNguonCProvider : MainAPI() {
                 type = ExtractorLinkType.M3U8
             ) {
                 this.quality = Qualities.P1080.value
-                this.headers = videoHeaders // Header này sẽ được dùng cho TẤT CẢ các request .png
+                this.headers = videoHeaders // Header này cực kỳ quan trọng để bẻ khóa file .png
             }
         )
         return true

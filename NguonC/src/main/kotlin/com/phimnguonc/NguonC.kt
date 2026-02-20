@@ -171,13 +171,18 @@ class PhimNguonCProvider : MainAPI() {
             }
         }
 
+        // Parse duration from string like "45 Phút/Tập" to Int (minutes)
+        val durationMinutes = movie.time?.let { 
+            Regex("""(\d+)""").find(it)?.groupValues?.get(1)?.toIntOrNull() 
+        }
+
         return if (tvType == TvType.Movie) {
             newMovieLoadResponse(movie.name ?: "", url, tvType, episodes.firstOrNull()?.data ?: "") {
                 this.posterUrl = movie.poster_url ?: movie.thumb_url
                 this.plot = fullDescription
                 this.year = year
                 this.tags = genres
-                this.duration = movie.time
+                this.duration = durationMinutes
                 this.recommendations = ArrayList()
             }
         } else {
@@ -186,7 +191,7 @@ class PhimNguonCProvider : MainAPI() {
                 this.plot = fullDescription
                 this.year = year
                 this.tags = genres
-                this.duration = movie.time
+                this.duration = durationMinutes
                 this.recommendations = ArrayList()
             }
         }

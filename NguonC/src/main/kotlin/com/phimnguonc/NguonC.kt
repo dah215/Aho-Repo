@@ -23,10 +23,13 @@ class PhimNguonCProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
 
+    // BỘ HEADERS GIẢ LẬP ANDROID THỰC TẾ ĐỂ VƯỢT LỖI 2001
     private val headers = mapOf(
-        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        "User-Agent" to "Mozilla/5.0 (Linux; Android 14; Pixel 8 Build/UQ1A.231205.015; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/120.0.6099.144 Mobile Safari/537.36",
+        "Accept" to "application/json, text/plain, */*",
         "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+        "X-Requested-With" to "com.phimnguonc.app", // Giả lập yêu cầu từ App Android
+        "Origin" to mainUrl,
         "Referer" to "$mainUrl/"
     )
 
@@ -63,25 +66,20 @@ class PhimNguonCProvider : MainAPI() {
         
         val title = a.attr("title").ifBlank { el.selectFirst("h2, h3, .title, .name")?.text() }?.trim() ?: return null
         val poster = imgUrl(el.selectFirst("img"))
-        
         val label = el.selectFirst(".status, .episode, .label, .ribbon, .quality, .ep-status")?.text()?.trim() ?: ""
-        
         val isSeries = label.contains("Tập", true) || href.contains("phim-bo") || Regex("""\d+/\d+""").containsMatchIn(label)
         
         return newAnimeSearchResponse(title, href, if (isSeries) TvType.TvSeries else TvType.Movie) {
             this.posterUrl = poster
-            
             val epNum = Regex("""\d+""").find(label)?.value?.toIntOrNull()
-            if (epNum != null) {
-                addSub(epNum)
-            }
+            if (epNum != null) addSub(epNum)
         }
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         try {
             val url = "$mainUrl/api/films/${request.data}?page=$page"
-            val res = app.get(url, headers = headers, timeout = 15).parsedSafe<NguonCResponse>()
+            val res = app.get(url, headers = headers, timeout = 20).parsedSafe<NguonCResponse>()
             if (res?.items != null && res.items.isNotEmpty()) {
                 val items = res.items.mapNotNull { it.toSearchResponse() }
                 return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
@@ -117,7 +115,6 @@ class PhimNguonCProvider : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse {
         val slug = url.substringAfterLast("/")
-        
         try {
             val apiUrl = "$mainUrl/api/film/$slug"
             val res = app.get(apiUrl, headers = headers).parsedSafe<NguonCDetailResponse>()?.movie
@@ -125,15 +122,12 @@ class PhimNguonCProvider : MainAPI() {
                 val title = res.name ?: ""
                 val poster = res.poster_url ?: res.thumb_url
                 val plot = res.description?.replace(Regex("<.*?>"), "")?.trim()
-                
                 val episodes = mutableListOf<Episode>()
                 res.episodes?.forEach { server ->
                     server.items?.forEach { ep ->
                         val epName = ep.name ?: ""
                         val epNum = Regex("""\d+""").find(epName)?.value?.toIntOrNull()
-                        
                         val data = if (!ep.m3u8.isNullOrBlank()) ep.m3u8 else ep.embed ?: ""
-                        
                         if (data.isNotBlank()) {
                             episodes.add(newEpisode(data) {
                                 this.name = epName
@@ -142,7 +136,6 @@ class PhimNguonCProvider : MainAPI() {
                         }
                     }
                 }
-
                 return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
                     this.posterUrl = poster
                     this.plot = plot
@@ -155,19 +148,16 @@ class PhimNguonCProvider : MainAPI() {
         val title = doc.selectFirst("h1, .title, .name")?.text()?.trim() ?: "Phim"
         val poster = imgUrl(doc.selectFirst(".film-poster img, .movie-thumb img, .poster img, img"))
         val plot = doc.selectFirst(".film-content, .description, .plot, #info-film")?.text()?.trim()
-        
         val episodes = mutableListOf<Episode>()
         doc.select(".episodes a, .server-item a, .list-episode a, .halim-list-eps a").forEach { ep ->
             val epHref = fixUrl(ep.attr("href")) ?: return@forEach
             val epName = ep.text().trim()
             val epNum = Regex("""\d+""").find(epName)?.value?.toIntOrNull()
-            
             episodes.add(newEpisode(epHref) {
                 this.name = epName
                 this.episode = epNum
             })
         }
-        
         return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes.distinctBy { it.data }) {
             this.posterUrl = poster
             this.plot = plot
@@ -182,14 +172,14 @@ class PhimNguonCProvider : MainAPI() {
     ): Boolean {
         val fixedData = data.replace("^http://".toRegex(), "https://")
 
-        // Trường hợp 1: Link m3u8 trực tiếp
+        // 1. Xử lý link m3u8 trực tiếp
         if (fixedData.contains(".m3u8")) {
             callback(
                 newExtractorLink(
                     "NguonC",
                     "NguonC (HLS)",
                     fixedData,
-                    null, // type: ExtractorLinkType?
+                    null,
                     {
                         this.referer = ""
                         this.quality = Qualities.P1080.value
@@ -199,7 +189,7 @@ class PhimNguonCProvider : MainAPI() {
             return true
         }
 
-        // Trường hợp 2: Link embed từ streamc.xyz
+        // 2. Xử lý link embed từ streamc.xyz (Giải mã thông minh)
         if (fixedData.contains("streamc.xyz/embed.php")) {
             val hash = fixedData.substringAfter("hash=").substringBefore("&")
             if (hash.isNotBlank()) {
@@ -209,7 +199,7 @@ class PhimNguonCProvider : MainAPI() {
                         "NguonC",
                         "NguonC (StreamC)",
                         m3u8Link,
-                        null, // type: ExtractorLinkType?
+                        null,
                         {
                             this.referer = "https://phim.nguonc.com/"
                             this.quality = Qualities.P1080.value
@@ -220,30 +210,32 @@ class PhimNguonCProvider : MainAPI() {
             }
         }
 
-        // Trường hợp 3: Cào link từ mã nguồn trang (Fallback)
-        val doc = app.get(fixedData, headers = headers).document
-        val html = doc.html()
-        val m3u8Regex = Regex("""https?://[^\s"']+\.m3u8[^\s"']*""")
-        val matches = m3u8Regex.findAll(html).map { it.value }.toList()
-        
-        var found = false
-        matches.forEach { link ->
-            callback(
-                newExtractorLink(
-                    "NguonC",
-                    "NguonC (HLS)",
-                    link.replace("^http://".toRegex(), "https://"),
-                    null, // type: ExtractorLinkType?
-                    {
-                        this.referer = ""
-                        this.quality = Qualities.P1080.value
-                    }
+        // 3. Fallback: Cào link từ mã nguồn trang
+        try {
+            val doc = app.get(fixedData, headers = headers).document
+            val html = doc.html()
+            val m3u8Regex = Regex("""https?://[^\s"']+\.m3u8[^\s"']*""")
+            val matches = m3u8Regex.findAll(html).map { it.value }.toList()
+            var found = false
+            matches.forEach { link ->
+                callback(
+                    newExtractorLink(
+                        "NguonC",
+                        "NguonC (HLS)",
+                        link.replace("^http://".toRegex(), "https://"),
+                        null,
+                        {
+                            this.referer = ""
+                            this.quality = Qualities.P1080.value
+                        }
+                    )
                 )
-            )
-            found = true
+                found = true
+            }
+            return found
+        } catch (e: Exception) {
+            return false
         }
-        
-        return found
     }
 
     private fun NguonCItem.toSearchResponse(): SearchResponse? {
@@ -251,7 +243,6 @@ class PhimNguonCProvider : MainAPI() {
         val href = "$mainUrl/phim/${this.slug}"
         val poster = this.thumb_url ?: this.poster_url
         val epText = this.current_episode ?: ""
-
         return newAnimeSearchResponse(title, href, TvType.TvSeries) {
             this.posterUrl = poster
             val epNum = Regex("""\d+""").find(epText)?.value?.toIntOrNull()

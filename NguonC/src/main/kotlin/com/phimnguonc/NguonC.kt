@@ -2,6 +2,8 @@ package com.phimnguonc
 
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
+import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
@@ -66,8 +68,11 @@ class PhimNguonCProvider : MainAPI() {
         
         return newAnimeSearchResponse(title, href, if (isSeries) TvType.TvSeries else TvType.Movie) {
             this.posterUrl = poster
-            if (label.isNotBlank()) {
-                addText(label)
+            
+            // Tách số tập từ chuỗi và dùng addSub (Chuẩn API mới)
+            val epNum = Regex("""\d+""").find(label)?.value?.toIntOrNull()
+            if (epNum != null) {
+                addSub(epNum)
             }
         }
     }
@@ -164,7 +169,7 @@ class PhimNguonCProvider : MainAPI() {
         val doc = app.get(url, headers = headers).document
         val title = doc.selectFirst("h1, .title, .name")?.text()?.trim() ?: "Phim"
         val poster = imgUrl(doc.selectFirst(".film-poster img, .movie-thumb img, .poster img, img"))
-        val plot = doc.selectFirst(".film-content, .description, .plot, #info-film,")?.text()?.trim()
+        val plot = doc.selectFirst(".film-content, .description, .plot, #info-film")?.text()?.trim()
         val year = doc.selectFirst("a, a")?.text()?.toIntOrNull()
         val tags = doc.select("a, a").map { it.text().trim() }
         
@@ -204,13 +209,13 @@ class PhimNguonCProvider : MainAPI() {
         // Nếu data đã là link m3u8 (Lấy từ API)
         if (data.contains(".m3u8")) {
             callback(
-                ExtractorLink(
+                newExtractorLink(
                     name,
                     name,
                     data,
-                    "",
-                    Qualities.P1080.value,
-                    true
+                    referer = "$mainUrl/",
+                    quality = Qualities.P1080.value,
+                    type = ExtractorLinkType.M3U8
                 )
             )
             return true
@@ -221,18 +226,18 @@ class PhimNguonCProvider : MainAPI() {
         val html = doc.html()
         
         val m3u8Regex = Regex("""(https?://+\.m3u8*)""")
-        val matches = m3u8Regex.findAll(html).map { it.groupValues }.toList()
+        val matches = m3u8Regex.findAll(html).map { it.value }.toList()
         
         var found = false
         matches.forEach { link ->
             callback(
-                ExtractorLink(
+                newExtractorLink(
                     name,
                     name,
                     link,
-                    "$mainUrl/",
-                    Qualities.P1080.value,
-                    true
+                    referer = "$mainUrl/",
+                    quality = Qualities.P1080.value,
+                    type = ExtractorLinkType.M3U8
                 )
             )
             found = true
@@ -242,16 +247,16 @@ class PhimNguonCProvider : MainAPI() {
             val iframe = doc.selectFirst("iframe")?.attr("src")
             if (iframe != null && iframe.startsWith("http")) {
                 val iframeHtml = app.get(iframe, headers = headers).text
-                val iframeMatches = m3u8Regex.findAll(iframeHtml).map { it.groupValues }.toList()
+                val iframeMatches = m3u8Regex.findAll(iframeHtml).map { it.value }.toList()
                 iframeMatches.forEach { link ->
                     callback(
-                        ExtractorLink(
+                        newExtractorLink(
                             name,
                             name,
                             link,
-                            iframe,
-                            Qualities.P1080.value,
-                            true
+                            referer = iframe,
+                            quality = Qualities.P1080.value,
+                            type = ExtractorLinkType.M3U8
                         )
                     )
                     found = true
@@ -270,8 +275,9 @@ class PhimNguonCProvider : MainAPI() {
 
         return newAnimeSearchResponse(title, href, TvType.TvSeries) {
             this.posterUrl = poster
-            if (epText.isNotBlank()) {
-                addText(epText)
+            val epNum = Regex("""\d+""").find(epText)?.value?.toIntOrNull()
+            if (epNum != null) {
+                addSub(epNum)
             }
         }
     }

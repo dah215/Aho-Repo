@@ -26,13 +26,13 @@ class PhimNguonCProvider : MainAPI() {
 
     private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
-    // Giải quyết Cloudflare cho toàn bộ hệ sinh thái
-    private val cfInterceptor = WebViewResolver(Regex("""phim\.nguonc\.com|.*streamc\.xyz|.*amass15\.top"""))
+    // Giải quyết Cloudflare cho tất cả các domain liên quan
+    private val cfInterceptor = WebViewResolver(Regex("""phim\.nguonc\.com|.*streamc\.xyz|.*amass15\.top|.*phimmoi\.net"""))
 
     private val commonHeaders = mapOf(
         "User-Agent" to USER_AGENT,
         "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language" to "vi-VN,vi;q=0.9",
+        "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8",
     )
 
     override val mainPage = mainPageOf(
@@ -70,22 +70,23 @@ class PhimNguonCProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val slug = url.trimEnd('/').substringAfterLast("/")
+        val slug = url.trim().trimEnd('/').substringAfterLast("/")
         val episodes = mutableListOf<Episode>()
         var movieTitle = ""
         var moviePoster = ""
         var moviePlot = ""
 
-        // NGUỒN 1: Thử gọi API JSON (Chính xác nhất theo mẫu bạn gửi)
+        // CỐ GẮNG LẤY DỮ LIỆU TỪ 2 NGUỒN ĐỂ TRÁNH LỖI "KHÔNG TÌM THẤY LIÊN KẾT"
         try {
             val apiUrl = "$mainUrl/api/film/$slug"
-            val res = app.get(apiUrl, headers = commonHeaders).parsedSafe<NguonCDetailResponse>()
+            val res = app.get(apiUrl, headers = commonHeaders, timeout = 15).parsedSafe<NguonCDetailResponse>()
             res?.movie?.let { movie ->
                 movieTitle = movie.name ?: ""
                 moviePoster = movie.poster_url ?: movie.thumb_url ?: ""
                 moviePlot = movie.description ?: ""
                 movie.episodes?.forEach { server ->
-                    server.items?.forEach { ep ->
+                    val items = server.items ?: server.list
+                    items?.forEach { ep ->
                         val m3u8 = ep.m3u8?.replace("\\/", "/") ?: ""
                         val embed = ep.embed?.replace("\\/", "/") ?: ""
                         if (m3u8.isNotBlank()) {
@@ -99,7 +100,6 @@ class PhimNguonCProvider : MainAPI() {
             }
         } catch (e: Exception) { }
 
-        // NGUỒN 2: Dự phòng bằng cách quét Script HTML nếu API lỗi
         if (episodes.isEmpty()) {
             val doc = app.get(url, headers = commonHeaders, interceptor = cfInterceptor).document
             movieTitle = doc.selectFirst("h1")?.text()?.trim() ?: ""
@@ -110,7 +110,8 @@ class PhimNguonCProvider : MainAPI() {
                     val jsonStr = scriptData.substringAfter("var episodes = ").substringBefore("];") + "]"
                     val servers = AppUtils.parseJson<List<NguonCServer>>(jsonStr)
                     servers.forEach { server ->
-                        server.list?.forEach { ep ->
+                        val items = server.list ?: server.items
+                        items?.forEach { ep ->
                             val m3u8 = ep.m3u8?.replace("\\/", "/") ?: ""
                             val embed = ep.embed?.replace("\\/", "/") ?: ""
                             if (m3u8.isNotBlank()) {
@@ -125,7 +126,7 @@ class PhimNguonCProvider : MainAPI() {
             }
         }
 
-        if (episodes.isEmpty()) throw ErrorLoadingException("Không tìm thấy tập phim")
+        if (episodes.isEmpty()) throw ErrorLoadingException("Dữ liệu tập phim trống, vui lòng thử lại")
 
         return newTvSeriesLoadResponse(movieTitle, url, TvType.TvSeries, episodes) {
             this.posterUrl = moviePoster
@@ -143,22 +144,27 @@ class PhimNguonCProvider : MainAPI() {
         val m3u8Url = parts[0]
         val embedUrl = if (parts.size > 1) parts[1] else ""
 
-        // Lấy domain của server embed để làm Origin (VD: https://embed18.streamc.xyz)
-        val embedDomain = if (embedUrl.startsWith("http")) {
-            Regex("""https?://[^/]+""").find(embedUrl)?.value ?: ""
-        } else ""
+        // BƯỚC 1: Giải quyết Redirect thủ công để lấy link CDN thật (amass15.top)
+        // Việc này cực kỳ quan trọng để tránh lỗi 2001 do mất Header khi redirect
+        val finalRes = try {
+            app.get(m3u8Url, headers = mapOf("Referer" to "$mainUrl/", "User-Agent" to USER_AGENT), timeout = 15)
+        } catch (e: Exception) { null }
+        
+        val finalVideoUrl = finalRes?.url ?: m3u8Url
+        val cookies = finalRes?.cookies?.entries?.joinToString("; ") { "${it.key}=${it.value}" } ?: ""
 
-        // THUẬT TOÁN BẺ KHÓA PNG: Bộ Header giả dạng trình duyệt đang xem ảnh cực mạnh
+        // BƯỚC 2: Xây dựng bộ Header "Bẻ khóa PNG"
         val videoHeaders = mapOf(
             "User-Agent" to USER_AGENT,
             "Referer" to (if (embedUrl.isNotBlank()) embedUrl else "$mainUrl/"),
-            "Origin" to embedDomain,
+            "Origin" to (if (embedUrl.isNotBlank()) embedUrl.substringBefore("/embed.php") else mainUrl),
+            "Cookie" to cookies,
             "Accept" to "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
             "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8",
             "Sec-Fetch-Dest" to "video",
             "Sec-Fetch-Mode" to "cors",
             "Sec-Fetch-Site" to "cross-site",
-            "Range" to "bytes=0-", // Ép CDN nhả luồng dữ liệu thay vì file tĩnh
+            "Range" to "bytes=0-",
             "Connection" to "keep-alive"
         )
 
@@ -166,17 +172,16 @@ class PhimNguonCProvider : MainAPI() {
             newExtractorLink(
                 source = "NguonC (Ultra-Bypass)",
                 name = "HLS - 1080p",
-                url = m3u8Url,
+                url = finalVideoUrl,
                 type = ExtractorLinkType.M3U8
             ) {
                 this.quality = Qualities.P1080.value
-                this.headers = videoHeaders // Header này sẽ bẻ khóa các phân đoạn .png
+                this.headers = videoHeaders
             }
         )
         return true
     }
 
-    // Data classes linh hoạt cho cả API và HTML
     data class NguonCDetailResponse(@JsonProperty("movie") val movie: NguonCMovie? = null)
     data class NguonCMovie(
         @JsonProperty("name") val name: String? = null,
@@ -186,6 +191,7 @@ class PhimNguonCProvider : MainAPI() {
         @JsonProperty("episodes") val episodes: List<NguonCServer>? = null
     )
     data class NguonCServer(
+        @JsonProperty("server_name") val server_name: String? = null,
         @JsonProperty("items") val items: List<NguonCEpisode>? = null,
         @JsonProperty("list") val list: List<NguonCEpisode>? = null
     )

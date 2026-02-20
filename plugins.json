@@ -59,6 +59,26 @@
         "name": "NangCuc"
     },
     {
+        "iconUrl": "https://phim.nguonc.com/favicon.ico",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/dah215/Aho-Repo",
+        "fileSize": 25508,
+        "status": 1,
+        "language": "vi",
+        "authors": [
+            "NguonC"
+        ],
+        "tvTypes": [
+            "Movie",
+            "AnimeMovie"
+        ],
+        "version": 1,
+        "internalName": "NguonC",
+        "description": "Vietnamese anime streaming site",
+        "url": "https://raw.githubusercontent.com/dah215/Aho-Repo/builds/NguonC.cs3",
+        "name": "NguonC"
+    },
+    {
         "iconUrl": "https://phimmoichill.now/favicon.ico",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/dah215/Aho-Repo",

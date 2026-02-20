@@ -75,7 +75,7 @@ class PhimNguonCProvider : MainAPI() {
             this.dubStatus = dubStatus
             // episodeCount != null → hiện badge "Phụ đề Tập X"
             // episodeCount == null (FULL) → chỉ hiện badge "Phụ đề"
-            this.episodes = mapOf(DubStatus.Subbed to (episodeCount ?: 0))
+            this.episodes = mutableMapOf(DubStatus.Subbed to (episodeCount ?: 0))
         }
     }
 

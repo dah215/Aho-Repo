@@ -36,7 +36,7 @@ class PhimNguonCProvider : MainAPI() {
     )
 
     override val mainPage = mainPageOf(
-        "/" to "Mới Cập Nhật",
+        "api/films/phim-moi-cap-nhat" to "Mới Cập Nhật",
         "danh-sach/phim-le" to "Phim Lẻ",
         "danh-sach/phim-bo" to "Phim Bộ",
         "danh-sach/tv-shows" to "TV Shows"

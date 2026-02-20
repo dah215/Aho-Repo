@@ -9,6 +9,7 @@ import com.lagradost.cloudstream3.network.WebViewResolver
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
 import android.util.Base64
+import java.util.EnumSet
 
 @CloudstreamPlugin
 class PhimNguonCPlugin : Plugin() {
@@ -46,11 +47,64 @@ class PhimNguonCProvider : MainAPI() {
         val href = a.attr("href")
         val title = el.selectFirst("h3")?.text()?.trim() ?: a.attr("title")
         val poster = el.selectFirst("img")?.let { it.attr("data-src").ifBlank { it.attr("src") } }
-        val label = el.selectFirst(".bg-green-300")?.text()?.trim() ?: ""
-        
+
+        // Lấy toàn bộ text của card để phân tích
+        val fullText = el.text()
+        val allBadges = el.select("span, div[class*='bg-'], div[class*='badge'], .label").map { it.text().trim() }
+
+        // ── Chất lượng (HD / FHD / CAM / SD) ──────────────────────────────────
+        val quality: SearchQuality? = when {
+            allBadges.any { it.equals("FHD", ignoreCase = true) }  -> SearchQuality.HD
+            allBadges.any { it.equals("HD", ignoreCase = true) }   -> SearchQuality.HD
+            allBadges.any { it.equals("CAM", ignoreCase = true) }  -> SearchQuality.Cam
+            allBadges.any { it.equals("SD", ignoreCase = true) }   -> SearchQuality.SD
+            fullText.contains("HD", ignoreCase = true)             -> SearchQuality.HD
+            else                                                    -> null
+        }
+
+        // ── Phụ đề / Lồng tiếng ───────────────────────────────────────────────
+        val hasSub  = fullText.contains("Phụ đề",    ignoreCase = true) ||
+                      fullText.contains("Vietsub",    ignoreCase = true) ||
+                      fullText.contains("Sub",        ignoreCase = true)
+        val hasDub  = fullText.contains("Lồng tiếng", ignoreCase = true) ||
+                      fullText.contains("Thuyết minh",ignoreCase = true) ||
+                      fullText.contains("Dubbed",     ignoreCase = true)
+
+        val dubStatus: EnumSet<DubStatus> = when {
+            hasSub && hasDub -> EnumSet.of(DubStatus.Subbed, DubStatus.Dubbed)
+            hasDub           -> EnumSet.of(DubStatus.Dubbed)
+            hasSub           -> EnumSet.of(DubStatus.Subbed)
+            else             -> EnumSet.noneOf(DubStatus::class.java)
+        }
+
+        // ── Số tập (ví dụ: "Tập 7", "27/36 tập", "Full") ─────────────────────
+        // Ưu tiên badge .bg-green-300 (giống code gốc)
+        val labelText = el.selectFirst(".bg-green-300")?.text()?.trim() ?: ""
+
+        // Tìm số tập từ các dạng: "Tập 7", "7 tập", "27/36"
+        val episodeCount: Int? = Regex("""[Tt]ập\s*(\d+)""").find(labelText)?.groupValues?.get(1)?.toIntOrNull()
+            ?: Regex("""(\d+)\s*/\s*\d+""").find(labelText)?.groupValues?.get(1)?.toIntOrNull()
+            ?: Regex("""(\d+)\s*[Tt]ập""").find(labelText)?.groupValues?.get(1)?.toIntOrNull()
+            // fallback tìm trong toàn card nếu label trống
+            ?: run {
+                if (labelText.isBlank()) {
+                    Regex("""[Tt]ập\s*(\d+)""").find(fullText)?.groupValues?.get(1)?.toIntOrNull()
+                        ?: Regex("""(\d+)\s*/\s*\d+""").find(fullText)?.groupValues?.get(1)?.toIntOrNull()
+                } else null
+            }
+
         return newAnimeSearchResponse(title, href, TvType.TvSeries) {
-            this.posterUrl = poster
-            this.otherName = label 
+            this.posterUrl   = poster
+            this.quality     = quality
+            this.dubStatus   = dubStatus
+            // Gán số tập cho từng trạng thái lồng tiếng/phụ đề
+            if (episodeCount != null) {
+                val epMap = mutableMapOf<DubStatus, Int>()
+                if (hasSub)  epMap[DubStatus.Subbed]  = episodeCount
+                if (hasDub)  epMap[DubStatus.Dubbed]  = episodeCount
+                if (epMap.isEmpty()) epMap[DubStatus.Subbed] = episodeCount
+                this.episodes = epMap
+            }
         }
     }
 
@@ -70,7 +124,7 @@ class PhimNguonCProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         val slug = url.trim().trimEnd('/').substringAfterLast("/")
         val apiUrl = "$mainUrl/api/film/$slug"
-        
+
         val res = app.get(apiUrl, headers = commonHeaders, interceptor = cfInterceptor).parsedSafe<NguonCDetailResponse>()
         val movie = res?.movie ?: throw ErrorLoadingException("Không thể tải dữ liệu phim")
 
@@ -81,7 +135,7 @@ class PhimNguonCProvider : MainAPI() {
                 val embed = ep.embed?.replace("\\/", "/") ?: ""
                 if (embed.isNotBlank()) {
                     episodes.add(newEpisode(embed) {
-                        this.name = "Tập ${ep.name}"
+                        this.name    = "Tập ${ep.name}"
                         this.episode = ep.name?.toIntOrNull()
                     })
                 }
@@ -92,14 +146,14 @@ class PhimNguonCProvider : MainAPI() {
 
         return newTvSeriesLoadResponse(movie.name ?: "", url, TvType.TvSeries, episodes) {
             this.posterUrl = movie.poster_url ?: movie.thumb_url
-            this.plot = movie.description
+            this.plot      = movie.description
         }
     }
 
     // Data class cho JSON từ data-obf
     data class StreamData(
-        @JsonProperty("sUb") val sUb: String? = null,  // Token URL
-        @JsonProperty("hD") val hD: String? = null     // Hash
+        @JsonProperty("sUb") val sUb: String? = null,
+        @JsonProperty("hD")  val hD: String?  = null
     )
 
     override suspend fun loadLinks(
@@ -108,62 +162,49 @@ class PhimNguonCProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // data = https://embed13.streamc.xyz/embed.php?hash=f71c4bddcc66969be2cd4d29e709cfa2
-        val embedUrl = data
-        
-        // Lấy domain: https://embed13.streamc.xyz
+        val embedUrl    = data
         val embedDomain = Regex("""https?://[^/]+""").find(embedUrl)?.value ?: ""
 
         try {
-            // Tải trang embed
             val embedRes = app.get(
-                embedUrl, 
+                embedUrl,
                 headers = mapOf(
-                    "Referer" to "$mainUrl/", 
+                    "Referer"    to "$mainUrl/",
                     "User-Agent" to USER_AGENT
-                ), 
+                ),
                 interceptor = cfInterceptor
             )
-            val html = embedRes.text
+            val html    = embedRes.text
             val cookies = embedRes.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
 
-            // Tìm data-obf trong HTML
-            // <div id="player" data-obf="eyJzVWIiOi...J9">
             val obfMatch = Regex("""data-obf\s*=\s*["']([A-Za-z0-9+/=]+)["']""").find(html)
-            
+
             if (obfMatch != null) {
-                val obfBase64 = obfMatch.groupValues[1]
-                
-                // Decode Base64 layer 1 → JSON {"sUb": "...", "hD": "..."}
-                val jsonData = String(Base64.decode(obfBase64, Base64.DEFAULT))
+                val obfBase64  = obfMatch.groupValues[1]
+                val jsonData   = String(Base64.decode(obfBase64, Base64.DEFAULT))
                 val streamData = AppUtils.parseJson<StreamData>(jsonData)
-                
-                // sUb chính là token cho URL m3u8
+
                 val sUb = streamData.sUb
                 if (!sUb.isNullOrBlank()) {
-                    // URL m3u8: https://embed13.streamc.xyz/{sUb}.m3u8
                     val finalM3u8Url = "$embedDomain/$sUb.m3u8"
-                    
-                    // Headers để phát video
                     val videoHeaders = mapOf(
-                        "User-Agent" to USER_AGENT,
-                        "Referer" to embedUrl,
-                        "Origin" to embedDomain,
-                        "Cookie" to cookies,
-                        "Accept" to "*/*",
+                        "User-Agent"      to USER_AGENT,
+                        "Referer"         to embedUrl,
+                        "Origin"          to embedDomain,
+                        "Cookie"          to cookies,
+                        "Accept"          to "*/*",
                         "Accept-Language" to "vi-VN,vi;q=0.9",
-                        "Connection" to "keep-alive",
-                        "Sec-Fetch-Dest" to "video",
-                        "Sec-Fetch-Mode" to "cors",
-                        "Sec-Fetch-Site" to "same-origin"
+                        "Connection"      to "keep-alive",
+                        "Sec-Fetch-Dest"  to "video",
+                        "Sec-Fetch-Mode"  to "cors",
+                        "Sec-Fetch-Site"  to "same-origin"
                     )
-
                     callback(
                         newExtractorLink(
                             source = "NguonC Server",
-                            name = "HLS",
-                            url = finalM3u8Url,
-                            type = ExtractorLinkType.M3U8
+                            name   = "HLS",
+                            url    = finalM3u8Url,
+                            type   = ExtractorLinkType.M3U8
                         ) {
                             this.quality = Qualities.P1080.value
                             this.headers = videoHeaders
@@ -172,31 +213,29 @@ class PhimNguonCProvider : MainAPI() {
                     return true
                 }
             }
-
         } catch (e: Exception) {
             println("Error in loadLinks: ${e.message}")
             e.printStackTrace()
         }
 
-        // Fallback
         return loadExtractor(embedUrl, "$mainUrl/", subtitleCallback, callback)
     }
 
     data class NguonCDetailResponse(@JsonProperty("movie") val movie: NguonCMovie? = null)
     data class NguonCMovie(
-        @JsonProperty("name") val name: String? = null,
-        @JsonProperty("description") val description: String? = null,
-        @JsonProperty("thumb_url") val thumb_url: String? = null,
-        @JsonProperty("poster_url") val poster_url: String? = null,
-        @JsonProperty("episodes") val episodes: List<NguonCServer>? = null
+        @JsonProperty("name")        val name: String?            = null,
+        @JsonProperty("description") val description: String?     = null,
+        @JsonProperty("thumb_url")   val thumb_url: String?       = null,
+        @JsonProperty("poster_url")  val poster_url: String?      = null,
+        @JsonProperty("episodes")    val episodes: List<NguonCServer>? = null
     )
     data class NguonCServer(
         @JsonProperty("items") val items: List<NguonCEpisode>? = null,
-        @JsonProperty("list") val list: List<NguonCEpisode>? = null
+        @JsonProperty("list")  val list:  List<NguonCEpisode>? = null
     )
     data class NguonCEpisode(
-        @JsonProperty("name") val name: String? = null,
+        @JsonProperty("name")  val name:  String? = null,
         @JsonProperty("embed") val embed: String? = null,
-        @JsonProperty("m3u8") val m3u8: String? = null
+        @JsonProperty("m3u8")  val m3u8:  String? = null
     )
 }

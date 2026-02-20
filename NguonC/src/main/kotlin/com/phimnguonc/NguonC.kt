@@ -8,15 +8,6 @@ import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.network.WebViewResolver
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
-import android.annotation.SuppressLint
-import android.webkit.WebResourceRequest
-import android.webkit.WebResourceResponse
-import android.webkit.WebView
-import android.webkit.WebViewClient
-import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
-import kotlin.coroutines.resume
 
 @CloudstreamPlugin
 class PhimNguonCPlugin : Plugin() {
@@ -87,7 +78,7 @@ class PhimNguonCProvider : MainAPI() {
         val episodes = mutableListOf<Episode>()
         movie.episodes?.forEach { server ->
             server.items?.forEach { ep ->
-                // CHỈ LẤY LINK EMBED ĐỂ ĐƯA VÀO WEBVIEW
+                // Lấy link embed để xử lý
                 val embed = ep.embed?.replace("\\/", "/") ?: ""
                 if (embed.isNotBlank()) {
                     episodes.add(newEpisode(embed) {
@@ -106,8 +97,6 @@ class PhimNguonCProvider : MainAPI() {
         }
     }
 
-    // THUẬT TOÁN VŨ KHÍ TỐI THƯỢNG: BẮT LINK BẰNG WEBVIEW THẬT
-    @SuppressLint("SetJavaScriptEnabled")
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -119,76 +108,62 @@ class PhimNguonCProvider : MainAPI() {
             Regex("""https?://+""").find(embedUrl)?.value ?: ""
         } else ""
 
-        // Chạy WebView trên Main Thread (bắt buộc đối với Android)
-        val finalM3u8Url = withContext(Dispatchers.Main) {
-            suspendCancellableCoroutine<String?> { continuation ->
-                val webView = WebView(AcraApplication.context)
-                webView.settings.javaScriptEnabled = true
-                webView.settings.domStorageEnabled = true
-                webView.settings.userAgentString = USER_AGENT
+        // THUẬT TOÁN: Tự động cào link m3u8 từ mã nguồn trang embed
+        try {
+            // 1. Tải trang embed để lấy Cookie và HTML
+            val embedRes = app.get(embedUrl, headers = mapOf("Referer" to "$mainUrl/", "User-Agent" to USER_AGENT))
+            val html = embedRes.text
+            val cookies = embedRes.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
 
-                webView.webViewClient = object : WebViewClient() {
-                    override fun shouldInterceptRequest(
-                        view: WebView?,
-                        request: WebResourceRequest?
-                    ): WebResourceResponse? {
-                        val url = request?.url?.toString() ?: ""
-                        
-                        // Bắt cóc link .m3u8 ngay khi trang web định tải nó
-                        if (url.contains(".m3u8")) {
-                            if (continuation.isActive) {
-                                continuation.resume(url)
-                            }
-                        }
-                        return super.shouldInterceptRequest(view, request)
+            // 2. Tìm link m3u8 trong mã nguồn (Hỗ trợ cả link bị escape \/)
+            val m3u8Regex = Regex("""(https?://+?\.m3u8*)""")
+            val match = m3u8Regex.find(html)
+            
+            if (match != null) {
+                val rawM3u8 = match.value.replace("\\/", "/")
+                
+                // 3. Giải quyết Redirect để lấy link CDN thật (amass15.top)
+                val finalRes = try {
+                    app.get(rawM3u8, headers = mapOf("Referer" to embedUrl, "Cookie" to cookies, "User-Agent" to USER_AGENT), timeout = 15)
+                } catch (e: Exception) { null }
+                
+                val finalM3u8Url = finalRes?.url ?: rawM3u8
+                val finalCookies = finalRes?.cookies?.entries?.joinToString("; ") { "${it.key}=${it.value}" } ?: cookies
+
+                // 4. Bộ Header "Bất tử" để bẻ khóa file .png
+                val videoHeaders = mapOf(
+                    "User-Agent" to USER_AGENT,
+                    "Referer" to embedUrl,
+                    "Origin" to embedDomain,
+                    "Cookie" to finalCookies,
+                    "Accept" to "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+                    "Accept-Language" to "vi-VN,vi;q=0.9",
+                    "Connection" to "keep-alive",
+                    "Sec-Fetch-Dest" to "video",
+                    "Sec-Fetch-Mode" to "cors",
+                    "Sec-Fetch-Site" to "cross-site",
+                    "Range" to "bytes=0-"
+                )
+
+                callback(
+                    newExtractorLink(
+                        source = "NguonC (Direct)",
+                        name = "HLS - 1080p",
+                        url = finalM3u8Url,
+                        type = ExtractorLinkType.M3U8
+                    ) {
+                        this.quality = Qualities.P1080.value
+                        this.headers = videoHeaders
                     }
-                }
-
-                // Nạp thêm Referer để vượt Cloudflare của trang embed
-                val extraHeaders = mutableMapOf("Referer" to "$mainUrl/")
-                webView.loadUrl(embedUrl, extraHeaders)
-
-                // Timeout an toàn sau 15 giây nếu không tìm thấy link
-                continuation.invokeOnCancellation {
-                    webView.destroy()
-                }
+                )
+                return true
             }
+        } catch (e: Exception) {
+            e.printStackTrace()
         }
 
-        if (finalM3u8Url != null) {
-            // Lấy Cookie từ CookieManager của Android (chứa toàn bộ session vừa tạo)
-            val cookies = android.webkit.CookieManager.getInstance().getCookie(embedUrl) ?: ""
-
-            // Bộ Header "Bất tử" để tải file .png
-            val videoHeaders = mapOf(
-                "User-Agent" to USER_AGENT,
-                "Referer" to embedUrl,
-                "Origin" to embedDomain,
-                "Cookie" to cookies,
-                "Accept" to "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-                "Accept-Language" to "vi-VN,vi;q=0.9",
-                "Connection" to "keep-alive",
-                "Sec-Fetch-Dest" to "video",
-                "Sec-Fetch-Mode" to "cors",
-                "Sec-Fetch-Site" to "cross-site",
-                "Range" to "bytes=0-"
-            )
-
-            callback(
-                newExtractorLink(
-                    source = "NguonC (WebView-Bypass)",
-                    name = "HLS - 1080p",
-                    url = finalM3u8Url,
-                    type = ExtractorLinkType.M3U8
-                ) {
-                    this.quality = Qualities.P1080.value
-                    this.headers = videoHeaders
-                }
-            )
-            return true
-        }
-
-        return false
+        // Fallback: Nếu không cào được, thử dùng Extractor mặc định của Cloudstream
+        return loadExtractor(embedUrl, "$mainUrl/", subtitleCallback, callback)
     }
 
     data class NguonCDetailResponse(@JsonProperty("movie") val movie: NguonCMovie? = null)

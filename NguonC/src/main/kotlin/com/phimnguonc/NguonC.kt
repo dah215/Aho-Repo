@@ -24,28 +24,13 @@ class PhimNguonCProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
 
-    private val headers = mapOf(
+    // Bộ Header giả lập trình duyệt máy tính để tránh bị Cloudflare nghi ngờ
+    private val commonHeaders = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language" to "vi-VN,vi;q=0.8,en-US;q=0.5,en;q=0.3",
-        "Connection" to "keep-alive",
-        "Upgrade-Insecure-Requests" to "1",
-        "Sec-Fetch-Dest" to "document",
-        "Sec-Fetch-Mode" to "navigate",
-        "Sec-Fetch-Site" to "none",
-        "Sec-Fetch-User" to "?1"
-    )
-
-    private val apiHeaders = mapOf(
-        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept" to "application/json, text/plain, */*",
-        "Accept-Language" to "vi-VN,vi;q=0.8,en-US;q=0.5,en;q=0.3",
+        "Accept-Language" to "vi-VN,vi;q=0.9",
         "Referer" to "$mainUrl/",
-        "Origin" to mainUrl,
-        "Connection" to "keep-alive",
-        "Sec-Fetch-Dest" to "empty",
-        "Sec-Fetch-Mode" to "cors",
-        "Sec-Fetch-Site" to "same-origin"
+        "Origin" to mainUrl
     )
 
     private val cfInterceptor = WebViewResolver(Regex("""phim\.nguonc\.com"""))
@@ -58,257 +43,134 @@ class PhimNguonCProvider : MainAPI() {
         "danh-sach/tv-shows" to "TV Shows"
     )
 
-    private fun fixUrl(url: String?): String? {
-        if (url.isNullOrBlank() || url == "#" || url.startsWith("javascript")) return null
-        return when {
-            url.startsWith("http://") -> url.replace("http://", "https://")
-            url.startsWith("https://") -> url
-            url.startsWith("//") -> "https:$url"
-            url.startsWith("/") -> "$mainUrl$url"
-            else -> "$mainUrl/$url"
-        }
-    }
-
-    private fun imgUrl(el: Element?): String? {
-        if (el == null) return null
-        return listOf("data-src", "data-original", "data-lazy", "src")
-            .mapNotNull { el.attr(it).takeIf { it.isNotBlank() && !it.startsWith("data:image") } }
-            .firstOrNull()?.let { fixUrl(it) }
-    }
-
+    // Thuật toán bóc tách thẻ phim từ trang chủ (Dựa trên cấu hình Table trong HTML bạn gửi)
     private fun parseCard(el: Element): SearchResponse? {
         val a = el.selectFirst("a") ?: return null
-        val href = fixUrl(a.attr("href")) ?: return null
-        if (!href.contains("/phim/")) return null
+        val href = a.attr("href")
+        val title = el.selectFirst("h3")?.text()?.trim() ?: a.attr("title")
+        val poster = el.selectFirst("img")?.let { 
+            it.attr("data-src").ifBlank { it.attr("src") } 
+        }
+        val label = el.selectFirst(".bg-green-300")?.text()?.trim() ?: ""
         
-        val title = a.attr("title").ifBlank { el.selectFirst("h2, h3, .title, .name")?.text() }?.trim() ?: return null
-        val poster = imgUrl(el.selectFirst("img"))
-        val label = el.selectFirst(".status, .episode, .label, .ribbon, .quality, .ep-status")?.text()?.trim() ?: ""
-        val isSeries = label.contains("Tập", true) || href.contains("phim-bo") || Regex("""\d+/\d+""").containsMatchIn(label)
-        
-        return newAnimeSearchResponse(title, href, if (isSeries) TvType.TvSeries else TvType.Movie) {
+        return newAnimeSearchResponse(title, href, TvType.TvSeries) {
             this.posterUrl = poster
-            val epNum = Regex("""\d+""").find(label)?.value?.toIntOrNull()
-            if (epNum != null) addSub(epNum)
+            addStatus(label)
         }
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        try {
-            val url = "$mainUrl/api/films/${request.data}?page=$page"
-            val res = app.get(url, headers = apiHeaders, interceptor = cfInterceptor, timeout = 30).parsedSafe<NguonCResponse>()
-            if (res?.items != null && res.items.isNotEmpty()) {
-                val items = res.items.mapNotNull { it.toSearchResponse() }
-                return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-
-        val htmlUrl = if (page == 1) "$mainUrl/${request.data}" else "$mainUrl/${request.data}/page/$page"
-        val doc = app.get(htmlUrl, headers = headers, interceptor = cfInterceptor, timeout = 30).document
-        var items = doc.select(".item, .movie-item, article, .halim-item, .col-md-2, .col-md-3").mapNotNull { parseCard(it) }
-        
-        if (items.isEmpty() && page > 1) {
-            val url2 = "$mainUrl/${request.data}/page-$page"
-            val doc2 = app.get(url2, headers = headers, interceptor = cfInterceptor, timeout = 30).document
-            items = doc2.select(".item, .movie-item, article, .halim-item, .col-md-2, .col-md-3").mapNotNull { parseCard(it) }
-        }
-        
+        val url = if (page == 1) "$mainUrl/${request.data}" else "$mainUrl/${request.data}?page=$page"
+        val doc = app.get(url, headers = commonHeaders, interceptor = cfInterceptor).document
+        // Tìm trong bảng danh sách phim
+        val items = doc.select("table tbody tr").mapNotNull { parseCard(it) }
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        try {
-            val url = "$mainUrl/api/films/search?keyword=${URLEncoder.encode(query, "utf-8")}"
-            val res = app.get(url, headers = apiHeaders, interceptor = cfInterceptor, timeout = 30).parsedSafe<NguonCResponse>()
-            if (res?.items != null && res.items.isNotEmpty()) {
-                return res.items.mapNotNull { it.toSearchResponse() }
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-
         val url = "$mainUrl/tim-kiem?keyword=${URLEncoder.encode(query, "utf-8")}"
-        val doc = app.get(url, headers = headers, interceptor = cfInterceptor, timeout = 30).document
-        return doc.select(".item, .movie-item, article, .halim-item, .col-md-2, .col-md-3").mapNotNull { parseCard(it) }
+        val doc = app.get(url, headers = commonHeaders, interceptor = cfInterceptor).document
+        return doc.select("table tbody tr").mapNotNull { parseCard(it) }
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val slug = url.substringAfterLast("/")
-        try {
-            val apiUrl = "$mainUrl/api/film/$slug"
-            val res = app.get(apiUrl, headers = apiHeaders, interceptor = cfInterceptor, timeout = 30).parsedSafe<NguonCDetailResponse>()?.movie
-            if (res != null) {
-                val title = res.name ?: ""
-                val poster = res.poster_url ?: res.thumb_url
-                val plot = res.description?.replace(Regex("<.*?>"), "")?.trim()
-                val episodes = mutableListOf<Episode>()
-                res.episodes?.forEach { server ->
-                    server.items?.forEach { ep ->
-                        val epName = ep.name ?: ""
-                        val epNum = Regex("""\d+""").find(epName)?.value?.toIntOrNull()
-                        val data = if (!ep.m3u8.isNullOrBlank()) ep.m3u8 else ep.embed ?: ""
-                        if (data.isNotBlank()) {
-                            episodes.add(newEpisode(data) {
-                                this.name = epName
-                                this.episode = epNum
+        val res = app.get(url, headers = commonHeaders, interceptor = cfInterceptor)
+        val doc = res.document
+        
+        val title = doc.selectFirst("h1")?.text()?.trim() ?: ""
+        val poster = doc.selectFirst("img.rounded-md")?.attr("src")
+        val plot = doc.selectFirst("article")?.text()?.trim()
+        val year = doc.select("td:contains(Năm phát hành) + td").text().toIntOrNull()
+
+        val episodes = mutableListOf<Episode>()
+
+        // THUẬT TOÁN THÔNG MINH: Bóc tách JSON từ thẻ <script> như trong HTML bạn gửi
+        val scriptData = doc.select("script").find { it.data().contains("var episodes =") }?.data()
+        if (scriptData != null) {
+            try {
+                val jsonStr = scriptData.substringAfter("var episodes = ").substringBefore("];") + "]"
+                val servers = parseJson<List<NguonCServer>>(jsonStr)
+                
+                servers.forEach { server ->
+                    server.list?.forEach { ep ->
+                        // Ưu tiên lấy link m3u8 trực tiếp từ JSON
+                        val link = ep.m3u8?.replace("\\/", "/") ?: ep.embed?.replace("\\/", "/") ?: ""
+                        if (link.isNotBlank()) {
+                            episodes.add(newEpisode(link) {
+                                this.name = "Tập ${ep.name}"
+                                this.episode = ep.name?.toIntOrNull()
                             })
                         }
                     }
                 }
-                return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
-                    this.posterUrl = poster
-                    this.plot = plot
-                    this.year = res.year
-                }
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
+            } catch (e: Exception) { e.printStackTrace() }
         }
 
-        val doc = app.get(url, headers = headers, interceptor = cfInterceptor, timeout = 30).document
-        val title = doc.selectFirst("h1, .title, .name")?.text()?.trim() ?: "Phim"
-        val poster = imgUrl(doc.selectFirst(".film-poster img, .movie-thumb img, .poster img, img"))
-        val plot = doc.selectFirst(".film-content, .description, .plot, #info-film")?.text()?.trim()
-        val episodes = mutableListOf<Episode>()
-        doc.select(".episodes a, .server-item a, .list-episode a, .halim-list-eps a").forEach { ep ->
-            val epHref = fixUrl(ep.attr("href")) ?: return@forEach
-            val epName = ep.text().trim()
-            val epNum = Regex("""\d+""").find(epName)?.value?.toIntOrNull()
-            episodes.add(newEpisode(epHref) {
-                this.name = epName
-                this.episode = epNum
-            })
-        }
-        return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes.distinctBy { it.data }) {
+        return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
             this.posterUrl = poster
             this.plot = plot
+            this.year = year
         }
     }
 
-    // HÀM LOADLINKS ĐƯỢC VIẾT LẠI HOÀN TOÀN
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val fixedData = data.replace("^http://".toRegex(), "https://")
-
-        // Header chuẩn để truyền thẳng vào ExoPlayer (giúp player không bị chặn 2001)
-        val playerHeaders = mapOf(
+        // Header quan trọng nhất để vượt lỗi 2001
+        val videoHeaders = mapOf(
             "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Accept" to "*/*",
+            "Referer" to "$mainUrl/", // Bắt buộc phải là domain gốc
             "Origin" to mainUrl,
-            "Referer" to "$mainUrl/"
+            "Accept" to "*/*"
         )
 
-        // 1. Xử lý link m3u8 trực tiếp
-        if (fixedData.contains(".m3u8")) {
+        if (data.contains("phimmoi.net") || data.contains(".m3u8")) {
             callback(
                 ExtractorLink(
-                    source = "NguonC",
-                    name = "NguonC (HLS)",
-                    url = fixedData,
+                    source = "NguonC (VIP)",
+                    name = "HLS - 1080p",
+                    url = data,
                     referer = "$mainUrl/",
                     quality = Qualities.P1080.value,
                     isM3u8 = true,
-                    headers = playerHeaders // Bắt buộc phải có để ExoPlayer không bị chặn
+                    headers = videoHeaders // Truyền header vào trình phát
                 )
             )
             return true
         }
 
-        // 2. Xử lý link embed (iframe)
-        try {
-            // Lấy domain của link embed để làm Referer cho chính nó
-            val embedDomain = Regex("""^(https?://+)""").find(fixedData)?.value ?: mainUrl
-            
-            val embedHeaders = mapOf(
-                "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                "Referer" to "$mainUrl/",
-                "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
-            )
-            
-            // Tải trang embed để tìm link m3u8 thực sự
-            val response = app.get(fixedData, headers = embedHeaders, timeout = 30).text
-            
-            // Regex chuẩn để bắt link m3u8 trong mã nguồn (bao gồm cả link bị escape như \/)
-            val m3u8Regex = Regex("""(https?://+\.m3u8*)""")
-            val matches = m3u8Regex.findAll(response).map { it.groupValues }.toList()
-            
-            var found = false
-            matches.forEach { link ->
-                // Xóa các ký tự escape (nếu có) trong chuỗi JSON (VD: https:\/\/ -> https://)
-                val cleanLink = link.replace("\\/", "/")
-                
-                callback(
-                    ExtractorLink(
-                        source = "NguonC",
-                        name = "NguonC (Embed)",
-                        url = cleanLink,
-                        referer = fixedData,
-                        quality = Qualities.P1080.value,
-                        isM3u8 = true,
-                        headers = mapOf(
-                            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                            "Origin" to embedDomain,
-                            "Referer" to fixedData
-                        )
-                    )
+        // Nếu là link embed streamc.xyz, bóc hash để tạo link m3u8
+        if (data.contains("streamc.xyz")) {
+            val hash = data.substringAfter("hash=").substringBefore("&")
+            val finalUrl = "https://sing.phimmoi.net/$hash/hls.m3u8"
+            callback(
+                ExtractorLink(
+                    source = "NguonC (Embed)",
+                    name = "HLS - StreamC",
+                    url = finalUrl,
+                    referer = "$mainUrl/",
+                    quality = Qualities.P1080.value,
+                    isM3u8 = true,
+                    headers = videoHeaders
                 )
-                found = true
-            }
-            
-            // Nếu Regex không tìm thấy m3u8, thử dùng Extractor mặc định của Cloudstream (hỗ trợ Doodstream, Streamtape...)
-            if (!found) {
-                return loadExtractor(fixedData, "$mainUrl/", subtitleCallback, callback)
-            }
-            
-            return found
-        } catch (e: Exception) {
-            e.printStackTrace()
-            return false
+            )
+            return true
         }
+
+        return false
     }
 
-    private fun NguonCItem.toSearchResponse(): SearchResponse? {
-        val title = this.name ?: return null
-        val href = "$mainUrl/phim/${this.slug}"
-        val poster = this.thumb_url ?: this.poster_url
-        val epText = this.current_episode ?: ""
-        return newAnimeSearchResponse(title, href, TvType.TvSeries) {
-            this.posterUrl = poster
-            val epNum = Regex("""\d+""").find(epText)?.value?.toIntOrNull()
-            if (epNum != null) addSub(epNum)
-        }
-    }
-
-    data class NguonCResponse(@JsonProperty("items") val items: List<NguonCItem>? = null)
-    data class NguonCItem(
-        @JsonProperty("name") val name: String? = null,
-        @JsonProperty("slug") val slug: String? = null,
-        @JsonProperty("thumb_url") val thumb_url: String? = null,
-        @JsonProperty("poster_url") val poster_url: String? = null,
-        @JsonProperty("current_episode") val current_episode: String? = null
-    )
-    data class NguonCDetailResponse(@JsonProperty("movie") val movie: NguonCMovie? = null)
-    data class NguonCMovie(
-        @JsonProperty("name") val name: String? = null,
-        @JsonProperty("description") val description: String? = null,
-        @JsonProperty("thumb_url") val thumb_url: String? = null,
-        @JsonProperty("poster_url") val poster_url: String? = null,
-        @JsonProperty("year") val year: Int? = null,
-        @JsonProperty("episodes") val episodes: List<NguonCServer>? = null
-    )
+    // Data classes để map với JSON trong HTML
     data class NguonCServer(
         @JsonProperty("server_name") val server_name: String? = null,
-        @JsonProperty("items") val items: List<NguonCEpisode>? = null
+        @JsonProperty("list") val list: List<NguonCEpisode>? = null
     )
     data class NguonCEpisode(
         @JsonProperty("name") val name: String? = null,
-        @JsonProperty("m3u8") val m3u8: String? = null,
-        @JsonProperty("embed") val embed: String? = null
+        @JsonProperty("embed") val embed: String? = null,
+        @JsonProperty("m3u8") val m3u8: String? = null
     )
 }

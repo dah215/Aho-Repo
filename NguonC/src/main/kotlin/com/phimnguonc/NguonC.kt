@@ -54,7 +54,6 @@ class PhimNguonCProvider : MainAPI() {
         
         return newAnimeSearchResponse(title, href, TvType.TvSeries) {
             this.posterUrl = poster
-            // Sửa lỗi addStatus -> dùng thuộc tính status trực tiếp
             this.otherName = label 
         }
     }
@@ -83,13 +82,12 @@ class PhimNguonCProvider : MainAPI() {
 
         val episodes = mutableListOf<Episode>()
 
-        // Bóc tách JSON từ thẻ <script>
         val scriptData = doc.select("script").find { it.data().contains("var episodes =") }?.data()
         if (scriptData != null) {
             try {
                 val jsonStr = scriptData.substringAfter("var episodes = ").substringBefore("];") + "]"
-                // Sửa lỗi parseJson -> gọi qua AppUtils
-                val servers = parseJson<List<NguonCServer>>(jsonStr)
+                // Gọi parseJson thông qua AppUtils
+                val servers = AppUtils.parseJson<List<NguonCServer>>(jsonStr)
                 
                 servers.forEach { server ->
                     server.list?.forEach { ep ->
@@ -125,18 +123,19 @@ class PhimNguonCProvider : MainAPI() {
             "Accept" to "*/*"
         )
 
-        // Sửa lỗi ExtractorLink constructor -> dùng newExtractorLink
+        // SỬA LỖI: Sử dụng đúng signature của newExtractorLink
         if (data.contains("phimmoi.net") || data.contains(".m3u8")) {
             callback(
                 newExtractorLink(
-                    "NguonC (VIP)",
-                    "HLS - 1080p",
-                    data,
-                    "$mainUrl/",
-                    Qualities.P1080.value,
-                    true,
-                    videoHeaders
-                )
+                    source = "NguonC (VIP)",
+                    name = "HLS - 1080p",
+                    url = data,
+                    type = ExtractorLinkType.M3U8
+                ) {
+                    this.quality = Qualities.P1080.value
+                    this.referer = "$mainUrl/"
+                    this.headers = videoHeaders
+                }
             )
             return true
         }
@@ -146,14 +145,15 @@ class PhimNguonCProvider : MainAPI() {
             val finalUrl = "https://sing.phimmoi.net/$hash/hls.m3u8"
             callback(
                 newExtractorLink(
-                    "NguonC (Embed)",
-                    "HLS - StreamC",
-                    finalUrl,
-                    "$mainUrl/",
-                    Qualities.P1080.value,
-                    true,
-                    videoHeaders
-                )
+                    source = "NguonC (Embed)",
+                    name = "HLS - StreamC",
+                    url = finalUrl,
+                    type = ExtractorLinkType.M3U8
+                ) {
+                    this.quality = Qualities.P1080.value
+                    this.referer = "$mainUrl/"
+                    this.headers = videoHeaders
+                }
             )
             return true
         }
@@ -161,7 +161,6 @@ class PhimNguonCProvider : MainAPI() {
         return false
     }
 
-    // Data classes đặt trong Provider để parseJson nhận diện được
     data class NguonCServer(
         @JsonProperty("server_name") val server_name: String? = null,
         @JsonProperty("list") val list: List<NguonCEpisode>? = null

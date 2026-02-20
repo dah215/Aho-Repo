@@ -108,46 +108,84 @@ class PhimNguonCProvider : MainAPI() {
 
         if (episodes.isEmpty()) throw ErrorLoadingException("Không tìm thấy tập phim")
 
-        // Tạo tên hiển thị với thông tin bổ sung
-        val displayName = buildString {
-            append(movie.name ?: "")
-            if (!movie.original_name.isNullOrBlank()) {
-                append(" - ${movie.original_name}")
+        // Tạo mô tả đầy đủ với thông tin bổ sung
+        val fullDescription = buildString {
+            append(movie.description ?: "")
+            append("\n\n")
+            append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            append("\n")
+            
+            // Trạng thái tập
+            if (!movie.current_episode.isNullOrBlank()) {
+                val status = if (movie.total_episodes != null && movie.total_episodes > 0) {
+                    val current = movie.current_episode.replace("Tập ", "").toIntOrNull() ?: 0
+                    if (current >= movie.total_episodes) "Hoàn tất" else movie.current_episode
+                } else {
+                    movie.current_episode
+                }
+                append("📺 Trạng thái: $status")
+                if (movie.total_episodes != null && movie.total_episodes > 0) {
+                    append(" / ${movie.total_episodes} tập")
+                }
+                append("\n")
             }
-        }
-
-        // Tạo thông tin bổ sung cho rating text
-        val ratingText = buildString {
+            
+            // Chất lượng
             if (!movie.quality.isNullOrBlank()) {
-                append(movie.quality)
+                append("🎬 Chất lượng: ${movie.quality}\n")
             }
+            
+            // Ngôn ngữ
             if (!movie.language.isNullOrBlank()) {
-                if (isNotEmpty()) append(" • ")
-                append(movie.language)
+                append("🔊 Ngôn ngữ: ${movie.language}\n")
             }
+            
+            // Thời lượng
             if (!movie.time.isNullOrBlank()) {
-                if (isNotEmpty()) append(" • ")
-                append(movie.time)
+                append("⏱️ Thời lượng: ${movie.time}\n")
+            }
+            
+            // Đạo diễn
+            if (!movie.director.isNullOrBlank()) {
+                append("🎭 Đạo diễn: ${movie.director}\n")
+            }
+            
+            // Diễn viên
+            if (!movie.casts.isNullOrBlank()) {
+                append("🌟 Diễn viên: ${movie.casts}\n")
+            }
+            
+            // Quốc gia
+            if (country.isNotBlank()) {
+                append("🌍 Quốc gia: $country\n")
+            }
+            
+            // Thể loại
+            if (genres.isNotEmpty()) {
+                append("🏷️ Thể loại: ${genres.joinToString(", ")}\n")
+            }
+            
+            // Năm
+            if (year != null) {
+                append("📅 Năm: $year\n")
             }
         }
 
         return if (tvType == TvType.Movie) {
             newMovieLoadResponse(movie.name ?: "", url, tvType, episodes.firstOrNull()?.data ?: "") {
                 this.posterUrl = movie.poster_url ?: movie.thumb_url
-                this.plot = movie.description
+                this.plot = fullDescription
                 this.year = year
                 this.tags = genres
-                this.rating = ratingText
                 this.duration = movie.time
                 this.recommendations = ArrayList()
             }
         } else {
             newTvSeriesLoadResponse(movie.name ?: "", url, tvType, episodes) {
                 this.posterUrl = movie.poster_url ?: movie.thumb_url
-                this.plot = movie.description
+                this.plot = fullDescription
                 this.year = year
                 this.tags = genres
-                this.rating = ratingText
                 this.duration = movie.time
                 this.recommendations = ArrayList()
             }

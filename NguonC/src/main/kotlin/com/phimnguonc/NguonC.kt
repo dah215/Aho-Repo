@@ -26,12 +26,12 @@ class PhimNguonCProvider : MainAPI() {
 
     private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
-    // Interceptor quét qua toàn bộ hệ sinh thái để giải mã Cloudflare
-    private val cfInterceptor = WebViewResolver(Regex("""phim\.nguonc\.com|.*streamc\.xyz|.*amass15\.top|.*phimmoi\.net"""))
+    // Chỉ dùng WebViewResolver cho domain chính để lấy API
+    private val cfInterceptor = WebViewResolver(Regex("""phim\.nguonc\.com"""))
 
     private val commonHeaders = mapOf(
         "User-Agent" to USER_AGENT,
-        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept" to "application/json, text/plain, */*",
         "Accept-Language" to "vi-VN,vi;q=0.9",
     )
 
@@ -73,18 +73,16 @@ class PhimNguonCProvider : MainAPI() {
         val slug = url.trim().trimEnd('/').substringAfterLast("/")
         val apiUrl = "$mainUrl/api/film/$slug"
         
-        // Lấy dữ liệu từ API với cấu trúc movie -> episodes -> items
         val res = app.get(apiUrl, headers = commonHeaders, interceptor = cfInterceptor).parsedSafe<NguonCDetailResponse>()
         val movie = res?.movie ?: throw ErrorLoadingException("Không thể tải dữ liệu phim")
 
         val episodes = mutableListOf<Episode>()
         movie.episodes?.forEach { server ->
             server.items?.forEach { ep ->
-                val m3u8 = ep.m3u8?.replace("\\/", "/") ?: ""
+                // PHƯƠNG PHÁP HACKER: Chỉ lấy link Embed, bỏ qua link m3u8 ảo
                 val embed = ep.embed?.replace("\\/", "/") ?: ""
-                if (m3u8.isNotBlank()) {
-                    // Gộp m3u8 và embed để loadLinks xử lý bẻ khóa
-                    episodes.add(newEpisode("$m3u8|$embed") {
+                if (embed.isNotBlank()) {
+                    episodes.add(newEpisode(embed) {
                         this.name = "Tập ${ep.name}"
                         this.episode = ep.name?.toIntOrNull()
                     })
@@ -106,45 +104,18 @@ class PhimNguonCProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val parts = data.split("|")
-        val m3u8Url = parts[0]
-        val embedUrl = if (parts.size > 1) parts[1] else ""
-
-        // BƯỚC 1: Lấy Cookie từ trang Embed (Kích hoạt Session)
-        val embedRes = app.get(embedUrl, headers = commonHeaders, interceptor = cfInterceptor)
-        val cookies = embedRes.cookies
-        val cookieString = cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
-
-        // BƯỚC 2: Xây dựng bộ Header "Vạn năng"
-        val videoHeaders = mapOf(
-            "User-Agent" to USER_AGENT,
-            "Referer" to embedUrl,
-            "Origin" to embedUrl.substringBefore("/embed.php"),
-            "Cookie" to cookieString, // Ép trình phát mang theo Cookie xác thực
-            "Accept" to "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8", // Bẻ khóa PNG
-            "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8",
-            "Sec-Fetch-Dest" to "video",
-            "Sec-Fetch-Mode" to "cors",
-            "Sec-Fetch-Site" to "cross-site",
-            "Range" to "bytes=0-",
-            "Connection" to "keep-alive"
+        // PHƯƠNG PHÁP HACKER: Sử dụng loadExtractor
+        // Hàm này sẽ tự động gọi các script giải mã có sẵn trong Cloudstream
+        // Nó sẽ tự động mở WebView ngầm, chạy JavaScript của streamc.xyz, lấy Token và trả về link m3u8 thật sự
+        
+        return loadExtractor(
+            url = data, // data lúc này là link embed (VD: https://embed18.streamc.xyz/embed.php?hash=...)
+            referer = "$mainUrl/",
+            subtitleCallback = subtitleCallback,
+            callback = callback
         )
-
-        callback(
-            newExtractorLink(
-                source = "NguonC (VIP-Bypass)",
-                name = "HLS - 1080p",
-                url = m3u8Url,
-                type = ExtractorLinkType.M3U8
-            ) {
-                this.quality = Qualities.P1080.value
-                this.headers = videoHeaders
-            }
-        )
-        return true
     }
 
-    // Data classes chuẩn theo JSON API bạn cung cấp
     data class NguonCDetailResponse(@JsonProperty("movie") val movie: NguonCMovie? = null)
     data class NguonCMovie(
         @JsonProperty("name") val name: String? = null,

@@ -24,19 +24,16 @@ class PhimNguonCProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
 
-    // User-Agent chuẩn Chrome Windows để khớp với TLS Fingerprint
     private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
-    // Interceptor bao phủ toàn bộ hệ sinh thái của NguonC
-    private val cfInterceptor = WebViewResolver(Regex("""phim\.nguonc\.com|.*streamc\.xyz|.*amass15\.top|.*phimmoi\.net"""))
+    // Giải quyết Cloudflare cho toàn bộ hệ thống liên quan
+    private val cfInterceptor = WebViewResolver(Regex("""phim\.nguonc\.com|.*streamc\.xyz|.*amass15\.top"""))
 
     private val commonHeaders = mapOf(
         "User-Agent" to USER_AGENT,
         "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8",
-        "Sec-Ch-Ua" to "\"Chromium\";v=\"122\", \"Not(A:Brand\";v=\"24\", \"Google Chrome\";v=\"122\"",
-        "Sec-Ch-Ua-Mobile" to "?0",
-        "Sec-Ch-Ua-Platform" to "\"Windows\"",
+        "Accept-Language" to "vi-VN,vi;q=0.9",
+        "Referer" to "$mainUrl/",
     )
 
     override val mainPage = mainPageOf(
@@ -74,29 +71,59 @@ class PhimNguonCProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val slug = url.substringAfterLast("/")
-        val apiUrl = "$mainUrl/api/film/$slug"
-        val res = app.get(apiUrl, headers = commonHeaders, interceptor = cfInterceptor).parsedSafe<NguonCDetailResponse>()
-        val movie = res?.movie ?: throw ErrorLoadingException("Dữ liệu trống")
+        val res = app.get(url, headers = commonHeaders, interceptor = cfInterceptor)
+        val doc = res.document
+        
+        val title = doc.selectFirst("h1")?.text()?.trim() ?: ""
+        val poster = doc.selectFirst("img.rounded-md")?.attr("src")
+        val plot = doc.selectFirst("article")?.text()?.trim()
 
         val episodes = mutableListOf<Episode>()
-        movie.episodes?.forEach { server ->
-            server.items?.forEach { ep ->
-                val m3u8 = ep.m3u8 ?: ""
-                val embed = ep.embed ?: ""
-                if (m3u8.isNotBlank()) {
-                    // Gộp m3u8 và embed để xử lý session ở bước loadLinks
-                    episodes.add(newEpisode("$m3u8|$embed") {
-                        this.name = "Tập ${ep.name}"
-                        this.episode = ep.name?.toIntOrNull()
-                    })
+
+        // THUẬT TOÁN 1: Quét script 'var episodes' (Dành cho trang web)
+        val scriptData = doc.select("script").find { it.data().contains("var episodes =") }?.data()
+        if (scriptData != null) {
+            try {
+                val jsonStr = scriptData.substringAfter("var episodes = ").substringBefore("];") + "]"
+                val servers = AppUtils.parseJson<List<NguonCServer>>(jsonStr)
+                servers.forEach { server ->
+                    (server.list ?: server.items)?.forEach { ep ->
+                        val m3u8 = ep.m3u8?.replace("\\/", "/") ?: ""
+                        val embed = ep.embed?.replace("\\/", "/") ?: ""
+                        if (m3u8.isNotBlank()) {
+                            episodes.add(newEpisode("$m3u8|$embed") {
+                                this.name = "Tập ${ep.name}"
+                                this.episode = ep.name?.toIntOrNull()
+                            })
+                        }
+                    }
+                }
+            } catch (e: Exception) { }
+        }
+
+        // THUẬT TOÁN 2: Nếu vẫn trống, gọi API dự phòng
+        if (episodes.isEmpty()) {
+            val slug = url.substringAfterLast("/")
+            val apiRes = app.get("$mainUrl/api/film/$slug", headers = commonHeaders).parsedSafe<NguonCDetailResponse>()
+            apiRes?.movie?.episodes?.forEach { server ->
+                server.items?.forEach { ep ->
+                    val m3u8 = ep.m3u8 ?: ""
+                    val embed = ep.embed ?: ""
+                    if (m3u8.isNotBlank()) {
+                        episodes.add(newEpisode("$m3u8|$embed") {
+                            this.name = "Tập ${ep.name}"
+                            this.episode = ep.name?.toIntOrNull()
+                        })
+                    }
                 }
             }
         }
 
-        return newTvSeriesLoadResponse(movie.name ?: "", url, TvType.TvSeries, episodes) {
-            this.posterUrl = movie.poster_url ?: movie.thumb_url
-            this.plot = movie.description
+        if (episodes.isEmpty()) throw ErrorLoadingException("Không tìm thấy tập phim")
+
+        return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
+            this.posterUrl = poster
+            this.plot = plot
         }
     }
 
@@ -110,69 +137,44 @@ class PhimNguonCProvider : MainAPI() {
         val m3u8Url = parts[0]
         val embedUrl = if (parts.size > 1) parts[1] else ""
 
-        // BƯỚC 1: Kích hoạt Session trên domain Embed
-        val embedRes = app.get(embedUrl, headers = commonHeaders, interceptor = cfInterceptor)
-        val embedCookies = embedRes.cookies
-
-        // BƯỚC 2: Kích hoạt Session trên domain CDN (Giải quyết Redirect & Cloudflare CDN)
-        // Đây là bước quan trọng nhất để bẻ khóa các file .png
-        val cdnRes = app.get(
-            m3u8Url, 
-            headers = commonHeaders.plus("Referer" to embedUrl),
-            interceptor = cfInterceptor,
-            timeout = 20
-        )
-        val finalVideoUrl = cdnRes.url
-        
-        // Hợp nhất tất cả Cookie thu thập được
-        val allCookies = (embedCookies + cdnRes.cookies)
-        val cookieString = allCookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
-
-        // BƯỚC 3: Xây dựng bộ Header "Thần thánh"
+        // THUẬT TOÁN 3: Bẻ khóa file .png bằng Header Injection
         val videoHeaders = mapOf(
             "User-Agent" to USER_AGENT,
-            "Referer" to embedUrl,
-            "Origin" to embedUrl.substringBefore("/embed.php"),
-            "Cookie" to cookieString,
-            "Accept" to "*/*",
-            "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8",
+            "Referer" to (if (embedUrl.isNotBlank()) embedUrl else "$mainUrl/"),
+            "Origin" to (if (embedUrl.isNotBlank()) embedUrl.substringBefore("/embed.php") else mainUrl),
+            "Accept" to "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+            "Accept-Language" to "vi-VN,vi;q=0.9",
             "Connection" to "keep-alive",
             "Sec-Fetch-Dest" to "video",
             "Sec-Fetch-Mode" to "cors",
             "Sec-Fetch-Site" to "cross-site",
-            "Range" to "bytes=0-",
-            // Bổ sung Client Hints để khớp hoàn toàn với trình duyệt
-            "sec-ch-ua" to "\"Chromium\";v=\"122\", \"Not(A:Brand\";v=\"24\", \"Google Chrome\";v=\"122\"",
-            "sec-ch-ua-mobile" to "?0",
-            "sec-ch-ua-platform" to "\"Windows\""
+            "Range" to "bytes=0-" // Ép CDN nhả luồng video thay vì file ảnh tĩnh
         )
 
         callback(
             newExtractorLink(
-                source = "NguonC (Deep-Bypass)",
+                source = "NguonC (VIP)",
                 name = "HLS - 1080p",
-                url = finalVideoUrl,
+                url = m3u8Url,
                 type = ExtractorLinkType.M3U8
             ) {
                 this.quality = Qualities.P1080.value
-                this.headers = videoHeaders
+                this.headers = videoHeaders // Header này sẽ bẻ khóa các phân đoạn .png
             }
         )
         return true
     }
 
-    data class NguonCDetailResponse(@JsonProperty("movie") val movie: NguonCMovie? = null)
-    data class NguonCMovie(
-        @JsonProperty("name") val name: String? = null,
-        @JsonProperty("description") val description: String? = null,
-        @JsonProperty("thumb_url") val thumb_url: String? = null,
-        @JsonProperty("poster_url") val poster_url: String? = null,
-        @JsonProperty("episodes") val episodes: List<NguonCServer>? = null
+    data class NguonCServer(
+        @JsonProperty("server_name") val server_name: String? = null,
+        @JsonProperty("list") val list: List<NguonCEpisode>? = null,
+        @JsonProperty("items") val items: List<NguonCEpisode>? = null
     )
-    data class NguonCServer(@JsonProperty("items") val items: List<NguonCEpisode>? = null)
     data class NguonCEpisode(
         @JsonProperty("name") val name: String? = null,
         @JsonProperty("embed") val embed: String? = null,
         @JsonProperty("m3u8") val m3u8: String? = null
     )
+    data class NguonCDetailResponse(@JsonProperty("movie") val movie: NguonCMovie? = null)
+    data class NguonCMovie(@JsonProperty("episodes") val episodes: List<NguonCServer>? = null)
 }

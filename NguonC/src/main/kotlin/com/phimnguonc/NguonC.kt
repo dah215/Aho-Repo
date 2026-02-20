@@ -25,7 +25,6 @@ class PhimNguonCProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
 
-    // Dùng User-Agent cố định để đồng bộ giữa lúc lấy link và lúc phát
     private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
     private val commonHeaders = mapOf(
@@ -94,12 +93,8 @@ class PhimNguonCProvider : MainAPI() {
                 servers.forEach { server ->
                     server.list?.forEach { ep ->
                         val m3u8 = ep.m3u8?.replace("\\/", "/") ?: ""
-                        val embed = ep.embed?.replace("\\/", "/") ?: ""
-                        
                         if (m3u8.isNotBlank()) {
-                            // Gộp link m3u8 và link embed để loadLinks xử lý Referer
-                            val combinedData = "$m3u8|$embed"
-                            episodes.add(newEpisode(combinedData) {
+                            episodes.add(newEpisode(m3u8) {
                                 this.name = "Tập ${ep.name}"
                                 this.episode = ep.name?.toIntOrNull()
                             })
@@ -122,39 +117,38 @@ class PhimNguonCProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val parts = data.split("|")
-        val streamUrl = parts[0]
-        val embedUrl = if (parts.size > 1) parts[1] else ""
-
-        // Thuật toán xử lý manh mối .png (amass15.top)
-        // Chúng ta cần Referer của chính server embed để tải được các file .png ngụy trang
-        val videoHeaders = mapOf(
-            "User-Agent" to USER_AGENT,
-            "Referer" to embedUrl, 
-            "Origin" to (if (embedUrl.isNotBlank()) embedUrl.substringBefore("/embed.php") else mainUrl),
-            "Accept" to "*/*",
-            "Sec-Fetch-Dest" to "video",
-            "Sec-Fetch-Mode" to "cors",
-            "Sec-Fetch-Site" to "cross-site"
-        )
-
-        if (streamUrl.contains(".m3u8")) {
-            callback(
-                newExtractorLink(
-                    source = "NguonC (CDN)",
-                    name = "HLS - 1080p",
-                    url = streamUrl,
-                    type = ExtractorLinkType.M3U8
-                ) {
-                    this.quality = Qualities.P1080.value
-                    // Gán headers vào đây để trình phát video sử dụng cho TẤT CẢ các request (bao gồm cả file .png)
-                    this.headers = videoHeaders
-                }
+        // THUẬT TOÁN THÔNG MINH: Tự giải quyết Redirect trước khi đưa link cho Player
+        val finalVideoUrl = try {
+            val res = app.get(
+                data, 
+                headers = mapOf("Referer" to "$mainUrl/", "User-Agent" to USER_AGENT),
+                timeout = 15
             )
-            return true
+            res.url // Đây là link cuối cùng sau khi đã Redirect (link amass15.top)
+        } catch (e: Exception) {
+            data
         }
 
-        return false
+        val videoHeaders = mapOf(
+            "User-Agent" to USER_AGENT,
+            "Referer" to "$mainUrl/",
+            "Origin" to mainUrl,
+            "Accept" to "*/*",
+            "Connection" to "keep-alive"
+        )
+
+        callback(
+            newExtractorLink(
+                source = "NguonC (VIP)",
+                name = "HLS - 1080p",
+                url = finalVideoUrl,
+                type = ExtractorLinkType.M3U8
+            ) {
+                this.quality = Qualities.P1080.value
+                this.headers = videoHeaders
+            }
+        )
+        return true
     }
 
     data class NguonCServer(

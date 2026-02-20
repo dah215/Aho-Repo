@@ -95,7 +95,6 @@ class PhimNguonCProvider : MainAPI() {
         var genreText = ""
         var yearText = ""
         var countryText = ""
-        var ratingText = ""  // không có trong html, nhưng để trống
 
         val rows = doc.select("table tbody tr")
         for (row in rows) {
@@ -123,7 +122,6 @@ class PhimNguonCProvider : MainAPI() {
             listTypeText.contains("Phim lẻ", ignoreCase = true) -> TvType.Movie
             listTypeText.contains("Phim bộ", ignoreCase = true) -> TvType.TvSeries
             else -> {
-                // Nếu không có, dựa vào số tập
                 val episodeCount = episodeCountText.toIntOrNull()
                 if (episodeCount != null && episodeCount > 1) TvType.TvSeries else TvType.Movie
             }
@@ -140,15 +138,15 @@ class PhimNguonCProvider : MainAPI() {
 
         if (episodeList.isEmpty()) throw ErrorLoadingException("Danh sách tập rỗng")
 
+        // Tạo danh sách tập cho series
         val episodes = episodeList.map { ep ->
             newEpisode(ep.embed ?: "") {
                 this.name = "Tập ${ep.name}"
                 this.episode = ep.name?.toIntOrNull()
-                // Có thể thêm m3u8 nếu cần, nhưng loadLinks sẽ xử lý embed
             }
         }
 
-        // ---------- Xử lý các trường cho LoadResponse ----------
+        // Metadata chung
         val year = yearText.toIntOrNull()
         val duration = durationText.replace(Regex("[^0-9]"), "").toIntOrNull()
         val tags = genreText.split(',').map { it.trim() }.filter { it.isNotEmpty() }
@@ -163,31 +161,21 @@ class PhimNguonCProvider : MainAPI() {
             else -> null
         }
 
-        // Trả về đúng loại phim
         return if (tvType == TvType.Movie) {
-            newMovieLoadResponse(title, url, TvType.Movie, url) {
+            val firstEmbed = episodeList.firstOrNull()?.embed
+                ?: throw ErrorLoadingException("Không tìm thấy link phim")
+            newMovieLoadResponse(title, url, TvType.Movie, firstEmbed) {
                 this.posterUrl = poster
                 this.plot = plot
                 this.year = year
                 this.tags = tags
-                this.cast = cast
-                this.director = director
+                addCast(cast)
+                addDirector(director)
                 this.duration = duration
                 this.quality = quality
-                this.language = language
-                this.country = country
-                this.rating = ratingText.toFloatOrNull()
-                // Đối với phim lẻ, chỉ có một tập, ta có thể truyền data là link embed của tập đầu
-                // Nhưng LoadResponse của movie không chứa episodes, nên loadLinks sẽ nhận data = url (ở trên)
-                // và trong loadLinks ta xử lý từ url đó (embed). Tuy nhiên, để đồng nhất, ta vẫn giữ data = url
-                // và trong loadLinks ta sẽ parse url để lấy embed? Không, vì data lúc này là url trang phim, không phải embed.
-                // Cần điều chỉnh: với movie, ta nên set data là link embed của tập duy nhất.
-                // Ta có thể lấy embed đầu tiên từ episodeList.
-                val firstEmbed = episodeList.firstOrNull()?.embed
-                if (firstEmbed != null) {
-                    // Ghi đè data bằng embed
-                    this.data = firstEmbed
-                }
+                addLanguage(language)
+                addCountry(country)
+                // Không có rating nên bỏ qua
             }
         } else {
             newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
@@ -195,13 +183,12 @@ class PhimNguonCProvider : MainAPI() {
                 this.plot = plot
                 this.year = year
                 this.tags = tags
-                this.cast = cast
-                this.director = director
+                addCast(cast)
+                addDirector(director)
                 this.duration = duration
                 this.quality = quality
-                this.language = language
-                this.country = country
-                this.rating = ratingText.toFloatOrNull()
+                addLanguage(language)
+                addCountry(country)
                 this.status = status
             }
         }
@@ -221,8 +208,8 @@ class PhimNguonCProvider : MainAPI() {
 
     // Data class cho stream data từ data-obf
     data class StreamData(
-        @JsonProperty("sUb") val sUb: String? = null,  // Token URL
-        @JsonProperty("hD") val hD: String? = null     // Hash
+        @JsonProperty("sUb") val sUb: String? = null,
+        @JsonProperty("hD") val hD: String? = null
     )
 
     override suspend fun loadLinks(
@@ -231,11 +218,7 @@ class PhimNguonCProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // data có thể là embedUrl (từ episode) hoặc url trang phim (trong trường hợp movie)
-        // Nếu data là trang phim, ta cần lấy embed từ episode đầu tiên? Nhưng trong load movie, ta đã set data = firstEmbed.
-        // Vậy data luôn là embedUrl.
         val embedUrl = data
-
         val embedDomain = Regex("""https?://[^/]+""").find(embedUrl)?.value ?: return false
 
         try {
@@ -250,7 +233,6 @@ class PhimNguonCProvider : MainAPI() {
             val html = embedRes.text
             val cookies = embedRes.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
 
-            // Tìm data-obf
             val obfMatch = Regex("""data-obf\s*=\s*["']([A-Za-z0-9+/=]+)["']""").find(html)
             if (obfMatch != null) {
                 val obfBase64 = obfMatch.groupValues[1]
@@ -290,7 +272,6 @@ class PhimNguonCProvider : MainAPI() {
             e.printStackTrace()
         }
 
-        // Fallback
         return loadExtractor(embedUrl, "$mainUrl/", subtitleCallback, callback)
     }
 }

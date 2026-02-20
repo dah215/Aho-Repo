@@ -44,46 +44,40 @@ class PhimNguonCProvider : MainAPI() {
     )
 
     private fun parseCard(el: Element): SearchResponse? {
-    // Lấy tất cả các cột (td) trong dòng (tr)
-    val cells = el.select("td")
-    if (cells.size < 3) return null
-
-    val titleEl = cells[0].selectFirst("h3") ?: return null
-    val a = cells[0].selectFirst("a") ?: return null
-    val href = a.attr("href")
-    val title = titleEl.text().trim()
-    
-    // Lấy ảnh poster từ data-src hoặc src
-    val img = cells[0].selectFirst("img")
-    val poster = img?.attr("data-src")?.ifBlank { img.attr("src") }
-
-    // Cột 2: Tình trạng (Ví dụ: "Tập 4", "Hoàn tất (15/15)", "FULL")
-    val episodeStatus = cells[1].text().trim()
-    
-    // Cột 3: Định dạng (Ví dụ: "Phim bộ", "Phim lẻ")
-    val movieType = cells[2].text().trim()
-
-    // Xác định TvType dựa trên định dạng
-    val type = if (movieType.contains("Phim lẻ", ignoreCase = true)) TvType.Movie else TvType.TvSeries
-
-    // Tạo nhãn hiển thị (Badge) giống trong ảnh: HD | Phụ Đề | Tập ...
-    // Vì web này đa số là HD và Phụ đề nên ta có thể thêm vào cho đẹp
-    val quality = "HD"
-    val sub = "Vietsub"
-    val displayLabel = "$quality | $sub | $episodeStatus".replace("Hoàn tất", "Full")
-
-    return if (type == TvType.TvSeries) {
-        newTvSeriesSearchResponse(title, href, type) {
-            this.posterUrl = poster
-            this.otherName = displayLabel // Đây là nơi hiển thị các nhãn trên card
+        val a = el.selectFirst("a") ?: return null
+        val href = fixUrl(a.attr("href"))
+        val title = el.selectFirst("h3")?.text()?.trim() ?: a.attr("title")
+        val poster = el.selectFirst("img")?.let { 
+            fixUrl(it.attr("data-src").ifBlank { it.attr("src") })
         }
-    } else {
-        newMovieSearchResponse(title, href, type) {
+
+        // Lấy chất lượng từ badge (HD, FHD, 4K...)
+        val quality = el.selectFirst(".bg-green-300, .bg-blue-300, .bg-red-300, .bg-yellow-300, .bg-violet-300")?.text()?.trim() ?: ""
+
+        // Lấy số tập hiện tại/tổng số tập
+        val episodeText = el.selectFirst(".bg-gray-800, .bg-black, .bg-slate-800, .bg-gray-900")?.text()?.trim() ?: ""
+        val episodeNum = episodeText.replace(Regex("[^0-9/]"), "")
+
+        // Xác định loại phim
+        val type = when {
+            href.contains("/phim-le/") -> TvType.Movie
+            href.contains("/hoat-hinh/") -> TvType.Anime
+            else -> TvType.TvSeries
+        }
+
+        return newMovieSearchResponse(title, href, type) {
             this.posterUrl = poster
-            this.otherName = displayLabel
+            this.quality = quality
+            this.otherName = if (episodeNum.isNotBlank() && type != TvType.Movie) {
+                "Tập $episodeNum"
+            } else {
+                quality
+            }
+            if (episodeNum.isNotBlank() && type != TvType.Movie) {
+                this.episode = episodeNum.toIntOrNull()
+            }
         }
     }
-}
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page == 1) "$mainUrl/${request.data}" else "$mainUrl/${request.data}?page=$page"
@@ -101,15 +95,19 @@ class PhimNguonCProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         val slug = url.trim().trimEnd('/').substringAfterLast("/")
         val apiUrl = "$mainUrl/api/film/$slug"
-        
+
         val res = app.get(apiUrl, headers = commonHeaders, interceptor = cfInterceptor).parsedSafe<NguonCDetailResponse>()
         val movie = res?.movie ?: throw ErrorLoadingException("Không thể tải dữ liệu phim")
 
         val episodes = mutableListOf<Episode>()
+        var totalEpisodes = 0
+
         movie.episodes?.forEach { server ->
             val items = server.items ?: server.list
+            totalEpisodes = items?.size ?: 0
             items?.forEach { ep ->
                 val embed = ep.embed?.replace("\\/", "/") ?: ""
+                val m3u8 = ep.m3u8?.replace("\\/", "/") ?: ""
                 if (embed.isNotBlank()) {
                     episodes.add(newEpisode(embed) {
                         this.name = "Tập ${ep.name}"
@@ -121,17 +119,66 @@ class PhimNguonCProvider : MainAPI() {
 
         if (episodes.isEmpty()) throw ErrorLoadingException("Không tìm thấy tập phim")
 
+        // Xác định trạng thái và thông tin tập
+        val status = movie.status ?: ""
+        val episodeCurrent = movie.episode_current ?: ""
+        val episodeTotal = movie.episode_total ?: totalEpisodes.toString()
+
+        val statusText = when {
+            status.contains("Hoàn tất", ignoreCase = true) -> "Hoàn tất"
+            status.contains("Đang chiếu", ignoreCase = true) -> "Đang chiếu"
+            episodeCurrent.contains("Hoàn tất", ignoreCase = true) -> "Hoàn tất"
+            else -> "Đang cập nhật"
+        }
+
+        val episodeInfo = if (statusText == "Hoàn tất") {
+            "Hoàn tất ($episodeTotal/$episodeTotal)"
+        } else {
+            "$episodeCurrent/$episodeTotal"
+        }
+
+        // Tạo danh sách tags từ thể loại và quốc gia
+        val tags = mutableListOf<String>()
+        movie.category?.forEach { it.name?.let { name -> tags.add(name) } }
+        movie.country?.forEach { it.name?.let { name -> tags.add(name) } }
+
         return newTvSeriesLoadResponse(movie.name ?: "", url, TvType.TvSeries, episodes) {
-            this.posterUrl = movie.poster_url ?: movie.thumb_url
-            this.plot = movie.description
+            this.posterUrl = fixUrl(movie.poster_url ?: movie.thumb_url ?: "")
+            this.year = movie.year?.toIntOrNull()
+            this.tags = tags
+            this.rating = movie.rating?.toRatingInt()
+            this.duration = movie.time
+            this.quality = movie.quality ?: "HD"
+
+            // Tạo plot với đầy đủ thông tin
+            val infoBuilder = StringBuilder()
+            infoBuilder.appendLine("📺 Trạng thái: $statusText")
+            infoBuilder.appendLine("🎬 Số tập: $episodeInfo")
+            infoBuilder.appendLine("🎞️ Chất lượng: ${movie.quality ?: "HD"}")
+            infoBuilder.appendLine("🌐 Ngôn ngữ: ${movie.lang ?: "Vietsub"}")
+            if (!movie.time.isNullOrBlank()) infoBuilder.appendLine("⏱️ Thời lượng: ${movie.time}")
+            if (!movie.director.isNullOrBlank()) infoBuilder.appendLine("🎬 Đạo diễn: ${movie.director}")
+            if (!movie.actor.isNullOrBlank()) infoBuilder.appendLine("🎭 Diễn viên: ${movie.actor}")
+            if (!movie.year.isNullOrBlank()) infoBuilder.appendLine("📅 Năm: ${movie.year}")
+            infoBuilder.appendLine()
+            infoBuilder.appendLine("📖 Nội dung:")
+            infoBuilder.appendLine(movie.description ?: movie.content ?: "Không có mô tả")
+
+            this.plot = infoBuilder.toString()
+
+            // Phim liên quan
+            this.recommendations = movie.related?.mapNotNull { related ->
+                val relatedHref = related.link ?: return@mapNotNull null
+                val relatedTitle = related.name ?: return@mapNotNull null
+                val relatedPoster = related.poster ?: related.thumb
+                val relatedQuality = related.quality ?: ""
+                newMovieSearchResponse(relatedTitle, fixUrl(relatedHref), TvType.TvSeries) {
+                    this.posterUrl = fixUrl(relatedPoster ?: "")
+                    this.quality = relatedQuality
+                }
+            }
         }
     }
-
-    // Data class cho JSON từ data-obf
-    data class StreamData(
-        @JsonProperty("sUb") val sUb: String? = null,  // Token URL
-        @JsonProperty("hD") val hD: String? = null     // Hash
-    )
 
     override suspend fun loadLinks(
         data: String,
@@ -139,14 +186,10 @@ class PhimNguonCProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // data = https://embed13.streamc.xyz/embed.php?hash=f71c4bddcc66969be2cd4d29e709cfa2
         val embedUrl = data
-        
-        // Lấy domain: https://embed13.streamc.xyz
         val embedDomain = Regex("""https?://[^/]+""").find(embedUrl)?.value ?: ""
 
         try {
-            // Tải trang embed
             val embedRes = app.get(
                 embedUrl, 
                 headers = mapOf(
@@ -158,24 +201,17 @@ class PhimNguonCProvider : MainAPI() {
             val html = embedRes.text
             val cookies = embedRes.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
 
-            // Tìm data-obf trong HTML
-            // <div id="player" data-obf="eyJzVWIiOi...J9">
             val obfMatch = Regex("""data-obf\s*=\s*["']([A-Za-z0-9+/=]+)["']""").find(html)
-            
+
             if (obfMatch != null) {
                 val obfBase64 = obfMatch.groupValues[1]
-                
-                // Decode Base64 layer 1 → JSON {"sUb": "...", "hD": "..."}
                 val jsonData = String(Base64.decode(obfBase64, Base64.DEFAULT))
                 val streamData = AppUtils.parseJson<StreamData>(jsonData)
-                
-                // sUb chính là token cho URL m3u8
+
                 val sUb = streamData.sUb
                 if (!sUb.isNullOrBlank()) {
-                    // URL m3u8: https://embed13.streamc.xyz/{sUb}.m3u8
                     val finalM3u8Url = "$embedDomain/$sUb.m3u8"
-                    
-                    // Headers để phát video
+
                     val videoHeaders = mapOf(
                         "User-Agent" to USER_AGENT,
                         "Referer" to embedUrl,
@@ -191,7 +227,7 @@ class PhimNguonCProvider : MainAPI() {
 
                     callback(
                         newExtractorLink(
-                            source = "NguonC Server",
+                            source = "NguonC",
                             name = "HLS",
                             url = finalM3u8Url,
                             type = ExtractorLinkType.M3U8
@@ -209,25 +245,85 @@ class PhimNguonCProvider : MainAPI() {
             e.printStackTrace()
         }
 
-        // Fallback
         return loadExtractor(embedUrl, "$mainUrl/", subtitleCallback, callback)
     }
 
-    data class NguonCDetailResponse(@JsonProperty("movie") val movie: NguonCMovie? = null)
+    // ==================== DATA CLASSES ====================
+
+    data class StreamData(
+        @JsonProperty("sUb") val sUb: String? = null,
+        @JsonProperty("hD") val hD: String? = null
+    )
+
+    data class NguonCDetailResponse(
+        @JsonProperty("movie") val movie: NguonCMovie? = null,
+        @JsonProperty("status") val status: Boolean? = null,
+        @JsonProperty("msg") val msg: String? = null
+    )
+
     data class NguonCMovie(
+        @JsonProperty("id") val id: String? = null,
         @JsonProperty("name") val name: String? = null,
+        @JsonProperty("slug") val slug: String? = null,
+        @JsonProperty("origin_name") val origin_name: String? = null,
         @JsonProperty("description") val description: String? = null,
+        @JsonProperty("content") val content: String? = null,
+        @JsonProperty("status") val status: String? = null,
         @JsonProperty("thumb_url") val thumb_url: String? = null,
         @JsonProperty("poster_url") val poster_url: String? = null,
-        @JsonProperty("episodes") val episodes: List<NguonCServer>? = null
+        @JsonProperty("trailer_url") val trailer_url: String? = null,
+        @JsonProperty("time") val time: String? = null,
+        @JsonProperty("episode_current") val episode_current: String? = null,
+        @JsonProperty("episode_total") val episode_total: String? = null,
+        @JsonProperty("quality") val quality: String? = null,
+        @JsonProperty("lang") val lang: String? = null,
+        @JsonProperty("year") val year: String? = null,
+        @JsonProperty("director") val director: String? = null,
+        @JsonProperty("actor") val actor: String? = null,
+        @JsonProperty("category") val category: List<NguonCCategory>? = null,
+        @JsonProperty("country") val country: List<NguonCCountry>? = null,
+        @JsonProperty("episodes") val episodes: List<NguonCServer>? = null,
+        @JsonProperty("related") val related: List<NguonCRelated>? = null,
+        @JsonProperty("rating") val rating: String? = null,
+        @JsonProperty("view") val view: String? = null,
+        @JsonProperty("type") val type: String? = null
     )
+
+    data class NguonCCategory(
+        @JsonProperty("id") val id: String? = null,
+        @JsonProperty("name") val name: String? = null,
+        @JsonProperty("slug") val slug: String? = null
+    )
+
+    data class NguonCCountry(
+        @JsonProperty("id") val id: String? = null,
+        @JsonProperty("name") val name: String? = null,
+        @JsonProperty("slug") val slug: String? = null
+    )
+
     data class NguonCServer(
+        @JsonProperty("server_name") val server_name: String? = null,
         @JsonProperty("items") val items: List<NguonCEpisode>? = null,
         @JsonProperty("list") val list: List<NguonCEpisode>? = null
     )
+
     data class NguonCEpisode(
         @JsonProperty("name") val name: String? = null,
+        @JsonProperty("slug") val slug: String? = null,
         @JsonProperty("embed") val embed: String? = null,
-        @JsonProperty("m3u8") val m3u8: String? = null
+        @JsonProperty("m3u8") val m3u8: String? = null,
+        @JsonProperty("link_embed") val link_embed: String? = null,
+        @JsonProperty("link_m3u8") val link_m3u8: String? = null
+    )
+
+    data class NguonCRelated(
+        @JsonProperty("id") val id: String? = null,
+        @JsonProperty("name") val name: String? = null,
+        @JsonProperty("slug") val slug: String? = null,
+        @JsonProperty("thumb") val thumb: String? = null,
+        @JsonProperty("poster") val poster: String? = null,
+        @JsonProperty("quality") val quality: String? = null,
+        @JsonProperty("link") val link: String? = null,
+        @JsonProperty("episode_current") val episode_current: String? = null
     )
 }

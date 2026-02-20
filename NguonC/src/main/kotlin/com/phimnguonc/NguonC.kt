@@ -25,8 +25,11 @@ class PhimNguonCProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
 
+    // Sử dụng một User-Agent cố định cho toàn bộ quá trình từ load đến play
+    private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+
     private val commonHeaders = mapOf(
-        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "User-Agent" to USER_AGENT,
         "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language" to "vi-VN,vi;q=0.9",
         "Referer" to "$mainUrl/",
@@ -86,14 +89,17 @@ class PhimNguonCProvider : MainAPI() {
         if (scriptData != null) {
             try {
                 val jsonStr = scriptData.substringAfter("var episodes = ").substringBefore("];") + "]"
-                // Gọi parseJson thông qua AppUtils
                 val servers = AppUtils.parseJson<List<NguonCServer>>(jsonStr)
                 
                 servers.forEach { server ->
                     server.list?.forEach { ep ->
-                        val link = ep.m3u8?.replace("\\/", "/") ?: ep.embed?.replace("\\/", "/") ?: ""
-                        if (link.isNotBlank()) {
-                            episodes.add(newEpisode(link) {
+                        val m3u8 = ep.m3u8?.replace("\\/", "/") ?: ""
+                        val embed = ep.embed?.replace("\\/", "/") ?: ""
+                        
+                        if (m3u8.isNotBlank()) {
+                            // THUẬT TOÁN: Gộp link m3u8 và link embed bằng dấu | để loadLinks xử lý
+                            val combinedData = "$m3u8|$embed"
+                            episodes.add(newEpisode(combinedData) {
                                 this.name = "Tập ${ep.name}"
                                 this.episode = ep.name?.toIntOrNull()
                             })
@@ -116,42 +122,29 @@ class PhimNguonCProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        // Tách link m3u8 và link embed (referer)
+        val parts = data.split("|")
+        val streamUrl = parts[0]
+        val embedUrl = if (parts.size > 1) parts[1] else "$mainUrl/"
+
         val videoHeaders = mapOf(
-            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Referer" to "$mainUrl/",
-            "Origin" to mainUrl,
-            "Accept" to "*/*"
+            "User-Agent" to USER_AGENT,
+            "Referer" to embedUrl, // QUAN TRỌNG: Referer phải là link embed
+            "Origin" to embedUrl.substringBefore("/embed.php"),
+            "Accept" to "*/*",
+            "Connection" to "keep-alive"
         )
 
-        // SỬA LỖI: Sử dụng đúng signature của newExtractorLink
-        if (data.contains("phimmoi.net") || data.contains(".m3u8")) {
+        if (streamUrl.contains(".m3u8")) {
             callback(
                 newExtractorLink(
                     source = "NguonC (VIP)",
                     name = "HLS - 1080p",
-                    url = data,
+                    url = streamUrl,
                     type = ExtractorLinkType.M3U8
                 ) {
                     this.quality = Qualities.P1080.value
-                    this.referer = "$mainUrl/"
-                    this.headers = videoHeaders
-                }
-            )
-            return true
-        }
-
-        if (data.contains("streamc.xyz")) {
-            val hash = data.substringAfter("hash=").substringBefore("&")
-            val finalUrl = "https://sing.phimmoi.net/$hash/hls.m3u8"
-            callback(
-                newExtractorLink(
-                    source = "NguonC (Embed)",
-                    name = "HLS - StreamC",
-                    url = finalUrl,
-                    type = ExtractorLinkType.M3U8
-                ) {
-                    this.quality = Qualities.P1080.value
-                    this.referer = "$mainUrl/"
+                    this.referer = embedUrl
                     this.headers = videoHeaders
                 }
             )

@@ -24,11 +24,10 @@ class PhimNguonCProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
 
-    // Dùng User-Agent Chrome Windows chuẩn để khớp với TLS Fingerprint của Cloudflare
     private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
-    // Interceptor bao phủ toàn bộ các domain để giải mã Cloudflare tập trung
-    private val cfInterceptor = WebViewResolver(Regex("""phim\.nguonc\.com|.*streamc\.xyz|.*amass15\.top|.*phimmoi\.net"""))
+    // Giải quyết Cloudflare cho toàn bộ hệ sinh thái
+    private val cfInterceptor = WebViewResolver(Regex("""phim\.nguonc\.com|.*streamc\.xyz|.*amass15\.top"""))
 
     private val commonHeaders = mapOf(
         "User-Agent" to USER_AGENT,
@@ -72,30 +71,65 @@ class PhimNguonCProvider : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse {
         val slug = url.trimEnd('/').substringAfterLast("/")
-        val apiUrl = "$mainUrl/api/film/$slug"
-        
-        val res = app.get(apiUrl, headers = commonHeaders, interceptor = cfInterceptor).parsedSafe<NguonCDetailResponse>()
-        val movie = res?.movie ?: throw ErrorLoadingException("Dữ liệu trống")
-
         val episodes = mutableListOf<Episode>()
-        movie.episodes?.forEach { server ->
-            val items = server.items ?: server.list
-            items?.forEach { ep ->
-                val m3u8 = ep.m3u8 ?: ""
-                val embed = ep.embed ?: ""
-                if (m3u8.isNotBlank()) {
-                    // Gộp m3u8 và embed để loadLinks xử lý bẻ khóa
-                    episodes.add(newEpisode("$m3u8|$embed") {
-                        this.name = "Tập ${ep.name}"
-                        this.episode = ep.name?.toIntOrNull()
-                    })
+        var movieTitle = ""
+        var moviePoster = ""
+        var moviePlot = ""
+
+        // NGUỒN 1: Thử gọi API JSON (Chính xác nhất theo mẫu bạn gửi)
+        try {
+            val apiUrl = "$mainUrl/api/film/$slug"
+            val res = app.get(apiUrl, headers = commonHeaders).parsedSafe<NguonCDetailResponse>()
+            res?.movie?.let { movie ->
+                movieTitle = movie.name ?: ""
+                moviePoster = movie.poster_url ?: movie.thumb_url ?: ""
+                moviePlot = movie.description ?: ""
+                movie.episodes?.forEach { server ->
+                    server.items?.forEach { ep ->
+                        val m3u8 = ep.m3u8?.replace("\\/", "/") ?: ""
+                        val embed = ep.embed?.replace("\\/", "/") ?: ""
+                        if (m3u8.isNotBlank()) {
+                            episodes.add(newEpisode("$m3u8|$embed") {
+                                this.name = "Tập ${ep.name}"
+                                this.episode = ep.name?.toIntOrNull()
+                            })
+                        }
+                    }
                 }
+            }
+        } catch (e: Exception) { }
+
+        // NGUỒN 2: Dự phòng bằng cách quét Script HTML nếu API lỗi
+        if (episodes.isEmpty()) {
+            val doc = app.get(url, headers = commonHeaders, interceptor = cfInterceptor).document
+            movieTitle = doc.selectFirst("h1")?.text()?.trim() ?: ""
+            moviePoster = doc.selectFirst("img.rounded-md")?.attr("src") ?: ""
+            val scriptData = doc.select("script").find { it.data().contains("var episodes =") }?.data()
+            if (scriptData != null) {
+                try {
+                    val jsonStr = scriptData.substringAfter("var episodes = ").substringBefore("];") + "]"
+                    val servers = AppUtils.parseJson<List<NguonCServer>>(jsonStr)
+                    servers.forEach { server ->
+                        server.list?.forEach { ep ->
+                            val m3u8 = ep.m3u8?.replace("\\/", "/") ?: ""
+                            val embed = ep.embed?.replace("\\/", "/") ?: ""
+                            if (m3u8.isNotBlank()) {
+                                episodes.add(newEpisode("$m3u8|$embed") {
+                                    this.name = "Tập ${ep.name}"
+                                    this.episode = ep.name?.toIntOrNull()
+                                })
+                            }
+                        }
+                    }
+                } catch (e: Exception) { }
             }
         }
 
-        return newTvSeriesLoadResponse(movie.name ?: "", url, TvType.TvSeries, episodes) {
-            this.posterUrl = movie.poster_url ?: movie.thumb_url
-            this.plot = movie.description
+        if (episodes.isEmpty()) throw ErrorLoadingException("Không tìm thấy tập phim")
+
+        return newTvSeriesLoadResponse(movieTitle, url, TvType.TvSeries, episodes) {
+            this.posterUrl = moviePoster
+            this.plot = moviePlot
         }
     }
 
@@ -109,36 +143,22 @@ class PhimNguonCProvider : MainAPI() {
         val m3u8Url = parts[0]
         val embedUrl = if (parts.size > 1) parts[1] else ""
 
-        // BƯỚC 1: Kích hoạt phiên làm việc (Session Warm-up)
-        // Truy cập trang embed để lấy Cookie cf_clearance từ Cloudflare
-        val embedRes = app.get(embedUrl, headers = commonHeaders, interceptor = cfInterceptor)
-        val cookies = embedRes.cookies
+        // Lấy domain của server embed để làm Origin (VD: https://embed18.streamc.xyz)
+        val embedDomain = if (embedUrl.startsWith("http")) {
+            Regex("""https?://[^/]+""").find(embedUrl)?.value ?: ""
+        } else ""
 
-        // BƯỚC 2: Tự giải mã Redirect để lấy link CDN thật (amass15.top)
-        // Dùng chính Cookie vừa lấy được để vượt qua Cloudflare của CDN
-        val finalRes = app.get(
-            m3u8Url, 
-            headers = commonHeaders.plus("Referer" to embedUrl).plus("Cookie" to cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }),
-            interceptor = cfInterceptor,
-            timeout = 20
-        )
-        val finalVideoUrl = finalRes.url
-        
-        // Hợp nhất Cookie từ cả trang embed và trang redirect
-        val allCookies = (cookies + finalRes.cookies).entries.joinToString("; ") { "${it.key}=${it.value}" }
-
-        // BƯỚC 3: Xây dựng bộ Header "Bất tử"
+        // THUẬT TOÁN BẺ KHÓA PNG: Bộ Header giả dạng trình duyệt đang xem ảnh cực mạnh
         val videoHeaders = mapOf(
             "User-Agent" to USER_AGENT,
-            "Referer" to embedUrl,
-            "Origin" to embedUrl.substringBefore("/embed.php"),
-            "Cookie" to allCookies, // Ép trình phát mang theo Cookie xác thực
+            "Referer" to (if (embedUrl.isNotBlank()) embedUrl else "$mainUrl/"),
+            "Origin" to embedDomain,
             "Accept" to "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
             "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8",
             "Sec-Fetch-Dest" to "video",
             "Sec-Fetch-Mode" to "cors",
             "Sec-Fetch-Site" to "cross-site",
-            "Range" to "bytes=0-",
+            "Range" to "bytes=0-", // Ép CDN nhả luồng dữ liệu thay vì file tĩnh
             "Connection" to "keep-alive"
         )
 
@@ -146,7 +166,7 @@ class PhimNguonCProvider : MainAPI() {
             newExtractorLink(
                 source = "NguonC (Ultra-Bypass)",
                 name = "HLS - 1080p",
-                url = finalVideoUrl,
+                url = m3u8Url,
                 type = ExtractorLinkType.M3U8
             ) {
                 this.quality = Qualities.P1080.value
@@ -156,6 +176,7 @@ class PhimNguonCProvider : MainAPI() {
         return true
     }
 
+    // Data classes linh hoạt cho cả API và HTML
     data class NguonCDetailResponse(@JsonProperty("movie") val movie: NguonCMovie? = null)
     data class NguonCMovie(
         @JsonProperty("name") val name: String? = null,

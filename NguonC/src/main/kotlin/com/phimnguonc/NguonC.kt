@@ -27,15 +27,7 @@ class PhimNguonCProvider : MainAPI() {
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
         "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
         "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Cache-Control" to "max-age=0",
-        "Sec-Ch-Ua" to "\"Not(A:Brand\";v=\"99\", \"Google Chrome\";v=\"133\", \"Chromium\";v=\"133\"",
-        "Sec-Ch-Ua-Mobile" to "?0",
-        "Sec-Ch-Ua-Platform" to "\"Windows\"",
-        "Sec-Fetch-Dest" to "document",
-        "Sec-Fetch-Mode" to "navigate",
-        "Sec-Fetch-Site" to "none",
-        "Sec-Fetch-User" to "?1",
-        "Upgrade-Insecure-Requests" to "1"
+        "Referer" to "$mainUrl/"
     )
 
     override val mainPage = mainPageOf(
@@ -96,12 +88,7 @@ class PhimNguonCProvider : MainAPI() {
             }
         } catch (e: Exception) {}
 
-        val htmlUrl = if (page == 1) {
-            "$mainUrl/${request.data}"
-        } else {
-            "$mainUrl/${request.data}/page/$page"
-        }
-        
+        val htmlUrl = if (page == 1) "$mainUrl/${request.data}" else "$mainUrl/${request.data}/page/$page"
         val doc = app.get(htmlUrl, headers = headers).document
         var items = doc.select(".item, .movie-item, article, .halim-item, .col-md-2, .col-md-3").mapNotNull { parseCard(it) }
         
@@ -145,10 +132,11 @@ class PhimNguonCProvider : MainAPI() {
                         val epName = ep.name ?: ""
                         val epNum = Regex("""\d+""").find(epName)?.value?.toIntOrNull()
                         
-                        val link = if (!ep.m3u8.isNullOrBlank()) ep.m3u8 else ep.embed ?: ""
+                        // Thuật toán thông minh: Kết hợp link m3u8 và embed để tăng khả năng phát video
+                        val data = if (!ep.m3u8.isNullOrBlank()) ep.m3u8 else ep.embed ?: ""
                         
-                        if (link.isNotBlank()) {
-                            episodes.add(newEpisode(link) {
+                        if (data.isNotBlank()) {
+                            episodes.add(newEpisode(data) {
                                 this.name = epName
                                 this.episode = epNum
                             })
@@ -195,77 +183,60 @@ class PhimNguonCProvider : MainAPI() {
     ): Boolean {
         val fixedData = data.replace("^http://".toRegex(), "https://")
 
+        // Trường hợp 1: Link m3u8 trực tiếp
         if (fixedData.contains(".m3u8")) {
             callback(
                 newExtractorLink(
                     "NguonC",
                     "NguonC (HLS)",
                     fixedData,
+                    "",
+                    Qualities.P1080.value,
                     ExtractorLinkType.M3U8
-                ) {
-                    this.referer = ""
-                    this.quality = Qualities.P1080.value
-                }
-            )
-            callback(
-                newExtractorLink(
-                    "NguonC",
-                    "NguonC (Alt)",
-                    fixedData,
-                    ExtractorLinkType.M3U8
-                ) {
-                    this.referer = "$mainUrl/"
-                    this.quality = Qualities.P1080.value
-                }
+                )
             )
             return true
         }
 
+        // Trường hợp 2: Link embed từ streamc.xyz
+        if (fixedData.contains("streamc.xyz/embed.php")) {
+            val hash = fixedData.substringAfter("hash=").substringBefore("&")
+            if (hash.isNotBlank()) {
+                // Thuật toán thông minh: Tự động chuyển đổi link embed sang link m3u8 dựa trên hash
+                val m3u8Link = "https://sing.phimmoi.net/$hash/hls.m3u8"
+                callback(
+                    newExtractorLink(
+                        "NguonC",
+                        "NguonC (StreamC)",
+                        m3u8Link,
+                        "https://phim.nguonc.com/",
+                        Qualities.P1080.value,
+                        ExtractorLinkType.M3U8
+                    )
+                )
+                return true
+            }
+        }
+
+        // Trường hợp 3: Cào link từ mã nguồn trang (Fallback)
         val doc = app.get(fixedData, headers = headers).document
         val html = doc.html()
-        
         val m3u8Regex = Regex("""https?://[^\s"']+\.m3u8[^\s"']*""")
         val matches = m3u8Regex.findAll(html).map { it.value }.toList()
         
         var found = false
         matches.forEach { link ->
-            val safeLink = link.replace("^http://".toRegex(), "https://")
             callback(
                 newExtractorLink(
                     "NguonC",
                     "NguonC (HLS)",
-                    safeLink,
+                    link.replace("^http://".toRegex(), "https://"),
+                    "",
+                    Qualities.P1080.value,
                     ExtractorLinkType.M3U8
-                ) {
-                    this.referer = ""
-                    this.quality = Qualities.P1080.value
-                }
+                )
             )
             found = true
-        }
-        
-        if (!found) {
-            val iframe = doc.selectFirst("iframe")?.attr("src")
-            if (iframe != null && iframe.startsWith("http")) {
-                val safeIframe = iframe.replace("^http://".toRegex(), "https://")
-                val iframeHtml = app.get(safeIframe, headers = headers).text
-                val iframeMatches = m3u8Regex.findAll(iframeHtml).map { it.value }.toList()
-                iframeMatches.forEach { link ->
-                    val safeLink = link.replace("^http://".toRegex(), "https://")
-                    callback(
-                        newExtractorLink(
-                            "NguonC",
-                            "NguonC (HLS)",
-                            safeLink,
-                            ExtractorLinkType.M3U8
-                        ) {
-                            this.referer = ""
-                            this.quality = Qualities.P1080.value
-                        }
-                    )
-                    found = true
-                }
-            }
         }
         
         return found
@@ -280,16 +251,11 @@ class PhimNguonCProvider : MainAPI() {
         return newAnimeSearchResponse(title, href, TvType.TvSeries) {
             this.posterUrl = poster
             val epNum = Regex("""\d+""").find(epText)?.value?.toIntOrNull()
-            if (epNum != null) {
-                addSub(epNum)
-            }
+            if (epNum != null) addSub(epNum)
         }
     }
 
-    data class NguonCResponse(
-        @JsonProperty("items") val items: List<NguonCItem>? = null
-    )
-
+    data class NguonCResponse(@JsonProperty("items") val items: List<NguonCItem>? = null)
     data class NguonCItem(
         @JsonProperty("name") val name: String? = null,
         @JsonProperty("slug") val slug: String? = null,
@@ -297,11 +263,7 @@ class PhimNguonCProvider : MainAPI() {
         @JsonProperty("poster_url") val poster_url: String? = null,
         @JsonProperty("current_episode") val current_episode: String? = null
     )
-
-    data class NguonCDetailResponse(
-        @JsonProperty("movie") val movie: NguonCMovie? = null
-    )
-
+    data class NguonCDetailResponse(@JsonProperty("movie") val movie: NguonCMovie? = null)
     data class NguonCMovie(
         @JsonProperty("name") val name: String? = null,
         @JsonProperty("description") val description: String? = null,
@@ -310,12 +272,10 @@ class PhimNguonCProvider : MainAPI() {
         @JsonProperty("year") val year: Int? = null,
         @JsonProperty("episodes") val episodes: List<NguonCServer>? = null
     )
-
     data class NguonCServer(
         @JsonProperty("server_name") val server_name: String? = null,
         @JsonProperty("items") val items: List<NguonCEpisode>? = null
     )
-
     data class NguonCEpisode(
         @JsonProperty("name") val name: String? = null,
         @JsonProperty("m3u8") val m3u8: String? = null,

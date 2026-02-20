@@ -57,11 +57,9 @@ class AnimeVietSub : MainAPI() {
     )
 
     override suspend fun getMainPage(page: Int, req: MainPageRequest): HomePageResponse {
-        // ===== FIX: Dung URL phan trang dung /trang-X =====
         val url = if (page == 1) {
             req.data
         } else {
-            // /the-loai/anime-moi/ -> /the-loai/anime-moi/trang-2
             "${req.data.removeSuffix("/")}trang-$page"
         }
         
@@ -72,7 +70,6 @@ class AnimeVietSub : MainAPI() {
             .mapNotNull { it.toSR() }
             .distinctBy { it.url }
         
-        // Kiem tra xem con trang tiep theo hay khong
         val hasNext = items.isNotEmpty() && page < 50
         
         return newHomePageResponse(req.name, items, hasNext = hasNext)
@@ -92,7 +89,6 @@ class AnimeVietSub : MainAPI() {
                             text.contains("Thuyết minh", ignoreCase = true))
             DubStatus.Dubbed else DubStatus.Subbed
         
-        // Lay so tap tu <span class="ep">TẬP<i>XX</i></span>
         val episodeCount = a.selectFirst("span.ep i")?.text()?.toIntOrNull()
             ?: a.selectFirst(".ep i")?.text()?.toIntOrNull()
             ?: a.selectFirst("span.ep")?.text()?.let { 
@@ -150,8 +146,6 @@ class AnimeVietSub : MainAPI() {
             app.get(watchUrl, interceptor = cf, headers = hdrs).document
         } catch (_: Exception) { doc }
 
-        // ===== FIX: Tim episode links voi format /tap-XX =====
-        // Format: /xem-phim/{slug}/tap-07
         val epLinks = watchDoc.select("a[href*='/tap-']")
             .ifEmpty { watchDoc.select("a[href*='/episode-']") }
             .ifEmpty { watchDoc.select("a[href*='/ep-']") }
@@ -161,7 +155,7 @@ class AnimeVietSub : MainAPI() {
         val episodes = epLinks.mapNotNull { ep ->
                 val href = fix(ep.attr("href")) ?: return@mapNotNull null
                 val raw  = ep.text().trim().ifBlank { ep.attr("title").trim() }
-                // Lay so tap tu URL /tap-07 hoac tu text
+        
                 val epNum = Regex("""/tap-0*(\d+)""", RegexOption.IGNORE_CASE)
                     .find(href)?.groupValues?.get(1)?.toIntOrNull()
                     ?: Regex("""(?:tap|ep|episode)[-_]?0*(\d+)""", RegexOption.IGNORE_CASE)
@@ -190,7 +184,6 @@ class AnimeVietSub : MainAPI() {
         }
     }
 
-    // Patterns tìm video URL
     private val streamPatterns = listOf(
         Regex("""var\s+streamUrl\s*=\s*["']([^"']+)["']"""),
         Regex("""streamUrl\s*=\s*["']([^"']+)["']"""),

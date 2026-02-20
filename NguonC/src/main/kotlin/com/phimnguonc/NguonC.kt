@@ -8,6 +8,15 @@ import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.network.WebViewResolver
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
+import android.annotation.SuppressLint
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlin.coroutines.resume
 
 @CloudstreamPlugin
 class PhimNguonCPlugin : Plugin() {
@@ -26,12 +35,11 @@ class PhimNguonCProvider : MainAPI() {
 
     private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
-    // Chỉ dùng WebViewResolver cho domain chính để lấy API
     private val cfInterceptor = WebViewResolver(Regex("""phim\.nguonc\.com"""))
 
     private val commonHeaders = mapOf(
         "User-Agent" to USER_AGENT,
-        "Accept" to "application/json, text/plain, */*",
+        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language" to "vi-VN,vi;q=0.9",
     )
 
@@ -79,7 +87,7 @@ class PhimNguonCProvider : MainAPI() {
         val episodes = mutableListOf<Episode>()
         movie.episodes?.forEach { server ->
             server.items?.forEach { ep ->
-                // PHƯƠNG PHÁP HACKER: Chỉ lấy link Embed, bỏ qua link m3u8 ảo
+                // CHỈ LẤY LINK EMBED ĐỂ ĐƯA VÀO WEBVIEW
                 val embed = ep.embed?.replace("\\/", "/") ?: ""
                 if (embed.isNotBlank()) {
                     episodes.add(newEpisode(embed) {
@@ -98,22 +106,89 @@ class PhimNguonCProvider : MainAPI() {
         }
     }
 
+    // THUẬT TOÁN VŨ KHÍ TỐI THƯỢNG: BẮT LINK BẰNG WEBVIEW THẬT
+    @SuppressLint("SetJavaScriptEnabled")
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // PHƯƠNG PHÁP HACKER: Sử dụng loadExtractor
-        // Hàm này sẽ tự động gọi các script giải mã có sẵn trong Cloudstream
-        // Nó sẽ tự động mở WebView ngầm, chạy JavaScript của streamc.xyz, lấy Token và trả về link m3u8 thật sự
-        
-        return loadExtractor(
-            url = data, // data lúc này là link embed (VD: https://embed18.streamc.xyz/embed.php?hash=...)
-            referer = "$mainUrl/",
-            subtitleCallback = subtitleCallback,
-            callback = callback
-        )
+        val embedUrl = data
+        val embedDomain = if (embedUrl.startsWith("http")) {
+            Regex("""https?://+""").find(embedUrl)?.value ?: ""
+        } else ""
+
+        // Chạy WebView trên Main Thread (bắt buộc đối với Android)
+        val finalM3u8Url = withContext(Dispatchers.Main) {
+            suspendCancellableCoroutine<String?> { continuation ->
+                val webView = WebView(AcraApplication.context)
+                webView.settings.javaScriptEnabled = true
+                webView.settings.domStorageEnabled = true
+                webView.settings.userAgentString = USER_AGENT
+
+                webView.webViewClient = object : WebViewClient() {
+                    override fun shouldInterceptRequest(
+                        view: WebView?,
+                        request: WebResourceRequest?
+                    ): WebResourceResponse? {
+                        val url = request?.url?.toString() ?: ""
+                        
+                        // Bắt cóc link .m3u8 ngay khi trang web định tải nó
+                        if (url.contains(".m3u8")) {
+                            if (continuation.isActive) {
+                                continuation.resume(url)
+                            }
+                        }
+                        return super.shouldInterceptRequest(view, request)
+                    }
+                }
+
+                // Nạp thêm Referer để vượt Cloudflare của trang embed
+                val extraHeaders = mutableMapOf("Referer" to "$mainUrl/")
+                webView.loadUrl(embedUrl, extraHeaders)
+
+                // Timeout an toàn sau 15 giây nếu không tìm thấy link
+                continuation.invokeOnCancellation {
+                    webView.destroy()
+                }
+            }
+        }
+
+        if (finalM3u8Url != null) {
+            // Lấy Cookie từ CookieManager của Android (chứa toàn bộ session vừa tạo)
+            val cookies = android.webkit.CookieManager.getInstance().getCookie(embedUrl) ?: ""
+
+            // Bộ Header "Bất tử" để tải file .png
+            val videoHeaders = mapOf(
+                "User-Agent" to USER_AGENT,
+                "Referer" to embedUrl,
+                "Origin" to embedDomain,
+                "Cookie" to cookies,
+                "Accept" to "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+                "Accept-Language" to "vi-VN,vi;q=0.9",
+                "Connection" to "keep-alive",
+                "Sec-Fetch-Dest" to "video",
+                "Sec-Fetch-Mode" to "cors",
+                "Sec-Fetch-Site" to "cross-site",
+                "Range" to "bytes=0-"
+            )
+
+            callback(
+                newExtractorLink(
+                    source = "NguonC (WebView-Bypass)",
+                    name = "HLS - 1080p",
+                    url = finalM3u8Url,
+                    type = ExtractorLinkType.M3U8
+                ) {
+                    this.quality = Qualities.P1080.value
+                    this.headers = videoHeaders
+                }
+            )
+            return true
+        }
+
+        return false
     }
 
     data class NguonCDetailResponse(@JsonProperty("movie") val movie: NguonCMovie? = null)

@@ -24,16 +24,19 @@ class PhimNguonCProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
 
-    // User-Agent cố định để khớp hoàn toàn với WebView
+    // User-Agent chuẩn Chrome Windows để khớp với TLS Fingerprint
     private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
-    // Interceptor quét qua tất cả các domain liên quan để giải mã Cloudflare
+    // Interceptor bao phủ toàn bộ hệ sinh thái của NguonC
     private val cfInterceptor = WebViewResolver(Regex("""phim\.nguonc\.com|.*streamc\.xyz|.*amass15\.top|.*phimmoi\.net"""))
 
     private val commonHeaders = mapOf(
         "User-Agent" to USER_AGENT,
         "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language" to "vi-VN,vi;q=0.9",
+        "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8",
+        "Sec-Ch-Ua" to "\"Chromium\";v=\"122\", \"Not(A:Brand\";v=\"24\", \"Google Chrome\";v=\"122\"",
+        "Sec-Ch-Ua-Mobile" to "?0",
+        "Sec-Ch-Ua-Platform" to "\"Windows\"",
     )
 
     override val mainPage = mainPageOf(
@@ -73,7 +76,6 @@ class PhimNguonCProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         val slug = url.substringAfterLast("/")
         val apiUrl = "$mainUrl/api/film/$slug"
-        
         val res = app.get(apiUrl, headers = commonHeaders, interceptor = cfInterceptor).parsedSafe<NguonCDetailResponse>()
         val movie = res?.movie ?: throw ErrorLoadingException("Dữ liệu trống")
 
@@ -108,43 +110,46 @@ class PhimNguonCProvider : MainAPI() {
         val m3u8Url = parts[0]
         val embedUrl = if (parts.size > 1) parts[1] else ""
 
-        // BƯỚC 1: Giải quyết Cloudflare cho trang Embed bằng WebView
-        // Đây là bước "Warm-up" để lấy Cookie cf_clearance quan trọng
-        val embedPage = app.get(embedUrl, headers = commonHeaders, interceptor = cfInterceptor)
-        val cookies = embedPage.cookies
-        val cookieString = cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+        // BƯỚC 1: Kích hoạt Session trên domain Embed
+        val embedRes = app.get(embedUrl, headers = commonHeaders, interceptor = cfInterceptor)
+        val embedCookies = embedRes.cookies
 
-        // BƯỚC 2: Tự giải mã Redirect để lấy link CDN thật (amass15.top)
-        // Chúng ta dùng chính bộ Cookie vừa lấy được để "thông quan" qua Cloudflare của CDN
-        val finalRes = app.get(
+        // BƯỚC 2: Kích hoạt Session trên domain CDN (Giải quyết Redirect & Cloudflare CDN)
+        // Đây là bước quan trọng nhất để bẻ khóa các file .png
+        val cdnRes = app.get(
             m3u8Url, 
-            headers = commonHeaders.plus(mapOf("Referer" to embedUrl, "Cookie" to cookieString)),
+            headers = commonHeaders.plus("Referer" to embedUrl),
             interceptor = cfInterceptor,
             timeout = 20
         )
-        val finalVideoUrl = finalRes.url
-        // Lấy thêm cookie mới nếu CDN có set thêm session
-        val finalCookies = (cookies + finalRes.cookies).entries.joinToString("; ") { "${it.key}=${it.value}" }
+        val finalVideoUrl = cdnRes.url
+        
+        // Hợp nhất tất cả Cookie thu thập được
+        val allCookies = (embedCookies + cdnRes.cookies)
+        val cookieString = allCookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
 
-        // BƯỚC 3: Xây dựng bộ Header "Bất tử" cho trình phát video
-        // Bộ header này sẽ đánh lừa CDN rằng trình phát chính là cái WebView vừa giải mã xong
+        // BƯỚC 3: Xây dựng bộ Header "Thần thánh"
         val videoHeaders = mapOf(
             "User-Agent" to USER_AGENT,
             "Referer" to embedUrl,
             "Origin" to embedUrl.substringBefore("/embed.php"),
-            "Cookie" to finalCookies, // Ép trình phát mang theo toàn bộ Cookie xác thực
+            "Cookie" to cookieString,
             "Accept" to "*/*",
             "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8",
             "Connection" to "keep-alive",
             "Sec-Fetch-Dest" to "video",
             "Sec-Fetch-Mode" to "cors",
             "Sec-Fetch-Site" to "cross-site",
-            "Range" to "bytes=0-" // Cần thiết để CDN nhả luồng dữ liệu thay vì file tĩnh
+            "Range" to "bytes=0-",
+            // Bổ sung Client Hints để khớp hoàn toàn với trình duyệt
+            "sec-ch-ua" to "\"Chromium\";v=\"122\", \"Not(A:Brand\";v=\"24\", \"Google Chrome\";v=\"122\"",
+            "sec-ch-ua-mobile" to "?0",
+            "sec-ch-ua-platform" to "\"Windows\""
         )
 
         callback(
             newExtractorLink(
-                source = "NguonC (Ultra-Bypass)",
+                source = "NguonC (Deep-Bypass)",
                 name = "HLS - 1080p",
                 url = finalVideoUrl,
                 type = ExtractorLinkType.M3U8

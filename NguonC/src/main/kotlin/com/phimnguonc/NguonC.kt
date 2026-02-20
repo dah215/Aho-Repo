@@ -36,25 +36,27 @@ class PhimNguonCProvider : MainAPI() {
         "Accept-Language" to "vi-VN,vi;q=0.9",
     )
 
+    // Prefix để phân biệt API endpoint vs HTML endpoint
+    private val API_PREFIX = "API::"
+
     override val mainPage = mainPageOf(
-        "danh-sach/phim-le" to "Phim Lẻ",
-        "danh-sach/phim-bo" to "Phim Bộ",
-        "danh-sach/tv-shows" to "TV Shows"
+        "${API_PREFIX}api/films/phim-moi-cap-nhat" to "Phim Mới Cập Nhật",
+        "danh-sach/phim-le"                        to "Phim Lẻ",
+        "danh-sach/phim-bo"                        to "Phim Bộ",
+        "danh-sach/tv-shows"                       to "TV Shows"
     )
 
+    // ── Parse card HTML (trang danh sách) ────────────────────────────────────
     private fun parseCard(el: Element): SearchResponse? {
-        val a = el.selectFirst("a") ?: return null
-        val href = a.attr("href")
+        val a     = el.selectFirst("a") ?: return null
+        val href  = a.attr("href")
         val title = el.selectFirst("h3")?.text()?.trim() ?: a.attr("title")
         val poster = el.selectFirst("img")?.let {
             it.attr("data-src").ifBlank { it.attr("src") }
         }
 
-        // ── Tình trạng: "FULL", "Tập 7", "27/36", v.v. ──────────────────────
         val statusText = el.selectFirst("span.bg-green-300")?.text()?.trim() ?: ""
 
-        // ── Số tập: parse từ statusText ───────────────────────────────────────
-        // Dạng: "Tập 7" → 7 | "27/36" → 27 | "FULL" → null
         val episodeCount: Int? = when {
             statusText.equals("FULL", ignoreCase = true) -> null
             else ->
@@ -63,28 +65,84 @@ class PhimNguonCProvider : MainAPI() {
                     ?: Regex("""^(\d+)$""").find(statusText)?.groupValues?.get(1)?.toIntOrNull()
         }
 
-        // ── nguonc.com là site vietsub → luôn Subbed ─────────────────────────
         val dubStatus = EnumSet.of(DubStatus.Subbed)
 
-        // ── Quality: mặc định HD (trang danh sách không hiển thị) ────────────
-        val quality = SearchQuality.HD
+        return newAnimeSearchResponse(title, href, TvType.TvSeries) {
+            this.posterUrl = poster
+            this.quality   = SearchQuality.HD
+            this.dubStatus = dubStatus
+            this.episodes  = mutableMapOf(DubStatus.Subbed to (episodeCount ?: 0))
+        }
+    }
+
+    // ── Parse item JSON (API phim mới cập nhật) ───────────────────────────────
+    private fun parseApiItem(item: NguonCApiItem): SearchResponse? {
+        val slug  = item.slug ?: return null
+        val title = item.name ?: return null
+        val href  = "$mainUrl/phim/$slug"
+        val poster = item.poster_url ?: item.thumb_url
+
+        // current_episode: "Tập 4", "FULL", "Hoàn tất (15/15)", "Tập 28"
+        val currentEp = item.current_episode ?: ""
+
+        val episodeCount: Int? = when {
+            currentEp.equals("FULL", ignoreCase = true)         -> null
+            currentEp.startsWith("Hoàn tất", ignoreCase = true) -> null
+            else ->
+                Regex("""[Tt]ập\s*(\d+)""").find(currentEp)?.groupValues?.get(1)?.toIntOrNull()
+                    ?: Regex("""(\d+)\s*/\s*\d+""").find(currentEp)?.groupValues?.get(1)?.toIntOrNull()
+        }
+
+        // language: "Vietsub", "Vietsub + Thuyết Minh", "Thuyết Minh"
+        val lang      = item.language ?: ""
+        val hasSub    = lang.contains("Vietsub",     ignoreCase = true)
+        val hasDub    = lang.contains("Thuyết Minh", ignoreCase = true)
+        val dubStatus = when {
+            hasSub && hasDub -> EnumSet.of(DubStatus.Subbed, DubStatus.Dubbed)
+            hasDub           -> EnumSet.of(DubStatus.Dubbed)
+            else             -> EnumSet.of(DubStatus.Subbed)
+        }
+
+        // quality: "HD", "FHD", "CAM", "SD"
+        val quality = when (item.quality?.uppercase()) {
+            "FHD" -> SearchQuality.HD
+            "HD"  -> SearchQuality.HD
+            "CAM" -> SearchQuality.Cam
+            "SD"  -> SearchQuality.SD
+            else  -> SearchQuality.HD
+        }
 
         return newAnimeSearchResponse(title, href, TvType.TvSeries) {
             this.posterUrl = poster
             this.quality   = quality
             this.dubStatus = dubStatus
-            // episodeCount != null → hiện badge "Phụ đề Tập X"
-            // episodeCount == null (FULL) → chỉ hiện badge "Phụ đề"
-            this.episodes = mutableMapOf(DubStatus.Subbed to (episodeCount ?: 0))
+            // Badge số tập: nếu có tập hiện tại thì hiện, nếu FULL thì 0
+            val ep = episodeCount
+            this.episodes = mutableMapOf(
+                DubStatus.Subbed to (ep ?: 0)
+            ).also { map ->
+                if (hasDub) map[DubStatus.Dubbed] = ep ?: 0
+            }
         }
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = if (page == 1) "$mainUrl/${request.data}"
-                  else "$mainUrl/${request.data}?page=$page"
-        val doc = app.get(url, headers = commonHeaders, interceptor = cfInterceptor).document
-        val items = doc.select("table tbody tr").mapNotNull { parseCard(it) }
-        return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
+        return if (request.data.startsWith(API_PREFIX)) {
+            // ── API JSON endpoint ─────────────────────────────────────────────
+            val path = request.data.removePrefix(API_PREFIX)
+            val url  = "$mainUrl/$path?page=$page"
+            val res  = app.get(url, headers = commonHeaders, interceptor = cfInterceptor)
+                          .parsedSafe<NguonCApiResponse>()
+            val items = res?.items?.mapNotNull { parseApiItem(it) } ?: emptyList()
+            newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
+        } else {
+            // ── HTML scrape endpoint ──────────────────────────────────────────
+            val url = if (page == 1) "$mainUrl/${request.data}"
+                      else "$mainUrl/${request.data}?page=$page"
+            val doc = app.get(url, headers = commonHeaders, interceptor = cfInterceptor).document
+            val items = doc.select("table tbody tr").mapNotNull { parseCard(it) }
+            newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
+        }
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
@@ -154,8 +212,7 @@ class PhimNguonCProvider : MainAPI() {
                 val obfBase64  = obfMatch.groupValues[1]
                 val jsonData   = String(Base64.decode(obfBase64, Base64.DEFAULT))
                 val streamData = AppUtils.parseJson<StreamData>(jsonData)
-
-                val sUb = streamData.sUb
+                val sUb        = streamData.sUb
                 if (!sUb.isNullOrBlank()) {
                     val finalM3u8Url = "$embedDomain/$sUb.m3u8"
                     val videoHeaders = mapOf(
@@ -192,6 +249,25 @@ class PhimNguonCProvider : MainAPI() {
         return loadExtractor(embedUrl, "$mainUrl/", subtitleCallback, callback)
     }
 
+    // ── Data classes API phim mới cập nhật ───────────────────────────────────
+    data class NguonCApiResponse(
+        @JsonProperty("status")   val status: String?            = null,
+        @JsonProperty("items")    val items: List<NguonCApiItem>? = null
+    )
+
+    data class NguonCApiItem(
+        @JsonProperty("name")             val name: String?             = null,
+        @JsonProperty("slug")             val slug: String?             = null,
+        @JsonProperty("original_name")    val original_name: String?    = null,
+        @JsonProperty("thumb_url")        val thumb_url: String?        = null,
+        @JsonProperty("poster_url")       val poster_url: String?       = null,
+        @JsonProperty("total_episodes")   val total_episodes: Int?      = null,
+        @JsonProperty("current_episode")  val current_episode: String?  = null,
+        @JsonProperty("quality")          val quality: String?          = null,
+        @JsonProperty("language")         val language: String?         = null
+    )
+
+    // ── Data classes API chi tiết phim ───────────────────────────────────────
     data class NguonCDetailResponse(@JsonProperty("movie") val movie: NguonCMovie? = null)
     data class NguonCMovie(
         @JsonProperty("name")        val name: String?                 = null,

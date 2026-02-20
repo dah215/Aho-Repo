@@ -201,20 +201,22 @@ class PhimNguonCProvider : MainAPI() {
                     "NguonC",
                     "NguonC (HLS)",
                     fixedData,
-                    "",
-                    Qualities.P1080.value,
-                    isM3u8 = true
-                )
+                    ExtractorLinkType.M3U8
+                ) {
+                    this.referer = ""
+                    this.quality = Qualities.P1080.value
+                }
             )
             callback(
                 newExtractorLink(
                     "NguonC",
                     "NguonC (Alt)",
                     fixedData,
-                    "$mainUrl/",
-                    Qualities.P1080.value,
-                    isM3u8 = true
-                )
+                    ExtractorLinkType.M3U8
+                ) {
+                    this.referer = "$mainUrl/"
+                    this.quality = Qualities.P1080.value
+                }
             )
             return true
         }
@@ -233,10 +235,11 @@ class PhimNguonCProvider : MainAPI() {
                     "NguonC",
                     "NguonC (HLS)",
                     safeLink,
-                    "",
-                    Qualities.P1080.value,
-                    isM3u8 = true
-                )
+                    ExtractorLinkType.M3U8
+                ) {
+                    this.referer = ""
+                    this.quality = Qualities.P1080.value
+                }
             )
             found = true
         }
@@ -254,10 +257,11 @@ class PhimNguonCProvider : MainAPI() {
                             "NguonC",
                             "NguonC (HLS)",
                             safeLink,
-                            "",
-                            Qualities.P1080.value,
-                            isM3u8 = true
-                        )
+                            ExtractorLinkType.M3U8
+                        ) {
+                            this.referer = ""
+                            this.quality = Qualities.P1080.value
+                        }
                     )
                     found = true
                 }

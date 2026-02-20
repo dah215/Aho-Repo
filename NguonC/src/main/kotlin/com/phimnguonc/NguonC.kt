@@ -69,7 +69,6 @@ class PhimNguonCProvider : MainAPI() {
         return newAnimeSearchResponse(title, href, if (isSeries) TvType.TvSeries else TvType.Movie) {
             this.posterUrl = poster
             
-            // Tách số tập từ chuỗi và dùng addSub (Chuẩn API mới)
             val epNum = Regex("""\d+""").find(label)?.value?.toIntOrNull()
             if (epNum != null) {
                 addSub(epNum)
@@ -213,10 +212,11 @@ class PhimNguonCProvider : MainAPI() {
                     name,
                     name,
                     data,
-                    referer = "$mainUrl/",
-                    quality = Qualities.P1080.value,
-                    type = ExtractorLinkType.M3U8
-                )
+                    ExtractorLinkType.M3U8
+                ) {
+                    this.referer = "$mainUrl/"
+                    this.quality = Qualities.P1080.value
+                }
             )
             return true
         }
@@ -225,8 +225,8 @@ class PhimNguonCProvider : MainAPI() {
         val doc = app.get(data, headers = headers).document
         val html = doc.html()
         
-        val m3u8Regex = Regex("""(https?://+\.m3u8*)""")
-        val matches = m3u8Regex.findAll(html).map { it.value }.toList()
+        val m3u8Regex = Regex("""(https?://+\.m3u8)""")
+        val matches = m3u8Regex.findAll(html).map { it.groupValues }.toList()
         
         var found = false
         matches.forEach { link ->
@@ -235,10 +235,11 @@ class PhimNguonCProvider : MainAPI() {
                     name,
                     name,
                     link,
-                    referer = "$mainUrl/",
-                    quality = Qualities.P1080.value,
-                    type = ExtractorLinkType.M3U8
-                )
+                    ExtractorLinkType.M3U8
+                ) {
+                    this.referer = "$mainUrl/"
+                    this.quality = Qualities.P1080.value
+                }
             )
             found = true
         }
@@ -247,17 +248,18 @@ class PhimNguonCProvider : MainAPI() {
             val iframe = doc.selectFirst("iframe")?.attr("src")
             if (iframe != null && iframe.startsWith("http")) {
                 val iframeHtml = app.get(iframe, headers = headers).text
-                val iframeMatches = m3u8Regex.findAll(iframeHtml).map { it.value }.toList()
+                val iframeMatches = m3u8Regex.findAll(iframeHtml).map { it.groupValues }.toList()
                 iframeMatches.forEach { link ->
                     callback(
                         newExtractorLink(
                             name,
                             name,
                             link,
-                            referer = iframe,
-                            quality = Qualities.P1080.value,
-                            type = ExtractorLinkType.M3U8
-                        )
+                            ExtractorLinkType.M3U8
+                        ) {
+                            this.referer = iframe
+                            this.quality = Qualities.P1080.value
+                        }
                     )
                     found = true
                 }

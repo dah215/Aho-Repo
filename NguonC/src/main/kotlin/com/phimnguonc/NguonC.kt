@@ -43,13 +43,25 @@ class PhimNguonCProvider : MainAPI() {
         "danh-sach/tv-shows" to "TV Shows"
     )
 
+    // Hàm chuyển đổi chuỗi text sang Enum chất lượng của Cloudstream
+    private fun getQualityFromString(quality: String): SearchQuality? {
+        return when (quality.uppercase()) {
+            "4K" -> SearchQuality.FourK
+            "FHD", "1080P" -> SearchQuality.FHD
+            "HD", "720P" -> SearchQuality.HD
+            "SD", "480P" -> SearchQuality.SD
+            "CAM" -> SearchQuality.Cam
+            else -> null
+        }
+    }
+
     private fun parseCard(el: Element): SearchResponse? {
         val a = el.selectFirst("a") ?: return null
         val href = a.attr("href")
         val title = el.selectFirst("h3")?.text()?.trim() ?: a.attr("title")
         val poster = el.selectFirst("img")?.let { it.attr("data-src").ifBlank { it.attr("src") } }
         
-        // 1. Trích xuất tất cả các nhãn (badge) từ thẻ span, div có màu nền hoặc từ các cột td
+        // 1. Trích xuất tất cả các nhãn (badge) từ thẻ span, div hoặc cột td
         val badges = el.select("span, div, span.badge, .bg-green-300, .bg-red-500, .bg-blue-500, .bg-yellow-500")
             .map { it.text().trim() }
             .filter { it.isNotEmpty() && it.length < 30 }
@@ -63,17 +75,16 @@ class PhimNguonCProvider : MainAPI() {
         var qualityStr: String? = null
         val episodeInfo = mutableListOf<String>()
 
-        // 2. Phân loại các nhãn thu thập được
+        // 2. Phân loại các nhãn
         for (text in allLabels) {
-            // Lọc chất lượng (HD, FHD, CAM, SD...)
+            // Nhận diện chất lượng
             if (text.matches(Regex("(?i)^(HD|FHD|CAM|SD|4K|1080p|720p)$"))) {
                 qualityStr = text
             } 
-            // Lọc thông tin tập, phụ đề, thuyết minh...
+            // Nhận diện thông tin tập/phụ đề
             else if (text.contains("Tập", true) || text.contains("Phụ đề", true) || 
                        text.contains("Thuyết minh", true) || text.contains("Vietsub", true) || 
                        text.contains("Lồng tiếng", true) || text.matches(Regex("(?i)(Hoàn tất|Đang cập nhật)"))) {
-                // Tránh thêm trùng lặp (ví dụ đã có "Phụ đề Tập 2" thì không thêm chữ "Tập 2" rời rạc nữa)
                 if (episodeInfo.none { it.contains(text, true) }) {
                     episodeInfo.removeAll { text.contains(it, true) }
                     episodeInfo.add(text)
@@ -81,7 +92,7 @@ class PhimNguonCProvider : MainAPI() {
             }
         }
 
-        // Fallback: Nếu không tìm thấy gì, thử lấy theo class cũ của bạn
+        // Fallback nếu không tìm thấy gì
         if (episodeInfo.isEmpty() && qualityStr == null) {
             val fallbackLabel = el.selectFirst(".bg-green-300")?.text()?.trim() ?: ""
             if (fallbackLabel.isNotEmpty()) {
@@ -89,20 +100,16 @@ class PhimNguonCProvider : MainAPI() {
             }
         }
 
-        // Gộp các thông tin tập lại (VD: "Phụ đề" + "Tập 2" -> "Phụ đề Tập 2")
         val finalEpisodeStr = if (episodeInfo.isNotEmpty()) episodeInfo.joinToString(" ") else null
 
-        // 3. Đưa dữ liệu vào SearchResponse để hiển thị lên UI
         return newAnimeSearchResponse(title, href, TvType.TvSeries) {
             this.posterUrl = poster
-            
-            // Hiển thị chất lượng ở góc trên bên trái (VD: HD)
+            // Gán chất lượng (hiển thị badge HD/FHD)
             if (qualityStr != null) {
                 this.quality = getQualityFromString(qualityStr)
             }
-            
-            // Hiển thị thông tin tập/phụ đề ở góc trên bên phải (VD: Phụ đề Tập 2)
-            this.posterText = finalEpisodeStr
+            // Gán thông tin tập vào otherName (hiển thị text phụ)
+            this.otherName = finalEpisodeStr
         }
     }
 
@@ -150,8 +157,8 @@ class PhimNguonCProvider : MainAPI() {
 
     // Data class cho JSON từ data-obf
     data class StreamData(
-        @JsonProperty("sUb") val sUb: String? = null,  // Token URL
-        @JsonProperty("hD") val hD: String? = null     // Hash
+        @JsonProperty("sUb") val sUb: String? = null,
+        @JsonProperty("hD") val hD: String? = null
     )
 
     override suspend fun loadLinks(
@@ -160,14 +167,10 @@ class PhimNguonCProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // data = https://embed13.streamc.xyz/embed.php?hash=f71c4bddcc66969be2cd4d29e709cfa2
         val embedUrl = data
-        
-        // Lấy domain: https://embed13.streamc.xyz
         val embedDomain = Regex("""https?://[^/]+""").find(embedUrl)?.value ?: ""
 
         try {
-            // Tải trang embed
             val embedRes = app.get(
                 embedUrl, 
                 headers = mapOf(
@@ -179,24 +182,17 @@ class PhimNguonCProvider : MainAPI() {
             val html = embedRes.text
             val cookies = embedRes.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
 
-            // Tìm data-obf trong HTML
-            // <div id="player" data-obf="eyJzVWIiOi...J9">
             val obfMatch = Regex("""data-obf\s*=\s*["']([A-Za-z0-9+/=]+)["']""").find(html)
             
             if (obfMatch != null) {
                 val obfBase64 = obfMatch.groupValues[1]
-                
-                // Decode Base64 layer 1 → JSON {"sUb": "...", "hD": "..."}
                 val jsonData = String(Base64.decode(obfBase64, Base64.DEFAULT))
                 val streamData = AppUtils.parseJson<StreamData>(jsonData)
                 
-                // sUb chính là token cho URL m3u8
                 val sUb = streamData.sUb
                 if (!sUb.isNullOrBlank()) {
-                    // URL m3u8: https://embed13.streamc.xyz/{sUb}.m3u8
                     val finalM3u8Url = "$embedDomain/$sUb.m3u8"
                     
-                    // Headers để phát video
                     val videoHeaders = mapOf(
                         "User-Agent" to USER_AGENT,
                         "Referer" to embedUrl,
@@ -230,7 +226,6 @@ class PhimNguonCProvider : MainAPI() {
             e.printStackTrace()
         }
 
-        // Fallback
         return loadExtractor(embedUrl, "$mainUrl/", subtitleCallback, callback)
     }
 

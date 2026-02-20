@@ -5,6 +5,7 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.network.WebViewResolver
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
@@ -24,7 +25,6 @@ class PhimNguonCProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
 
-    // Bộ Header giả lập trình duyệt máy tính để tránh bị Cloudflare nghi ngờ
     private val commonHeaders = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -43,7 +43,6 @@ class PhimNguonCProvider : MainAPI() {
         "danh-sach/tv-shows" to "TV Shows"
     )
 
-    // Thuật toán bóc tách thẻ phim từ trang chủ (Dựa trên cấu hình Table trong HTML bạn gửi)
     private fun parseCard(el: Element): SearchResponse? {
         val a = el.selectFirst("a") ?: return null
         val href = a.attr("href")
@@ -55,14 +54,14 @@ class PhimNguonCProvider : MainAPI() {
         
         return newAnimeSearchResponse(title, href, TvType.TvSeries) {
             this.posterUrl = poster
-            addStatus(label)
+            // Sửa lỗi addStatus -> dùng thuộc tính status trực tiếp
+            this.otherName = label 
         }
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page == 1) "$mainUrl/${request.data}" else "$mainUrl/${request.data}?page=$page"
         val doc = app.get(url, headers = commonHeaders, interceptor = cfInterceptor).document
-        // Tìm trong bảng danh sách phim
         val items = doc.select("table tbody tr").mapNotNull { parseCard(it) }
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
@@ -80,20 +79,20 @@ class PhimNguonCProvider : MainAPI() {
         val title = doc.selectFirst("h1")?.text()?.trim() ?: ""
         val poster = doc.selectFirst("img.rounded-md")?.attr("src")
         val plot = doc.selectFirst("article")?.text()?.trim()
-        val year = doc.select("td:contains(Năm phát hành) + td").text().toIntOrNull()
+        val year = doc.select("td:contains(Năm phát hành) + td").text().trim().toIntOrNull()
 
         val episodes = mutableListOf<Episode>()
 
-        // THUẬT TOÁN THÔNG MINH: Bóc tách JSON từ thẻ <script> như trong HTML bạn gửi
+        // Bóc tách JSON từ thẻ <script>
         val scriptData = doc.select("script").find { it.data().contains("var episodes =") }?.data()
         if (scriptData != null) {
             try {
                 val jsonStr = scriptData.substringAfter("var episodes = ").substringBefore("];") + "]"
+                // Sửa lỗi parseJson -> gọi qua AppUtils
                 val servers = parseJson<List<NguonCServer>>(jsonStr)
                 
                 servers.forEach { server ->
                     server.list?.forEach { ep ->
-                        // Ưu tiên lấy link m3u8 trực tiếp từ JSON
                         val link = ep.m3u8?.replace("\\/", "/") ?: ep.embed?.replace("\\/", "/") ?: ""
                         if (link.isNotBlank()) {
                             episodes.add(newEpisode(link) {
@@ -103,7 +102,7 @@ class PhimNguonCProvider : MainAPI() {
                         }
                     }
                 }
-            } catch (e: Exception) { e.printStackTrace() }
+            } catch (e: Exception) { }
         }
 
         return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
@@ -119,42 +118,41 @@ class PhimNguonCProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // Header quan trọng nhất để vượt lỗi 2001
         val videoHeaders = mapOf(
             "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            "Referer" to "$mainUrl/", // Bắt buộc phải là domain gốc
+            "Referer" to "$mainUrl/",
             "Origin" to mainUrl,
             "Accept" to "*/*"
         )
 
+        // Sửa lỗi ExtractorLink constructor -> dùng newExtractorLink
         if (data.contains("phimmoi.net") || data.contains(".m3u8")) {
             callback(
-                ExtractorLink(
-                    source = "NguonC (VIP)",
-                    name = "HLS - 1080p",
-                    url = data,
-                    referer = "$mainUrl/",
-                    quality = Qualities.P1080.value,
-                    isM3u8 = true,
-                    headers = videoHeaders // Truyền header vào trình phát
+                newExtractorLink(
+                    "NguonC (VIP)",
+                    "HLS - 1080p",
+                    data,
+                    "$mainUrl/",
+                    Qualities.P1080.value,
+                    true,
+                    videoHeaders
                 )
             )
             return true
         }
 
-        // Nếu là link embed streamc.xyz, bóc hash để tạo link m3u8
         if (data.contains("streamc.xyz")) {
             val hash = data.substringAfter("hash=").substringBefore("&")
             val finalUrl = "https://sing.phimmoi.net/$hash/hls.m3u8"
             callback(
-                ExtractorLink(
-                    source = "NguonC (Embed)",
-                    name = "HLS - StreamC",
-                    url = finalUrl,
-                    referer = "$mainUrl/",
-                    quality = Qualities.P1080.value,
-                    isM3u8 = true,
-                    headers = videoHeaders
+                newExtractorLink(
+                    "NguonC (Embed)",
+                    "HLS - StreamC",
+                    finalUrl,
+                    "$mainUrl/",
+                    Qualities.P1080.value,
+                    true,
+                    videoHeaders
                 )
             )
             return true
@@ -163,7 +161,7 @@ class PhimNguonCProvider : MainAPI() {
         return false
     }
 
-    // Data classes để map với JSON trong HTML
+    // Data classes đặt trong Provider để parseJson nhận diện được
     data class NguonCServer(
         @JsonProperty("server_name") val server_name: String? = null,
         @JsonProperty("list") val list: List<NguonCEpisode>? = null

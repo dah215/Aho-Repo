@@ -47,12 +47,46 @@ class PhimNguonCProvider : MainAPI() {
         val a = el.selectFirst("a") ?: return null
         val href = a.attr("href")
         val title = el.selectFirst("h3")?.text()?.trim() ?: a.attr("title")
+        val originalTitle = el.selectFirst("h4")?.text()?.trim() ?: ""
         val poster = el.selectFirst("img")?.let { it.attr("data-src").ifBlank { it.attr("src") } }
-        val label = el.selectFirst(".bg-green-300")?.text()?.trim() ?: ""
         
-        return newAnimeSearchResponse(title, href, TvType.TvSeries) {
+        // Lấy các td chứa thông tin
+        val tds = el.select("td")
+        
+        // td[1]: Tình trạng (Tập 4, Hoàn tất 15/15, FULL...)
+        val status = tds.getOrNull(1)?.selectFirst("span")?.text()?.trim() ?: ""
+        
+        // td[2]: Định dạng (Phim bộ, Phim lẻ, Phim đang chiếu...)
+        val types = tds.getOrNull(2)?.select("div")?.mapNotNull { it.text().trim() } ?: emptyList()
+        val isMovie = types.contains("Phim lẻ")
+        
+        // td[3]: Năm
+        val year = tds.getOrNull(3)?.selectFirst("div")?.text()?.trim()?.toIntOrNull()
+        
+        // td[4]: Quốc gia
+        val country = tds.getOrNull(4)?.selectFirst("div")?.text()?.trim() ?: ""
+        
+        // Tạo display name với thông tin
+        val displayName = buildString {
+            append(title)
+            if (originalTitle.isNotBlank()) {
+                append(" - $originalTitle")
+            }
+        }
+        
+        // Tạo info text hiển thị dưới tên
+        val infoText = buildList {
+            if (status.isNotBlank()) add(status)
+            if (country.isNotBlank()) add(country)
+            if (year != null) add(year.toString())
+        }.joinToString(" • ")
+        
+        val tvType = if (isMovie) TvType.Movie else TvType.TvSeries
+        
+        return newAnimeSearchResponse(title, href, tvType) {
             this.posterUrl = poster
-            this.otherName = label 
+            this.otherName = infoText
+            this.year = year
         }
     }
 
@@ -112,7 +146,7 @@ class PhimNguonCProvider : MainAPI() {
         val fullDescription = buildString {
             append(movie.description ?: "")
             append("\n\n")
-            append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            append("━━")
             append("\n")
             
             // Trạng thái tập

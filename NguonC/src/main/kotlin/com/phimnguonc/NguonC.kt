@@ -25,7 +25,7 @@ class PhimNguonCProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
 
-    // Sử dụng một User-Agent cố định cho toàn bộ quá trình từ load đến play
+    // Dùng User-Agent cố định để đồng bộ giữa lúc lấy link và lúc phát
     private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
     private val commonHeaders = mapOf(
@@ -97,7 +97,7 @@ class PhimNguonCProvider : MainAPI() {
                         val embed = ep.embed?.replace("\\/", "/") ?: ""
                         
                         if (m3u8.isNotBlank()) {
-                            // THUẬT TOÁN: Gộp link m3u8 và link embed bằng dấu | để loadLinks xử lý
+                            // Gộp link m3u8 và link embed để loadLinks xử lý Referer
                             val combinedData = "$m3u8|$embed"
                             episodes.add(newEpisode(combinedData) {
                                 this.name = "Tập ${ep.name}"
@@ -122,29 +122,32 @@ class PhimNguonCProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // Tách link m3u8 và link embed (referer)
         val parts = data.split("|")
         val streamUrl = parts[0]
-        val embedUrl = if (parts.size > 1) parts[1] else "$mainUrl/"
+        val embedUrl = if (parts.size > 1) parts[1] else ""
 
+        // Thuật toán xử lý manh mối .png (amass15.top)
+        // Chúng ta cần Referer của chính server embed để tải được các file .png ngụy trang
         val videoHeaders = mapOf(
             "User-Agent" to USER_AGENT,
-            "Referer" to embedUrl, // QUAN TRỌNG: Referer phải là link embed
-            "Origin" to embedUrl.substringBefore("/embed.php"),
+            "Referer" to embedUrl, 
+            "Origin" to (if (embedUrl.isNotBlank()) embedUrl.substringBefore("/embed.php") else mainUrl),
             "Accept" to "*/*",
-            "Connection" to "keep-alive"
+            "Sec-Fetch-Dest" to "video",
+            "Sec-Fetch-Mode" to "cors",
+            "Sec-Fetch-Site" to "cross-site"
         )
 
         if (streamUrl.contains(".m3u8")) {
             callback(
                 newExtractorLink(
-                    source = "NguonC (VIP)",
+                    source = "NguonC (CDN)",
                     name = "HLS - 1080p",
                     url = streamUrl,
                     type = ExtractorLinkType.M3U8
                 ) {
                     this.quality = Qualities.P1080.value
-                    this.referer = embedUrl
+                    // Gán headers vào đây để trình phát video sử dụng cho TẤT CẢ các request (bao gồm cả file .png)
                     this.headers = videoHeaders
                 }
             )

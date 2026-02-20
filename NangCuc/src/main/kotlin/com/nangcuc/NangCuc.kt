@@ -92,7 +92,6 @@ class NangCucProvider : MainAPI() {
 
         val potentialUrls = mutableSetOf<String>()
         
-        // 1. Quét tất cả thuộc tính để tìm link server
         doc.allElements.forEach { el ->
             el.attributes().forEach { attr ->
                 val value = attr.value
@@ -102,13 +101,11 @@ class NangCucProvider : MainAPI() {
             }
         }
         
-        // 2. Quét link trong script
         Regex("""https?[:\\]+[/\\/]+[^\s"'<>]+""").findAll(html).forEach { potentialUrls.add(it.value) }
 
         potentialUrls.filter { it.isNotBlank() }.distinct().forEach { rawUrl ->
             val fullUrl = fixUrl(rawUrl)
             
-            // Xử lý DFPlayer (Tự động nhận diện host và ID)
             if (fullUrl.contains("dfplayer")) {
                 val id = Regex("""(?:did|id|v|s)[=/](\d+)""").find(fullUrl)?.groupValues?.get(1)
                 val host = Regex("""https?://([^/]+)""").find(fullUrl)?.groupValues?.get(1)
@@ -123,7 +120,7 @@ class NangCucProvider : MainAPI() {
                     )
                 }
             } 
-            // Xử lý link m3u8 trực tiếp
+        
             else if (fullUrl.contains(".m3u8")) {
                 callback(
                     newExtractorLink(name, "Server VIP", fullUrl, type = ExtractorLinkType.M3U8) {
@@ -132,7 +129,7 @@ class NangCucProvider : MainAPI() {
                     }
                 )
             }
-            // Các server khác
+
             else if (fullUrl.contains("dood") || fullUrl.contains("tape") || fullUrl.contains("voe")) {
                 loadExtractor(fullUrl, data, subtitleCallback, callback)
             }

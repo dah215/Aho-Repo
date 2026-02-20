@@ -27,7 +27,6 @@ class PhimNguonCProvider : MainAPI() {
 
     private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
-    // Interceptor cho toàn bộ hệ sinh thái
     private val cfInterceptor = WebViewResolver(Regex("""phim\.nguonc\.com|.*streamc\.xyz|.*amass15\.top"""))
 
     private val commonHeaders = mapOf(
@@ -81,7 +80,6 @@ class PhimNguonCProvider : MainAPI() {
         movie.episodes?.forEach { server ->
             val items = server.items ?: server.list
             items?.forEach { ep ->
-                // CHỈ LẤY LINK EMBED
                 val embed = ep.embed?.replace("\\/", "/") ?: ""
                 if (embed.isNotBlank()) {
                     episodes.add(newEpisode(embed) {
@@ -100,19 +98,26 @@ class PhimNguonCProvider : MainAPI() {
         }
     }
 
+    // Data class cho JSON từ data-obf
+    data class StreamData(
+        @JsonProperty("sUb") val sUb: String? = null,  // Token URL
+        @JsonProperty("hD") val hD: String? = null     // Hash
+    )
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val embedUrl = data // VD: https://embed18.streamc.xyz/embed.php?hash=87ccab...
+        // data = https://embed13.streamc.xyz/embed.php?hash=f71c4bddcc66969be2cd4d29e709cfa2
+        val embedUrl = data
         
-        // Lấy domain gốc của embed (VD: https://embed18.streamc.xyz)
+        // Lấy domain: https://embed13.streamc.xyz
         val embedDomain = Regex("""https?://[^/]+""").find(embedUrl)?.value ?: ""
 
         try {
-            // BƯỚC 1: Tải mã nguồn trang embed
+            // Tải trang embed
             val embedRes = app.get(
                 embedUrl, 
                 headers = mapOf(
@@ -124,111 +129,58 @@ class PhimNguonCProvider : MainAPI() {
             val html = embedRes.text
             val cookies = embedRes.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
 
-            // BƯỚC 2: Tìm chuỗi Base64 chứa token/hash
-            // URL thực tế: https://embed18.streamc.xyz/eyJoIjoi...J9.m3u8
-            // Chuỗi Base64: eyJoIjoiMTJkOTA5YWYyYjg3ZjU1ZDBjMjk1OGU2MDFmNDA1ZjAiLCJ0IjoiNjI3OGRlNTE0ODg4NzY3NTkxZWQyNGM1NDcwZTJmNzNmOTQ1M2U5ODMzOTVhZjVkNjM2MWRiNjE1OWQ1Zjc0NSJ9
+            // Tìm data-obf trong HTML
+            // <div id="player" data-obf="eyJzVWIiOi...J9">
+            val obfMatch = Regex("""data-obf\s*=\s*["']([A-Za-z0-9+/=]+)["']""").find(html)
             
-            var finalM3u8Url = ""
-            var base64Token = ""
+            if (obfMatch != null) {
+                val obfBase64 = obfMatch.groupValues[1]
+                
+                // Decode Base64 layer 1 → JSON {"sUb": "...", "hD": "..."}
+                val jsonData = String(Base64.decode(obfBase64, Base64.DEFAULT))
+                val streamData = AppUtils.parseJson<StreamData>(jsonData)
+                
+                // sUb chính là token cho URL m3u8
+                val sUb = streamData.sUb
+                if (!sUb.isNullOrBlank()) {
+                    // URL m3u8: https://embed13.streamc.xyz/{sUb}.m3u8
+                    val finalM3u8Url = "$embedDomain/$sUb.m3u8"
+                    
+                    // Headers để phát video
+                    val videoHeaders = mapOf(
+                        "User-Agent" to USER_AGENT,
+                        "Referer" to embedUrl,
+                        "Origin" to embedDomain,
+                        "Cookie" to cookies,
+                        "Accept" to "*/*",
+                        "Accept-Language" to "vi-VN,vi;q=0.9",
+                        "Connection" to "keep-alive",
+                        "Sec-Fetch-Dest" to "video",
+                        "Sec-Fetch-Mode" to "cors",
+                        "Sec-Fetch-Site" to "same-origin"
+                    )
 
-            // Các pattern để tìm chuỗi Base64
-            // Chuỗi Base64 JSON hợp lệ bắt đầu bằng "ey" (vì JSON bắt đầu bằng "{" được encode thành "ey")
-            val base64Patterns = listOf(
-                // Pattern 1: Tìm trong biến file (player config)
-                // file: "eyJoIjoi..." hoặc file:"eyJoIjoi..."
-                Regex("""file\s*[:=]\s*["']([e][yA-Za-z0-9+/=]+)["']"""),
-                
-                // Pattern 2: Tìm source: "ey..." hoặc source:'ey...'
-                Regex("""source\s*[:=]\s*["']([e][yA-Za-z0-9+/=]+)["']"""),
-                
-                // Pattern 3: Tìm trong URL hoặc tham số
-                // hash=ey... hoặc ?ey...
-                Regex("""[?&]hash=([A-Za-z0-9+/=]+)"""),
-                
-                // Pattern 4: Tìm chuỗi Base64 dài (>50 chars) bắt đầu bằng "ey"
-                // Đây là pattern tổng quát nhất
-                Regex("""["'\s]([e][yA-Za-z0-9+/=]{50,})["'\s]"""),
-                
-                // Pattern 5: Tìm trong Player initialization
-                // new Player("ey...") hoặc Player.init("ey...")
-                Regex("""Player\s*\(\s*["']([A-Za-z0-9+/=]+)["']"""),
-                
-                // Pattern 6: Tìm trực tiếp chuỗi có format eyJoIjoi (JSON với key "h")
-                Regex("""(eyJoIjoi[A-Za-z0-9+/=]+)""")
-            )
-
-            for (pattern in base64Patterns) {
-                val match = pattern.find(html)
-                if (match != null && match.groupValues.size > 1) {
-                    base64Token = match.groupValues[1].trim()
-                    // Kiểm tra xem có phải chuỗi Base64 hợp lệ không
-                    if (base64Token.length > 30) {
-                        break
-                    }
+                    callback(
+                        newExtractorLink(
+                            source = "NguonC Server",
+                            name = "HLS",
+                            url = finalM3u8Url,
+                            type = ExtractorLinkType.M3U8
+                        ) {
+                            this.quality = Qualities.P1080.value
+                            this.headers = videoHeaders
+                        }
+                    )
+                    return true
                 }
             }
 
-            // Nếu tìm thấy Base64 token, tạo URL m3u8
-            if (base64Token.isNotBlank()) {
-                // URL format: https://embedXX.streamc.xyz/{base64Token}.m3u8
-                finalM3u8Url = "$embedDomain/$base64Token.m3u8"
-                
-                // Log để debug
-                println("Found Base64 token: $base64Token")
-                println("Generated m3u8 URL: $finalM3u8Url")
-            }
-
-            // Fallback: Tìm link m3u8 trực tiếp
-            if (finalM3u8Url.isBlank()) {
-                val m3u8Patterns = listOf(
-                    Regex("""(https?://[^\s"'<>]+\.m3u8)"""),
-                    Regex("""["']([^"']*(?:streamc|amass)[^"']*\.m3u8)["']"""),
-                    Regex("""["']([^"']*\.m3u8)["']""")
-                )
-                
-                for (pattern in m3u8Patterns) {
-                    val match = pattern.find(html)
-                    if (match != null && match.groupValues.size > 1) {
-                        finalM3u8Url = match.groupValues[1].replace("\\/", "/")
-                        break
-                    }
-                }
-            }
-
-            if (finalM3u8Url.isNotBlank()) {
-                // BƯỚC 3: Headers để phát video
-                val videoHeaders = mapOf(
-                    "User-Agent" to USER_AGENT,
-                    "Referer" to embedUrl,
-                    "Origin" to embedDomain,
-                    "Cookie" to cookies,
-                    "Accept" to "*/*",
-                    "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8",
-                    "Connection" to "keep-alive",
-                    "Sec-Fetch-Dest" to "video",
-                    "Sec-Fetch-Mode" to "cors",
-                    "Sec-Fetch-Site" to "same-origin"
-                )
-
-                callback(
-                    newExtractorLink(
-                        source = "NguonC Server",
-                        name = "HLS - 1080p",
-                        url = finalM3u8Url,
-                        type = ExtractorLinkType.M3U8
-                    ) {
-                        this.quality = Qualities.P1080.value
-                        this.headers = videoHeaders
-                    }
-                )
-                return true
-            }
         } catch (e: Exception) {
             println("Error in loadLinks: ${e.message}")
             e.printStackTrace()
         }
 
-        // Fallback cuối cùng
+        // Fallback
         return loadExtractor(embedUrl, "$mainUrl/", subtitleCallback, callback)
     }
 

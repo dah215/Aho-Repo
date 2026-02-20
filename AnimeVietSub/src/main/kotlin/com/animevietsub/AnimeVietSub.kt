@@ -252,7 +252,6 @@ class AnimeVietSubProvider : MainAPI() {
                 this.plot      = plot
                 this.tags      = tags
                 this.year      = year
-                this.dubStatus = DubStatus.Subbed
             }
         } else {
             newAnimeLoadResponse(title, url, TvType.Anime, episodes.isNotEmpty()) {
@@ -309,7 +308,6 @@ class AnimeVietSubProvider : MainAPI() {
                         )
                     }
                 )
-                return true
             }
         }
 

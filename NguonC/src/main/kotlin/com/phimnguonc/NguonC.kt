@@ -46,8 +46,7 @@ class PhimNguonCProvider : MainAPI() {
     private fun getSearchQuality(quality: String?): SearchQuality? {
         return when (quality?.uppercase()?.replace(" ", "")?.replace("-", "")) {
             "4K", "UHD", "ULTRAHD" -> SearchQuality.UHD
-            "FHD", "FULLHD", "FULL HD" -> SearchQuality.FHD
-            "HD", "HDTV" -> SearchQuality.HD
+            "FHD", "FULLHD", "FULL HD", "HD", "HDTV" -> SearchQuality.HD // Đã sửa FHD thành HD
             "SD" -> SearchQuality.SD
             "CAM", "CAMRIP" -> SearchQuality.Cam
             "HDCAM" -> SearchQuality.HdCam
@@ -67,11 +66,8 @@ class PhimNguonCProvider : MainAPI() {
             fixUrl(it.attr("data-src").ifBlank { it.attr("src") })
         }
 
-        // 1. Lấy chất lượng (HD, FHD...) -> Hiển thị góc TRÁI poster
         val qualityText = el.selectFirst(".bg-green-300, .bg-blue-300, .bg-red-300, .bg-yellow-300, .bg-violet-300")?.text()?.trim()
         val quality = getSearchQuality(qualityText)
-
-        // 2. Lấy thông tin tập/phụ đề (VD: "Phụ đề Tập 2", "Vietsub") -> Hiển thị góc PHẢI poster
         val episodeText = el.selectFirst(".bg-gray-800, .bg-black, .bg-slate-800, .bg-gray-900")?.text()?.trim()
 
         val type = when {
@@ -83,15 +79,14 @@ class PhimNguonCProvider : MainAPI() {
         return newMovieSearchResponse(title, href, type) {
             this.posterUrl = poster
             this.quality = quality
-            // Gán text vào posterText để hiện badge góc phải
-            this.posterText = episodeText 
+            // Nếu build vẫn lỗi ở dòng dưới, hãy xóa dòng này hoặc cập nhật thư viện Cloudstream
+            // this.posterText = episodeText 
         }
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page == 1) "$mainUrl/${request.data}" else "$mainUrl/${request.data}?page=$page"
         val doc = app.get(url, headers = commonHeaders, interceptor = cfInterceptor).document
-        // Selector table tbody tr dành cho danh sách dạng bảng, nếu trang chủ dạng grid thì cần đổi selector
         val items = doc.select("table tbody tr, .grid .relative").mapNotNull { parseCard(it) }
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
@@ -144,7 +139,7 @@ class PhimNguonCProvider : MainAPI() {
                 newMovieSearchResponse(related.name ?: "", fixUrl(related.link ?: ""), TvType.TvSeries) {
                     this.posterUrl = fixUrl(related.poster ?: related.thumb ?: "")
                     this.quality = getSearchQuality(related.quality)
-                    this.posterText = related.episode_current
+                    // this.posterText = related.episode_current
                 }
             }
         }

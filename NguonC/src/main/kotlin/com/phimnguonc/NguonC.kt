@@ -25,12 +25,13 @@ class PhimNguonCProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
 
+    // User-Agent đồng nhất để giữ Session TLS Fingerprint
     private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
     private val commonHeaders = mapOf(
         "User-Agent" to USER_AGENT,
         "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language" to "vi-VN,vi;q=0.9",
+        "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8",
     )
 
     private val cfInterceptor = WebViewResolver(Regex("""phim\.nguonc\.com|streamc\.xyz|amass15\.top"""))
@@ -71,7 +72,6 @@ class PhimNguonCProvider : MainAPI() {
         return doc.select("table tbody tr").mapNotNull { parseCard(it) }
     }
 
-    // SỬ DỤNG API JSON ĐỂ LOAD CHI TIẾT PHIM
     override suspend fun load(url: String): LoadResponse {
         val slug = url.substringAfterLast("/")
         val apiUrl = "$mainUrl/api/film/$slug"
@@ -90,7 +90,7 @@ class PhimNguonCProvider : MainAPI() {
                 val m3u8 = ep.m3u8 ?: ""
                 val embed = ep.embed ?: ""
                 if (m3u8.isNotBlank()) {
-                    // Gộp m3u8 và embed để loadLinks xử lý Referer
+                    // Gộp m3u8 và embed để loadLinks xử lý
                     val combinedData = "$m3u8|$embed"
                     episodes.add(newEpisode(combinedData) {
                         this.name = "Tập ${ep.name}"
@@ -117,44 +117,51 @@ class PhimNguonCProvider : MainAPI() {
         val m3u8Url = parts[0]
         val embedUrl = if (parts.size > 1) parts[1] else ""
 
-        // BƯỚC 1: Tự giải mã Redirect để lấy link CDN thật (amass15.top)
-        // Điều này cực kỳ quan trọng để tránh lỗi 2001 khi trình phát tự redirect
+        // KỸ THUẬT 1: Session Warm-up
+        // Truy cập trang embed để lấy Cookie và kích hoạt phiên làm việc trên CDN
+        val embedRes = app.get(embedUrl, headers = commonHeaders, interceptor = cfInterceptor)
+        val cookies = embedRes.cookies
+        val cookieString = cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+
+        // KỸ THUẬT 2: Manual Redirect Resolution
+        // Tự giải mã redirect để lấy link CDN thật (amass15.top), tránh trình phát làm mất Header
         val finalRes = app.get(
             m3u8Url, 
-            headers = mapOf("Referer" to "$mainUrl/", "User-Agent" to USER_AGENT),
+            headers = commonHeaders.plus("Referer" to embedUrl).plus("Cookie" to cookieString),
             interceptor = cfInterceptor,
             timeout = 15
         )
         val finalVideoUrl = finalRes.url
 
-        // BƯỚC 2: Header "PNG-Bypass" - Ép trình phát gửi Referer của trang Embed
-        // CDN amass15.top yêu cầu Referer từ streamc.xyz để nhả các file .png (video TS)
+        // KỸ THUẬT 3: Header Injection cho Segments (.png)
+        // Ép trình phát gửi đúng Referer và Cookie cho từng phân đoạn ảnh ngụy trang
         val videoHeaders = mapOf(
             "User-Agent" to USER_AGENT,
-            "Referer" to embedUrl, 
+            "Referer" to embedUrl,
             "Origin" to embedUrl.substringBefore("/embed.php"),
+            "Cookie" to cookieString,
             "Accept" to "*/*",
-            "Connection" to "keep-alive",
+            "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8",
             "Sec-Fetch-Dest" to "video",
             "Sec-Fetch-Mode" to "cors",
-            "Sec-Fetch-Site" to "cross-site"
+            "Sec-Fetch-Site" to "cross-site",
+            "Range" to "bytes=0-" // Ép CDN nhả luồng dữ liệu thay vì file tĩnh
         )
 
         callback(
             newExtractorLink(
-                source = "NguonC (StreamC-PNG)",
+                source = "NguonC (PNG-Bypass)",
                 name = "HLS - 1080p",
                 url = finalVideoUrl,
                 type = ExtractorLinkType.M3U8
             ) {
                 this.quality = Qualities.P1080.value
-                this.headers = videoHeaders // Header này sẽ áp dụng cho cả playlist và các file .png
+                this.headers = videoHeaders // Header này sẽ được dùng cho TẤT CẢ các request .png
             }
         )
         return true
     }
 
-    // DATA CLASSES DỰA TRÊN JSON BẠN CUNG CẤP
     data class NguonCDetailResponse(@JsonProperty("movie") val movie: NguonCMovie? = null)
     data class NguonCMovie(
         @JsonProperty("name") val name: String? = null,

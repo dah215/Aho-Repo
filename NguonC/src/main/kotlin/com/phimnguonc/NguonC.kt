@@ -132,7 +132,6 @@ class PhimNguonCProvider : MainAPI() {
                         val epName = ep.name ?: ""
                         val epNum = Regex("""\d+""").find(epName)?.value?.toIntOrNull()
                         
-                        // Thuật toán thông minh: Kết hợp link m3u8 và embed để tăng khả năng phát video
                         val data = if (!ep.m3u8.isNullOrBlank()) ep.m3u8 else ep.embed ?: ""
                         
                         if (data.isNotBlank()) {
@@ -190,9 +189,11 @@ class PhimNguonCProvider : MainAPI() {
                     "NguonC",
                     "NguonC (HLS)",
                     fixedData,
-                    "",
-                    Qualities.P1080.value,
-                    ExtractorLinkType.M3U8
+                    null, // type: ExtractorLinkType?
+                    {
+                        this.referer = ""
+                        this.quality = Qualities.P1080.value
+                    }
                 )
             )
             return true
@@ -202,16 +203,17 @@ class PhimNguonCProvider : MainAPI() {
         if (fixedData.contains("streamc.xyz/embed.php")) {
             val hash = fixedData.substringAfter("hash=").substringBefore("&")
             if (hash.isNotBlank()) {
-                // Thuật toán thông minh: Tự động chuyển đổi link embed sang link m3u8 dựa trên hash
                 val m3u8Link = "https://sing.phimmoi.net/$hash/hls.m3u8"
                 callback(
                     newExtractorLink(
                         "NguonC",
                         "NguonC (StreamC)",
                         m3u8Link,
-                        "https://phim.nguonc.com/",
-                        Qualities.P1080.value,
-                        ExtractorLinkType.M3U8
+                        null, // type: ExtractorLinkType?
+                        {
+                            this.referer = "https://phim.nguonc.com/"
+                            this.quality = Qualities.P1080.value
+                        }
                     )
                 )
                 return true
@@ -231,9 +233,11 @@ class PhimNguonCProvider : MainAPI() {
                     "NguonC",
                     "NguonC (HLS)",
                     link.replace("^http://".toRegex(), "https://"),
-                    "",
-                    Qualities.P1080.value,
-                    ExtractorLinkType.M3U8
+                    null, // type: ExtractorLinkType?
+                    {
+                        this.referer = ""
+                        this.quality = Qualities.P1080.value
+                    }
                 )
             )
             found = true

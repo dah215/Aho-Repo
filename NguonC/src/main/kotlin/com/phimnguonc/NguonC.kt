@@ -24,8 +24,6 @@ class PhimNguonCProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
 
-    // 1. BỘ HEADERS CHUẨN TRÌNH DUYỆT PC ĐỂ VƯỢT CLOUDFLARE
-    // Loại bỏ X-Requested-With vì dễ bị Cloudflare nhận diện là bot nếu TLS fingerprint không khớp
     private val headers = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -38,7 +36,6 @@ class PhimNguonCProvider : MainAPI() {
         "Sec-Fetch-User" to "?1"
     )
 
-    // 2. BỘ HEADERS DÀNH RIÊNG CHO API
     private val apiHeaders = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Accept" to "application/json, text/plain, */*",
@@ -51,7 +48,6 @@ class PhimNguonCProvider : MainAPI() {
         "Sec-Fetch-Site" to "same-origin"
     )
 
-    // 3. SỬ DỤNG WEBVIEW RESOLVER ĐỂ TỰ ĐỘNG GIẢI MÃ CLOUDFLARE CHALLENGE
     private val cfInterceptor = WebViewResolver(Regex("""phim\.nguonc\.com"""))
 
     override val mainPage = mainPageOf(
@@ -100,7 +96,6 @@ class PhimNguonCProvider : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         try {
             val url = "$mainUrl/api/films/${request.data}?page=$page"
-            // Thêm interceptor và tăng timeout lên 30s để WebView có thời gian giải mã
             val res = app.get(url, headers = apiHeaders, interceptor = cfInterceptor, timeout = 30).parsedSafe<NguonCResponse>()
             if (res?.items != null && res.items.isNotEmpty()) {
                 val items = res.items.mapNotNull { it.toSearchResponse() }
@@ -192,6 +187,7 @@ class PhimNguonCProvider : MainAPI() {
         }
     }
 
+    // HÀM LOADLINKS ĐƯỢC VIẾT LẠI HOÀN TOÀN
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -200,66 +196,76 @@ class PhimNguonCProvider : MainAPI() {
     ): Boolean {
         val fixedData = data.replace("^http://".toRegex(), "https://")
 
+        // Header chuẩn để truyền thẳng vào ExoPlayer (giúp player không bị chặn 2001)
+        val playerHeaders = mapOf(
+            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Accept" to "*/*",
+            "Origin" to mainUrl,
+            "Referer" to "$mainUrl/"
+        )
+
         // 1. Xử lý link m3u8 trực tiếp
         if (fixedData.contains(".m3u8")) {
             callback(
-                newExtractorLink(
-                    "NguonC",
-                    "NguonC (HLS)",
-                    fixedData,
-                    null,
-                    {
-                        this.referer = ""
-                        this.quality = Qualities.P1080.value
-                    }
+                ExtractorLink(
+                    source = "NguonC",
+                    name = "NguonC (HLS)",
+                    url = fixedData,
+                    referer = "$mainUrl/",
+                    quality = Qualities.P1080.value,
+                    isM3u8 = true,
+                    headers = playerHeaders // Bắt buộc phải có để ExoPlayer không bị chặn
                 )
             )
             return true
         }
 
-        // 2. Xử lý link embed từ streamc.xyz (Giải mã thông minh)
-        if (fixedData.contains("streamc.xyz/embed.php")) {
-            val hash = fixedData.substringAfter("hash=").substringBefore("&")
-            if (hash.isNotBlank()) {
-                val m3u8Link = "https://sing.phimmoi.net/$hash/hls.m3u8"
-                callback(
-                    newExtractorLink(
-                        "NguonC",
-                        "NguonC (StreamC)",
-                        m3u8Link,
-                        null,
-                        {
-                            this.referer = "https://phim.nguonc.com/"
-                            this.quality = Qualities.P1080.value
-                        }
-                    )
-                )
-                return true
-            }
-        }
-
-        // 3. Fallback: Cào link từ mã nguồn trang
+        // 2. Xử lý link embed (iframe)
         try {
-            val doc = app.get(fixedData, headers = headers, interceptor = cfInterceptor, timeout = 30).document
-            val html = doc.html()
-            val m3u8Regex = Regex("""https?://+\.m3u8*""")
-            val matches = m3u8Regex.findAll(html).map { it.value }.toList()
+            // Lấy domain của link embed để làm Referer cho chính nó
+            val embedDomain = Regex("""^(https?://+)""").find(fixedData)?.value ?: mainUrl
+            
+            val embedHeaders = mapOf(
+                "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                "Referer" to "$mainUrl/",
+                "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+            )
+            
+            // Tải trang embed để tìm link m3u8 thực sự
+            val response = app.get(fixedData, headers = embedHeaders, timeout = 30).text
+            
+            // Regex chuẩn để bắt link m3u8 trong mã nguồn (bao gồm cả link bị escape như \/)
+            val m3u8Regex = Regex("""(https?://+\.m3u8*)""")
+            val matches = m3u8Regex.findAll(response).map { it.groupValues }.toList()
+            
             var found = false
             matches.forEach { link ->
+                // Xóa các ký tự escape (nếu có) trong chuỗi JSON (VD: https:\/\/ -> https://)
+                val cleanLink = link.replace("\\/", "/")
+                
                 callback(
-                    newExtractorLink(
-                        "NguonC",
-                        "NguonC (HLS)",
-                        link.replace("^http://".toRegex(), "https://"),
-                        null,
-                        {
-                            this.referer = ""
-                            this.quality = Qualities.P1080.value
-                        }
+                    ExtractorLink(
+                        source = "NguonC",
+                        name = "NguonC (Embed)",
+                        url = cleanLink,
+                        referer = fixedData,
+                        quality = Qualities.P1080.value,
+                        isM3u8 = true,
+                        headers = mapOf(
+                            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                            "Origin" to embedDomain,
+                            "Referer" to fixedData
+                        )
                     )
                 )
                 found = true
             }
+            
+            // Nếu Regex không tìm thấy m3u8, thử dùng Extractor mặc định của Cloudstream (hỗ trợ Doodstream, Streamtape...)
+            if (!found) {
+                return loadExtractor(fixedData, "$mainUrl/", subtitleCallback, callback)
+            }
+            
             return found
         } catch (e: Exception) {
             e.printStackTrace()

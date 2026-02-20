@@ -81,7 +81,7 @@ class PhimNguonCProvider : MainAPI() {
         movie.episodes?.forEach { server ->
             val items = server.items ?: server.list
             items?.forEach { ep ->
-                // CHỈ LẤY LINK EMBED, BỎ QUA LINK M3U8 ẢO
+                // CHỈ LẤY LINK EMBED
                 val embed = ep.embed?.replace("\\/", "/") ?: ""
                 if (embed.isNotBlank()) {
                     episodes.add(newEpisode(embed) {
@@ -109,57 +109,110 @@ class PhimNguonCProvider : MainAPI() {
         val embedUrl = data // VD: https://embed18.streamc.xyz/embed.php?hash=87ccab...
         
         // Lấy domain gốc của embed (VD: https://embed18.streamc.xyz)
-        val embedDomain = if (embedUrl.startsWith("http")) {
-            Regex("""https?://+""").find(embedUrl)?.value ?: ""
-        } else ""
+        val embedDomain = Regex("""https?://[^/]+""").find(embedUrl)?.value ?: ""
 
         try {
-            // BƯỚC 1: Tải mã nguồn trang embed để lấy Token/Hash thật
-            val embedRes = app.get(embedUrl, headers = mapOf("Referer" to "$mainUrl/", "User-Agent" to USER_AGENT), interceptor = cfInterceptor)
+            // BƯỚC 1: Tải mã nguồn trang embed
+            val embedRes = app.get(
+                embedUrl, 
+                headers = mapOf(
+                    "Referer" to "$mainUrl/", 
+                    "User-Agent" to USER_AGENT
+                ), 
+                interceptor = cfInterceptor
+            )
             val html = embedRes.text
             val cookies = embedRes.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
 
-            // BƯỚC 2: Tìm chuỗi Base64 chứa link m3u8 thật sự (Dựa trên manh mối của bạn)
-            // Thường nó nằm trong một biến JS như: var player = new Player("eyJoIjoi...");
-            // Hoặc file: "eyJoIjoi..."
-            val base64Regex = Regex("""(eyJoIjoi+)""")
-            val match = base64Regex.find(html)
-
+            // BƯỚC 2: Tìm chuỗi Base64 chứa token/hash
+            // URL thực tế: https://embed18.streamc.xyz/eyJoIjoi...J9.m3u8
+            // Chuỗi Base64: eyJoIjoiMTJkOTA5YWYyYjg3ZjU1ZDBjMjk1OGU2MDFmNDA1ZjAiLCJ0IjoiNjI3OGRlNTE0ODg4NzY3NTkxZWQyNGM1NDcwZTJmNzNmOTQ1M2U5ODMzOTVhZjVkNjM2MWRiNjE1OWQ1Zjc0NSJ9
+            
             var finalM3u8Url = ""
+            var base64Token = ""
 
-            if (match != null) {
-                // Nếu tìm thấy chuỗi Base64, ghép nó với domain embed để tạo link m3u8 thật
-                val base64String = match.groupValues
-                finalM3u8Url = "$embedDomain/$base64String.m3u8"
-            } else {
-                // Fallback: Nếu không tìm thấy Base64, thử tìm link m3u8 trực tiếp trong HTML
-                val directM3u8Regex = Regex("""(https?://+\.m3u8)""")
-                val directMatch = directM3u8Regex.find(html)
-                if (directMatch != null) {
-                    finalM3u8Url = directMatch.value.replace("\\/", "/")
+            // Các pattern để tìm chuỗi Base64
+            // Chuỗi Base64 JSON hợp lệ bắt đầu bằng "ey" (vì JSON bắt đầu bằng "{" được encode thành "ey")
+            val base64Patterns = listOf(
+                // Pattern 1: Tìm trong biến file (player config)
+                // file: "eyJoIjoi..." hoặc file:"eyJoIjoi..."
+                Regex("""file\s*[:=]\s*["']([e][yA-Za-z0-9+/=]+)["']"""),
+                
+                // Pattern 2: Tìm source: "ey..." hoặc source:'ey...'
+                Regex("""source\s*[:=]\s*["']([e][yA-Za-z0-9+/=]+)["']"""),
+                
+                // Pattern 3: Tìm trong URL hoặc tham số
+                // hash=ey... hoặc ?ey...
+                Regex("""[?&]hash=([A-Za-z0-9+/=]+)"""),
+                
+                // Pattern 4: Tìm chuỗi Base64 dài (>50 chars) bắt đầu bằng "ey"
+                // Đây là pattern tổng quát nhất
+                Regex("""["'\s]([e][yA-Za-z0-9+/=]{50,})["'\s]"""),
+                
+                // Pattern 5: Tìm trong Player initialization
+                // new Player("ey...") hoặc Player.init("ey...")
+                Regex("""Player\s*\(\s*["']([A-Za-z0-9+/=]+)["']"""),
+                
+                // Pattern 6: Tìm trực tiếp chuỗi có format eyJoIjoi (JSON với key "h")
+                Regex("""(eyJoIjoi[A-Za-z0-9+/=]+)""")
+            )
+
+            for (pattern in base64Patterns) {
+                val match = pattern.find(html)
+                if (match != null && match.groupValues.size > 1) {
+                    base64Token = match.groupValues[1].trim()
+                    // Kiểm tra xem có phải chuỗi Base64 hợp lệ không
+                    if (base64Token.length > 30) {
+                        break
+                    }
+                }
+            }
+
+            // Nếu tìm thấy Base64 token, tạo URL m3u8
+            if (base64Token.isNotBlank()) {
+                // URL format: https://embedXX.streamc.xyz/{base64Token}.m3u8
+                finalM3u8Url = "$embedDomain/$base64Token.m3u8"
+                
+                // Log để debug
+                println("Found Base64 token: $base64Token")
+                println("Generated m3u8 URL: $finalM3u8Url")
+            }
+
+            // Fallback: Tìm link m3u8 trực tiếp
+            if (finalM3u8Url.isBlank()) {
+                val m3u8Patterns = listOf(
+                    Regex("""(https?://[^\s"'<>]+\.m3u8)"""),
+                    Regex("""["']([^"']*(?:streamc|amass)[^"']*\.m3u8)["']"""),
+                    Regex("""["']([^"']*\.m3u8)["']""")
+                )
+                
+                for (pattern in m3u8Patterns) {
+                    val match = pattern.find(html)
+                    if (match != null && match.groupValues.size > 1) {
+                        finalM3u8Url = match.groupValues[1].replace("\\/", "/")
+                        break
+                    }
                 }
             }
 
             if (finalM3u8Url.isNotBlank()) {
-                // BƯỚC 3: Xây dựng Header "Bất tử" để bẻ khóa các file .png
-                // Dựa trên manh mối 2, CDN amass15.top cần Referer là trang embed
+                // BƯỚC 3: Headers để phát video
                 val videoHeaders = mapOf(
                     "User-Agent" to USER_AGENT,
-                    "Referer" to embedUrl, // Cực kỳ quan trọng
+                    "Referer" to embedUrl,
                     "Origin" to embedDomain,
                     "Cookie" to cookies,
-                    "Accept" to "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8", // Đánh lừa CDN
-                    "Accept-Language" to "vi-VN,vi;q=0.9",
+                    "Accept" to "*/*",
+                    "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8",
                     "Connection" to "keep-alive",
                     "Sec-Fetch-Dest" to "video",
                     "Sec-Fetch-Mode" to "cors",
-                    "Sec-Fetch-Site" to "cross-site",
-                    "Range" to "bytes=0-" // Ép CDN nhả luồng video
+                    "Sec-Fetch-Site" to "same-origin"
                 )
 
                 callback(
                     newExtractorLink(
-                        source = "NguonC (Base64-Bypass)",
+                        source = "NguonC Server",
                         name = "HLS - 1080p",
                         url = finalM3u8Url,
                         type = ExtractorLinkType.M3U8
@@ -171,10 +224,11 @@ class PhimNguonCProvider : MainAPI() {
                 return true
             }
         } catch (e: Exception) {
+            println("Error in loadLinks: ${e.message}")
             e.printStackTrace()
         }
 
-        // Fallback cuối cùng nếu mọi cách cào đều thất bại
+        // Fallback cuối cùng
         return loadExtractor(embedUrl, "$mainUrl/", subtitleCallback, callback)
     }
 

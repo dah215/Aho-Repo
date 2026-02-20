@@ -8,6 +8,7 @@ import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.network.WebViewResolver
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
+import android.util.Base64
 
 @CloudstreamPlugin
 class PhimNguonCPlugin : Plugin() {
@@ -26,8 +27,8 @@ class PhimNguonCProvider : MainAPI() {
 
     private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
-    // Interceptor để giải quyết Cloudflare
-    private val cfInterceptor = WebViewResolver(Regex("""phim\.nguonc\.com|.*streamc\.xyz|.*amass15\.top|.*phimmoi\.net"""))
+    // Interceptor cho toàn bộ hệ sinh thái
+    private val cfInterceptor = WebViewResolver(Regex("""phim\.nguonc\.com|.*streamc\.xyz|.*amass15\.top"""))
 
     private val commonHeaders = mapOf(
         "User-Agent" to USER_AGENT,
@@ -78,15 +79,12 @@ class PhimNguonCProvider : MainAPI() {
 
         val episodes = mutableListOf<Episode>()
         movie.episodes?.forEach { server ->
-            // Hỗ trợ cả 'items' và 'list' để không bao giờ bị lỗi "Dữ liệu trống"
             val items = server.items ?: server.list
             items?.forEach { ep ->
-                val m3u8 = ep.m3u8?.replace("\\/", "/") ?: ""
+                // CHỈ LẤY LINK EMBED, BỎ QUA LINK M3U8 ẢO
                 val embed = ep.embed?.replace("\\/", "/") ?: ""
-                
-                // CHỈ CẦN CÓ M3U8 LÀ CHẮC CHẮN CÓ LINK
-                if (m3u8.isNotBlank()) {
-                    episodes.add(newEpisode("$m3u8|$embed") {
+                if (embed.isNotBlank()) {
+                    episodes.add(newEpisode(embed) {
                         this.name = "Tập ${ep.name}"
                         this.episode = ep.name?.toIntOrNull()
                     })
@@ -108,60 +106,76 @@ class PhimNguonCProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val parts = data.split("|")
-        val m3u8Url = parts // Link sing.phimmoi.net
-        val embedUrl = if (parts.size > 1) parts else "" // Link streamc.xyz
-
+        val embedUrl = data // VD: https://embed18.streamc.xyz/embed.php?hash=87ccab...
+        
+        // Lấy domain gốc của embed (VD: https://embed18.streamc.xyz)
         val embedDomain = if (embedUrl.startsWith("http")) {
             Regex("""https?://+""").find(embedUrl)?.value ?: ""
         } else ""
 
-        // BƯỚC 1: Lấy Cookie từ trang Embed (Rất quan trọng để vượt Cloudflare)
-        val embedRes = app.get(embedUrl, headers = commonHeaders, interceptor = cfInterceptor)
-        val cookies = embedRes.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+        try {
+            // BƯỚC 1: Tải mã nguồn trang embed để lấy Token/Hash thật
+            val embedRes = app.get(embedUrl, headers = mapOf("Referer" to "$mainUrl/", "User-Agent" to USER_AGENT), interceptor = cfInterceptor)
+            val html = embedRes.text
+            val cookies = embedRes.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
 
-        // BƯỚC 2: Tự giải mã Redirect để lấy link CDN thật (amass15.top)
-        // Tránh việc trình phát video tự redirect và làm mất Header
-        val finalRes = try {
-            app.get(
-                m3u8Url, 
-                headers = mapOf("Referer" to embedUrl, "Cookie" to cookies, "User-Agent" to USER_AGENT), 
-                interceptor = cfInterceptor,
-                timeout = 15
-            )
-        } catch (e: Exception) { null }
-        
-        val finalVideoUrl = finalRes?.url ?: m3u8Url
-        val finalCookies = finalRes?.cookies?.entries?.joinToString("; ") { "${it.key}=${it.value}" } ?: cookies
+            // BƯỚC 2: Tìm chuỗi Base64 chứa link m3u8 thật sự (Dựa trên manh mối của bạn)
+            // Thường nó nằm trong một biến JS như: var player = new Player("eyJoIjoi...");
+            // Hoặc file: "eyJoIjoi..."
+            val base64Regex = Regex("""(eyJoIjoi+)""")
+            val match = base64Regex.find(html)
 
-        // BƯỚC 3: Bộ Header "Bất tử" để bẻ khóa file .png
-        val videoHeaders = mapOf(
-            "User-Agent" to USER_AGENT,
-            "Referer" to (if (embedUrl.isNotBlank()) embedUrl else "$mainUrl/"),
-            "Origin" to embedDomain,
-            "Cookie" to finalCookies,
-            "Accept" to "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8", // Đánh lừa CDN đây là request tải ảnh
-            "Accept-Language" to "vi-VN,vi;q=0.9",
-            "Connection" to "keep-alive",
-            "Sec-Fetch-Dest" to "video",
-            "Sec-Fetch-Mode" to "cors",
-            "Sec-Fetch-Site" to "cross-site",
-            "Range" to "bytes=0-" // Ép CDN nhả luồng video
-        )
+            var finalM3u8Url = ""
 
-        // LUÔN LUÔN TRẢ VỀ LINK CHO TRÌNH PHÁT (Hết lỗi "Không tìm thấy liên kết")
-        callback(
-            newExtractorLink(
-                source = "NguonC (VIP)",
-                name = "HLS - 1080p",
-                url = finalVideoUrl,
-                type = ExtractorLinkType.M3U8
-            ) {
-                this.quality = Qualities.P1080.value
-                this.headers = videoHeaders
+            if (match != null) {
+                // Nếu tìm thấy chuỗi Base64, ghép nó với domain embed để tạo link m3u8 thật
+                val base64String = match.groupValues
+                finalM3u8Url = "$embedDomain/$base64String.m3u8"
+            } else {
+                // Fallback: Nếu không tìm thấy Base64, thử tìm link m3u8 trực tiếp trong HTML
+                val directM3u8Regex = Regex("""(https?://+\.m3u8)""")
+                val directMatch = directM3u8Regex.find(html)
+                if (directMatch != null) {
+                    finalM3u8Url = directMatch.value.replace("\\/", "/")
+                }
             }
-        )
-        return true
+
+            if (finalM3u8Url.isNotBlank()) {
+                // BƯỚC 3: Xây dựng Header "Bất tử" để bẻ khóa các file .png
+                // Dựa trên manh mối 2, CDN amass15.top cần Referer là trang embed
+                val videoHeaders = mapOf(
+                    "User-Agent" to USER_AGENT,
+                    "Referer" to embedUrl, // Cực kỳ quan trọng
+                    "Origin" to embedDomain,
+                    "Cookie" to cookies,
+                    "Accept" to "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8", // Đánh lừa CDN
+                    "Accept-Language" to "vi-VN,vi;q=0.9",
+                    "Connection" to "keep-alive",
+                    "Sec-Fetch-Dest" to "video",
+                    "Sec-Fetch-Mode" to "cors",
+                    "Sec-Fetch-Site" to "cross-site",
+                    "Range" to "bytes=0-" // Ép CDN nhả luồng video
+                )
+
+                callback(
+                    newExtractorLink(
+                        source = "NguonC (Base64-Bypass)",
+                        name = "HLS - 1080p",
+                        url = finalM3u8Url,
+                        type = ExtractorLinkType.M3U8
+                    ) {
+                        this.quality = Qualities.P1080.value
+                        this.headers = videoHeaders
+                    }
+                )
+                return true
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+
+        // Fallback cuối cùng nếu mọi cách cào đều thất bại
+        return loadExtractor(embedUrl, "$mainUrl/", subtitleCallback, callback)
     }
 
     data class NguonCDetailResponse(@JsonProperty("movie") val movie: NguonCMovie? = null)
@@ -173,7 +187,6 @@ class PhimNguonCProvider : MainAPI() {
         @JsonProperty("episodes") val episodes: List<NguonCServer>? = null
     )
     data class NguonCServer(
-        @JsonProperty("server_name") val server_name: String? = null,
         @JsonProperty("items") val items: List<NguonCEpisode>? = null,
         @JsonProperty("list") val list: List<NguonCEpisode>? = null
     )

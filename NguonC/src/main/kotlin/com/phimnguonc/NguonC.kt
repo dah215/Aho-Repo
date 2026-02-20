@@ -25,17 +25,15 @@ class PhimNguonCProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
 
-    // User-Agent hiện đại nhất để khớp với TLS Fingerprint của trình duyệt
+    // User-Agent phải đồng nhất tuyệt đối để giữ Session
     private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
     private val commonHeaders = mapOf(
         "User-Agent" to USER_AGENT,
         "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8",
-        "Connection" to "keep-alive",
     )
 
-    // Resolver cho cả trang chủ và trang embed
     private val cfInterceptor = WebViewResolver(Regex("""phim\.nguonc\.com|streamc\.xyz|amass15\.top"""))
 
     override val mainPage = mainPageOf(
@@ -125,41 +123,43 @@ class PhimNguonCProvider : MainAPI() {
         val m3u8Url = parts[0]
         val embedUrl = if (parts.size > 1) parts[1] else ""
 
-        // BƯỚC 1: Sử dụng WebView để "mồi" session cho trang embed
-        // Điều này giúp lấy được Cookie cần thiết để tải các file .png sau này
-        val embedPage = app.get(embedUrl, headers = commonHeaders, interceptor = cfInterceptor)
-        val cookies = embedPage.cookies
+        // KỸ THUẬT MỚI 1: Lấy Cookie từ trang Embed để duy trì Session
+        val embedRes = app.get(embedUrl, headers = commonHeaders, interceptor = cfInterceptor)
+        val cookies = embedRes.cookies
+        val cookieString = cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
 
-        // BƯỚC 2: Tự giải mã Redirect để lấy link CDN cuối cùng (amass15.top)
-        // Việc này tránh lỗi mất Header khi trình phát tự động redirect
-        val finalRes = app.get(m3u8Url, headers = commonHeaders.plus("Referer" to embedUrl), interceptor = cfInterceptor)
+        // KỸ THUẬT MỚI 2: Tự giải mã Redirect và lấy link CDN cuối cùng
+        val finalRes = app.get(
+            m3u8Url, 
+            headers = commonHeaders.plus("Referer" to embedUrl).plus("Cookie" to cookieString),
+            interceptor = cfInterceptor
+        )
         val finalVideoUrl = finalRes.url
 
-        // BƯỚC 3: Xây dựng bộ Header "Browser-Like" cực mạnh
+        // KỸ THUẬT MỚI 3: Header "Siêu giả lập" để tải file .png
         val videoHeaders = mapOf(
             "User-Agent" to USER_AGENT,
             "Referer" to embedUrl,
             "Origin" to embedUrl.substringBefore("/embed.php"),
+            "Cookie" to cookieString, // Ép trình phát gửi kèm Cookie
             "Accept" to "*/*",
             "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8",
+            "Connection" to "keep-alive",
             "Sec-Fetch-Dest" to "video",
             "Sec-Fetch-Mode" to "cors",
             "Sec-Fetch-Site" to "cross-site",
-            "Range" to "bytes=0-"
+            "Range" to "bytes=0-" // Cần thiết để CDN nhả luồng video
         )
 
         callback(
             newExtractorLink(
-                source = "NguonC (StreamC-Bypass)",
+                source = "NguonC (PNG-Fix)",
                 name = "HLS - 1080p",
                 url = finalVideoUrl,
                 type = ExtractorLinkType.M3U8
             ) {
                 this.quality = Qualities.P1080.value
-                // Truyền cả Header và Cookie vào trình phát
                 this.headers = videoHeaders
-                // Một số bản Cloudstream hỗ trợ truyền cookie trực tiếp
-                // this.cookies = cookies 
             }
         )
         return true

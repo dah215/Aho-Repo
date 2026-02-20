@@ -43,6 +43,18 @@ class PhimNguonCProvider : MainAPI() {
         "danh-sach/tv-shows" to "TV Shows"
     )
 
+    // Chuyển đổi string quality sang SearchQuality enum
+    private fun getSearchQuality(quality: String?): SearchQuality? {
+        return when (quality?.uppercase()) {
+            "4K" -> SearchQuality.UltraHD
+            "FHD", "FULL HD" -> SearchQuality.FullHD
+            "HD" -> SearchQuality.HD
+            "SD" -> SearchQuality.SD
+            "CAM", "CAMRIP" -> SearchQuality.Cam
+            else -> null
+        }
+    }
+
     private fun parseCard(el: Element): SearchResponse? {
         val a = el.selectFirst("a") ?: return null
         val href = fixUrl(a.attr("href"))
@@ -52,7 +64,8 @@ class PhimNguonCProvider : MainAPI() {
         }
 
         // Lấy chất lượng từ badge (HD, FHD, 4K...)
-        val quality = el.selectFirst(".bg-green-300, .bg-blue-300, .bg-red-300, .bg-yellow-300, .bg-violet-300")?.text()?.trim() ?: ""
+        val qualityText = el.selectFirst(".bg-green-300, .bg-blue-300, .bg-red-300, .bg-yellow-300, .bg-violet-300")?.text()?.trim() ?: ""
+        val quality = getSearchQuality(qualityText)
 
         // Lấy số tập hiện tại/tổng số tập
         val episodeText = el.selectFirst(".bg-gray-800, .bg-black, .bg-slate-800, .bg-gray-900")?.text()?.trim() ?: ""
@@ -65,17 +78,16 @@ class PhimNguonCProvider : MainAPI() {
             else -> TvType.TvSeries
         }
 
+        // Tạo label hiển thị: "HD | Tập 5/10" hoặc "HD"
+        val label = if (episodeNum.isNotBlank() && type != TvType.Movie) {
+            "$qualityText | Tập $episodeNum"
+        } else {
+            qualityText
+        }
+
         return newMovieSearchResponse(title, href, type) {
             this.posterUrl = poster
             this.quality = quality
-            this.otherName = if (episodeNum.isNotBlank() && type != TvType.Movie) {
-                "Tập $episodeNum"
-            } else {
-                quality
-            }
-            if (episodeNum.isNotBlank() && type != TvType.Movie) {
-                this.episode = episodeNum.toIntOrNull()
-            }
         }
     }
 
@@ -107,7 +119,6 @@ class PhimNguonCProvider : MainAPI() {
             totalEpisodes = items?.size ?: 0
             items?.forEach { ep ->
                 val embed = ep.embed?.replace("\\/", "/") ?: ""
-                val m3u8 = ep.m3u8?.replace("\\/", "/") ?: ""
                 if (embed.isNotBlank()) {
                     episodes.add(newEpisode(embed) {
                         this.name = "Tập ${ep.name}"
@@ -142,13 +153,16 @@ class PhimNguonCProvider : MainAPI() {
         movie.category?.forEach { it.name?.let { name -> tags.add(name) } }
         movie.country?.forEach { it.name?.let { name -> tags.add(name) } }
 
+        // Parse duration từ string (vd: "35 phút/tập" -> 35)
+        val durationMin = movie.time?.let { timeStr ->
+            Regex("""(\d+)""").find(timeStr)?.groupValues?.get(1)?.toIntOrNull()
+        }
+
         return newTvSeriesLoadResponse(movie.name ?: "", url, TvType.TvSeries, episodes) {
             this.posterUrl = fixUrl(movie.poster_url ?: movie.thumb_url ?: "")
             this.year = movie.year?.toIntOrNull()
             this.tags = tags
-            this.rating = movie.rating?.toRatingInt()
-            this.duration = movie.time
-            this.quality = movie.quality ?: "HD"
+            this.duration = durationMin
 
             // Tạo plot với đầy đủ thông tin
             val infoBuilder = StringBuilder()
@@ -171,7 +185,7 @@ class PhimNguonCProvider : MainAPI() {
                 val relatedHref = related.link ?: return@mapNotNull null
                 val relatedTitle = related.name ?: return@mapNotNull null
                 val relatedPoster = related.poster ?: related.thumb
-                val relatedQuality = related.quality ?: ""
+                val relatedQuality = getSearchQuality(related.quality)
                 newMovieSearchResponse(relatedTitle, fixUrl(relatedHref), TvType.TvSeries) {
                     this.posterUrl = fixUrl(relatedPoster ?: "")
                     this.quality = relatedQuality

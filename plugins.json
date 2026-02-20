@@ -20,26 +20,6 @@
         "name": "AnimeVietSub"
     },
     {
-        "iconUrl": "https://hanime1.me/favicon.ico",
-        "apiVersion": 1,
-        "repositoryUrl": "https://github.com/dah215/Aho-Repo",
-        "fileSize": 13331,
-        "status": 1,
-        "language": "vi",
-        "authors": [
-            "Hanime"
-        ],
-        "tvTypes": [
-            "Anime",
-            "AnimeMovie"
-        ],
-        "version": 1,
-        "internalName": "Hanime",
-        "description": "Hanime1",
-        "url": "https://raw.githubusercontent.com/dah215/Aho-Repo/builds/Hanime.cs3",
-        "name": "Hanime"
-    },
-    {
         "iconUrl": "https://nangcuc.cv/favicon.ico",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/dah215/Aho-Repo",
@@ -62,7 +42,7 @@
         "iconUrl": "https://phim.nguonc.com/favicon.ico",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/dah215/Aho-Repo",
-        "fileSize": 25594,
+        "fileSize": 23632,
         "status": 1,
         "language": "vi",
         "authors": [

@@ -40,7 +40,8 @@ class PhimNguonCProvider : MainAPI() {
     private fun fixUrl(url: String?): String? {
         if (url.isNullOrBlank() || url == "#" || url.startsWith("javascript")) return null
         return when {
-            url.startsWith("http") -> url
+            url.startsWith("http://") -> url.replace("http://", "https://")
+            url.startsWith("https://") -> url
             url.startsWith("//") -> "https:$url"
             url.startsWith("/") -> "$mainUrl$url"
             else -> "$mainUrl/$url"
@@ -77,7 +78,6 @@ class PhimNguonCProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        // 1. Ưu tiên dùng API JSON (Nhanh & Ổn định)
         try {
             val url = "$mainUrl/api/films/${request.data}?page=$page"
             val res = app.get(url, headers = headers).parsedSafe<NguonCResponse>()
@@ -85,11 +85,8 @@ class PhimNguonCProvider : MainAPI() {
                 val items = res.items.mapNotNull { it.toSearchResponse() }
                 return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
             }
-        } catch (e: Exception) {
-            // Bỏ qua lỗi và chuyển sang cào HTML
-        }
+        } catch (e: Exception) {}
 
-        // 2. Dự phòng cào HTML nếu API lỗi
         val htmlUrl = if (page == 1) {
             "$mainUrl/${request.data}"
         } else {
@@ -109,18 +106,14 @@ class PhimNguonCProvider : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        // 1. Ưu tiên dùng API JSON
         try {
             val url = "$mainUrl/api/films/search?keyword=${URLEncoder.encode(query, "utf-8")}"
             val res = app.get(url, headers = headers).parsedSafe<NguonCResponse>()
             if (res?.items != null && res.items.isNotEmpty()) {
                 return res.items.mapNotNull { it.toSearchResponse() }
             }
-        } catch (e: Exception) {
-            // Bỏ qua lỗi và chuyển sang cào HTML
-        }
+        } catch (e: Exception) {}
 
-        // 2. Dự phòng cào HTML
         val url = "$mainUrl/tim-kiem?keyword=${URLEncoder.encode(query, "utf-8")}"
         val doc = app.get(url, headers = headers).document
         return doc.select(".item, .movie-item, article, .halim-item, .col-md-2, .col-md-3").mapNotNull { parseCard(it) }
@@ -129,7 +122,6 @@ class PhimNguonCProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         val slug = url.substringAfterLast("/")
         
-        // 1. Ưu tiên dùng API JSON
         try {
             val apiUrl = "$mainUrl/api/film/$slug"
             val res = app.get(apiUrl, headers = headers).parsedSafe<NguonCDetailResponse>()?.movie
@@ -143,7 +135,9 @@ class PhimNguonCProvider : MainAPI() {
                     server.items?.forEach { ep ->
                         val epName = ep.name ?: ""
                         val epNum = Regex("""\d+""").find(epName)?.value?.toIntOrNull()
-                        val link = ep.m3u8 ?: ep.embed ?: ""
+                        
+                        // Ưu tiên lấy link m3u8, nếu không có thì lấy embed
+                        val link = if (!ep.m3u8.isNullOrBlank()) ep.m3u8 else ep.embed ?: ""
                         
                         if (link.isNotBlank()) {
                             episodes.add(newEpisode(link) {
@@ -160,11 +154,8 @@ class PhimNguonCProvider : MainAPI() {
                     this.year = res.year
                 }
             }
-        } catch (e: Exception) {
-            // Bỏ qua lỗi và chuyển sang cào HTML
-        }
+        } catch (e: Exception) {}
 
-        // 2. Dự phòng cào HTML
         val doc = app.get(url, headers = headers).document
         val title = doc.selectFirst("h1, .title, .name")?.text()?.trim() ?: "Phim"
         val poster = imgUrl(doc.selectFirst(".film-poster img, .movie-thumb img, .poster img, img"))
@@ -205,40 +196,55 @@ class PhimNguonCProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // Nếu data đã là link m3u8 (Lấy từ API)
-        if (data.contains(".m3u8")) {
+        // FIX 1: Chuyển đổi http sang https để tránh lỗi chặn kết nối của Android
+        val fixedData = data.replace("^http://".toRegex(), "https://")
+
+        if (fixedData.contains(".m3u8")) {
+            // Server 1: Không gửi Referer (Hoạt động tốt nhất với đa số CDN)
             callback(
                 newExtractorLink(
-                    name,
-                    name,
-                    data,
+                    "NguonC",
+                    "NguonC (HLS)",
+                    fixedData,
                     ExtractorLinkType.M3U8
                 ) {
-                    this.referer = "$mainUrl/"
+                    this.referer = "" 
+                    this.quality = Qualities.P1080.value
+                }
+            )
+            // Server 2: Gửi Referer dự phòng
+            callback(
+                newExtractorLink(
+                    "NguonC",
+                    "NguonC (Alt)",
+                    fixedData,
+                    ExtractorLinkType.M3U8
+                ) {
+                    this.referer = "$mainUrl/" 
                     this.quality = Qualities.P1080.value
                 }
             )
             return true
         }
 
-        // Nếu data là link web (Lấy từ HTML Fallback)
-        val doc = app.get(data, headers = headers).document
+        val doc = app.get(fixedData, headers = headers).document
         val html = doc.html()
         
-        // FIX LỖI TẠI ĐÂY: Dùng it.value thay vì it.groupValues để lấy String
+        // FIX 2: Sửa lại Regex bắt link m3u8 chuẩn xác hơn
         val m3u8Regex = Regex("""https?://+\.m3u8""")
         val matches = m3u8Regex.findAll(html).map { it.value }.toList()
         
         var found = false
         matches.forEach { link ->
+            val safeLink = link.replace("^http://".toRegex(), "https://")
             callback(
                 newExtractorLink(
-                    name,
-                    name,
-                    link,
+                    "NguonC",
+                    "NguonC (HLS)",
+                    safeLink,
                     ExtractorLinkType.M3U8
                 ) {
-                    this.referer = "$mainUrl/"
+                    this.referer = ""
                     this.quality = Qualities.P1080.value
                 }
             )
@@ -248,17 +254,19 @@ class PhimNguonCProvider : MainAPI() {
         if (!found) {
             val iframe = doc.selectFirst("iframe")?.attr("src")
             if (iframe != null && iframe.startsWith("http")) {
-                val iframeHtml = app.get(iframe, headers = headers).text
+                val safeIframe = iframe.replace("^http://".toRegex(), "https://")
+                val iframeHtml = app.get(safeIframe, headers = headers).text
                 val iframeMatches = m3u8Regex.findAll(iframeHtml).map { it.value }.toList()
                 iframeMatches.forEach { link ->
+                    val safeLink = link.replace("^http://".toRegex(), "https://")
                     callback(
                         newExtractorLink(
-                            name,
-                            name,
-                            link,
+                            "NguonC",
+                            "NguonC (HLS)",
+                            safeLink,
                             ExtractorLinkType.M3U8
                         ) {
-                            this.referer = iframe
+                            this.referer = ""
                             this.quality = Qualities.P1080.value
                         }
                     )
@@ -285,7 +293,6 @@ class PhimNguonCProvider : MainAPI() {
         }
     }
 
-    // --- CÁC DATA CLASS ĐỂ PARSE JSON TỪ API ---
     data class NguonCResponse(
         @JsonProperty("items") val items: List<NguonCItem>? = null
     )

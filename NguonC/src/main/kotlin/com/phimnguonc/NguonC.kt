@@ -225,8 +225,9 @@ class PhimNguonCProvider : MainAPI() {
         val doc = app.get(data, headers = headers).document
         val html = doc.html()
         
-        val m3u8Regex = Regex("""(https?://+\.m3u8)""")
-        val matches = m3u8Regex.findAll(html).map { it.groupValues }.toList()
+        // FIX LỖI TẠI ĐÂY: Dùng it.value thay vì it.groupValues để lấy String
+        val m3u8Regex = Regex("""https?://+\.m3u8""")
+        val matches = m3u8Regex.findAll(html).map { it.value }.toList()
         
         var found = false
         matches.forEach { link ->
@@ -248,7 +249,7 @@ class PhimNguonCProvider : MainAPI() {
             val iframe = doc.selectFirst("iframe")?.attr("src")
             if (iframe != null && iframe.startsWith("http")) {
                 val iframeHtml = app.get(iframe, headers = headers).text
-                val iframeMatches = m3u8Regex.findAll(iframeHtml).map { it.groupValues }.toList()
+                val iframeMatches = m3u8Regex.findAll(iframeHtml).map { it.value }.toList()
                 iframeMatches.forEach { link ->
                     callback(
                         newExtractorLink(

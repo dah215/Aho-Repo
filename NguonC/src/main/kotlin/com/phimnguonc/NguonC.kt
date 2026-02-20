@@ -25,20 +25,18 @@ class PhimNguonCProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
 
-    // Bộ User-Agent đồng nhất để tránh bị lệch TLS Fingerprint
+    // User-Agent hiện đại nhất để khớp với TLS Fingerprint của trình duyệt
     private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
     private val commonHeaders = mapOf(
         "User-Agent" to USER_AGENT,
         "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8",
-        "Cache-Control" to "max-age=0",
-        "Sec-Ch-Ua" to "\"Chromium\";v=\"122\", \"Not(A:Brand\";v=\"24\", \"Google Chrome\";v=\"122\"",
-        "Sec-Ch-Ua-Mobile" to "?0",
-        "Sec-Ch-Ua-Platform" to "\"Windows\"",
+        "Connection" to "keep-alive",
     )
 
-    private val cfInterceptor = WebViewResolver(Regex("""phim\.nguonc\.com"""))
+    // Resolver cho cả trang chủ và trang embed
+    private val cfInterceptor = WebViewResolver(Regex("""phim\.nguonc\.com|streamc\.xyz|amass15\.top"""))
 
     override val mainPage = mainPageOf(
         "phim-moi-cap-nhat" to "Phim Mới Cập Nhật",
@@ -98,7 +96,7 @@ class PhimNguonCProvider : MainAPI() {
                         val m3u8 = ep.m3u8?.replace("\\/", "/") ?: ""
                         val embed = ep.embed?.replace("\\/", "/") ?: ""
                         if (m3u8.isNotBlank()) {
-                            // Gộp m3u8 và embed để loadLinks xử lý Referer chính xác cho từng tập
+                            // Gộp m3u8 và embed để loadLinks xử lý
                             val combinedData = "$m3u8|$embed"
                             episodes.add(newEpisode(combinedData) {
                                 this.name = "Tập ${ep.name}"
@@ -127,39 +125,41 @@ class PhimNguonCProvider : MainAPI() {
         val m3u8Url = parts[0]
         val embedUrl = if (parts.size > 1) parts[1] else ""
 
-        // 1. Thuật toán giải mã Redirect: Lấy link CDN thật (amass15.top)
-        // CDN này yêu cầu Referer từ trang chủ hoặc trang embed để nhả link redirect
-        val resolvedRes = app.get(
-            m3u8Url, 
-            headers = mapOf("Referer" to "$mainUrl/", "User-Agent" to USER_AGENT),
-            interceptor = cfInterceptor,
-            timeout = 15
-        )
-        val finalVideoUrl = resolvedRes.url
+        // BƯỚC 1: Sử dụng WebView để "mồi" session cho trang embed
+        // Điều này giúp lấy được Cookie cần thiết để tải các file .png sau này
+        val embedPage = app.get(embedUrl, headers = commonHeaders, interceptor = cfInterceptor)
+        val cookies = embedPage.cookies
 
-        // 2. Xây dựng bộ Header "PNG-Friendly"
-        // Dựa trên manh mối của bạn, CDN cần Referer từ streamc.xyz để tải file .png
+        // BƯỚC 2: Tự giải mã Redirect để lấy link CDN cuối cùng (amass15.top)
+        // Việc này tránh lỗi mất Header khi trình phát tự động redirect
+        val finalRes = app.get(m3u8Url, headers = commonHeaders.plus("Referer" to embedUrl), interceptor = cfInterceptor)
+        val finalVideoUrl = finalRes.url
+
+        // BƯỚC 3: Xây dựng bộ Header "Browser-Like" cực mạnh
         val videoHeaders = mapOf(
             "User-Agent" to USER_AGENT,
-            "Referer" to (if (embedUrl.isNotBlank()) embedUrl else "$mainUrl/"),
-            "Origin" to (if (embedUrl.isNotBlank()) embedUrl.substringBefore("/embed.php") else mainUrl),
-            "Accept" to "*/*", // Quan trọng để tải được cả playlist và file ảnh ngụy trang
+            "Referer" to embedUrl,
+            "Origin" to embedUrl.substringBefore("/embed.php"),
+            "Accept" to "*/*",
             "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8",
             "Sec-Fetch-Dest" to "video",
             "Sec-Fetch-Mode" to "cors",
-            "Sec-Fetch-Site" to "cross-site"
+            "Sec-Fetch-Site" to "cross-site",
+            "Range" to "bytes=0-"
         )
 
         callback(
             newExtractorLink(
-                source = "NguonC (PNG-Bypass)",
+                source = "NguonC (StreamC-Bypass)",
                 name = "HLS - 1080p",
                 url = finalVideoUrl,
                 type = ExtractorLinkType.M3U8
             ) {
                 this.quality = Qualities.P1080.value
-                // Ép trình phát video sử dụng bộ Header này cho TẤT CẢ các sub-request (.png)
+                // Truyền cả Header và Cookie vào trình phát
                 this.headers = videoHeaders
+                // Một số bản Cloudstream hỗ trợ truyền cookie trực tiếp
+                // this.cookies = cookies 
             }
         )
         return true

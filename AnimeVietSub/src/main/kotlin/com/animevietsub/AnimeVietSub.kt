@@ -25,7 +25,6 @@ class AnimeVietSubProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA)
 
-    // Khớp User-Agent chính xác từ log của bạn
     private val UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
 
     private val videoInterceptor = WebViewResolver(
@@ -58,7 +57,7 @@ class AnimeVietSubProvider : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page == 1) request.data else "${request.data.trimEnd('/')}/trang-$page.html"
         val doc = app.get(url, headers = headers).document
-        val items = doc.select("ul.MovieList li.TPostMv").mapNotNull { parseCard(it) }
+        val items = doc.select("ul.MovieList li.TPostMv").mapNotNull { parseCard(el = it) }
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
 
@@ -97,7 +96,7 @@ class AnimeVietSubProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // 1. Dùng WebView lấy Session và Token quan trọng
+        // BƯỚC 1: Lấy trang xem phim và "bẫy" Token từ Cookie
         val webRes = app.get(data, headers = headers, interceptor = videoInterceptor)
         val pageHtml = webRes.text
         val cookies = webRes.cookies
@@ -111,39 +110,39 @@ class AnimeVietSubProvider : MainAPI() {
         )
 
         safeApiCall {
-            // Bước 1: Gọi PLAYER (Theo Log 1 & 2)
+            // BƯỚC 2: Gọi PLAYER (Log 2) - Lấy HTML chứa server
             val playerRes = app.post("$mainUrl/ajax/player", headers = ajaxHdr, cookies = cookies,
                 data = mapOf("episodeId" to episodeID, "backup" to "1")
             ).parsedSafe<PlayerResponse>()
 
-            // Bước 2: Gọi GET_EPISODE (Theo Log 4)
-            app.get("$mainUrl/ajax/get_episode?filmId=$filmId&episodeId=$episodeID", headers = ajaxHdr, cookies = cookies)
+            // BƯỚC 3: Gọi ALL (Log 5) - PHẢI CÓ TOKEN TRONG COOKIE
+            // Đây là bước "giải vây" để server nhả link video
+            if (episodeID.isNotEmpty()) {
+                delay(500) // Nghỉ một chút mô phỏng người dùng
+                app.post("$mainUrl/ajax/all", headers = ajaxHdr, cookies = cookies, 
+                    data = mapOf("EpisodeMess" to "1", "EpisodeID" to episodeID)
+                )
+            }
 
-            // Bước 3: Gọi ALL (Bước xác thực cuối cùng - Theo Log 5)
-            app.post("$mainUrl/ajax/all", headers = ajaxHdr, cookies = cookies, 
-                data = mapOf("EpisodeMess" to "1", "EpisodeID" to episodeID)
-            )
-
-            // Bước 4: Xử lý kết quả từ Player
+            // BƯỚC 4: Nếu là Server API, ta cần "vét" link m3u8 phát sinh
             if (playerRes?.success == 1 && !playerRes.html.isNullOrBlank()) {
                 val playerDoc = Jsoup.parse(playerRes.html!!)
-                playerDoc.select("a.btn3dsv").forEach { server ->
-                    val type = server.attr("data-play")
-                    val videoHref = server.attr("data-href")
-
-                    if (type == "embed") {
-                        loadExtractor(if (videoHref.startsWith("http")) videoHref else "$mainUrl/embed/$videoHref", data, subtitleCallback, callback)
-                    } else {
-                        // Kích hoạt WebView lần cuối để "vét" link m3u8 sau khi đã qua bước /ajax/all
-                        val finalRes = app.get(data, headers = headers, cookies = cookies, interceptor = videoInterceptor)
-                        if (finalRes.url != data && (finalRes.url.contains(".m3u8") || finalRes.url.contains(".mp4"))) {
-                            callback(newExtractorLink(name, "Server VIP", finalRes.url, 
-                                type = if (finalRes.url.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                            ) {
-                                this.quality = Qualities.P1080.value
-                                this.referer = data
-                            })
-                        }
+                val serverBtn = playerDoc.selectFirst("a.btn3dsv")
+                
+                if (serverBtn?.attr("data-play") == "embed") {
+                    val embedUrl = serverBtn.attr("data-href").let { if (it.startsWith("http")) it else "$mainUrl/embed/$it" }
+                    loadExtractor(embedUrl, data, subtitleCallback, callback)
+                } else {
+                    // Cú chốt: Gọi lại trang một lần nữa sau khi đã thực hiện /ajax/all
+                    // để WebView bắt được link m3u8 thực sự (vì server đã được "mở khóa")
+                    val finalLink = app.get(data, headers = headers, cookies = cookies, interceptor = videoInterceptor).url
+                    if (finalLink != data && (finalLink.contains(".m3u8") || finalLink.contains(".mp4"))) {
+                        callback(newExtractorLink(name, "Server VIP", finalLink, 
+                            type = if (finalLink.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                        ) {
+                            this.quality = Qualities.P1080.value
+                            this.referer = data
+                        })
                     }
                 }
             }

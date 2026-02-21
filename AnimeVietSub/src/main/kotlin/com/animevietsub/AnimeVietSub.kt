@@ -40,27 +40,11 @@ class AnimeVietSubProvider : MainAPI() {
     //
     // JS injection: retry gọi play() mỗi 300ms trong 15s
     // (JWPlayer cần thời gian init sau khi decode hash)
+    // Android WebView trong CloudStream có mediaPlaybackRequiresUserGesture=false
+    // → JWPlayer/HLS.js có thể autoplay → fetch chunks tự động
+    // Intercept chunk đầu tiên → extract storageId → build master.m3u8
     private val webViewInterceptor = WebViewResolver(
-        Regex("""storage\.googleapiscdn\.com/chunks/[a-f0-9]{12,}/"""),
-        // Inject JS tự động click play sau khi JWPlayer init xong
-        userScript = """
-(function(){
-    var n=0;
-    var t=setInterval(function(){
-        n++;
-        if(n>50){clearInterval(t);return;}
-        try{
-            if(window.jwplayer){
-                var p=window.jwplayer();
-                if(p&&typeof p.play==='function'){
-                    p.play(true);
-                    clearInterval(t);
-                }
-            }
-        }catch(e){}
-    },300);
-})();
-        """.trimIndent()
+        Regex("""storage\.googleapiscdn\.com/chunks/[a-f0-9]{12,}/""")
     )
 
     // ── Trang chủ ─────────────────────────────────────────────────────────────

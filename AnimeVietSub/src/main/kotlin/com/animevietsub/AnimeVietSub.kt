@@ -41,9 +41,7 @@ class AnimeVietSubProvider : MainAPI() {
         "$mainUrl/anime-moi/"                 to "Anime Mới Nhất",
         "$mainUrl/anime-bo/"                  to "Anime Bộ (TV/Series)",
         "$mainUrl/anime-le/"                  to "Anime Lẻ (Movie/OVA)",
-        "$mainUrl/hoat-hinh-trung-quoc/"      to "Hoạt Hình Trung Quốc",
-        "$mainUrl/danh-sach/list-dang-chieu/" to "Anime Đang Chiếu",
-        "$mainUrl/danh-sach/list-tron-bo/"    to "Anime Trọn Bộ"
+        "$mainUrl/hoat-hinh-trung-quoc/"      to "Hoạt Hình Trung Quốc"
     )
 
     private fun parseCard(el: Element): SearchResponse? {
@@ -51,10 +49,7 @@ class AnimeVietSubProvider : MainAPI() {
         val href = a.attr("href").let { if (it.startsWith("http")) it else "$mainUrl$it" }
         val title = el.selectFirst("h2.Title")?.text() ?: a.attr("title")
         val poster = el.selectFirst("img")?.attr("src")
-        
-        return newAnimeSearchResponse(title, href, TvType.Anime) {
-            this.posterUrl = poster
-        }
+        return newAnimeSearchResponse(title, href, TvType.Anime) { this.posterUrl = poster }
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -71,22 +66,24 @@ class AnimeVietSubProvider : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse {
         val doc = app.get(url, headers = headers).document
-        val watchUrl = doc.selectFirst("a.btn-watch")?.attr("href")?.let { if (it.startsWith("http")) it else "$mainUrl$it" } ?: url
-
+        val watchUrl = if (url.contains("xem-phim.html")) url 
+                      else doc.selectFirst("a.btn-watch")?.attr("href")?.let { if (it.startsWith("http")) it else "$mainUrl$it" } 
+                      ?: "$url/xem-phim.html"
+        
         val watchDoc = app.get(watchUrl, headers = headers).document
-        val title = watchDoc.selectFirst("h1.Title")?.text() ?: ""
-        val poster = watchDoc.selectFirst(".Image img")?.attr("src")
-
-        val episodes = watchDoc.select("ul.list-episode a").map { a ->
+        
+        // SỬA LỖI "SẮP CÓ": Dùng selector chính xác btn-episode
+        val episodes = watchDoc.select("a.btn-episode").mapNotNull { a ->
             val href = a.attr("href").let { if (it.startsWith("http")) it else "$mainUrl$it" }
+            if (href.contains("javascript")) return@mapNotNull null
             newEpisode(href) {
-                this.name = a.text().trim()
-                this.episode = Regex("""\d+""").find(this.name ?: "")?.value?.toIntOrNull()
+                this.name = "Tập " + a.text().trim()
+                this.episode = Regex("""\d+""").find(a.text())?.value?.toIntOrNull()
             }
-        }
+        }.distinctBy { it.data }.sortedBy { it.episode }
 
-        return newAnimeLoadResponse(title, url, TvType.Anime, true) {
-            this.posterUrl = poster
+        return newAnimeLoadResponse(watchDoc.selectFirst("h1.Title")?.text() ?: "Anime", url, TvType.Anime, true) {
+            this.posterUrl = watchDoc.selectFirst(".Image img")?.attr("src")
             addEpisodes(DubStatus.Subbed, episodes)
         }
     }
@@ -97,59 +94,44 @@ class AnimeVietSubProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val res = app.get(data, headers = headers)
-        val pageHtml = res.text
-        
+        val pageHtml = app.get(data, headers = headers).text
         val doc = Jsoup.parse(pageHtml)
-        val currentEpi = doc.selectFirst("a.episode-link.active") ?: doc.selectFirst("a.episode-link")
-        val encryptedLink = currentEpi?.attr("data-link") ?: ""
+        
+        // Lấy data-hash từ nút tập phim (Dựa trên thẻ bạn gửi)
+        val currentEpi = doc.selectFirst("a.btn-episode[href='$data']") 
+                        ?: doc.selectFirst("a.btn-episode.active") 
+                        ?: doc.selectFirst("a.btn-episode")
+        
+        val hash = currentEpi?.attr("data-hash") ?: ""
 
         val ajaxHdr = mapOf(
-            "User-Agent"       to UA,
-            "Accept"           to "application/json, text/javascript, */*; q=0.01",
+            "User-Agent" to UA,
+            "Accept" to "application/json, text/javascript, */*; q=0.01",
             "X-Requested-With" to "XMLHttpRequest",
-            "Content-Type"     to "application/x-www-form-urlencoded; charset=UTF-8",
-            "Origin"           to mainUrl,
-            "Referer"          to data
+            "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
+            "Referer" to data
         )
 
         safeApiCall {
-            val response = app.post(
-                "$mainUrl/ajax/player",
-                headers = ajaxHdr,
-                data = mapOf(
-                    "link" to encryptedLink,
-                    "play" to "api",
-                    "id"   to "0",
-                    "backuplinks" to "1"
-                )
+            // Gửi hash vào tham số link (theo đúng file.txt của bạn)
+            val response = app.post("$mainUrl/ajax/player", headers = ajaxHdr, 
+                data = mapOf("link" to hash, "play" to "api", "id" to "0", "backuplinks" to "1")
             ).parsed<PlayerResponse>()
 
             if (response.status == true && !response.html.isNullOrBlank()) {
                 val playerDoc = Jsoup.parseBodyFragment(response.html)
-                
                 playerDoc.select("a[data-href]").forEach { server ->
-                    val videoType = server.attr("data-play")
                     val videoHref = server.attr("data-href")
-
-                    if (videoType == "embed") {
-                        val finalEmbed = if (videoHref.startsWith("http")) videoHref else "$mainUrl/embed/$videoHref"
-                        loadExtractor(finalEmbed, data, subtitleCallback, callback)
+                    if (server.attr("data-play") == "embed") {
+                        loadExtractor(if (videoHref.startsWith("http")) videoHref else "$mainUrl/embed/$videoHref", data, subtitleCallback, callback)
                     } else {
+                        // Vét link thật qua WebView
                         val capturedUrl = app.get(data, headers = headers, interceptor = videoInterceptor).url
                         if (capturedUrl.contains(".m3u8") || capturedUrl.contains(".mp4")) {
-                            // FIXED: Đưa tham số vào đúng khối lambda { }
-                            callback(
-                                newExtractorLink(
-                                    source  = name,
-                                    name    = "$name Player",
-                                    url     = capturedUrl,
-                                    type    = if (capturedUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                                ) {
-                                    this.quality = Qualities.P1080.value
-                                    this.referer = data
-                                }
-                            )
+                            callback(newExtractorLink(name, "$name Player", capturedUrl, capturedUrl.contains(".m3u8")) {
+                                this.quality = Qualities.P1080.value
+                                this.referer = data
+                            })
                         }
                     }
                 }

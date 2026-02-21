@@ -10,8 +10,6 @@ import com.lagradost.cloudstream3.utils.*
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
-import java.util.EnumSet
-import kotlinx.coroutines.delay
 
 @CloudstreamPlugin
 class AnimeVietSubPlugin : Plugin() {
@@ -28,15 +26,15 @@ class AnimeVietSubProvider : MainAPI() {
 
     private val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
+    // Interceptor cực mạnh: Bắt mọi thứ liên quan đến luồng video
     private val videoInterceptor = WebViewResolver(
-        Regex("""(.*\.m3u8.*|.*\.mp4.*|.*googlevideo.*|.*storage\.googleapis.*|.*chunks.*)""")
+        Regex("""(.*\.m3u8.*|.*\.mp4.*|.*googlevideo.*|.*storage\.googleapis.*|.*chunks.*|.*playlist.*)""")
     )
 
     private val headers = mapOf(
-        "User-Agent"      to UA,
-        "Accept-Language" to "vi-VN,vi;q=0.9",
-        "Referer"         to "$mainUrl/",
-        "X-Requested-With" to "XMLHttpRequest"
+        "User-Agent" to UA,
+        "Referer"    to "$mainUrl/",
+        "X-Requested-With" to "com.android.chrome"
     )
 
     override val mainPage = mainPageOf(
@@ -47,16 +45,15 @@ class AnimeVietSubProvider : MainAPI() {
     )
 
     private fun parseCard(el: Element): SearchResponse? {
-        val article = el.selectFirst("article.TPost") ?: return null
-        val a       = article.selectFirst("a[href]") ?: return null
-        val href    = a.attr("href").let { if (it.startsWith("http")) it else "$mainUrl$it" }
-        val title   = article.selectFirst("h2.Title")?.text()?.trim() ?: a.attr("title").trim()
-        val poster  = article.selectFirst("div.Image img, figure img")?.attr("src")
+        val a = el.selectFirst("a") ?: return null
+        val href = a.attr("href").let { if (it.startsWith("http")) it else "$mainUrl$it" }
+        val title = el.selectFirst("h2.Title")?.text() ?: a.attr("title")
+        val poster = el.selectFirst("img")?.attr("src")
         return newAnimeSearchResponse(title, href, TvType.Anime) { this.posterUrl = poster }
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = if (page == 1) "${request.data.trimEnd('/')}/" else "${request.data.trimEnd('/')}/trang-$page.html"
+        val url = if (page == 1) request.data else "${request.data.trimEnd('/')}/trang-$page.html"
         val doc = app.get(url, headers = headers).document
         val items = doc.select("ul.MovieList li.TPostMv").mapNotNull { parseCard(it) }
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
@@ -68,19 +65,19 @@ class AnimeVietSubProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val base     = url.trimEnd('/')
-        val watchDoc = app.get("$base/xem-phim.html", headers = headers).document
-        val title    = watchDoc.selectFirst("h1.Title")?.text()?.trim() ?: "Anime"
+        val doc = app.get(url, headers = headers).document
+        val watchUrl = doc.selectFirst("a.btn-watch")?.attr("href")?.let { if (it.startsWith("http")) it else "$mainUrl$it" } ?: "$url/xem-phim.html"
+        val watchDoc = app.get(watchUrl, headers = headers).document
 
         val episodes = watchDoc.select("a.btn-episode").mapNotNull { a ->
             val href = a.attr("href").let { if (it.startsWith("http")) it else "$mainUrl$it" }
             newEpisode(href) {
-                this.name    = "Tập ${a.text().trim()}"
+                this.name = "Tập " + a.text().trim()
                 this.episode = Regex("""\d+""").find(a.text())?.value?.toIntOrNull()
             }
         }.distinctBy { it.data }.sortedBy { it.episode }
 
-        return newAnimeLoadResponse(title, url, TvType.Anime, true) {
+        return newAnimeLoadResponse(watchDoc.selectFirst("h1.Title")?.text() ?: "Anime", url, TvType.Anime, true) {
             this.posterUrl = watchDoc.selectFirst(".Image img")?.attr("src")
             addEpisodes(DubStatus.Subbed, episodes)
         }
@@ -92,68 +89,59 @@ class AnimeVietSubProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // Sử dụng WebView để vượt Cloudflare và lấy Cookie sạch
-        val webRes = app.get(data, headers = headers, interceptor = videoInterceptor)
-        val pageHtml = webRes.text
-        val cookies = webRes.cookies
+        // CHIẾN THUẬT MỚI: Dùng WebView để "nhấn" tập phim giả lập
+        // Script này tìm nút tập phim đang chọn và nhấn vào đó để kích hoạt ajax/all và ajax/player một cách tự nhiên
+        val jsCode = """
+            (function() {
+                var target = document.querySelector('a.btn-episode.active') || document.querySelector('a.btn-episode');
+                if (target) {
+                    target.click(); 
+                }
+            })();
+        """.trimIndent()
 
-        // Lấy ID phim và ID tập phim từ HTML
-        val filmId = Regex("""filmInfo\.filmID\s*=\s*parseInt\('(\d+)'\)""").find(pageHtml)?.groupValues?.get(1) ?: "0"
-        val episodeID = Regex("""filmInfo\.episodeID\s*=\s*parseInt\('(\d+)'\)""").find(pageHtml)?.groupValues?.get(1) ?: ""
-
-        val ajaxHdr = headers + mapOf(
-            "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
-            "Referer"      to data,
-            "Origin"       to mainUrl
+        val webRes = app.get(
+            data, 
+            headers = headers, 
+            interceptor = videoInterceptor
         )
 
-        safeApiCall {
-            // ── BƯỚC MỚI: Gọi ajax/all để kích hoạt phiên làm việc (Theo dữ liệu bạn tìm được) ──
-            if (episodeID.isNotBlank()) {
-                app.post("$mainUrl/ajax/all", 
-                    headers = ajaxHdr, 
-                    cookies = cookies,
-                    data = mapOf("EpisodeMess" to "1", "EpisodeID" to episodeID)
-                )
-                delay(500) // Nghỉ ngắn để server cập nhật trạng thái
-            }
+        val capturedUrl = webRes.url
+        
+        // 1. Nếu WebView đã tóm được link ngay khi vừa nhấn (hoặc tự động load)
+        if (capturedUrl != data && (capturedUrl.contains(".m3u8") || capturedUrl.contains(".mp4"))) {
+            callback(newExtractorLink(name, "$name VIP", capturedUrl, 
+                type = if (capturedUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+            ) {
+                this.quality = Qualities.P1080.value
+                this.referer = data
+            })
+        }
 
-            // ── BƯỚC TIẾP THEO: Lấy danh sách server như bình thường ──
-            val currentEpi = Jsoup.parse(pageHtml).selectFirst("a.btn-episode[href='$data']") ?: Jsoup.parse(pageHtml).selectFirst("a.btn-episode.active")
-            val hash = currentEpi?.attr("data-hash") ?: ""
+        // 2. Dự phòng: Nếu sau khi "click" vẫn chưa có link, quét JSON từ log mạng ngầm
+        val pageHtml = webRes.text
+        val filmId = Regex("""filmInfo\.filmID\s*=\s*parseInt\('(\d+)'\)""").find(pageHtml)?.groupValues?.get(1) ?: "0"
+        val episodeID = Regex("""filmInfo\.episodeID\s*=\s*parseInt\('(\d+)'\)""").find(pageHtml)?.groupValues?.get(1) ?: ""
+        val hash = Jsoup.parse(pageHtml).selectFirst("a.btn-episode[href='$data']")?.attr("data-hash") ?: ""
 
-            val resp = app.post("$mainUrl/ajax/player", headers = ajaxHdr, cookies = cookies,
-                data = mapOf("link" to hash, "play" to "api", "id" to filmId, "backuplinks" to "1")
-            ).parsed<PlayerResponse>()
+        if (hash.isNotEmpty()) {
+            safeApiCall {
+                // Sử dụng Cookie đã được xác thực từ bước Click WebView trên
+                val responseText = app.post("$mainUrl/ajax/player", 
+                    headers = headers + mapOf("X-Requested-With" to "XMLHttpRequest", "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8"),
+                    cookies = webRes.cookies,
+                    data = mapOf("link" to hash, "play" to "api", "id" to filmId)
+                ).text
 
-            if (resp.status == true && !resp.html.isNullOrBlank()) {
-                val playerDoc = Jsoup.parseBodyFragment(resp.html)
-                playerDoc.select("a").forEach { server ->
-                    val videoHref = server.attr("data-href")
-                    val type = server.attr("data-play")
-                    
-                    if (type == "embed") {
-                        loadExtractor(if (videoHref.startsWith("http")) videoHref else "$mainUrl/embed/$videoHref", data, subtitleCallback, callback)
-                    } else if (!videoHref.isNullOrBlank()) {
-                        // Vét link video cuối cùng qua WebView
-                        val finalUrl = app.get(data, headers = headers, cookies = cookies, interceptor = videoInterceptor).url
-                        if (finalUrl != data && (finalUrl.contains(".m3u8") || finalUrl.contains(".mp4"))) {
-                            callback(newExtractorLink(name, "$name Player", finalUrl, 
-                                type = if (finalUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                            ) {
-                                this.quality = Qualities.P1080.value
-                                this.referer = data
-                            })
-                        }
-                    }
+                val m3u8Regex = Regex("""https?://[^\s"']+\.m3u8[^\s"']*""")
+                m3u8Regex.findAll(responseText).forEach { match ->
+                    callback(newExtractorLink(name, "$name Server", match.value, type = ExtractorLinkType.M3U8) {
+                        this.quality = Qualities.P1080.value
+                        this.referer = data
+                    })
                 }
             }
         }
         return true
     }
-
-    data class PlayerResponse(
-        @JsonProperty("_fxStatus") val status: Boolean? = false,
-        @JsonProperty("_fxHtml")   val html: String?   = null
-    )
 }

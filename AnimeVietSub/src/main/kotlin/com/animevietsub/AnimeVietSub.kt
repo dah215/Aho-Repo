@@ -72,7 +72,6 @@ class AnimeVietSubProvider : MainAPI() {
         
         val watchDoc = app.get(watchUrl, headers = headers).document
         
-        // SỬA LỖI "SẮP CÓ": Dùng selector chính xác btn-episode
         val episodes = watchDoc.select("a.btn-episode").mapNotNull { a ->
             val href = a.attr("href").let { if (it.startsWith("http")) it else "$mainUrl$it" }
             if (href.contains("javascript")) return@mapNotNull null
@@ -97,7 +96,7 @@ class AnimeVietSubProvider : MainAPI() {
         val pageHtml = app.get(data, headers = headers).text
         val doc = Jsoup.parse(pageHtml)
         
-        // Lấy data-hash từ nút tập phim (Dựa trên thẻ bạn gửi)
+        // Lấy data-hash từ nút tập phim
         val currentEpi = doc.selectFirst("a.btn-episode[href='$data']") 
                         ?: doc.selectFirst("a.btn-episode.active") 
                         ?: doc.selectFirst("a.btn-episode")
@@ -113,7 +112,6 @@ class AnimeVietSubProvider : MainAPI() {
         )
 
         safeApiCall {
-            // Gửi hash vào tham số link (theo đúng file.txt của bạn)
             val response = app.post("$mainUrl/ajax/player", headers = ajaxHdr, 
                 data = mapOf("link" to hash, "play" to "api", "id" to "0", "backuplinks" to "1")
             ).parsed<PlayerResponse>()
@@ -127,8 +125,15 @@ class AnimeVietSubProvider : MainAPI() {
                     } else {
                         // Vét link thật qua WebView
                         val capturedUrl = app.get(data, headers = headers, interceptor = videoInterceptor).url
-                        if (capturedUrl.contains(".m3u8") || capturedUrl.contains(".mp4")) {
-                            callback(newExtractorLink(name, "$name Player", capturedUrl, capturedUrl.contains(".m3u8")) {
+                        if (capturedUrl.contains(".m3u8") || capturedUrl.contains(".mp4") || capturedUrl.contains("googlevideo")) {
+                            
+                            // FIX LỖI TYPE MISMATCH: Sử dụng tham số đặt tên 'type' với ExtractorLinkType
+                            callback(newExtractorLink(
+                                source = name,
+                                name   = "$name Player",
+                                url    = capturedUrl,
+                                type   = if (capturedUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                            ) {
                                 this.quality = Qualities.P1080.value
                                 this.referer = data
                             })

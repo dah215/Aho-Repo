@@ -10,7 +10,6 @@ import com.lagradost.cloudstream3.utils.*
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
-import kotlinx.coroutines.delay
 
 @CloudstreamPlugin
 class AnimeVietSubPlugin : Plugin() {
@@ -27,8 +26,9 @@ class AnimeVietSubProvider : MainAPI() {
 
     private val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
 
+    // Chỉ dùng WebView khi thực sự cần bắt link m3u8 ẩn
     private val videoInterceptor = WebViewResolver(
-        Regex("""(.*\.m3u8.*|.*\.mp4.*|.*googlevideo.*|.*storage\.googleapis.*|.*chunks.*)""")
+        Regex("""(.*\.m3u8.*|.*\.mp4.*|.*googlevideo.*|.*chunks.*)""")
     )
 
     private val headers = mapOf(
@@ -54,6 +54,7 @@ class AnimeVietSubProvider : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page == 1) request.data else "${request.data.trimEnd('/')}/trang-$page.html"
+        // Sử dụng app.get thông thường để tránh treo khi load trang chủ
         val doc = app.get(url, headers = headers).document
         val items = doc.select("ul.MovieList li.TPostMv").mapNotNull { parseCard(it) }
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
@@ -65,30 +66,25 @@ class AnimeVietSubProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        // Vượt Cloudflare ngay từ bước Load để tránh lỗi "Sắp có"
-        val res = app.get(url, headers = headers, interceptor = videoInterceptor)
-        var doc = Jsoup.parse(res.text)
+        // Bước 1: Lấy trang chi tiết
+        val res = app.get(url, headers = headers)
+        val doc = res.document
         
-        var watchUrl = doc.selectFirst("a.btn-watch")?.attr("href")?.let { 
+        // Bước 2: Tìm link xem phim
+        val watchUrl = doc.selectFirst("a.btn-watch")?.attr("href")?.let { 
             if (it.startsWith("http")) it else "$mainUrl$it" 
         } ?: "${url.trimEnd('/')}/xem-phim.html"
         
-        var watchRes = app.get(watchUrl, headers = headers, cookies = res.cookies)
-        var watchDoc = Jsoup.parse(watchRes.text)
+        // Bước 3: Lấy danh sách tập phim bằng request thông thường (nhanh, không treo)
+        val watchRes = app.get(watchUrl, headers = headers, cookies = res.cookies)
+        val watchDoc = watchRes.document
 
-        // Nếu vẫn không thấy tập phim, đợi 1 giây và thử tải lại trang xem phim (tránh Cloudflare kẹt)
-        if (watchDoc.select("a.btn-episode").isEmpty()) {
-            delay(1500)
-            watchRes = app.get(watchUrl, headers = headers, cookies = res.cookies)
-            watchDoc = Jsoup.parse(watchRes.text)
-        }
-
-        val episodes = watchDoc.select("a.btn-episode, a.episode-link").mapNotNull { a ->
+        val episodes = watchDoc.select("a.btn-episode").mapNotNull { a ->
             val href = a.attr("href").let { if (it.startsWith("http")) it else "$mainUrl$it" }
             val name = a.text().trim()
             if (href.contains("javascript") || name.isEmpty()) return@mapNotNull null
             newEpisode(href) {
-                this.name = if (name.startsWith("Tập")) name else "Tập $name"
+                this.name = "Tập $name"
                 this.episode = Regex("""\d+""").find(name)?.value?.toIntOrNull()
             }
         }.distinctBy { it.data }.sortedBy { it.episode }
@@ -105,14 +101,13 @@ class AnimeVietSubProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        // Chỉ dùng WebView ở đây để giải quyết Cloudflare 1 lần duy nhất khi chọn tập
         val webRes = app.get(data, headers = headers, interceptor = videoInterceptor)
         val pageHtml = webRes.text
-        val cookies = webRes.cookies
-
+        
         val filmId = Regex("""filmInfo\.filmID\s*=\s*parseInt\('(\d+)'\)""").find(pageHtml)?.groupValues?.get(1) ?: "0"
         val episodeID = Regex("""filmInfo\.episodeID\s*=\s*parseInt\('(\d+)'\)""").find(pageHtml)?.groupValues?.get(1) ?: ""
-        val hash = Jsoup.parse(pageHtml).selectFirst("a.btn-episode[href='$data']")?.attr("data-hash") 
-                  ?: Jsoup.parse(pageHtml).selectFirst("a.btn-episode.active")?.attr("data-hash") ?: ""
+        val hash = Jsoup.parse(pageHtml).selectFirst("a.btn-episode[href='$data']")?.attr("data-hash") ?: ""
 
         val ajaxHdr = mapOf(
             "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
@@ -122,19 +117,20 @@ class AnimeVietSubProvider : MainAPI() {
         )
 
         safeApiCall {
-            // 1. Gọi ajax/player TRƯỚC
-            val apiRes = app.post("$mainUrl/ajax/player", headers = ajaxHdr, cookies = cookies,
+            // 1. AJAX PLAYER TRƯỚC
+            val playerRes = app.post("$mainUrl/ajax/player", headers = ajaxHdr, cookies = webRes.cookies,
                 data = mapOf("link" to hash, "play" to "api", "id" to filmId, "backuplinks" to "1")
             ).text
 
-            // 2. Gọi ajax/all SAU CÙNG (Như bạn đã chỉ ra)
+            // 2. AJAX ALL SAU (Đúng trình tự bạn cung cấp)
             if (episodeID.isNotEmpty()) {
-                app.post("$mainUrl/ajax/all", headers = ajaxHdr, cookies = cookies, 
+                app.post("$mainUrl/ajax/all", headers = ajaxHdr, cookies = webRes.cookies, 
                     data = mapOf("EpisodeMess" to "1", "EpisodeID" to episodeID))
             }
 
-            if (apiRes.contains("\"_fxStatus\":true")) {
-                val fxHtml = Regex("""\"_fxHtml\":\"(.*?)\"""").find(apiRes)?.groupValues?.get(1)?.replace("\\/", "/")
+            // Phân tích link từ kết quả player
+            if (playerRes.contains("\"_fxStatus\":true")) {
+                val fxHtml = Regex("""\"_fxHtml\":\"(.*?)\"""").find(playerRes)?.groupValues?.get(1)?.replace("\\/", "/")
                 if (!fxHtml.isNullOrBlank()) {
                     val playerDoc = Jsoup.parse(fxHtml)
                     playerDoc.select("a").forEach { server ->
@@ -142,8 +138,8 @@ class AnimeVietSubProvider : MainAPI() {
                         if (server.attr("data-play") == "embed") {
                             loadExtractor(if (videoHref.startsWith("http")) videoHref else "$mainUrl/embed/$videoHref", data, subtitleCallback, callback)
                         } else if (videoHref.isNotEmpty()) {
-                            // Dùng WebView quét link cuối cùng
-                            val finalUrl = app.get(data, headers = headers, cookies = cookies, interceptor = videoInterceptor).url
+                            // Tóm link cuối từ log mạng
+                            val finalUrl = app.get(data, headers = headers, cookies = webRes.cookies, interceptor = videoInterceptor).url
                             if (finalUrl != data && (finalUrl.contains(".m3u8") || finalUrl.contains(".mp4"))) {
                                 callback(newExtractorLink(name, "Server VIP", finalUrl, 
                                     type = if (finalUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO

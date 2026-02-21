@@ -138,16 +138,17 @@ class AnimeVietSubProvider : MainAPI() {
                     } else {
                         val capturedUrl = app.get(data, headers = headers, interceptor = videoInterceptor).url
                         if (capturedUrl.contains(".m3u8") || capturedUrl.contains(".mp4")) {
-                            // ĐÃ SỬA: Sử dụng newExtractorLink để tránh lỗi Deprecated
+                            // FIXED: Đưa tham số vào đúng khối lambda { }
                             callback(
                                 newExtractorLink(
                                     source  = name,
                                     name    = "$name Player",
                                     url     = capturedUrl,
-                                    referer = data,
-                                    quality = Qualities.P1080.value,
                                     type    = if (capturedUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                                )
+                                ) {
+                                    this.quality = Qualities.P1080.value
+                                    this.referer = data
+                                }
                             )
                         }
                     }

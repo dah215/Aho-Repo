@@ -32,13 +32,8 @@ class AnimeVietSubProvider : MainAPI() {
         "AppleWebKit/537.36 (KHTML, like Gecko) " +
         "Chrome/122.0.0.0 Safari/537.36"
 
-    // Bypass Cloudflare trên tất cả request HTML
-    private val cfInterceptor = WebViewResolver(
-        Regex("""animevietsub\.be""")
-    )
-
-    // Intercept request đến storage.googleapiscdn.com (nơi chứa HLS chunks)
-    // Blob m3u8 do JS tạo ra client-side, chunks fetch từ domain này
+    // Chỉ dùng WebViewResolver để intercept video stream (storage.googleapiscdn.com)
+    // KHÔNG dùng WebViewResolver cho HTML page loads — nó sẽ trả về sai content
     private val videoInterceptor = WebViewResolver(
         Regex("""storage\.googleapiscdn\.com|\.m3u8""")
     )
@@ -142,7 +137,7 @@ class AnimeVietSubProvider : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url  = buildPageUrl(request.data, page)
-        val doc  = app.get(url, headers = commonHeaders, interceptor = cfInterceptor).document
+        val doc  = app.get(url, headers = commonHeaders).document
 
         // ul.MovieList li.TPostMv
         val items = doc.select("ul.MovieList li.TPostMv").mapNotNull { parseCard(it) }
@@ -154,7 +149,7 @@ class AnimeVietSubProvider : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         val encoded = URLEncoder.encode(query, "UTF-8")
         val url     = "$mainUrl/tim-kiem/$encoded/"
-        val doc     = app.get(url, headers = commonHeaders, interceptor = cfInterceptor).document
+        val doc     = app.get(url, headers = commonHeaders).document
         return doc.select("ul.MovieList li.TPostMv").mapNotNull { parseCard(it) }
     }
 
@@ -166,8 +161,7 @@ class AnimeVietSubProvider : MainAPI() {
         // 1. Load trang detail
         val detailDoc = app.get(
             "$detailUrl/",
-            headers = commonHeaders,
-            interceptor = cfInterceptor
+            headers = commonHeaders
         ).document
 
         val title    = detailDoc.selectFirst("h1.Title")?.text()?.trim() ?: ""
@@ -199,8 +193,7 @@ class AnimeVietSubProvider : MainAPI() {
         val watchDoc = try {
             app.get(
                 "$detailUrl/xem-phim.html",
-                headers = commonHeaders,
-                interceptor = cfInterceptor
+                headers = commonHeaders
             ).document
         } catch (e: Exception) {
             detailDoc // fallback về trang detail nếu xem-phim.html không tải được
@@ -284,7 +277,7 @@ class AnimeVietSubProvider : MainAPI() {
     ): Boolean {
 
         // Load trang tập để lấy episodeID
-        val doc       = app.get(data, headers = commonHeaders, interceptor = cfInterceptor).document
+        val doc       = app.get(data, headers = commonHeaders).document
         val episodeID = Regex("""filmInfo\.episodeID\s*=\s*parseInt\('(\d+)'\)""")
             .find(doc.html())?.groupValues?.get(1) ?: ""
 
@@ -301,8 +294,7 @@ class AnimeVietSubProvider : MainAPI() {
                 val playerRes = app.post(
                     "$mainUrl/ajax/player",
                     headers = ajaxHeaders,
-                    data    = mapOf("episodeId" to episodeID, "backup" to "1"),
-                    interceptor = cfInterceptor
+                    data    = mapOf("episodeId" to episodeID, "backup" to "1")
                 ).parsed<PlayerResponse>()
 
                 if (playerRes.success == 1 && !playerRes.html.isNullOrBlank()) {

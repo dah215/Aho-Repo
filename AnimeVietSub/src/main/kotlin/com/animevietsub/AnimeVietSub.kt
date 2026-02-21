@@ -25,13 +25,10 @@ class AnimeVietSubProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA)
 
-    private val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-                     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    private val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
 
-    // Chỉ dùng WebViewResolver cho video (intercept chunk HLS)
-    // KHÔNG dùng cho HTML request bình thường
     private val videoInterceptor = WebViewResolver(
-        Regex("""storage\.googleapiscdn\.com/chunks/""")
+        Regex("""(.*\.m3u8.*|.*\.mp4.*|.*storage\.googleapiscdn\.com.*)""")
     )
 
     private val headers = mapOf(
@@ -40,7 +37,6 @@ class AnimeVietSubProvider : MainAPI() {
         "Referer"         to "$mainUrl/"
     )
 
-    // ── Trang chủ ─────────────────────────────────────────────────────────────
     override val mainPage = mainPageOf(
         "$mainUrl/anime-moi/"                 to "Anime Mới Nhất",
         "$mainUrl/anime-bo/"                  to "Anime Bộ (TV/Series)",
@@ -99,8 +95,6 @@ class AnimeVietSubProvider : MainAPI() {
         return doc.select("ul.MovieList li.TPostMv").mapNotNull { parseCard(it) }
     }
 
-    // ── Chi tiết ─────────────────────────────────────────────────────────────
-    // Chỉ 1 request: xem-phim.html (có đủ metadata + toàn bộ danh sách tập)
     override suspend fun load(url: String): LoadResponse {
         val base     = url.trimEnd('/')
         val watchDoc = app.get("$base/xem-phim.html", headers = headers).document
@@ -128,10 +122,7 @@ class AnimeVietSubProvider : MainAPI() {
         val isMovie = episodes.size <= 1
 
         return if (isMovie) {
-            newMovieLoadResponse(
-                title, url, TvType.AnimeMovie,
-                episodes.firstOrNull()?.data ?: "$base/xem-phim.html"
-            ) {
+            newMovieLoadResponse(title, url, TvType.AnimeMovie, episodes.firstOrNull()?.data ?: "$base/xem-phim.html") {
                 this.posterUrl = poster
                 this.plot      = plot
                 this.tags      = tags
@@ -148,17 +139,6 @@ class AnimeVietSubProvider : MainAPI() {
         }
     }
 
-    // ── Load video ────────────────────────────────────────────────────────────
-    //
-    // Network flow (đã xác nhận):
-    //   1. POST /ajax/player {episodeId, backup=1}
-    //      → JSON html chứa: data-play="api" (server DU, hash)
-    //                        data-play="embed" (server HDX, key)
-    //
-    //   2. Server EMBED → loadExtractor trực tiếp
-    //
-    //   3. Server API (DU) → hash cần JS decode (pako) → chunks storage.googleapiscdn.com
-    //      → WebViewResolver intercept chunk URL → extract storageId → master.m3u8
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -169,15 +149,15 @@ class AnimeVietSubProvider : MainAPI() {
         val episodeID = Regex("""filmInfo\.episodeID\s*=\s*parseInt\('(\d+)'\)""")
             .find(pageHtml)?.groupValues?.get(1) ?: ""
 
-        val ajaxHdr = headers + mapOf(
+        val ajaxHdr = mapOf(
+            "User-Agent"       to UA,
+            "Accept"           to "application/json, text/javascript, */*; q=0.01",
             "X-Requested-With" to "XMLHttpRequest",
             "Content-Type"     to "application/x-www-form-urlencoded; charset=UTF-8",
             "Origin"           to mainUrl,
             "Referer"          to data
         )
 
-        // ── Bước 1: Lấy danh sách server ─────────────────────────────────────
-        var hasApiServer = false
         if (episodeID.isNotBlank()) {
             safeApiCall {
                 val resp = app.post(
@@ -187,75 +167,43 @@ class AnimeVietSubProvider : MainAPI() {
                 ).parsed<PlayerResponse>()
 
                 if (resp.success == 1 && !resp.html.isNullOrBlank()) {
-                    Jsoup.parseBodyFragment(resp.html).select("a.btn3dsv").forEach { btn ->
+                    val doc = Jsoup.parseBodyFragment(resp.html)
+                    doc.select("a.btn3dsv").forEach { btn ->
                         val type = btn.attr("data-play")
                         val href = btn.attr("data-href").trim()
                         if (href.isBlank()) return@forEach
 
                         when (type) {
-                            "api"   -> hasApiServer = true
-                            "embed" -> safeApiCall {
-                                val embedUrl = if (href.startsWith("http")) href
-                                              else "$mainUrl/embed/$href"
+                            "embed" -> {
+                                val embedUrl = if (href.startsWith("http")) href else "$mainUrl/embed/$href"
                                 loadExtractor(embedUrl, data, subtitleCallback, callback)
+                            }
+                            "api" -> {
+                                val chunkUrl = app.get(
+                                    data,
+                                    headers     = headers,
+                                    interceptor = videoInterceptor
+                                ).url
+
+                                if (chunkUrl.contains(".m3u8") || chunkUrl.contains(".mp4")) {
+                                    callback(
+                                        newExtractorLink(
+                                            source = name,
+                                            name   = "$name - Player",
+                                            url    = chunkUrl,
+                                            type   = if (chunkUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                                        ) {
+                                            this.quality = Qualities.P1080.value
+                                            this.headers = mapOf("Referer" to data, "User-Agent" to UA)
+                                        }
+                                    )
+                                }
                             }
                         }
                     }
                 }
             }
         }
-
-        // ── Bước 2: Server DU (api) → WebView intercept HLS chunk ────────────
-        // WebView mở trang → JS chạy AnimeVsub(hash) → player fetch chunk đầu tiên
-        // WebViewResolver bắt URL chunk → extract storageId → build master.m3u8
-        if (hasApiServer || episodeID.isNotBlank()) {
-            safeApiCall {
-                val chunkUrl = app.get(
-                    data,
-                    headers     = headers,
-                    interceptor = videoInterceptor
-                ).url
-
-                val storageId = Regex("""storage\.googleapiscdn\.com/chunks/([a-f0-9]+)/""")
-                    .find(chunkUrl)?.groupValues?.get(1)
-
-                if (!storageId.isNullOrBlank()) {
-                    // Build master playlist URL từ storageId
-                    val m3u8 = "https://storage.googleapiscdn.com/chunks/$storageId/original/master.m3u8"
-                    callback(
-                        newExtractorLink(
-                            source = name,
-                            name   = "$name - DU",
-                            url    = m3u8,
-                            type   = ExtractorLinkType.M3U8
-                        ) {
-                            this.quality = Qualities.P1080.value
-                            this.headers = mapOf(
-                                "Referer"    to data,
-                                "User-Agent" to UA,
-                                "Origin"     to mainUrl
-                            )
-                        }
-                    )
-                } else if (chunkUrl.isNotBlank() && chunkUrl != data
-                           && !chunkUrl.startsWith("blob:")
-                           && (chunkUrl.contains(".m3u8") || chunkUrl.contains(".mp4"))) {
-                    callback(
-                        newExtractorLink(
-                            source = name,
-                            name   = "$name - Direct",
-                            url    = chunkUrl,
-                            type   = if (chunkUrl.contains(".m3u8")) ExtractorLinkType.M3U8
-                                     else ExtractorLinkType.VIDEO
-                        ) {
-                            this.quality = Qualities.P1080.value
-                            this.headers = mapOf("Referer" to data, "User-Agent" to UA)
-                        }
-                    )
-                }
-            }
-        }
-
         return true
     }
 

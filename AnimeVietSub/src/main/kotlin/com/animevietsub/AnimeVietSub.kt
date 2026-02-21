@@ -268,20 +268,14 @@ class AnimeVietSubProvider : MainAPI() {
     }
 
     // ── Load link video ───────────────────────────────────────────────────────
-    // Flow thực tế (từ network capture):
+    // Flow xác nhận từ network capture:
     //
-    // Bước 1: POST /ajax/player
-    //   Body: episodeId={episodeId}&backup=1
-    //   → JSON: {"success":1,"html":"<a data-play='api'  data-href='HASH'>DU</a>
-    //                               <a data-play='embed' data-href='KEY'>HDX</a>"}
+    // 1. POST /ajax/player → JSON {html: "<a data-play='api|embed' data-href='...'/>"}
+    //    - data-play="api"   → hash → WebView decode (avs.watch.js + pako)
+    //    - data-play="embed" → embed URL → loadExtractor
     //
-    // Bước 2a (server api): POST /ajax/all
-    //   Body: EpisodeMess=1&EpisodeID={episodeId}
-    //   → video URL (m3u8/mp4)
-    //
-    // Bước 2b (server embed): loadExtractor với embed URL
-    //
-    // Bước 3 (fallback): WebViewResolver intercept storage.googleapiscdn.com
+    // 2. Fallback: WebViewResolver intercept storage.googleapiscdn.com
+    //    (JS tự chạy AnimeVsub(hash) → fetch m3u8 → WebView intercept)
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -289,12 +283,10 @@ class AnimeVietSubProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
 
-        // Load trang tập để lấy episodeID từ script
-        val doc  = app.get(data, headers = commonHeaders, interceptor = cfInterceptor).document
-        val html = doc.html()
-
+        // Load trang tập để lấy episodeID
+        val doc       = app.get(data, headers = commonHeaders, interceptor = cfInterceptor).document
         val episodeID = Regex("""filmInfo\.episodeID\s*=\s*parseInt\('(\d+)'\)""")
-            .find(html)?.groupValues?.get(1) ?: ""
+            .find(doc.html())?.groupValues?.get(1) ?: ""
 
         val ajaxHeaders = commonHeaders + mapOf(
             "X-Requested-With" to "XMLHttpRequest",
@@ -303,7 +295,7 @@ class AnimeVietSubProvider : MainAPI() {
             "Referer"          to data
         )
 
-        // ── Bước 1: POST /ajax/player → lấy danh sách server ─────────────────
+        // ── Bước 1: /ajax/player → danh sách server ──────────────────────────
         if (episodeID.isNotBlank()) {
             safeApiCall {
                 val playerRes = app.post(
@@ -319,62 +311,24 @@ class AnimeVietSubProvider : MainAPI() {
                     serverDoc.select("a.btn3dsv").forEach { btn ->
                         val playType = btn.attr("data-play")
                         val href     = btn.attr("data-href").trim()
-                        val label    = btn.text().trim().ifBlank { "Server" }
 
-                        when (playType) {
-                            // ── Server API (DU): hash → /ajax/all → video URL ──
-                            "api" -> safeApiCall {
-                                val ajaxRes = app.post(
-                                    "$mainUrl/ajax/all",
-                                    headers = ajaxHeaders,
-                                    data    = mapOf(
-                                        "EpisodeMess" to "1",
-                                        "EpisodeID"   to episodeID
-                                    ),
-                                    interceptor = cfInterceptor
-                                ).text
-
-                                val videoUrl =
-                                    Regex("""https?://[^\s"'<>]+\.m3u8[^\s"'<>]*""").find(ajaxRes)?.value
-                                    ?: Regex("""https?://[^\s"'<>]+\.mp4[^\s"'<>]*""").find(ajaxRes)?.value
-                                    ?: Regex(""""(?:file|src|url|link|source)"\s*:\s*"([^"]+)"""")
-                                        .find(ajaxRes)?.groupValues?.get(1)?.replace("\\", "")
-
-                                if (!videoUrl.isNullOrBlank()) {
-                                    val isM3u8 = videoUrl.contains(".m3u8")
-                                    callback(
-                                        newExtractorLink(
-                                            source = name,
-                                            name   = "$name - $label",
-                                            url    = videoUrl,
-                                            type   = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                                        ) {
-                                            this.quality = Qualities.P1080.value
-                                            this.headers = mapOf(
-                                                "Referer"    to data,
-                                                "User-Agent" to USER_AGENT
-                                            )
-                                        }
-                                    )
-                                }
-                            }
-
-                            // ── Server embed (HDX...): dùng loadExtractor ──────
-                            "embed" -> safeApiCall {
-                                // href có thể là URL đầy đủ hoặc short key
+                        // Server embed (HDX, ADS...): loadExtractor trực tiếp
+                        if (playType == "embed" && href.isNotBlank()) {
+                            safeApiCall {
                                 val embedUrl = if (href.startsWith("http")) href
                                               else "$mainUrl/player/$href"
                                 loadExtractor(embedUrl, data, subtitleCallback, callback)
                             }
                         }
+                        // Server api (DU): hash cần JS decode → để WebViewResolver xử lý bên dưới
                     }
                 }
             }
         }
 
-        // ── Bước 3: WebViewResolver fallback ─────────────────────────────────
-        // Dùng khi cả 2 bước trên không ra video URL
-        // Intercept request đến storage.googleapiscdn.com (HLS chunks)
+        // ── Bước 2: WebViewResolver – JS chạy AnimeVsub(hash) → intercept m3u8
+        // JS trong avs.watch.js decode hash bằng pako, fetch m3u8 từ
+        // storage.googleapiscdn.com → WebView intercept được request này
         safeApiCall {
             val resolvedUrl = app.get(
                 data,
@@ -382,14 +336,19 @@ class AnimeVietSubProvider : MainAPI() {
                 interceptor = videoInterceptor
             ).url
 
-            if (resolvedUrl != data && resolvedUrl.isNotBlank()
-                && !resolvedUrl.startsWith("blob:")) {
+            if (resolvedUrl.isNotBlank()
+                && resolvedUrl != data
+                && !resolvedUrl.startsWith("blob:")
+                && (resolvedUrl.contains("storage.googleapiscdn.com")
+                    || resolvedUrl.contains(".m3u8")
+                    || resolvedUrl.contains(".mp4"))) {
+
                 val isM3u8 = resolvedUrl.contains(".m3u8")
                     || resolvedUrl.contains("storage.googleapiscdn.com")
                 callback(
                     newExtractorLink(
                         source = name,
-                        name   = "$name - WebView",
+                        name   = "$name - DU",
                         url    = resolvedUrl,
                         type   = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                     ) {

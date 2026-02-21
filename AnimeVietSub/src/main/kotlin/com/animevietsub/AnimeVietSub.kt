@@ -1,13 +1,11 @@
 package com.animevietsub
 
-import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.mvvm.safeApiCall
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
-import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
 import java.util.EnumSet
@@ -35,11 +33,34 @@ class AnimeVietSubProvider : MainAPI() {
     )
 
     // ── Đã xác nhận từ console log:
-    // JWPlayer load blob m3u8 → HLS.js fetch chunks từ storage.googleapiscdn.com
-    // Pattern chunk: chunks/{24-hex-storageId}/original/{encodedKey}/videoN.html
-    // Intercept chunk đầu tiên → extract storageId → build master.m3u8
+    // JWPlayer KHÔNG autoplay → phải inject JS gọi jwplayer().play()
+    // Sau khi play → HLS.js fetch chunks từ storage.googleapiscdn.com
+    // storageId = 24 hex chars (ví dụ: 6999e84f896b718999906bd7)
+    // Intercept chunk đầu → build master.m3u8 URL
+    //
+    // JS injection: retry gọi play() mỗi 300ms trong 15s
+    // (JWPlayer cần thời gian init sau khi decode hash)
     private val webViewInterceptor = WebViewResolver(
-        Regex("""storage\.googleapiscdn\.com/chunks/([a-f0-9]{24})/""")
+        Regex("""storage\.googleapiscdn\.com/chunks/[a-f0-9]{12,}/"""),
+        // Inject JS tự động click play sau khi JWPlayer init xong
+        userScript = """
+(function(){
+    var n=0;
+    var t=setInterval(function(){
+        n++;
+        if(n>50){clearInterval(t);return;}
+        try{
+            if(window.jwplayer){
+                var p=window.jwplayer();
+                if(p&&typeof p.play==='function'){
+                    p.play(true);
+                    clearInterval(t);
+                }
+            }
+        }catch(e){}
+    },300);
+})();
+        """.trimIndent()
     )
 
     // ── Trang chủ ─────────────────────────────────────────────────────────────
@@ -139,51 +160,52 @@ class AnimeVietSubProvider : MainAPI() {
 
     // ── Load video ────────────────────────────────────────────────────────────
     //
-    // Đã xác nhận từ console log thực tế:
+    // Root cause đã xác nhận từ console log thực tế:
     //
-    //   /ajax/all → trả về empty (PromiseResult: undefined) → DEAD END
-    //   ping.iamcdn.net → 502 Bad Gateway → DEAD END
+    //   /ajax/all → PromiseResult: undefined (empty response) → DEAD
+    //   ping.iamcdn.net → 502 Bad Gateway → DEAD
     //
-    //   DU Server flow thực tế:
-    //   trang tập → JS decode data-hash → tạo blob m3u8 → JWPlayer/HLS.js
-    //   → fetch chunk: storage.googleapiscdn.com/chunks/{storageId}/original/{key}/videoN.html
-    //   → extract storageId → master.m3u8
+    //   DU server THỰC TẾ:
+    //     trang tập load → JS decode data-hash → tạo blob m3u8 (KHÔNG fetch)
+    //     JWPlayer khởi tạo nhưng DỪNG (không autoplay)
+    //     User click play → JWPlayer.play() → HLS.js bắt đầu
+    //     HLS.js fetch: storage.googleapiscdn.com/chunks/{24hex}/original/{key}/videoN.html
     //
-    //   storageId từ log: "6999e84f896b718999906bd7" (24 hex chars)
+    //   Vấn đề của WebViewResolver trước: timeout vì JWPlayer không autoplay
+    //   Fix: inject JS gọi jwplayer().play() sau khi init
     //
-    //   HDX Server: ping.iamcdn.net đang 502 → không có API để gọi
-    //   → Dùng WebView load HDX page và intercept video chunks từ storage
+    //   Sau khi play() → WebViewResolver bắt chunk URL đầu tiên
+    //   Extract storageId → build master.m3u8
+    //   (master.m3u8 cần test: có thể tồn tại hoặc 403)
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // data = episode URL (plain, không pack thêm gì vì đã bỏ /ajax/all)
-        val epUrl = data.substringBefore("|")  // tương thích với format cũ nếu có
+        val epUrl = data.substringBefore("|")
 
-        // WebView load trang tập → JS chạy → HLS.js fetch chunk đầu tiên
-        // Interceptor bắt URL chunk storage.googleapiscdn.com
         safeApiCall {
-            val interceptedUrl = app.get(
+            // WebView load trang → JS inject → jwplayer().play() →
+            // HLS.js fetch chunk → interceptor bắt URL
+            val chunkUrl = app.get(
                 epUrl,
                 headers     = headers,
                 interceptor = webViewInterceptor
             ).url
 
             // Extract storageId từ chunk URL
-            // "https://storage.googleapiscdn.com/chunks/6999e84f896b718999906bd7/original/.../videoN.html"
-            val storageId = Regex("""storage\.googleapiscdn\.com/chunks/([a-f0-9]{24})/""")
-                .find(interceptedUrl)?.groupValues?.get(1)
+            // Ví dụ: .../chunks/6999e84f896b718999906bd7/original/.../video7.html
+            val storageId = Regex("""storage\.googleapiscdn\.com/chunks/([a-f0-9]{12,})/""")
+                .find(chunkUrl)?.groupValues?.get(1)
 
             if (!storageId.isNullOrBlank()) {
-                // master.m3u8 chứa danh sách các quality (đã xác nhận từ các file capture trước)
-                val m3u8Url = "https://storage.googleapiscdn.com/chunks/$storageId/original/master.m3u8"
-
+                // master.m3u8: CloudStream sẽ tự detect nếu 200 hoặc báo lỗi nếu 403
+                val m3u8 = "https://storage.googleapiscdn.com/chunks/$storageId/original/master.m3u8"
                 callback(newExtractorLink(
                     source = name,
                     name   = "$name - DU",
-                    url    = m3u8Url,
+                    url    = m3u8,
                     type   = ExtractorLinkType.M3U8
                 ) {
                     this.quality = Qualities.P1080.value
@@ -193,16 +215,15 @@ class AnimeVietSubProvider : MainAPI() {
                         "Origin"     to mainUrl
                     )
                 })
-            } else if (interceptedUrl.isNotBlank()
-                       && interceptedUrl != epUrl
-                       && !interceptedUrl.startsWith("blob:")) {
-                // Fallback: nếu interceptor bắt được URL khác (mp4, m3u8 trực tiếp)
-                val isM3u8 = interceptedUrl.contains(".m3u8")
+            } else if (chunkUrl.isNotBlank() && chunkUrl != epUrl
+                       && !chunkUrl.startsWith("blob:")) {
+                // Fallback: URL khác được intercept (mp4, m3u8 trực tiếp)
                 callback(newExtractorLink(
                     source = name,
                     name   = "$name - DU",
-                    url    = interceptedUrl,
-                    type   = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                    url    = chunkUrl,
+                    type   = if (chunkUrl.contains(".m3u8")) ExtractorLinkType.M3U8
+                             else ExtractorLinkType.VIDEO
                 ) {
                     this.quality = Qualities.P1080.value
                     this.headers = mapOf("Referer" to epUrl, "User-Agent" to UA)
@@ -212,9 +233,4 @@ class AnimeVietSubProvider : MainAPI() {
 
         return true
     }
-
-    data class PlayerResponse(
-        @JsonProperty("success") val success: Int  = 0,
-        @JsonProperty("html")    val html: String? = null
-    )
 }

@@ -27,7 +27,6 @@ class AnimeVietSubProvider : MainAPI() {
 
     private val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
 
-    // Bộ lọc bắt link video thực tế (m3u8/mp4)
     private val videoInterceptor = WebViewResolver(
         Regex("""(.*\.m3u8.*|.*\.mp4.*|.*googlevideo.*|.*storage\.googleapis.*)""")
     )
@@ -101,13 +100,10 @@ class AnimeVietSubProvider : MainAPI() {
         val res = app.get(data, headers = headers)
         val pageHtml = res.text
         
-        // 1. Tìm chuỗi link mã hóa cực kỳ quan trọng trong HTML
-        // Thường nằm trong attribute của nút tập phim đang chọn
         val doc = Jsoup.parse(pageHtml)
         val currentEpi = doc.selectFirst("a.episode-link.active") ?: doc.selectFirst("a.episode-link")
         val encryptedLink = currentEpi?.attr("data-link") ?: ""
 
-        // 2. Cấu hình Header chính xác theo file.txt bạn gửi
         val ajaxHdr = mapOf(
             "User-Agent"       to UA,
             "Accept"           to "application/json, text/javascript, */*; q=0.01",
@@ -118,7 +114,6 @@ class AnimeVietSubProvider : MainAPI() {
         )
 
         safeApiCall {
-            // 3. Gửi Request POST với link mã hóa và các tham số mới
             val response = app.post(
                 "$mainUrl/ajax/player",
                 headers = ajaxHdr,
@@ -130,11 +125,9 @@ class AnimeVietSubProvider : MainAPI() {
                 )
             ).parsed<PlayerResponse>()
 
-            // 4. Xử lý dữ liệu trả về theo cấu trúc _fxStatus và _fxHtml
             if (response.status == true && !response.html.isNullOrBlank()) {
                 val playerDoc = Jsoup.parseBodyFragment(response.html)
                 
-                // Quét tất cả các server có trong HTML trả về
                 playerDoc.select("a[data-href]").forEach { server ->
                     val videoType = server.attr("data-play")
                     val videoHref = server.attr("data-href")
@@ -143,13 +136,17 @@ class AnimeVietSubProvider : MainAPI() {
                         val finalEmbed = if (videoHref.startsWith("http")) videoHref else "$mainUrl/embed/$videoHref"
                         loadExtractor(finalEmbed, data, subtitleCallback, callback)
                     } else {
-                        // Dùng WebView để bắt link cuối cùng (Mạnh nhất)
                         val capturedUrl = app.get(data, headers = headers, interceptor = videoInterceptor).url
                         if (capturedUrl.contains(".m3u8") || capturedUrl.contains(".mp4")) {
+                            // ĐÃ SỬA: Sử dụng newExtractorLink để tránh lỗi Deprecated
                             callback(
-                                ExtractorLink(
-                                    name, "$name Player", capturedUrl, data,
-                                    Qualities.P1080.value, capturedUrl.contains(".m3u8")
+                                newExtractorLink(
+                                    source  = name,
+                                    name    = "$name Player",
+                                    url     = capturedUrl,
+                                    referer = data,
+                                    quality = Qualities.P1080.value,
+                                    type    = if (capturedUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                                 )
                             )
                         }
@@ -160,7 +157,6 @@ class AnimeVietSubProvider : MainAPI() {
         return true
     }
 
-    // Class map đúng theo cấu trúc JSON mới của web
     data class PlayerResponse(
         @JsonProperty("_fxStatus") val status: Boolean? = false,
         @JsonProperty("_fxHtml")   val html: String?   = null

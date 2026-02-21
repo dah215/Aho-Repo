@@ -11,6 +11,7 @@ import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
 import java.util.EnumSet
+import android.util.Base64
 
 @CloudstreamPlugin
 class AnimeVietSubPlugin : Plugin() {
@@ -34,9 +35,9 @@ class AnimeVietSubProvider : MainAPI() {
         "Referer"         to "$mainUrl/"
     )
 
-    // WebViewResolver chỉ dùng cho DU server (JS decode + blob m3u8)
-    // Intercept chunk đầu tiên từ storage.googleapiscdn.com
-    private val videoInterceptor = WebViewResolver(
+    // WebViewResolver: chỉ dùng cho DU server khi /ajax/all thất bại
+    // Intercept chunk HLS từ storage.googleapiscdn.com
+    private val duInterceptor = WebViewResolver(
         Regex("""storage\.googleapiscdn\.com/chunks/[a-f0-9]+/""")
     )
 
@@ -137,32 +138,33 @@ class AnimeVietSubProvider : MainAPI() {
 
     // ── Load video ────────────────────────────────────────────────────────────
     //
-    // Flow đã xác nhận từ network capture:
+    // Từ network capture thực tế:
     //
-    //  [1] POST /ajax/player {episodeId, backup=1}
-    //      Response: set-cookie: tokenXXX=YYY  ← QUAN TRỌNG
-    //      Response JSON: {html: "<a data-play='api' data-href=HASH>DU</a>
-    //                            <a data-play='embed' data-href=KEY>HDX(ADS)</a>"}
+    //  POST /ajax/player {episodeId, backup=1}
+    //  → set-cookie: tokenXXX=YYY (bắt buộc gửi kèm /ajax/all)
+    //  → html: data-play="api" (DU server, hash), data-play="embed" (HDX, key)
     //
-    //  [2] GET /ajax/get_episode?filmId=X&episodeId=Y   (với cookie từ bước 1)
+    //  Server HDX (embed):
+    //    - data-href = video ID trên Hydrax/AbyssCDN
+    //    - Player script: iamcdn.net/players/playhydraxs.min.js
+    //    - API: POST https://ping.iamcdn.net/ {slug=KEY}
+    //    - Response: {url: "BASE64=O", sources: ["sd","hd"], ...}
+    //    - Decode url: last char → prepend → base64 decode → CDN domain
+    //    - File ID: cần parse từ response (field "data" hoặc trong sources)
+    //    - Video: https://{cdn}/{file_id}          (360p/SD)
+    //             https://{cdn}/www{file_id}        (720p/HD)
+    //             https://{cdn}/whw{file_id}        (1080p/FHD)
     //
-    //  [3] POST /ajax/all {EpisodeMess=1, EpisodeID=Y}  (với cookie từ bước 1)
-    //      → Response chứa video source (format chưa biết)
-    //      → JS decode → blob m3u8 → chunks storage.googleapiscdn.com
-    //
-    //  [4] embed server HDX = AbyssCDN player
-    //      URL: https://abysscdn.com/?v={data-href}
-    //      CloudStream có extractor AbyssCDN sẵn
-    //
-    //  KEY INSIGHT: Cookie từ /ajax/player PHẢI được gửi kèm /ajax/all
-    //  Trước đây thiếu cookie này nên /ajax/all không hoạt động
+    //  Server DU (api):
+    //    - Cần cookie từ /ajax/player
+    //    - POST /ajax/all {EpisodeMess=1, EpisodeID=X} → response chứa video
+    //    - Fallback: WebViewResolver intercept storage.googleapiscdn.com chunk
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // Load trang tập → lấy filmID, episodeID
         val pageHtml  = app.get(data, headers = headers).text
         val filmID    = Regex("""filmInfo\.filmID\s*=\s*parseInt\('(\d+)'\)""")
                         .find(pageHtml)?.groupValues?.get(1) ?: ""
@@ -179,23 +181,21 @@ class AnimeVietSubProvider : MainAPI() {
             "Accept"           to "application/json, text/javascript, */*; q=0.01"
         )
 
-        // ── [1] POST /ajax/player → lấy server list + cookie ─────────────────
+        // Bước 1: POST /ajax/player → lấy server list + session cookie
         val playerResp = app.post(
             "$mainUrl/ajax/player",
             headers = ajaxHdr,
             data    = mapOf("episodeId" to episodeID, "backup" to "1")
         )
 
-        // Lấy cookie từ response (tokenXXX=YYY) - cần thiết cho /ajax/all
-        val sessionCookie = playerResp.cookies.entries
-            .joinToString("; ") { "${it.key}=${it.value}" }
-
-        val headersWithCookie = ajaxHdr + mapOf("Cookie" to sessionCookie)
+        // Cookie bắt buộc cho /ajax/all
+        val cookie = playerResp.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+        val ajaxHdrWithCookie = ajaxHdr + mapOf("Cookie" to cookie)
 
         val playerJson = playerResp.parsed<PlayerResponse>()
         if (playerJson.success != 1 || playerJson.html.isNullOrBlank()) return true
 
-        val serverDoc = Jsoup.parseBodyFragment(playerJson.html)
+        val serverDoc    = Jsoup.parseBodyFragment(playerJson.html)
         var hasApiServer = false
 
         serverDoc.select("a.btn3dsv").forEach { btn ->
@@ -204,35 +204,30 @@ class AnimeVietSubProvider : MainAPI() {
             if (href.isBlank()) return@forEach
 
             when (play) {
-                // ── [3] Server DU (api): POST /ajax/all với cookie ────────────
+
+                // ── Server DU (api) ───────────────────────────────────────────
                 "api" -> {
                     hasApiServer = true
                     safeApiCall {
-                        // Bước 2: GET get_episode (với cookie)
+                        // Bước 2: GET get_episode (warm up session)
                         app.get(
                             "$mainUrl/ajax/get_episode?filmId=$filmID&episodeId=$episodeID",
-                            headers = headersWithCookie
+                            headers = ajaxHdrWithCookie
                         )
-
-                        // Bước 3: POST /ajax/all (với cookie) → video source
-                        val allResp = app.post(
+                        // Bước 3: POST /ajax/all (cần cookie) → chứa video source
+                        val allText = app.post(
                             "$mainUrl/ajax/all",
-                            headers = headersWithCookie,
-                            data    = mapOf(
-                                "EpisodeMess" to "1",
-                                "EpisodeID"   to episodeID
-                            )
+                            headers = ajaxHdrWithCookie,
+                            data    = mapOf("EpisodeMess" to "1", "EpisodeID" to episodeID)
                         ).text
 
-                        // Parse URL trực tiếp nếu response chứa URL
-                        val videoUrl = extractVideoUrl(allResp)
+                        val videoUrl = extractAnyUrl(allText)
                         if (!videoUrl.isNullOrBlank()) {
                             callback(newExtractorLink(
-                                source = name,
-                                name   = "$name - DU",
-                                url    = videoUrl,
-                                type   = if (videoUrl.contains(".m3u8")) ExtractorLinkType.M3U8
-                                         else ExtractorLinkType.VIDEO
+                                source = name, name = "$name - DU",
+                                url  = videoUrl,
+                                type = if (videoUrl.contains(".m3u8")) ExtractorLinkType.M3U8
+                                       else ExtractorLinkType.VIDEO
                             ) {
                                 this.quality = Qualities.P1080.value
                                 this.headers = mapOf("Referer" to data, "User-Agent" to UA)
@@ -241,42 +236,29 @@ class AnimeVietSubProvider : MainAPI() {
                     }
                 }
 
-                // ── [4] Server HDX (embed) = AbyssCDN ────────────────────────
-                // data-href là video ID của AbyssCDN
-                // URL: https://abysscdn.com/?v={id}
-                // CloudStream có built-in extractor cho AbyssCDN
+                // ── Server HDX (embed) = Hydrax/AbyssCDN ─────────────────────
+                // API: POST ping.iamcdn.net {slug=KEY}
+                // Decode: prepend last char → base64 → CDN domain
                 "embed" -> safeApiCall {
-                    val embedUrl = "https://abysscdn.com/?v=$href"
-                    loadExtractor(embedUrl, data, subtitleCallback, callback)
+                    extractHydrax(href, data, callback)
                 }
             }
         }
 
-        // ── [5] Fallback: WebViewResolver cho DU server ───────────────────────
-        // Nếu /ajax/all không trả về URL trực tiếp,
-        // WebView sẽ chạy JS decode hash → tạo blob m3u8 → fetch chunks
-        // Interceptor bắt chunk URL đầu tiên → extract storageId → master.m3u8
+        // ── Fallback WebView cho DU server ────────────────────────────────────
+        // Nếu /ajax/all không trả về URL trực tiếp (response là encoded/blob)
+        // WebView chạy JS → decode hash → fetch chunk → ta intercept
         if (hasApiServer) {
             safeApiCall {
-                val chunkUrl = app.get(
-                    data,
-                    headers     = headers,
-                    interceptor = videoInterceptor
-                ).url
-
+                val resolved = app.get(data, headers = headers, interceptor = duInterceptor).url
                 val storageId = Regex("""storage\.googleapiscdn\.com/chunks/([a-f0-9]+)/""")
-                    .find(chunkUrl)?.groupValues?.get(1)
+                    .find(resolved)?.groupValues?.get(1)
 
                 if (!storageId.isNullOrBlank()) {
-                    // Build master.m3u8 từ storageId
-                    // Dựa trên blob m3u8: chunks/{storageId}/original/{key}/videoN.html
-                    // → master playlist tại: chunks/{storageId}/original/master.m3u8
                     val m3u8 = "https://storage.googleapiscdn.com/chunks/$storageId/original/master.m3u8"
                     callback(newExtractorLink(
-                        source = name,
-                        name   = "$name - DU (WebView)",
-                        url    = m3u8,
-                        type   = ExtractorLinkType.M3U8
+                        source = name, name = "$name - DU (WebView)",
+                        url  = m3u8, type = ExtractorLinkType.M3U8
                     ) {
                         this.quality = Qualities.P1080.value
                         this.headers = mapOf(
@@ -292,17 +274,124 @@ class AnimeVietSubProvider : MainAPI() {
         return true
     }
 
-    private fun extractVideoUrl(text: String): String? {
+    // ── Hydrax extractor ──────────────────────────────────────────────────────
+    //
+    // Từ ABPVN filter + GitHub research:
+    //   POST https://ping.iamcdn.net/ {slug=KEY}
+    //   → {status:true, url:"BASE64=O", sources:["sd","hd"], ...}
+    //
+    //   Decode CDN domain:
+    //     encoded = "WFleHh2bmc2aC54eXo=O"
+    //     lastChar = 'O' (ký tự cuối)
+    //     b64 = lastChar + encoded.dropLast(1)  → "OWFleHh2bmc2aC54eXo="
+    //     cdnDomain = base64Decode(b64)          → "9aexxvng6h.xyz"
+    //
+    //   Video URLs (fileId = slug hoặc từ response):
+    //     SD:   https://{cdn}/{fileId}
+    //     HD:   https://{cdn}/www{fileId}
+    //     FHD:  https://{cdn}/whw{fileId}
+    private suspend fun extractHydrax(
+        slug: String,
+        referer: String,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        val pingHeaders = mapOf(
+            "User-Agent"   to UA,
+            "Content-Type" to "application/x-www-form-urlencoded",
+            "Referer"      to "https://playhydrax.com/",
+            "Origin"       to "https://playhydrax.com"
+        )
+
+        val resp = app.post(
+            "https://ping.iamcdn.net/",
+            headers = pingHeaders,
+            data    = mapOf("slug" to slug)
+        ).parsed<HydraxResponse>()
+
+        if (resp.status != true || resp.url.isNullOrBlank()) return
+
+        // Decode CDN domain:
+        // encoded = "XYZ...=O" → take last char, prepend → base64 decode
+        val encoded  = resp.url
+        val lastChar = encoded.last().toString()
+        val b64input = lastChar + encoded.dropLast(1)
+        val cdnDomain = try {
+            String(Base64.decode(b64input, Base64.DEFAULT)).trim()
+        } catch (_: Exception) {
+            return
+        }
+
+        if (cdnDomain.isBlank() || !cdnDomain.contains('.')) return
+
+        // File ID: có thể là slug, hoặc từ resp.data
+        val fileId = resp.data?.takeIf { it.isNotBlank() } ?: slug
+
+        val videoHeaders = mapOf(
+            "Referer"    to referer,
+            "User-Agent" to UA,
+            "Origin"     to "https://playhydrax.com"
+        )
+
+        // Build quality URLs theo pattern đã xác nhận
+        val qualities = listOf(
+            Triple("https://$cdnDomain/$fileId",        Qualities.P360.value, "HDX 360p"),
+            Triple("https://$cdnDomain/www$fileId",     Qualities.P720.value, "HDX 720p"),
+            Triple("https://$cdnDomain/whw$fileId",     Qualities.P1080.value, "HDX 1080p"),
+        )
+
+        // Thêm từ sources array (sd/hd) nếu có
+        resp.sources?.forEachIndexed { i, src ->
+            val q = when (src.lowercase()) {
+                "sd"  -> Qualities.P480.value
+                "hd"  -> Qualities.P720.value
+                "fhd" -> Qualities.P1080.value
+                else  -> Qualities.Unknown.value
+            }
+            val prefix = when (src.lowercase()) { "hd" -> "www"; "fhd" -> "whw"; else -> "" }
+            callback(newExtractorLink(
+                source = name, name = "$name - HDX $src",
+                url  = "https://$cdnDomain/$prefix$fileId",
+                type = ExtractorLinkType.VIDEO
+            ) {
+                this.quality = q
+                this.headers = videoHeaders
+            })
+        }
+
+        // Nếu sources trống → thêm tất cả 3 qualities
+        if (resp.sources.isNullOrEmpty()) {
+            qualities.forEach { (url, q, label) ->
+                callback(newExtractorLink(
+                    source = name, name = "$name - $label",
+                    url = url, type = ExtractorLinkType.VIDEO
+                ) {
+                    this.quality = q
+                    this.headers = videoHeaders
+                })
+            }
+        }
+    }
+
+    private fun extractAnyUrl(text: String): String? {
         if (text.isBlank()) return null
         return Regex("""https?://[^\s"'<>\\]+\.m3u8[^\s"'<>\\]*""").find(text)?.value
             ?: Regex("""https?://[^\s"'<>\\]+\.mp4[^\s"'<>\\]*""").find(text)?.value
-            ?: Regex(""""(?:file|src|url|link|source|video|stream)"\s*:\s*"(https?://[^"\\]+)"""")
+            ?: Regex(""""(?:file|src|url|link|source)"\s*:\s*"(https?://[^"\\]+)"""")
                .find(text)?.groupValues?.get(1)
             ?: Regex("""<file>(https?://[^<]+)</file>""").find(text)?.groupValues?.get(1)
     }
 
+    // ── Data classes ─────────────────────────────────────────────────────────
     data class PlayerResponse(
         @JsonProperty("success") val success: Int  = 0,
         @JsonProperty("html")    val html: String? = null
+    )
+
+    data class HydraxResponse(
+        @JsonProperty("status")  val status: Boolean?      = null,
+        @JsonProperty("url")     val url: String?          = null,
+        @JsonProperty("sources") val sources: List<String>? = null,
+        @JsonProperty("data")    val data: String?         = null,
+        @JsonProperty("id")      val id: String?           = null
     )
 }

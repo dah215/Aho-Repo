@@ -25,7 +25,7 @@ class AnimeVietSubProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA)
 
-    // Khớp User-Agent chính xác từ file log bạn gửi
+    // Khớp User-Agent từ Log 2 và 5 của bạn
     private val UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
 
     private val videoInterceptor = WebViewResolver(
@@ -39,7 +39,7 @@ class AnimeVietSubProvider : MainAPI() {
         "X-Requested-With" to "com.android.chrome"
     )
 
-    // KHÔI PHỤC ĐẦY ĐỦ DANH SÁCH MỤC PHÍM
+    // --- DANH MỤC PHIM KỸ LƯỠNG ---
     override val mainPage = mainPageOf(
         "$mainUrl/anime-moi-cap-nhat/"        to "Anime Mới Cập Nhật",
         "$mainUrl/anime-bo/"                  to "Anime Bộ (Series)",
@@ -51,7 +51,7 @@ class AnimeVietSubProvider : MainAPI() {
     private fun parseCard(el: Element): SearchResponse? {
         val a = el.selectFirst("a") ?: return null
         val href = a.attr("href").let { if (it.startsWith("http")) it else "$mainUrl$it" }
-        val title = el.selectFirst("h2.Title")?.text() ?: el.selectFirst(".Title")?.text() ?: ""
+        val title = el.selectFirst("h2.Title")?.text() ?: el.selectFirst(".Title")?.text() ?: a.attr("title") ?: ""
         val poster = el.selectFirst("img")?.attr("src")
         return newAnimeSearchResponse(title, href, TvType.Anime) { this.posterUrl = poster }
     }
@@ -88,8 +88,8 @@ class AnimeVietSubProvider : MainAPI() {
             }
         }.distinctBy { it.data }.sortedBy { it.episode }
 
-        return newAnimeLoadResponse(watchDoc.selectFirst("h1.Title")?.text() ?: "Anime", url, TvType.Anime, true) {
-            this.posterUrl = watchDoc.selectFirst(".Image img")?.attr("src")
+        return newAnimeLoadResponse(watchDoc.selectFirst("h1.Title")?.text() ?: doc.selectFirst("h1.Title")?.text() ?: "Anime", url, TvType.Anime, true) {
+            this.posterUrl = watchDoc.selectFirst(".Image img")?.attr("src") ?: doc.selectFirst(".Image img")?.attr("src")
             addEpisodes(DubStatus.Subbed, episodes)
         }
     }
@@ -100,6 +100,7 @@ class AnimeVietSubProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        // BƯỚC 1: Khởi tạo phiên qua WebView (Lấy Cookie ban đầu)
         val webRes = app.get(data, headers = headers, interceptor = videoInterceptor)
         var currentCookies = webRes.cookies
         val pageHtml = webRes.text
@@ -116,38 +117,40 @@ class AnimeVietSubProvider : MainAPI() {
         )
 
         safeApiCall {
-            // 1. GỌI PLAYER (Log 1 & 2)
+            // BƯỚC 2: AJAX PLAYER (Log 2) - Lấy HTML chứa Server
             val playerCall = app.post("$mainUrl/ajax/player", headers = ajaxHdr, cookies = currentCookies,
                 data = mapOf("episodeId" to episodeID, "backup" to "1")
             )
             currentCookies = currentCookies + playerCall.cookies
             val playerRes = playerCall.parsedSafe<PlayerResponse>()
 
-            // 2. GỌI GET_EPISODE (Log 4) - BƯỚC ĐỆM BẮT BUỘC
+            // BƯỚC 3: AJAX GET_EPISODE (Log 4) - Bước đệm XML
             if (filmId.isNotEmpty()) {
                 val getEpi = app.get("$mainUrl/ajax/get_episode?filmId=$filmId&episodeId=$episodeID", headers = ajaxHdr, cookies = currentCookies)
                 currentCookies = currentCookies + getEpi.cookies
             }
 
-            // 3. GỌI ALL (Log 5) - CHỐT PHIÊN ĐỂ MỞ KHÓA M3U8
+            // BƯỚC 4: AJAX ALL (Log 5) - CHỐT PHIÊN ĐỂ UNLOCK M3U8
             if (episodeID.isNotEmpty()) {
                 val allCall = app.post("$mainUrl/ajax/all", headers = ajaxHdr, cookies = currentCookies, 
                     data = mapOf("EpisodeMess" to "1", "EpisodeID" to episodeID)
                 )
                 currentCookies = currentCookies + allCall.cookies
-                delay(1200) // Đợi server xử lý token mở khóa
+                // Đợi server đồng bộ Cookie Token mới (như tokene26139...)
+                delay(1500) 
             }
 
-            // 4. XỬ LÝ SERVER
+            // BƯỚC 5: XỬ LÝ SERVER
             if (playerRes?.success == 1) {
-                // Ép WebView chạy lại trang với FULL COOKIE TOKEN mới nhất
+                // ÉP TRÌNH DUYỆT CHẠY LẠI VỚI BỘ COOKIE MỚI NHẤT ĐỂ BẮT LINK M3U8
                 app.get(data, headers = headers, cookies = currentCookies, interceptor = videoInterceptor)
 
                 val playerDoc = Jsoup.parse(playerRes.html ?: "")
                 playerDoc.select("a.btn3dsv").forEach { server ->
                     val vHref = server.attr("data-href")
                     if (server.attr("data-play") == "embed") {
-                        loadExtractor(if (vHref.startsWith("http")) vHref else "$mainUrl/embed/$vHref", data, subtitleCallback, callback)
+                        val embedUrl = if (vHref.startsWith("http")) vHref else "$mainUrl/embed/$vHref"
+                        loadExtractor(embedUrl, data, subtitleCallback, callback)
                     }
                 }
             }

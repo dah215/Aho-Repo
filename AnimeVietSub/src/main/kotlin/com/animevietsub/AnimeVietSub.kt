@@ -1,8 +1,8 @@
 package com.animevietsub
 
+import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.mvvm.safeApiCall
-import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
@@ -32,22 +32,6 @@ class AnimeVietSubProvider : MainAPI() {
         "Referer"         to "$mainUrl/"
     )
 
-    // ── Đã xác nhận từ console log:
-    // JWPlayer KHÔNG autoplay → phải inject JS gọi jwplayer().play()
-    // Sau khi play → HLS.js fetch chunks từ storage.googleapiscdn.com
-    // storageId = 24 hex chars (ví dụ: 6999e84f896b718999906bd7)
-    // Intercept chunk đầu → build master.m3u8 URL
-    //
-    // JS injection: retry gọi play() mỗi 300ms trong 15s
-    // (JWPlayer cần thời gian init sau khi decode hash)
-    // Android WebView trong CloudStream có mediaPlaybackRequiresUserGesture=false
-    // → JWPlayer/HLS.js có thể autoplay → fetch chunks tự động
-    // Intercept chunk đầu tiên → extract storageId → build master.m3u8
-    private val webViewInterceptor = WebViewResolver(
-        Regex("""storage\.googleapiscdn\.com/chunks/[a-f0-9]{12,}/""")
-    )
-
-    // ── Trang chủ ─────────────────────────────────────────────────────────────
     override val mainPage = mainPageOf(
         "$mainUrl/anime-moi/"                 to "Anime Mới Nhất",
         "$mainUrl/anime-bo/"                  to "Anime Bộ (TV/Series)",
@@ -78,13 +62,9 @@ class AnimeVietSubProvider : MainAPI() {
         val poster  = article.selectFirst("div.Image img, figure img")?.attr("src")
                       ?.let { if (it.startsWith("http")) it else "$mainUrl$it" }
         val epiNum  = article.selectFirst("span.mli-eps i")?.text()?.trim()?.toIntOrNull()
-        val quality = when (article.selectFirst(".Qlty")?.text()?.uppercase()) {
-            "FHD" -> SearchQuality.HD; "HD" -> SearchQuality.HD
-            "CAM" -> SearchQuality.Cam; else -> SearchQuality.HD
-        }
         return newAnimeSearchResponse(title, href, TvType.Anime) {
             this.posterUrl = poster
-            this.quality   = quality
+            this.quality   = SearchQuality.HD
             this.dubStatus = EnumSet.of(DubStatus.Subbed)
             if (epiNum != null) this.episodes = mutableMapOf(DubStatus.Subbed to epiNum)
         }
@@ -144,23 +124,18 @@ class AnimeVietSubProvider : MainAPI() {
 
     // ── Load video ────────────────────────────────────────────────────────────
     //
-    // Root cause đã xác nhận từ console log thực tế:
+    // Đã xác nhận 100% từ DevTools:
     //
-    //   /ajax/all → PromiseResult: undefined (empty response) → DEAD
-    //   ping.iamcdn.net → 502 Bad Gateway → DEAD
+    //   /ajax/all → "" (rỗng) → DEAD
+    //   ping.iamcdn.net → 502 → DEAD
     //
-    //   DU server THỰC TẾ:
-    //     trang tập load → JS decode data-hash → tạo blob m3u8 (KHÔNG fetch)
-    //     JWPlayer khởi tạo nhưng DỪNG (không autoplay)
-    //     User click play → JWPlayer.play() → HLS.js bắt đầu
-    //     HLS.js fetch: storage.googleapiscdn.com/chunks/{24hex}/original/{key}/videoN.html
-    //
-    //   Vấn đề của WebViewResolver trước: timeout vì JWPlayer không autoplay
-    //   Fix: inject JS gọi jwplayer().play() sau khi init
-    //
-    //   Sau khi play() → WebViewResolver bắt chunk URL đầu tiên
-    //   Extract storageId → build master.m3u8
-    //   (master.m3u8 cần test: có thể tồn tại hoặc 403)
+    //   FLOW ĐÚNG (DU server):
+    //   1. POST /ajax/player {episodeId}
+    //      → Set-Cookie: tokene26139ad...=11f669... (Max-Age=3600)
+    //   2. GET /ajax/get_episode?filmId=X&episodeId=Y  +Cookie: tokene...
+    //      → RSS XML: <file>VIDEO_URL</file>
+    //      (Không có cookie → <file></file> rỗng!)
+    //   3. Parse <file> → callback
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -169,28 +144,53 @@ class AnimeVietSubProvider : MainAPI() {
     ): Boolean {
         val epUrl = data.substringBefore("|")
 
+        // Lấy filmID và episodeID từ JS trong trang tập
+        val pageHtml  = app.get(epUrl, headers = headers).text
+        val filmID    = Regex("""filmInfo\.filmID\s*=\s*parseInt\('(\d+)'\)""")
+                        .find(pageHtml)?.groupValues?.get(1) ?: ""
+        val episodeID = Regex("""filmInfo\.episodeID\s*=\s*parseInt\('(\d+)'\)""")
+                        .find(pageHtml)?.groupValues?.get(1) ?: ""
+
+        if (filmID.isBlank() || episodeID.isBlank()) return true
+
+        val ajaxHdr = headers + mapOf(
+            "X-Requested-With" to "XMLHttpRequest",
+            "Content-Type"     to "application/x-www-form-urlencoded; charset=UTF-8",
+            "Origin"           to mainUrl,
+            "Referer"          to epUrl,
+            "Accept"           to "application/json, text/javascript, */*; q=0.01"
+        )
+
+        // Bước 1: POST /ajax/player → lấy session cookie (tokene...=xxx)
+        val playerResp = app.post(
+            "$mainUrl/ajax/player",
+            headers = ajaxHdr,
+            data    = mapOf("episodeId" to episodeID, "backup" to "1")
+        )
+
+        val cookie = playerResp.cookies.entries
+            .joinToString("; ") { "${it.key}=${it.value}" }
+
+        if (cookie.isBlank()) return true
+
+        // Bước 2: GET /ajax/get_episode WITH cookie
+        // → RSS XML: <file>VIDEO_URL</file>
         safeApiCall {
-            // WebView load trang → JS inject → jwplayer().play() →
-            // HLS.js fetch chunk → interceptor bắt URL
-            val chunkUrl = app.get(
-                epUrl,
-                headers     = headers,
-                interceptor = webViewInterceptor
-            ).url
+            val rssText = app.get(
+                "$mainUrl/ajax/get_episode?filmId=$filmID&episodeId=$episodeID",
+                headers = ajaxHdr + mapOf("Cookie" to cookie)
+            ).text
 
-            // Extract storageId từ chunk URL
-            // Ví dụ: .../chunks/6999e84f896b718999906bd7/original/.../video7.html
-            val storageId = Regex("""storage\.googleapiscdn\.com/chunks/([a-f0-9]{12,})/""")
-                .find(chunkUrl)?.groupValues?.get(1)
+            val fileUrl = Regex("""<file>\s*(https?://[^<\s]+)\s*</file>""")
+                .find(rssText)?.groupValues?.get(1)?.trim()
 
-            if (!storageId.isNullOrBlank()) {
-                // master.m3u8: CloudStream sẽ tự detect nếu 200 hoặc báo lỗi nếu 403
-                val m3u8 = "https://storage.googleapiscdn.com/chunks/$storageId/original/master.m3u8"
+            if (!fileUrl.isNullOrBlank()) {
                 callback(newExtractorLink(
                     source = name,
                     name   = "$name - DU",
-                    url    = m3u8,
-                    type   = ExtractorLinkType.M3U8
+                    url    = fileUrl,
+                    type   = if (fileUrl.contains(".m3u8")) ExtractorLinkType.M3U8
+                             else ExtractorLinkType.VIDEO
                 ) {
                     this.quality = Qualities.P1080.value
                     this.headers = mapOf(
@@ -199,22 +199,14 @@ class AnimeVietSubProvider : MainAPI() {
                         "Origin"     to mainUrl
                     )
                 })
-            } else if (chunkUrl.isNotBlank() && chunkUrl != epUrl
-                       && !chunkUrl.startsWith("blob:")) {
-                // Fallback: URL khác được intercept (mp4, m3u8 trực tiếp)
-                callback(newExtractorLink(
-                    source = name,
-                    name   = "$name - DU",
-                    url    = chunkUrl,
-                    type   = if (chunkUrl.contains(".m3u8")) ExtractorLinkType.M3U8
-                             else ExtractorLinkType.VIDEO
-                ) {
-                    this.quality = Qualities.P1080.value
-                    this.headers = mapOf("Referer" to epUrl, "User-Agent" to UA)
-                })
             }
         }
 
         return true
     }
+
+    data class PlayerResponse(
+        @JsonProperty("success") val success: Int  = 0,
+        @JsonProperty("html")    val html: String? = null
+    )
 }

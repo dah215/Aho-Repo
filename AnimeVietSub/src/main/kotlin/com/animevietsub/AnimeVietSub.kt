@@ -87,15 +87,13 @@ class AnimeVietSubProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         val base     = url.trimEnd('/')
         val watchDoc = app.get("$base/xem-phim.html", headers = headers).document
-
-        val title  = watchDoc.selectFirst("h1.Title")?.text()?.trim() ?: watchDoc.title()
-        val poster = watchDoc.selectFirst("div.Image figure img")?.attr("src")
-                     ?.let { if (it.startsWith("http")) it else "$mainUrl$it" }
-        val plot   = watchDoc.selectFirst("div.Description")?.text()?.trim()
-        val year   = watchDoc.selectFirst("p.Info .Date a, p.Info .Date")
-                     ?.text()?.filter { it.isDigit() }?.take(4)?.toIntOrNull()
-        val tags   = watchDoc.select("p.Genre a")
-                     .map { it.text().trim() }.filter { it.isNotBlank() }
+        val title    = watchDoc.selectFirst("h1.Title")?.text()?.trim() ?: watchDoc.title()
+        val poster   = watchDoc.selectFirst("div.Image figure img")?.attr("src")
+                       ?.let { if (it.startsWith("http")) it else "$mainUrl$it" }
+        val plot     = watchDoc.selectFirst("div.Description")?.text()?.trim()
+        val year     = watchDoc.selectFirst("p.Info .Date a, p.Info .Date")
+                       ?.text()?.filter { it.isDigit() }?.take(4)?.toIntOrNull()
+        val tags     = watchDoc.select("p.Genre a").map { it.text().trim() }.filter { it.isNotBlank() }
 
         val seen     = mutableSetOf<String>()
         val episodes = watchDoc.select("#list-server .list-episode a.episode-link")
@@ -124,18 +122,16 @@ class AnimeVietSubProvider : MainAPI() {
 
     // ── Load video ────────────────────────────────────────────────────────────
     //
-    // Đã xác nhận 100% từ DevTools:
+    // Đã xác nhận từ DevTools (ảnh screenshot):
     //
-    //   /ajax/all → "" (rỗng) → DEAD
-    //   ping.iamcdn.net → 502 → DEAD
+    //   POST /ajax/player → Set-Cookie: tokene26139ad98e...=11f6e981a25... (Max-Age=3600)
+    //   GET /ajax/get_episode?filmId=5779&episodeId=X
+    //     → không có cookie: <file></file> rỗng
+    //     → có cookie:       <file>VIDEO_URL</file>
     //
-    //   FLOW ĐÚNG (DU server):
-    //   1. POST /ajax/player {episodeId}
-    //      → Set-Cookie: tokene26139ad...=11f669... (Max-Age=3600)
-    //   2. GET /ajax/get_episode?filmId=X&episodeId=Y  +Cookie: tokene...
-    //      → RSS XML: <file>VIDEO_URL</file>
-    //      (Không có cookie → <file></file> rỗng!)
-    //   3. Parse <file> → callback
+    // Cách lấy cookie đáng tin cậy nhất:
+    //   Parse thẳng Set-Cookie header từ OkHttp response headers
+    //   (không dùng .cookies vì có thể bị filter)
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -144,16 +140,15 @@ class AnimeVietSubProvider : MainAPI() {
     ): Boolean {
         val epUrl = data.substringBefore("|")
 
-        // Lấy filmID và episodeID từ JS trong trang tập
         val pageHtml  = app.get(epUrl, headers = headers).text
         val filmID    = Regex("""filmInfo\.filmID\s*=\s*parseInt\('(\d+)'\)""")
-                        .find(pageHtml)?.groupValues?.get(1) ?: ""
+                        .find(pageHtml)?.groupValues?.get(1) ?: return true
         val episodeID = Regex("""filmInfo\.episodeID\s*=\s*parseInt\('(\d+)'\)""")
-                        .find(pageHtml)?.groupValues?.get(1) ?: ""
+                        .find(pageHtml)?.groupValues?.get(1) ?: return true
 
-        if (filmID.isBlank() || episodeID.isBlank()) return true
-
-        val ajaxHdr = headers + mapOf(
+        val ajaxHdr = mapOf(
+            "User-Agent"       to UA,
+            "Accept-Language"  to "vi-VN,vi;q=0.9",
             "X-Requested-With" to "XMLHttpRequest",
             "Content-Type"     to "application/x-www-form-urlencoded; charset=UTF-8",
             "Origin"           to mainUrl,
@@ -161,24 +156,38 @@ class AnimeVietSubProvider : MainAPI() {
             "Accept"           to "application/json, text/javascript, */*; q=0.01"
         )
 
-        // Bước 1: POST /ajax/player → lấy session cookie (tokene...=xxx)
+        // Bước 1: POST /ajax/player → nhận Set-Cookie
         val playerResp = app.post(
             "$mainUrl/ajax/player",
             headers = ajaxHdr,
             data    = mapOf("episodeId" to episodeID, "backup" to "1")
         )
 
-        val cookie = playerResp.cookies.entries
+        // Lấy cookie theo 2 cách: .cookies map VÀ parse Set-Cookie header thủ công
+        // → dùng cái nào có giá trị
+        val cookieFromMap = playerResp.cookies.entries
             .joinToString("; ") { "${it.key}=${it.value}" }
+
+        val cookieFromHeader = playerResp.headers
+            .filter { it.first.equals("set-cookie", ignoreCase = true) }
+            .mapNotNull { header ->
+                // "tokene...=xxx; Max-Age=3600; ..." → lấy "tokene...=xxx"
+                header.second.split(";").firstOrNull()?.trim()
+            }
+            .joinToString("; ")
+
+        // Ưu tiên cookie từ header nếu map rỗng
+        val cookie = if (cookieFromMap.isNotBlank()) cookieFromMap else cookieFromHeader
 
         if (cookie.isBlank()) return true
 
-        // Bước 2: GET /ajax/get_episode WITH cookie
-        // → RSS XML: <file>VIDEO_URL</file>
+        val getHdr = ajaxHdr - "Content-Type" + mapOf("Cookie" to cookie)
+
+        // Bước 2: GET /ajax/get_episode WITH cookie → RSS XML có <file>URL</file>
         safeApiCall {
             val rssText = app.get(
                 "$mainUrl/ajax/get_episode?filmId=$filmID&episodeId=$episodeID",
-                headers = ajaxHdr + mapOf("Cookie" to cookie)
+                headers = getHdr
             ).text
 
             val fileUrl = Regex("""<file>\s*(https?://[^<\s]+)\s*</file>""")
@@ -199,6 +208,9 @@ class AnimeVietSubProvider : MainAPI() {
                         "Origin"     to mainUrl
                     )
                 })
+            } else {
+                // Throw để CloudStream log lỗi → giúp debug
+                throw Exception("file tag rỗng. RSS=${rssText.take(300)} cookie=$cookie")
             }
         }
 

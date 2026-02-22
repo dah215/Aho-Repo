@@ -3,6 +3,7 @@ package com.animevietsub
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.mvvm.safeApiCall
+import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
@@ -30,6 +31,14 @@ class AnimeVietSubProvider : MainAPI() {
         "User-Agent"      to UA,
         "Accept-Language" to "vi-VN,vi;q=0.9",
         "Referer"         to "$mainUrl/"
+    )
+
+    // Đã xác nhận chunk URL thực tế từ DevTools:
+    // https://storage.googleapiscdn.com/chunks/693e314e90eac4029ed54479/original/{TOKEN}/video8.html
+    // master.m3u8 URL: .../{TOKEN}/master.m3u8
+    // Regex bắt đến hết token (trước /videoN.html)
+    private val webViewInterceptor = WebViewResolver(
+        Regex("""storage\.googleapiscdn\.com/chunks/[a-f0-9]+/original/[^/]+/video\d+\.html""")
     )
 
     override val mainPage = mainPageOf(
@@ -122,16 +131,17 @@ class AnimeVietSubProvider : MainAPI() {
 
     // ── Load video ────────────────────────────────────────────────────────────
     //
-    // Đã xác nhận từ DevTools (ảnh screenshot):
+    // Đã xác nhận từ DevTools intercept thực tế:
     //
-    //   POST /ajax/player → Set-Cookie: tokene26139ad98e...=11f6e981a25... (Max-Age=3600)
-    //   GET /ajax/get_episode?filmId=5779&episodeId=X
-    //     → không có cookie: <file></file> rỗng
-    //     → có cookie:       <file>VIDEO_URL</file>
+    //   Chunk URL: storage.googleapiscdn.com/chunks/{id}/original/{TOKEN}/videoN.html
+    //   TOKEN là encoded path, bắt buộc để authenticate
+    //   master.m3u8 URL: .../chunks/{id}/original/{TOKEN}/master.m3u8
     //
-    // Cách lấy cookie đáng tin cậy nhất:
-    //   Parse thẳng Set-Cookie header từ OkHttp response headers
-    //   (không dùng .cookies vì có thể bị filter)
+    //   Flow:
+    //   1. GET trang tập → WebView load → JS decode → player start
+    //   2. WebView intercept chunk URL (có TOKEN trong path)
+    //   3. Extract base URL (trước /videoN.html) → thêm /master.m3u8
+    //   4. Feed vào ExoPlayer
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -140,66 +150,25 @@ class AnimeVietSubProvider : MainAPI() {
     ): Boolean {
         val epUrl = data.substringBefore("|")
 
-        val pageHtml  = app.get(epUrl, headers = headers).text
-        val filmID    = Regex("""filmInfo\.filmID\s*=\s*parseInt\('(\d+)'\)""")
-                        .find(pageHtml)?.groupValues?.get(1) ?: return true
-        val episodeID = Regex("""filmInfo\.episodeID\s*=\s*parseInt\('(\d+)'\)""")
-                        .find(pageHtml)?.groupValues?.get(1) ?: return true
-
-        val ajaxHdr = mapOf(
-            "User-Agent"       to UA,
-            "Accept-Language"  to "vi-VN,vi;q=0.9",
-            "X-Requested-With" to "XMLHttpRequest",
-            "Content-Type"     to "application/x-www-form-urlencoded; charset=UTF-8",
-            "Origin"           to mainUrl,
-            "Referer"          to epUrl,
-            "Accept"           to "application/json, text/javascript, */*; q=0.01"
-        )
-
-        // Bước 1: POST /ajax/player → nhận Set-Cookie
-        val playerResp = app.post(
-            "$mainUrl/ajax/player",
-            headers = ajaxHdr,
-            data    = mapOf("episodeId" to episodeID, "backup" to "1")
-        )
-
-        // Lấy cookie theo 2 cách: .cookies map VÀ parse Set-Cookie header thủ công
-        // → dùng cái nào có giá trị
-        val cookieFromMap = playerResp.cookies.entries
-            .joinToString("; ") { "${it.key}=${it.value}" }
-
-        val cookieFromHeader = playerResp.headers
-            .filter { it.first.equals("set-cookie", ignoreCase = true) }
-            .mapNotNull { header ->
-                // "tokene...=xxx; Max-Age=3600; ..." → lấy "tokene...=xxx"
-                header.second.split(";").firstOrNull()?.trim()
-            }
-            .joinToString("; ")
-
-        // Ưu tiên cookie từ header nếu map rỗng
-        val cookie = if (cookieFromMap.isNotBlank()) cookieFromMap else cookieFromHeader
-
-        if (cookie.isBlank()) return true
-
-        val getHdr = ajaxHdr - "Content-Type" + mapOf("Cookie" to cookie)
-
-        // Bước 2: GET /ajax/get_episode WITH cookie → RSS XML có <file>URL</file>
         safeApiCall {
-            val rssText = app.get(
-                "$mainUrl/ajax/get_episode?filmId=$filmID&episodeId=$episodeID",
-                headers = getHdr
-            ).text
+            // WebView load trang tập → JS decode hash → player fetch chunks
+            // Interceptor bắt URL chunk đầu tiên (có full TOKEN trong path)
+            val chunkUrl = app.get(
+                epUrl,
+                headers     = headers,
+                interceptor = webViewInterceptor
+            ).url
 
-            val fileUrl = Regex("""<file>\s*(https?://[^<\s]+)\s*</file>""")
-                .find(rssText)?.groupValues?.get(1)?.trim()
+            // chunkUrl: https://storage.googleapiscdn.com/chunks/{id}/original/{TOKEN}/videoN.html
+            // Cần: https://storage.googleapiscdn.com/chunks/{id}/original/{TOKEN}/master.m3u8
+            val m3u8Url = chunkUrl.replace(Regex("""/video\d+\.html$"""), "/master.m3u8")
 
-            if (!fileUrl.isNullOrBlank()) {
+            if (m3u8Url != chunkUrl && m3u8Url.startsWith("https://")) {
                 callback(newExtractorLink(
                     source = name,
                     name   = "$name - DU",
-                    url    = fileUrl,
-                    type   = if (fileUrl.contains(".m3u8")) ExtractorLinkType.M3U8
-                             else ExtractorLinkType.VIDEO
+                    url    = m3u8Url,
+                    type   = ExtractorLinkType.M3U8
                 ) {
                     this.quality = Qualities.P1080.value
                     this.headers = mapOf(
@@ -208,9 +177,6 @@ class AnimeVietSubProvider : MainAPI() {
                         "Origin"     to mainUrl
                     )
                 })
-            } else {
-                // Throw để CloudStream log lỗi → giúp debug
-                throw Exception("file tag rỗng. RSS=${rssText.take(300)} cookie=$cookie")
             }
         }
 

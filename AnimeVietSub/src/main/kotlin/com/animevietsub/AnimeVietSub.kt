@@ -191,18 +191,42 @@ class AnimeVietSubProvider : MainAPI() {
 
                     val shortUrl = resp.link ?: return@safeApiCall
 
-                    // Follow short.icu → abysscdn.com/?v=XXX
+                    // Follow short.icu -> abysscdn.com/?v=XXX
                     val abyssUrl = app.get(
                         shortUrl,
                         headers        = mapOf("User-Agent" to UA, "Referer" to epUrl),
                         allowRedirects = true
                     ).url
 
-                    // loadExtractor xử lý abysscdn.com
-                    loadExtractor(abyssUrl, epUrl, subtitleCallback, callback)
+                    if (!abyssUrl.contains("abysscdn.com")) return@safeApiCall
+
+                    // WebView load abysscdn -> service worker -> sssrr.org video
+                    val sssrrInterceptor = com.lagradost.cloudstream3.network.WebViewResolver(
+                        Regex("""sssrr\.org/sora/\d+/[A-Za-z0-9+/=_\-]+""")
+                    )
+
+                    val sssrrUrl = app.get(
+                        abyssUrl,
+                        headers     = mapOf("User-Agent" to UA, "Referer" to epUrl),
+                        interceptor = sssrrInterceptor
+                    ).url
+
+                    if (sssrrUrl.contains("sssrr.org")) {
+                        callback(newExtractorLink(
+                            source = name,
+                            name   = "$name - HDX",
+                            url    = sssrrUrl,
+                            type   = ExtractorLinkType.VIDEO
+                        ) {
+                            this.quality = Qualities.P1080.value
+                            this.headers = mapOf(
+                                "Referer"    to abyssUrl,
+                                "User-Agent" to UA
+                            )
+                        })
+                    }
                 }
 
-                // ── DU: api → /ajax/get_episode với cookie ─────────────────
                 "api" -> safeApiCall {
                     // Thử POST player với play=api (thường link rỗng)
                     val resp = app.post(

@@ -3,10 +3,10 @@ package com.animevietsub
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.mvvm.safeApiCall
-import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
 import java.util.EnumSet
@@ -31,14 +31,6 @@ class AnimeVietSubProvider : MainAPI() {
         "User-Agent"      to UA,
         "Accept-Language" to "vi-VN,vi;q=0.9",
         "Referer"         to "$mainUrl/"
-    )
-
-    // Đã xác nhận chunk URL thực tế từ DevTools:
-    // https://storage.googleapiscdn.com/chunks/693e314e90eac4029ed54479/original/{TOKEN}/video8.html
-    // master.m3u8 URL: .../{TOKEN}/master.m3u8
-    // Regex bắt đến hết token (trước /videoN.html)
-    private val webViewInterceptor = WebViewResolver(
-        Regex("""storage\.googleapiscdn\.com/chunks/[a-f0-9]+/original/[^/]+/video\d+\.html""")
     )
 
     override val mainPage = mainPageOf(
@@ -131,17 +123,20 @@ class AnimeVietSubProvider : MainAPI() {
 
     // ── Load video ────────────────────────────────────────────────────────────
     //
-    // Đã xác nhận từ DevTools intercept thực tế:
+    // Đã xác nhận từ DevTools capture thực tế:
     //
-    //   Chunk URL: storage.googleapiscdn.com/chunks/{id}/original/{TOKEN}/videoN.html
-    //   TOKEN là encoded path, bắt buộc để authenticate
-    //   master.m3u8 URL: .../chunks/{id}/original/{TOKEN}/master.m3u8
+    // SERVER HDX (embed):
+    //   POST /ajax/player với params:
+    //     link=DATA_HREF&play=embed&id=3&backuplinks=1
+    //   Response: {"_fxStatus":1,"success":1,"link":"https://short.icu/QFOHutDfU","playTech":"embed"}
+    //   Follow redirect từ link → video URL
     //
-    //   Flow:
-    //   1. GET trang tập → WebView load → JS decode → player start
-    //   2. WebView intercept chunk URL (có TOKEN trong path)
-    //   3. Extract base URL (trước /videoN.html) → thêm /master.m3u8
-    //   4. Feed vào ExoPlayer
+    // SERVER DU (api):
+    //   Video URL: storage.googleapis.com/mediastorage/{id}/{folder}/{file}.mp4
+    //   POST /ajax/player với episodeId → cookie
+    //   GET /ajax/get_episode với cookie → RSS có <file> encoded
+    //   Decode <file> → MP4 URL (JS decode trong avs.watch.js)
+    //   Fallback: thử lấy link từ /ajax/player với play=api params
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -150,41 +145,163 @@ class AnimeVietSubProvider : MainAPI() {
     ): Boolean {
         val epUrl = data.substringBefore("|")
 
-        safeApiCall {
-            // WebView load trang tập → JS decode hash → player fetch chunks
-            // Interceptor bắt URL chunk đầu tiên (có full TOKEN trong path)
-            val chunkUrl = app.get(
-                epUrl,
-                headers     = headers,
-                interceptor = webViewInterceptor
-            ).url
+        val ajaxHdr = mapOf(
+            "User-Agent"       to UA,
+            "Accept-Language"  to "vi-VN,vi;q=0.9",
+            "X-Requested-With" to "XMLHttpRequest",
+            "Content-Type"     to "application/x-www-form-urlencoded; charset=UTF-8",
+            "Origin"           to mainUrl,
+            "Referer"          to epUrl,
+            "Accept"           to "application/json, text/javascript, */*; q=0.01"
+        )
 
-            // chunkUrl: https://storage.googleapiscdn.com/chunks/{id}/original/{TOKEN}/videoN.html
-            // Cần: https://storage.googleapiscdn.com/chunks/{id}/original/{TOKEN}/master.m3u8
-            val m3u8Url = chunkUrl.replace(Regex("""/video\d+\.html$"""), "/master.m3u8")
+        // Bước 1: POST /ajax/player thông thường → lấy HTML chứa server list
+        val playerResp = app.post(
+            "$mainUrl/ajax/player",
+            headers = ajaxHdr,
+            data    = mapOf("episodeId" to extractEpisodeId(epUrl), "backup" to "1")
+        )
+        val cookie = playerResp.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+        val playerJson = try { playerResp.parsed<PlayerResponse>() } catch (_: Exception) { null }
 
-            if (m3u8Url != chunkUrl && m3u8Url.startsWith("https://")) {
-                callback(newExtractorLink(
-                    source = name,
-                    name   = "$name - DU",
-                    url    = m3u8Url,
-                    type   = ExtractorLinkType.M3U8
-                ) {
-                    this.quality = Qualities.P1080.value
-                    this.headers = mapOf(
-                        "Referer"    to epUrl,
-                        "User-Agent" to UA,
-                        "Origin"     to mainUrl
-                    )
-                })
+        if (playerJson?.success == 1 && !playerJson.html.isNullOrBlank()) {
+            val doc = Jsoup.parseBodyFragment(playerJson.html)
+
+            doc.select("a.btn3dsv").forEach { btn ->
+                val play = btn.attr("data-play")
+                val href = btn.attr("data-href").trim()
+                val id   = btn.attr("data-id").trim()
+                if (href.isBlank()) return@forEach
+
+                when (play) {
+                    // ── HDX server: POST player với link+play+id params ───────
+                    // Đã xác nhận: link=DATA_HREF&play=embed&id=3&backuplinks=1
+                    // Response: {"link":"https://short.icu/xxx",...}
+                    "embed" -> safeApiCall {
+                        val embedResp = app.post(
+                            "$mainUrl/ajax/player",
+                            headers = ajaxHdr,
+                            data    = mapOf(
+                                "link"         to href,
+                                "play"         to "embed",
+                                "id"           to id.ifBlank { "3" },
+                                "backuplinks"  to "1"
+                            )
+                        ).parsed<EmbedResponse>()
+
+                        val embedLink = embedResp.link
+                        if (!embedLink.isNullOrBlank()) {
+                            // Follow redirect để lấy URL thật
+                            val finalUrl = app.get(
+                                embedLink,
+                                headers     = mapOf("User-Agent" to UA, "Referer" to epUrl),
+                                allowRedirects = true
+                            ).url
+
+                            if (finalUrl.isNotBlank() && !finalUrl.contains("short.icu")) {
+                                addVideoLink(finalUrl, epUrl, "HDX", callback)
+                            } else {
+                                // Nếu không redirect, dùng link gốc
+                                addVideoLink(embedLink, epUrl, "HDX", callback)
+                            }
+                        }
+                    }
+
+                    // ── DU server: lấy link từ /ajax/player với play=api ──────
+                    "api" -> safeApiCall {
+                        // Thử POST player với play=api params (tương tự HDX)
+                        val apiResp = app.post(
+                            "$mainUrl/ajax/player",
+                            headers = ajaxHdr,
+                            data    = mapOf(
+                                "link"        to href,
+                                "play"        to "api",
+                                "id"          to id.ifBlank { "0" },
+                                "backuplinks" to "1"
+                            )
+                        ).parsed<EmbedResponse>()
+
+                        val apiLink = apiResp.link
+                        if (!apiLink.isNullOrBlank()) {
+                            addVideoLink(apiLink, epUrl, "DU", callback)
+                        } else {
+                            // Fallback: GET get_episode với cookie → parse <file>
+                            extractFromRss(epUrl, cookie, ajaxHdr, callback)
+                        }
+                    }
+                }
             }
         }
 
         return true
     }
 
+    private suspend fun extractFromRss(
+        epUrl: String,
+        cookie: String,
+        ajaxHdr: Map<String, String>,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        val pageHtml  = app.get(epUrl, headers = headers).text
+        val filmID    = Regex("""filmInfo\.filmID\s*=\s*parseInt\('(\d+)'\)""")
+                        .find(pageHtml)?.groupValues?.get(1) ?: return
+        val episodeID = Regex("""filmInfo\.episodeID\s*=\s*parseInt\('(\d+)'\)""")
+                        .find(pageHtml)?.groupValues?.get(1) ?: return
+
+        val rssText = app.get(
+            "$mainUrl/ajax/get_episode?filmId=$filmID&episodeId=$episodeID",
+            headers = ajaxHdr - "Content-Type" + mapOf("Cookie" to cookie)
+        ).text
+
+        // <file> có thể là URL trực tiếp sau khi có cookie đúng
+        val fileUrl = Regex("""<file>\s*(https?://[^<\s]+)\s*</file>""")
+            .find(rssText)?.groupValues?.get(1)?.trim()
+        if (!fileUrl.isNullOrBlank()) {
+            addVideoLink(fileUrl, epUrl, "DU", callback)
+        }
+    }
+
+    private fun addVideoLink(
+        url: String,
+        referer: String,
+        serverName: String,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        if (url.isBlank() || url.startsWith("blob:")) return
+        val isM3u8 = url.contains(".m3u8")
+        val isMp4  = url.contains(".mp4")
+        callback(newExtractorLink(
+            source = name,
+            name   = "$name - $serverName",
+            url    = url,
+            type   = when {
+                isM3u8 -> ExtractorLinkType.M3U8
+                else   -> ExtractorLinkType.VIDEO
+            }
+        ) {
+            this.quality = Qualities.P1080.value
+            this.headers = mapOf(
+                "Referer"    to referer,
+                "User-Agent" to UA,
+                "Origin"     to mainUrl
+            )
+        })
+    }
+
+    private fun extractEpisodeId(epUrl: String): String {
+        // URL: .../tap-11-110579.html → episodeId = 110579
+        return Regex("""-(\d+)\.html$""").find(epUrl)?.groupValues?.get(1) ?: ""
+    }
+
     data class PlayerResponse(
-        @JsonProperty("success") val success: Int  = 0,
-        @JsonProperty("html")    val html: String? = null
+        @JsonProperty("success") val success: Int    = 0,
+        @JsonProperty("html")    val html: String?   = null
+    )
+
+    data class EmbedResponse(
+        @JsonProperty("success")   val success: Int     = 0,
+        @JsonProperty("link")      val link: String?    = null,
+        @JsonProperty("playTech")  val playTech: String? = null,
+        @JsonProperty("_fxStatus") val fxStatus: Int    = 0
     )
 }

@@ -261,7 +261,7 @@ class AnimeVietSubProvider : MainAPI() {
         }
     }
 
-    private fun addVideoLink(
+    private suspend fun addVideoLink(
         url: String,
         referer: String,
         serverName: String,

@@ -6,16 +6,16 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.mvvm.safeApiCall
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
-import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
 import java.util.EnumSet
@@ -37,7 +37,7 @@ class AnimeVietSubProvider : MainAPI() {
     private val UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 " +
                      "(KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36"
 
-    private val headers = mapOf(
+    private val baseHeaders = mapOf(
         "User-Agent"      to UA,
         "Accept-Language" to "vi-VN,vi;q=0.9",
         "Referer"         to "$mainUrl/"
@@ -80,7 +80,7 @@ class AnimeVietSubProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val doc   = app.get(pageUrl(request.data, page), headers = headers).document
+        val doc   = app.get(pageUrl(request.data, page), headers = baseHeaders).document
         val items = doc.select("ul.MovieList li.TPostMv").mapNotNull { parseCard(it) }
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
@@ -88,14 +88,14 @@ class AnimeVietSubProvider : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         val doc = app.get(
             "$mainUrl/tim-kiem/${URLEncoder.encode(query, "UTF-8")}/",
-            headers = headers
+            headers = baseHeaders
         ).document
         return doc.select("ul.MovieList li.TPostMv").mapNotNull { parseCard(it) }
     }
 
     override suspend fun load(url: String): LoadResponse {
         val base     = url.trimEnd('/')
-        val watchDoc = app.get("$base/xem-phim.html", headers = headers).document
+        val watchDoc = app.get("$base/xem-phim.html", headers = baseHeaders).document
         val title    = watchDoc.selectFirst("h1.Title")?.text()?.trim() ?: watchDoc.title()
         val poster   = watchDoc.selectFirst("div.Image figure img")?.attr("src")
                        ?.let { if (it.startsWith("http")) it else "$mainUrl$it" }
@@ -129,156 +129,142 @@ class AnimeVietSubProvider : MainAPI() {
         }
     }
 
-    // ── Step 1: Lấy hash và filmId từ API ───────────────────────────────────
-    data class EpisodeInfo(
-        val fileHash: String,
-        val filmId:   String,
-        val cookie:   String
-    )
+    // ── API: lấy fileHash + cookie ──────────────────────────────────────────
+    data class EpInfo(val fileHash: String, val filmId: String, val cookieStr: String)
 
-    private suspend fun getEpisodeInfo(epUrl: String): EpisodeInfo? {
-        val pageHtml  = app.get(epUrl, headers = headers).text
-        val filmId    = Regex("""filmInfo\.filmID\s*=\s*parseInt\('(\d+)'\)""")
-                        .find(pageHtml)?.groupValues?.get(1) ?: return null
-        val episodeId = Regex("""filmInfo\.episodeID\s*=\s*parseInt\('(\d+)'\)""")
-                        .find(pageHtml)?.groupValues?.get(1)
-                        ?: Regex("""-(\d+)\.html""").find(epUrl)?.groupValues?.get(1)
-                        ?: return null
+    private suspend fun fetchEpInfo(epUrl: String): EpInfo? {
+        val pageText = app.get(epUrl, headers = baseHeaders).text
+        val filmId   = Regex("""filmInfo\.filmID\s*=\s*parseInt\('(\d+)'\)""")
+                       .find(pageText)?.groupValues?.get(1) ?: return null
+        val epId     = Regex("""filmInfo\.episodeID\s*=\s*parseInt\('(\d+)'\)""")
+                       .find(pageText)?.groupValues?.get(1)
+                       ?: Regex("""-(\d+)\.html""").find(epUrl)?.groupValues?.get(1)
+                       ?: return null
 
         val ajaxHdr = mapOf(
             "User-Agent"       to UA,
             "X-Requested-With" to "XMLHttpRequest",
             "Content-Type"     to "application/x-www-form-urlencoded; charset=UTF-8",
-            "Origin"           to mainUrl,
             "Referer"          to epUrl,
-            "Accept"           to "application/json, text/javascript, */*; q=0.01"
+            "Origin"           to mainUrl
         )
 
-        // POST /ajax/player để lấy cookie
         val playerResp = app.post(
             "$mainUrl/ajax/player",
             headers = ajaxHdr,
-            data    = mapOf("episodeId" to episodeId, "backup" to "1")
+            data    = mapOf("episodeId" to epId, "backup" to "1")
         )
-        val cookie = playerResp.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
-        if (cookie.isBlank()) return null
+        val cookieStr = playerResp.cookies.entries
+                        .joinToString("; ") { "${it.key}=${it.value}" }
+        if (cookieStr.isBlank()) return null
 
-        // GET /ajax/get_episode với cookie → RSS XML chứa <file>
-        val rssResp = app.get(
-            "$mainUrl/ajax/get_episode?filmId=$filmId&episodeId=$episodeId",
-            headers = ajaxHdr + mapOf("Cookie" to cookie) - "Content-Type"
-        )
+        val rss = app.get(
+            "$mainUrl/ajax/get_episode?filmId=$filmId&episodeId=$epId",
+            headers = ajaxHdr + mapOf("Cookie" to cookieStr) - "Content-Type"
+        ).text
         val fileHash = Regex("""<file>\s*([A-Za-z0-9_\-+/=]+)\s*</file>""")
-                       .find(rssResp.text)?.groupValues?.get(1)?.trim()
-                       ?: return null
+                       .find(rss)?.groupValues?.get(1)?.trim() ?: return null
 
-        return EpisodeInfo(fileHash, filmId, cookie)
+        return EpInfo(fileHash, filmId, cookieStr)
     }
 
-    // ── Step 2: WebView chạy custom HTML với avs.watch.js + hash ────────────
-    // Không dùng trang gốc (có ad detector) mà tạo HTML riêng inject avs.watch.js
+    // ── WebView: chạy avs.watch.js trong clean HTML ──────────────────────────
     inner class M3U8Bridge {
-        @Volatile var m3u8Content: String? = null
+        @Volatile var result: String? = null
 
         @JavascriptInterface
         fun onM3U8(content: String) {
-            if (content.contains("#EXTM3U")) m3u8Content = content
+            if (content.contains("#EXTM3U")) result = content
         }
     }
 
-    private fun buildCustomHtml(fileHash: String, filmId: String, cookie: String): String {
-        // HTML tự chứa script bắt blob + gọi AnimeVsub trực tiếp
-        // loadDataWithBaseURL với base = mainUrl để CORS pass
-        return """<!DOCTYPE html>
-<html>
-<head>
+    // HTML tối giản, không có quảng cáo, không có ad-detector
+    // jQuery stub đủ để avs.watch.js hoạt động
+    private fun buildHtml(fileHash: String, filmId: String): String = """<!DOCTYPE html>
+<html><head><meta charset="utf-8">
 <script>
-// Bắt blob M3U8 TRƯỚC khi load avs.watch.js
 (function(){
-var _orig = URL.createObjectURL;
-URL.createObjectURL = function(blob) {
-  var url = _orig.apply(this, arguments);
-  try {
-    if (blob && blob.type && blob.type.indexOf('mpegurl') !== -1) {
-      var r = new FileReader();
-      r.onload = function(e) {
-        try { if (window.Android) window.Android.onM3U8(e.target.result); } catch(x) {}
-      };
-      r.readAsText(blob);
-    }
-  } catch(x) {}
-  return url;
+// 1. Bắt blob M3U8 ngay từ đầu
+var _oc = URL.createObjectURL;
+URL.createObjectURL = function(b){
+  var u = _oc.apply(this,arguments);
+  try{ if(b&&b.type&&b.type.indexOf('mpegurl')!==-1){
+    var r=new FileReader();
+    r.onload=function(e){try{Android.onM3U8(e.target.result);}catch(x){}};
+    r.readAsText(b);
+  }}catch(x){}
+  return u;
 };
-// Fake jQuery minimal để avs.watch.js có thể chạy $.ajax
-window.$ = window.jQuery = function(x) { return window.$; };
-window.$.ajax = function(opts) {
-  var url = opts.url || '';
-  var data = opts.data || {};
-  var method = (opts.type || opts.method || 'GET').toUpperCase();
-  var xhr = new XMLHttpRequest();
-  xhr.open(method, url, true);
-  xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
-  xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded; charset=UTF-8');
-  xhr.setRequestHeader('Cookie', '${cookie.replace("'", "\\'")}');
-  xhr.onload = function() {
-    if (xhr.status === 200 && opts.success) opts.success(xhr.responseText);
-  };
-  xhr.onerror = function() { if (opts.error) opts.error(); };
-  if (method === 'POST' && data) {
-    var params = Object.keys(data).map(function(k){ return encodeURIComponent(k)+'='+encodeURIComponent(data[k]); }).join('&');
-    xhr.send(params);
-  } else {
-    xhr.send();
+// 2. Stub jQuery cho avs.watch.js
+function jqAjax(o){
+  var x=new XMLHttpRequest();
+  x.open((o.type||o.method||'GET').toUpperCase(),o.url,true);
+  x.setRequestHeader('X-Requested-With','XMLHttpRequest');
+  if(o.data&&typeof o.data==='object'){
+    x.setRequestHeader('Content-Type','application/x-www-form-urlencoded');
   }
-  return { done: function(f) { return this; }, fail: function(f) { return this; } };
+  x.onload=function(){if(x.status>=200&&x.status<300&&o.success)o.success(x.responseText);};
+  x.onerror=function(){if(o.error)o.error();};
+  var body=null;
+  if(o.data){
+    if(typeof o.data==='string') body=o.data;
+    else body=Object.keys(o.data).map(function(k){return encodeURIComponent(k)+'='+encodeURIComponent(o.data[k]);}).join('&');
+  }
+  x.send(body);
+  var p={done:function(f){return p;},fail:function(f){return p;}};return p;
+}
+var jq=function(s){
+  var el=typeof s==='string'?document.querySelectorAll(s):[];
+  var obj={
+    html:function(v){if(v===undefined)return '';document.body.innerHTML=v;return obj;},
+    val:function(){return '';},
+    on:function(){return obj;},
+    ready:function(f){if(document.readyState==='complete')f();else window.addEventListener('load',f);return obj;},
+    each:function(){return obj;},length:el.length
+  };
+  return obj;
 };
-window.$.fn = {};
-window.$.extend = function(a,b) { return Object.assign(a,b); };
-// filmInfo needed by AnimeVsub
-window.filmInfo = { filmID: $filmId };
+jq.ajax=jqAjax;
+jq.fn={};
+jq.extend=function(a,b){return Object.assign(a||{},b||{});};
+jq.parseXML=function(s){return new DOMParser().parseFromString(s,'text/xml');};
+window.$=window.jQuery=jq;
+// 3. filmInfo
+window.filmInfo={filmID:$filmId};
 })();
 </script>
 <script src="$mainUrl/statics/default/js/avs.watch.js?v=6.1.6"></script>
-</head>
-<body>
+</head><body>
 <script>
-// Gọi AnimeVsub với hash từ API
-try { AnimeVsub('$fileHash', $filmId); } catch(e) { console.error(e); }
+setTimeout(function(){
+  try{AnimeVsub('$fileHash',$filmId);}catch(e){console.error('AVS err:',e);}
+},500);
 </script>
-</body>
-</html>"""
-    }
+</body></html>"""
 
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun runAnimeVsubInWebView(
-        fileHash: String,
-        filmId:   String,
-        cookie:   String
-    ): String? {
-        return withTimeoutOrNull(30_000L) {
-            suspendCancellableCoroutine { cont ->
-                val bridge  = M3U8Bridge()
-                val context = try { AcraApplication.context }
+    private suspend fun getM3U8(info: EpInfo): String? {
+        // WebView PHẢI chạy trên Main thread
+        return withContext(Dispatchers.Main) {
+            withTimeoutOrNull(25_000L) {
+                suspendCancellableCoroutine { cont ->
+                    val ctx = try { AcraApplication.context }
                               catch (_: Exception) { null }
-                              ?: return@suspendCancellableCoroutine
+                    if (ctx == null) { cont.resume(null); return@suspendCancellableCoroutine }
 
-                android.os.Handler(android.os.Looper.getMainLooper()).post {
-                    // QUAN TRỌNG: Sync cookie vào WebView cookie store
-                    // Nếu không, GET /ajax/get_episode sẽ fail vì thiếu cookie
-                    val cookieManager = android.webkit.CookieManager.getInstance()
-                    cookieManager.setAcceptCookie(true)
-                    cookieManager.setAcceptThirdPartyCookies(
-                        android.webkit.WebView(context), true
-                    )
-                    cookie.split(";").forEach { pair ->
-                        val kv = pair.trim()
-                        if (kv.isNotBlank()) {
-                            cookieManager.setCookie(mainUrl, kv)
+                    val bridge = M3U8Bridge()
+
+                    // Sync cookie vào WebView store
+                    android.webkit.CookieManager.getInstance().apply {
+                        setAcceptCookie(true)
+                        info.cookieStr.split(";").forEach { kv ->
+                            val t = kv.trim()
+                            if (t.isNotBlank()) setCookie(mainUrl, t)
                         }
+                        flush()
                     }
-                    cookieManager.flush()
 
-                    val wv = WebView(context)
+                    val wv = WebView(ctx)
                     wv.settings.apply {
                         javaScriptEnabled                = true
                         domStorageEnabled                = true
@@ -286,53 +272,56 @@ try { AnimeVsub('$fileHash', $filmId); } catch(e) { console.error(e); }
                         userAgentString                  = UA
                         mixedContentMode                 = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                     }
-                    cookieManager.setAcceptThirdPartyCookies(wv, true)
+                    android.webkit.CookieManager.getInstance()
+                        .setAcceptThirdPartyCookies(wv, true)
                     wv.addJavascriptInterface(bridge, "Android")
                     wv.webViewClient = WebViewClient()
 
-                    // Load custom HTML với base URL = mainUrl (CORS pass + cookie domain match)
-                    val html = buildCustomHtml(fileHash, filmId, cookie)
+                    // loadDataWithBaseURL → CORS đúng domain, cookie đúng domain
                     wv.loadDataWithBaseURL(
-                        "$mainUrl/", html, "text/html", "utf-8", null
+                        "$mainUrl/",
+                        buildHtml(info.fileHash, info.filmId),
+                        "text/html", "utf-8", null
                     )
 
-                    val handler = android.os.Handler(android.os.Looper.getMainLooper())
+                    // Poll kết quả - vẫn trên Main thread nhưng không block
                     var elapsed = 0
+                    val handler = android.os.Handler(android.os.Looper.getMainLooper())
                     val checker = object : Runnable {
                         override fun run() {
-                            val m3u8 = bridge.m3u8Content
+                            val m = bridge.result
                             when {
-                                m3u8 != null && m3u8.contains("#EXTM3U") -> {
-                                    wv.destroy()
-                                    if (cont.isActive) cont.resume(m3u8)
+                                m != null -> {
+                                    wv.stopLoading(); wv.destroy()
+                                    if (cont.isActive) cont.resume(m)
                                 }
-                                elapsed >= 28_000 -> {
-                                    wv.destroy()
+                                elapsed >= 24_000 -> {
+                                    wv.stopLoading(); wv.destroy()
                                     if (cont.isActive) cont.resume(null)
                                 }
-                                else -> {
-                                    elapsed += 500
-                                    handler.postDelayed(this, 500)
-                                }
+                                else -> { elapsed += 300; handler.postDelayed(this, 300) }
                             }
                         }
                     }
                     handler.postDelayed(checker, 2_000)
-                    cont.invokeOnCancellation { wv.destroy() }
+                    cont.invokeOnCancellation {
+                        handler.removeCallbacks(checker)
+                        wv.stopLoading(); wv.destroy()
+                    }
                 }
             }
         }
     }
 
-    // ── Step 3: Resolve videoN.html → lh3.googleusercontent.com ────────────
-    private suspend fun parseM3U8AndCallback(
-        m3u8Text: String,
-        epUrl:    String,
+    // ── Resolve videoN.html → lh3.googleusercontent.com ─────────────────────
+    private suspend fun resolveAndCallback(
+        m3u8: String,
         callback: (ExtractorLink) -> Unit
     ) {
-        val segHdr   = mapOf("Referer" to "$mainUrl/", "User-Agent" to UA)
-        val lines    = m3u8Text.lines()
-        val newLines = coroutineScope {
+        val segHdr = mapOf("Referer" to "$mainUrl/", "User-Agent" to UA)
+        val lines  = m3u8.lines()
+
+        val resolved = coroutineScope {
             lines.map { line ->
                 async {
                     if (line.startsWith("https://storage.googleapiscdn.com") ||
@@ -346,17 +335,17 @@ try { AnimeVsub('$fileHash', $filmId); } catch(e) { console.error(e); }
             }.awaitAll()
         }
 
-        val sep       = "\n"
-        val newM3u8   = newLines.joinToString(sep)
-        val cacheDir  = AcraApplication.context?.cacheDir ?: return
+        val sep      = "\n"
+        val newM3u8  = resolved.joinToString(sep)
+        val cacheDir = AcraApplication.context?.cacheDir ?: return
         cacheDir.mkdirs()
-        val cacheFile = java.io.File(cacheDir, "avs_${System.currentTimeMillis()}.m3u8")
-        cacheFile.writeText(newM3u8, Charsets.UTF_8)
+        val file = java.io.File(cacheDir, "avs_${System.currentTimeMillis()}.m3u8")
+        file.writeText(newM3u8, Charsets.UTF_8)
 
         callback(newExtractorLink(
             source = name,
             name   = "$name - DU",
-            url    = "file://${cacheFile.absolutePath}",
+            url    = "file://${file.absolutePath}",
             type   = ExtractorLinkType.M3U8
         ) {
             this.quality = Qualities.P1080.value
@@ -364,7 +353,7 @@ try { AnimeVsub('$fileHash', $filmId); } catch(e) { console.error(e); }
         })
     }
 
-    // ── loadLinks ────────────────────────────────────────────────────────────
+    // ── loadLinks ─────────────────────────────────────────────────────────────
     override suspend fun loadLinks(
         data:             String,
         isCasting:        Boolean,
@@ -372,16 +361,9 @@ try { AnimeVsub('$fileHash', $filmId); } catch(e) { console.error(e); }
         callback:         (ExtractorLink) -> Unit
     ): Boolean {
         val epUrl = data.substringBefore("|")
-
-        // Bước 1: lấy hash + filmId từ API
-        val info = getEpisodeInfo(epUrl) ?: return true
-
-        // Bước 2: chạy AnimeVsub trong WebView riêng (không có ad detector)
-        val m3u8Text = runAnimeVsubInWebView(info.fileHash, info.filmId, info.cookie)
-            ?: return true
-
-        // Bước 3: resolve segments và callback
-        parseM3U8AndCallback(m3u8Text, epUrl, callback)
+        val info  = fetchEpInfo(epUrl) ?: return true
+        val m3u8  = getM3U8(info) ?: return true
+        resolveAndCallback(m3u8, callback)
         return true
     }
 

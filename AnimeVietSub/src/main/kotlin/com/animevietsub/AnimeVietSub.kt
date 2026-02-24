@@ -1,15 +1,23 @@
 package com.animevietsub
 
+import android.annotation.SuppressLint
+import android.webkit.JavascriptInterface
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.mvvm.safeApiCall
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
 import java.util.EnumSet
+import kotlin.coroutines.resume
 
 @CloudstreamPlugin
 class AnimeVietSubPlugin : Plugin() {
@@ -25,7 +33,7 @@ class AnimeVietSubProvider : MainAPI() {
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA)
 
     private val UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 " +
-                     "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+                     "(KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36"
 
     private val headers = mapOf(
         "User-Agent"      to UA,
@@ -121,25 +129,127 @@ class AnimeVietSubProvider : MainAPI() {
         }
     }
 
-    // ── Load video ────────────────────────────────────────────────────────────
-    //
-    // Flow đã xác nhận từ DevTools:
-    //
-    // 1. POST /ajax/player {episodeId, backup=1}
-    //    → HTML có 2 server buttons:
-    //      DU:  data-play="api"   data-id="0" data-href=HASH_DU
-    //      HDX: data-play="embed" data-id="3" data-href=HASH_HDX
-    //
-    // 2. HDX: POST /ajax/player {link=HASH_HDX, play=embed, id=3, backuplinks=1}
-    //    → JSON: {"link":"https://short.icu/jAUOc3H3i","playTech":"embed"}
-    //    → short.icu redirect → abysscdn.com/?v=jAUOc3H3i
-    //    → abysscdn.com dùng service worker + sssrr.org để serve video
-    //    → loadExtractor("https://abysscdn.com/?v=jAUOc3H3i")
-    //
-    // 3. DU: POST /ajax/player {link=HASH_DU, play=api, id=0, backuplinks=1}
-    //    → JSON: {"link":[],"playTech":"api"} (link rỗng)
-    //    → Video URL decode trong JS (avs.watch.js, obfuscated)
-    //    → Fallback: dùng /ajax/get_episode với cookie
+    // JavaScript interface để nhận M3U8 content từ WebView
+    inner class M3U8Bridge {
+        var m3u8Content: String? = null
+
+        @JavascriptInterface
+        fun onM3U8(content: String) {
+            m3u8Content = content
+        }
+    }
+
+    // Inject JS vào page để bắt blob M3U8 khi avs.watch.js tạo ra
+    private val interceptJs = """
+        (function() {
+            var origCreate = URL.createObjectURL;
+            URL.createObjectURL = function(blob) {
+                var url = origCreate.apply(this, arguments);
+                if (blob && blob.type && blob.type.indexOf('mpegurl') !== -1) {
+                    var reader = new FileReader();
+                    reader.onload = function(e) {
+                        if (window.Android) {
+                            window.Android.onM3U8(e.target.result);
+                        }
+                    };
+                    reader.readAsText(blob);
+                }
+                return url;
+            };
+        })();
+    """.trimIndent()
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private suspend fun getM3U8ViaWebView(epUrl: String): String? {
+        return withTimeoutOrNull(30_000L) {
+            suspendCancellableCoroutine { cont ->
+                val bridge = M3U8Bridge()
+                val context = try {
+                    AcraApplication.context ?: return@suspendCancellableCoroutine
+                } catch (_: Exception) { return@suspendCancellableCoroutine }
+
+                android.os.Handler(android.os.Looper.getMainLooper()).post {
+                    val webView = WebView(context)
+                    webView.settings.apply {
+                        javaScriptEnabled      = true
+                        domStorageEnabled      = true
+                        mediaPlaybackRequiresUserGesture = false
+                        userAgentString        = UA
+                    }
+                    webView.addJavascriptInterface(bridge, "Android")
+                    webView.webViewClient = object : WebViewClient() {
+                        override fun onPageFinished(view: WebView, url: String) {
+                            // Inject interceptor ngay khi page load xong
+                            view.evaluateJavascript(interceptJs, null)
+                        }
+                    }
+                    webView.loadUrl(epUrl, mapOf(
+                        "Accept-Language" to "vi-VN,vi;q=0.9",
+                        "Referer"         to "$mainUrl/"
+                    ))
+
+                    // Poll mỗi 500ms, tối đa 28 giây
+                    val handler = android.os.Handler(android.os.Looper.getMainLooper())
+                    var elapsed = 0
+                    val checker = object : Runnable {
+                        override fun run() {
+                            val m3u8 = bridge.m3u8Content
+                            if (m3u8 != null && m3u8.contains("#EXTM3U")) {
+                                webView.destroy()
+                                if (cont.isActive) cont.resume(m3u8)
+                            } else if (elapsed >= 28_000) {
+                                webView.destroy()
+                                if (cont.isActive) cont.resume(null)
+                            } else {
+                                elapsed += 500
+                                handler.postDelayed(this, 500)
+                            }
+                        }
+                    }
+                    handler.postDelayed(checker, 2_000)
+
+                    cont.invokeOnCancellation { webView.destroy() }
+                }
+            }
+        }
+    }
+
+    // Parse M3U8 text và tạo ExtractorLink từ segment đầu tiên để test quality
+    // Hoặc tạo m3u8 proxy nếu có thể
+    private suspend fun parseM3U8AndCallback(
+        m3u8Text: String,
+        epUrl: String,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        // Tìm tất cả segment URLs (videoN.html) trong M3U8
+        val segmentUrls = Regex("""https?://[^\s#]+""").findAll(m3u8Text)
+            .map { it.value.trim() }
+            .filter { it.contains("storage.googleapiscdn.com") || it.contains("googleapis.com") }
+            .toList()
+
+        if (segmentUrls.isEmpty()) return
+
+        // Lấy base URL từ segment đầu tiên để construct master URL
+        // Pattern: .../chunks/{id}/original/{TOKEN}/video0.html
+        val firstSeg = segmentUrls.first()
+        val masterUrl = firstSeg.replace(Regex("""/video\d+\.html.*$"""), "/master.m3u8")
+
+        // Thử dùng master.m3u8 trước
+        callback(newExtractorLink(
+            source = name,
+            name   = "$name - DU",
+            url    = masterUrl,
+            type   = ExtractorLinkType.M3U8
+        ) {
+            this.quality = Qualities.P1080.value
+            this.headers = mapOf(
+                "Referer"    to epUrl,
+                "User-Agent" to UA,
+                "Origin"     to mainUrl
+            )
+        })
+    }
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -158,27 +268,31 @@ class AnimeVietSubProvider : MainAPI() {
             "Accept"           to "application/json, text/javascript, */*; q=0.01"
         )
 
-        // Bước 1: GET server list
-        val playerResp = app.post(
-            "$mainUrl/ajax/player",
-            headers = ajaxHdr,
-            data    = mapOf("episodeId" to extractEpisodeId(epUrl), "backup" to "1")
-        )
-        val cookie     = playerResp.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
-        val playerJson = try { playerResp.parsed<PlayerResponse>() } catch (_: Exception) { null }
-        val html       = playerJson?.html ?: return true
-        val doc        = Jsoup.parseBodyFragment(html)
+        // Dùng WebView để chạy avs.watch.js và bắt blob M3U8
+        // avs.watch.js: POST /ajax/player → POST /ajax/all → tạo M3U8 blob
+        val m3u8Text = getM3U8ViaWebView(epUrl)
 
-        doc.select("a.btn3dsv").forEach { btn ->
-            val play = btn.attr("data-play")
-            val href = btn.attr("data-href").trim()
-            val id   = btn.attr("data-id").trim()
-            if (href.isBlank()) return@forEach
+        if (!m3u8Text.isNullOrBlank()) {
+            parseM3U8AndCallback(m3u8Text, epUrl, callback)
+        } else {
+            // Fallback: thử lấy qua API trực tiếp
+            safeApiCall {
+                val playerResp = app.post(
+                    "$mainUrl/ajax/player",
+                    headers = ajaxHdr,
+                    data    = mapOf("episodeId" to extractEpisodeId(epUrl), "backup" to "1")
+                )
+                val cookie = playerResp.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+                val html   = try { playerResp.parsed<PlayerResponse>().html } catch (_: Exception) { null }
+                    ?: return@safeApiCall
 
-            when (play) {
-                // ── HDX: embed → short.icu → abysscdn.com ─────────────────
-                "embed" -> safeApiCall {
-                    val resp = app.post(
+                val doc = Jsoup.parseBodyFragment(html)
+                doc.select("a.btn3dsv[data-play=embed]").firstOrNull()?.let { btn ->
+                    val href = btn.attr("data-href").trim()
+                    val id   = btn.attr("data-id").trim()
+                    if (href.isBlank()) return@let
+
+                    val embedResp = app.post(
                         "$mainUrl/ajax/player",
                         headers = ajaxHdr,
                         data    = mapOf(
@@ -189,114 +303,25 @@ class AnimeVietSubProvider : MainAPI() {
                         )
                     ).parsed<EmbedResponse>()
 
-                    val shortUrl = resp.link ?: return@safeApiCall
-
-                    // Follow short.icu -> abysscdn.com/?v=XXX
+                    val shortUrl = embedResp.link ?: return@let
                     val abyssUrl = app.get(
                         shortUrl,
                         headers        = mapOf("User-Agent" to UA, "Referer" to epUrl),
                         allowRedirects = true
                     ).url
 
-                    if (!abyssUrl.contains("abysscdn.com")) return@safeApiCall
-
-                    // WebView load abysscdn -> service worker -> sssrr.org video
-                    val sssrrInterceptor = com.lagradost.cloudstream3.network.WebViewResolver(
-                        Regex("""sssrr\.org/sora/\d+/[A-Za-z0-9+/=_\-]+""")
-                    )
-
-                    val sssrrUrl = app.get(
-                        abyssUrl,
-                        headers     = mapOf("User-Agent" to UA, "Referer" to epUrl),
-                        interceptor = sssrrInterceptor
-                    ).url
-
-                    if (sssrrUrl.contains("sssrr.org")) {
-                        callback(newExtractorLink(
-                            source = name,
-                            name   = "$name - HDX",
-                            url    = sssrrUrl,
-                            type   = ExtractorLinkType.VIDEO
-                        ) {
-                            this.quality = Qualities.P1080.value
-                            this.headers = mapOf(
-                                "Referer"    to abyssUrl,
-                                "User-Agent" to UA
-                            )
-                        })
-                    }
-                }
-
-                "api" -> safeApiCall {
-                    // Thử POST player với play=api (thường link rỗng)
-                    val resp = app.post(
-                        "$mainUrl/ajax/player",
-                        headers = ajaxHdr,
-                        data    = mapOf(
-                            "link"        to href,
-                            "play"        to "api",
-                            "id"          to id.ifBlank { "0" },
-                            "backuplinks" to "1"
-                        )
-                    )
-
-                    // Thử parse link trực tiếp từ JSON
-                    val apiResp = try { resp.parsed<EmbedResponse>() } catch (_: Exception) { null }
-                    val apiLink = apiResp?.link
-
-                    if (!apiLink.isNullOrBlank()) {
-                        // Nếu có link trực tiếp (mp4/m3u8)
-                        callback(newExtractorLink(
-                            source = name,
-                            name   = "$name - DU",
-                            url    = apiLink,
-                            type   = if (apiLink.contains(".m3u8")) ExtractorLinkType.M3U8
-                                     else ExtractorLinkType.VIDEO
-                        ) {
-                            this.quality = Qualities.P1080.value
-                            this.headers = mapOf("Referer" to epUrl, "User-Agent" to UA)
-                        })
-                    } else if (cookie.isNotBlank()) {
-                        // Fallback: /ajax/get_episode với cookie → RSS <file>
-                        extractFromRss(epUrl, cookie, ajaxHdr, callback)
+                    if (abyssUrl.contains("abysscdn.com") || abyssUrl.contains("abyss.to")) {
+                        // WebView lần 2 cho HDX nếu DU thất bại
+                        val hdxM3u8 = getM3U8ViaWebView(abyssUrl)
+                        if (!hdxM3u8.isNullOrBlank()) {
+                            parseM3U8AndCallback(hdxM3u8, epUrl, callback)
+                        }
                     }
                 }
             }
         }
 
         return true
-    }
-
-    private suspend fun extractFromRss(
-        epUrl: String,
-        cookie: String,
-        ajaxHdr: Map<String, String>,
-        callback: (ExtractorLink) -> Unit
-    ) {
-        val pageHtml  = app.get(epUrl, headers = headers).text
-        val filmID    = Regex("""filmInfo\.filmID\s*=\s*parseInt\('(\d+)'\)""")
-                        .find(pageHtml)?.groupValues?.get(1) ?: return
-        val episodeID = Regex("""filmInfo\.episodeID\s*=\s*parseInt\('(\d+)'\)""")
-                        .find(pageHtml)?.groupValues?.get(1) ?: return
-
-        val rssText = app.get(
-            "$mainUrl/ajax/get_episode?filmId=$filmID&episodeId=$episodeID",
-            headers = ajaxHdr - "Content-Type" + mapOf("Cookie" to cookie)
-        ).text
-
-        val fileUrl = Regex("""<file>\s*(https?://[^<\s]+)\s*</file>""")
-            .find(rssText)?.groupValues?.get(1)?.trim() ?: return
-
-        callback(newExtractorLink(
-            source = name,
-            name   = "$name - DU",
-            url    = fileUrl,
-            type   = if (fileUrl.contains(".m3u8")) ExtractorLinkType.M3U8
-                     else ExtractorLinkType.VIDEO
-        ) {
-            this.quality = Qualities.P1080.value
-            this.headers = mapOf("Referer" to epUrl, "User-Agent" to UA)
-        })
     }
 
     private fun extractEpisodeId(epUrl: String): String {

@@ -2,6 +2,8 @@ package com.animevietsub
 
 import android.annotation.SuppressLint
 import android.webkit.JavascriptInterface
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -129,28 +131,33 @@ class AnimeVietSubProvider : MainAPI() {
         }
     }
 
-    // ── JavaScript bridge để nhận M3U8 từ WebView ──────────────────────────
+    // ── JavaScript bridge ────────────────────────────────────────────────────
     inner class M3U8Bridge {
-        var m3u8Content: String? = null
+        @Volatile var m3u8Content: String? = null
 
         @JavascriptInterface
         fun onM3U8(content: String) {
-            m3u8Content = content
+            if (content.contains("#EXTM3U")) m3u8Content = content
         }
     }
 
-    private val interceptJs = """
+    // Inject nhiều lần để đảm bảo bắt được blob
+    private fun makeInterceptJs(): String = """
 (function() {
+    if (window.__avsHooked) return;
+    window.__avsHooked = true;
     var origCreate = URL.createObjectURL;
     URL.createObjectURL = function(blob) {
         var url = origCreate.apply(this, arguments);
-        if (blob && blob.type && blob.type.indexOf('mpegurl') !== -1) {
-            var reader = new FileReader();
-            reader.onload = function(e) {
-                if (window.Android) window.Android.onM3U8(e.target.result);
-            };
-            reader.readAsText(blob);
-        }
+        try {
+            if (blob && blob.type && blob.type.indexOf('mpegurl') !== -1) {
+                var reader = new FileReader();
+                reader.onload = function(e) {
+                    try { if (window.Android) window.Android.onM3U8(e.target.result); } catch(ex) {}
+                };
+                reader.readAsText(blob);
+            }
+        } catch(ex) {}
         return url;
     };
 })();
@@ -158,26 +165,44 @@ class AnimeVietSubProvider : MainAPI() {
 
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun getM3U8ViaWebView(epUrl: String): String? {
-        return withTimeoutOrNull(30_000L) {
+        return withTimeoutOrNull(35_000L) {
             suspendCancellableCoroutine { cont ->
                 val bridge  = M3U8Bridge()
-                val context = try { AcraApplication.context ?: return@suspendCancellableCoroutine }
-                              catch (_: Exception) { return@suspendCancellableCoroutine }
+                val context = try { AcraApplication.context }
+                              catch (_: Exception) { null }
+                              ?: return@suspendCancellableCoroutine
 
                 android.os.Handler(android.os.Looper.getMainLooper()).post {
                     val wv = WebView(context)
                     wv.settings.apply {
-                        javaScriptEnabled               = true
-                        domStorageEnabled               = true
+                        javaScriptEnabled                = true
+                        domStorageEnabled                = true
                         mediaPlaybackRequiresUserGesture = false
-                        userAgentString                 = UA
+                        userAgentString                  = UA
+                        mixedContentMode                 = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                        allowFileAccess                  = true
                     }
                     wv.addJavascriptInterface(bridge, "Android")
+
+                    val jsCode = makeInterceptJs()
+
                     wv.webViewClient = object : WebViewClient() {
+                        override fun onPageStarted(view: WebView, url: String, favicon: android.graphics.Bitmap?) {
+                            // Inject sớm nhất có thể
+                            view.evaluateJavascript(jsCode, null)
+                        }
                         override fun onPageFinished(view: WebView, url: String) {
-                            view.evaluateJavascript(interceptJs, null)
+                            view.evaluateJavascript(jsCode, null)
+                        }
+                        override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
+                            // Inject lại sau mỗi request JS
+                            if (request.url.toString().endsWith(".js")) {
+                                view.post { view.evaluateJavascript(jsCode, null) }
+                            }
+                            return null
                         }
                     }
+
                     wv.loadUrl(epUrl, mapOf(
                         "Accept-Language" to "vi-VN,vi;q=0.9",
                         "Referer"         to "$mainUrl/"
@@ -193,37 +218,29 @@ class AnimeVietSubProvider : MainAPI() {
                                     wv.destroy()
                                     if (cont.isActive) cont.resume(m3u8)
                                 }
-                                elapsed >= 28_000 -> {
+                                elapsed >= 33_000 -> {
                                     wv.destroy()
                                     if (cont.isActive) cont.resume(null)
                                 }
                                 else -> {
                                     elapsed += 500
+                                    // Re-inject every 2s
+                                    if (elapsed % 2000 == 0) {
+                                        wv.evaluateJavascript(jsCode, null)
+                                    }
                                     handler.postDelayed(this, 500)
                                 }
                             }
                         }
                     }
-                    handler.postDelayed(checker, 2_000)
+                    handler.postDelayed(checker, 3_000)
                     cont.invokeOnCancellation { wv.destroy() }
                 }
             }
         }
     }
 
-    // ── Ghi M3U8 vào cache file ─────────────────────────────────────────────
-    private fun writeM3U8ToCache(m3u8Text: String): String? {
-        return try {
-            val cacheDir = AcraApplication.context?.cacheDir
-                ?: java.io.File("/data/local/tmp")
-            cacheDir.mkdirs()
-            val file = java.io.File(cacheDir, "avs_${System.currentTimeMillis()}.m3u8")
-            file.writeText(m3u8Text, Charsets.UTF_8)
-            file.absolutePath
-        } catch (_: Exception) { null }
-    }
-
-    // ── Resolve videoN.html -> lh3.googleusercontent.com và ghi M3U8 mới ──
+    // ── Resolve videoN.html -> lh3.googleusercontent.com ────────────────────
     private suspend fun parseM3U8AndCallback(
         m3u8Text: String,
         epUrl: String,
@@ -256,14 +273,18 @@ class AnimeVietSubProvider : MainAPI() {
             }.awaitAll()
         }
 
-        val sep = "\n"
+        // Ghi M3U8 đã resolve vào cache
+        val sep       = "\n"
         val newM3u8   = newLines.joinToString(sep)
-        val cachePath = writeM3U8ToCache(newM3u8) ?: return
+        val cacheDir  = AcraApplication.context?.cacheDir ?: return
+        cacheDir.mkdirs()
+        val cacheFile = java.io.File(cacheDir, "avs_${System.currentTimeMillis()}.m3u8")
+        cacheFile.writeText(newM3u8, Charsets.UTF_8)
 
         callback(newExtractorLink(
             source = name,
             name   = "$name - DU",
-            url    = "file://$cachePath",
+            url    = "file://${cacheFile.absolutePath}",
             type   = ExtractorLinkType.M3U8
         ) {
             this.quality = Qualities.P1080.value
@@ -286,7 +307,7 @@ class AnimeVietSubProvider : MainAPI() {
             return true
         }
 
-        // Fallback: POST /ajax/player → HDX embed → abysscdn
+        // Fallback: HDX embed -> abysscdn
         val ajaxHdr = mapOf(
             "User-Agent"       to UA,
             "Accept-Language"  to "vi-VN,vi;q=0.9",
@@ -313,8 +334,7 @@ class AnimeVietSubProvider : MainAPI() {
                     val href = btn.attr("data-href").trim()
                     val id   = btn.attr("data-id").trim()
                     if (href.isBlank()) return@let
-
-                    val embedResp = app.post(
+                    val resp = app.post(
                         "$mainUrl/ajax/player",
                         headers = ajaxHdr,
                         data    = mapOf(
@@ -324,14 +344,12 @@ class AnimeVietSubProvider : MainAPI() {
                             "backuplinks" to "1"
                         )
                     ).parsed<EmbedResponse>()
-
-                    val shortUrl = embedResp.link ?: return@let
+                    val shortUrl = resp.link ?: return@let
                     val abyssUrl = app.get(
                         shortUrl,
                         headers        = mapOf("User-Agent" to UA, "Referer" to epUrl),
                         allowRedirects = true
                     ).url
-
                     if (abyssUrl.contains("abysscdn.com") || abyssUrl.contains("abyss.to")) {
                         val hdxM3u8 = getM3U8ViaWebView(abyssUrl)
                         if (!hdxM3u8.isNullOrBlank()) {

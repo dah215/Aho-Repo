@@ -225,14 +225,56 @@ class AnimeVietSubProvider : MainAPI() {
         } catch (_: Exception) { null }
     }
 
+    // video0.html -> 302 -> lh3.googleusercontent.com/TOKEN=d (segment thật)
+    // Cần fetch mỗi segment để lấy redirect URL, rồi ghi M3U8 mới vào cache
     private suspend fun parseM3U8AndCallback(
         m3u8Text: String,
         epUrl: String,
         callback: (ExtractorLink) -> Unit
     ) {
-        // Ghi blob M3U8 vào cache file để ExoPlayer đọc trực tiếp
-        val cachePath = writeM3U8ToCache(m3u8Text)
-        if (cachePath != null) {
+        val segHdr = mapOf(
+            "Referer"    to "$mainUrl/",
+            "User-Agent" to UA,
+            "Origin"     to mainUrl
+        )
+
+        // Tìm tất cả segment URLs trong M3U8
+        val lines = m3u8Text.lines().toMutableList()
+        var resolved = false
+
+        val newLines = lines.map { line ->
+            if (line.startsWith("https://storage.googleapiscdn.com") ||
+                line.startsWith("https://storage.googleapis.com")) {
+                // Fetch segment để lấy redirect URL (lh3.googleusercontent.com)
+                try {
+                    val resp = app.get(line.trim(), headers = segHdr, allowRedirects = false)
+                    val location = resp.headers["location"]
+                    if (!location.isNullOrBlank()) {
+                        resolved = true
+                        location.trim()
+                    } else line
+                } catch (_: Exception) { line }
+            } else line
+        }
+
+        val newM3u8 = newLines.joinToString("
+")
+        val cachePath = writeM3U8ToCache(newM3u8)
+
+        if (cachePath != null && resolved) {
+            // Feed file:// M3U8 với lh3.googleusercontent.com segments
+            // lh3 không cần Referer nên ExoPlayer load được
+            callback(newExtractorLink(
+                source = name,
+                name   = "$name - DU",
+                url    = "file://$cachePath",
+                type   = ExtractorLinkType.M3U8
+            ) {
+                this.quality = Qualities.P1080.value
+                this.headers = mapOf("User-Agent" to UA)
+            })
+        } else if (cachePath != null) {
+            // Segments chưa resolved nhưng vẫn thử
             callback(newExtractorLink(
                 source = name,
                 name   = "$name - DU",
@@ -241,34 +283,11 @@ class AnimeVietSubProvider : MainAPI() {
             ) {
                 this.quality = Qualities.P1080.value
                 this.headers = mapOf(
-                    "Referer"    to epUrl,
-                    "User-Agent" to UA,
-                    "Origin"     to mainUrl
+                    "Referer"    to "$mainUrl/",
+                    "User-Agent" to UA
                 )
             })
-            return
         }
-
-        // Fallback: construct master.m3u8 URL từ segment đầu tiên
-        val firstSeg = Regex("""https?://[^\s#]+""").findAll(m3u8Text)
-            .map { it.value.trim() }
-            .filter { it.contains("storage.googleapiscdn.com") || it.contains("googleapis.com") }
-            .firstOrNull() ?: return
-
-        val masterUrl = firstSeg.replace(Regex("""/video\d+\.html.*$"""), "/master.m3u8")
-        callback(newExtractorLink(
-            source = name,
-            name   = "$name - DU",
-            url    = masterUrl,
-            type   = ExtractorLinkType.M3U8
-        ) {
-            this.quality = Qualities.P1080.value
-            this.headers = mapOf(
-                "Referer"    to epUrl,
-                "User-Agent" to UA,
-                "Origin"     to mainUrl
-            )
-        })
     }
 
     override suspend fun loadLinks(

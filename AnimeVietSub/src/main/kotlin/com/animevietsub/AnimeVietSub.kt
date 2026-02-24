@@ -10,6 +10,9 @@ import com.lagradost.cloudstream3.mvvm.safeApiCall
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
@@ -214,19 +217,27 @@ class AnimeVietSubProvider : MainAPI() {
         }
     }
 
-    // Ghi M3U8 vào file tạm và trả về file:// URI cho ExoPlayer
+    // Ghi M3U8 vào file tạm /data/data/.../cache/
     private fun writeM3U8ToCache(m3u8Text: String): String? {
         return try {
-            val context = AcraApplication.context ?: return null
-            val cacheDir = context.cacheDir
-            val file = java.io.File(cacheDir, "avs_stream_${System.currentTimeMillis()}.m3u8")
+            val cacheDir = java.io.File(
+                android.os.Environment.getExternalStorageDirectory().absolutePath
+            ).let { null } ?: run {
+                // Dùng context từ AcraApplication hoặc fallback /data/local/tmp
+                val ctx = AcraApplication.context
+                if (ctx != null) ctx.cacheDir
+                else java.io.File("/data/local/tmp")
+            }
+            cacheDir.mkdirs()
+            val file = java.io.File(cacheDir, "avs_${System.currentTimeMillis()}.m3u8")
             file.writeText(m3u8Text, Charsets.UTF_8)
             file.absolutePath
         } catch (_: Exception) { null }
     }
 
-    // video0.html -> 302 -> lh3.googleusercontent.com/TOKEN=d (segment thật)
-    // Cần fetch mỗi segment để lấy redirect URL, rồi ghi M3U8 mới vào cache
+    // video0.html -> 302 -> lh3.googleusercontent.com/TOKEN=d
+    // Segment redirect cache-control: public, max-age=31536000 (1 year stable)
+    // Chỉ cần resolve 1 segment để verify, rồi dùng original M3U8 với đúng headers
     private suspend fun parseM3U8AndCallback(
         m3u8Text: String,
         epUrl: String,
@@ -238,55 +249,53 @@ class AnimeVietSubProvider : MainAPI() {
             "Origin"     to mainUrl
         )
 
-        // Tìm tất cả segment URLs trong M3U8
-        val lines = m3u8Text.lines().toMutableList()
-        var resolved = false
-
-        val newLines = lines.map { line ->
-            if (line.startsWith("https://storage.googleapiscdn.com") ||
-                line.startsWith("https://storage.googleapis.com")) {
-                // Fetch segment để lấy redirect URL (lh3.googleusercontent.com)
-                try {
-                    val resp = app.get(line.trim(), headers = segHdr, allowRedirects = false)
-                    val location = resp.headers["location"]
-                    if (!location.isNullOrBlank()) {
-                        resolved = true
-                        location.trim()
-                    } else line
-                } catch (_: Exception) { line }
-            } else line
+        val lines = m3u8Text.lines()
+        val firstSeg = lines.firstOrNull {
+            it.startsWith("https://storage.googleapiscdn.com") ||
+            it.startsWith("https://storage.googleapis.com")
+        } ?: run {
+            // Không có segment URL, thử ghi M3U8 thẳng
+            val path = writeM3U8ToCache(m3u8Text)
+            if (path != null) {
+                callback(newExtractorLink(
+                    source = name, name = "$name - DU",
+                    url = "file://$path", type = ExtractorLinkType.M3U8
+                ) {
+                    quality = Qualities.P1080.value
+                    headers = mapOf("Referer" to "$mainUrl/", "User-Agent" to UA)
+                })
+            }
+            return
         }
 
-        val newM3u8 = newLines.joinToString("\n")
-        val cachePath = writeM3U8ToCache(newM3u8)
-
-        if (cachePath != null && resolved) {
-            // Feed file:// M3U8 với lh3.googleusercontent.com segments
-            // lh3 không cần Referer nên ExoPlayer load được
-            callback(newExtractorLink(
-                source = name,
-                name   = "$name - DU",
-                url    = "file://$cachePath",
-                type   = ExtractorLinkType.M3U8
-            ) {
-                this.quality = Qualities.P1080.value
-                this.headers = mapOf("User-Agent" to UA)
-            })
-        } else if (cachePath != null) {
-            // Segments chưa resolved nhưng vẫn thử
-            callback(newExtractorLink(
-                source = name,
-                name   = "$name - DU",
-                url    = "file://$cachePath",
-                type   = ExtractorLinkType.M3U8
-            ) {
-                this.quality = Qualities.P1080.value
-                this.headers = mapOf(
-                    "Referer"    to "$mainUrl/",
-                    "User-Agent" to UA
-                )
-            })
+        // Resolve TẤT CẢ segments song song (chúng cached 1 year nên nhanh)
+        val newLines = coroutineScope {
+            lines.map { line ->
+                if (line.startsWith("https://storage.googleapiscdn.com") ||
+                    line.startsWith("https://storage.googleapis.com")) {
+                    async {
+                        try {
+                            val resp = app.get(line.trim(), headers = segHdr, allowRedirects = false)
+                            resp.headers["location"]?.trim() ?: line
+                        } catch (_: Exception) { line }
+                    }
+                } else async { line }
+            }.awaitAll()
         }
+
+        val newM3u8 = newLines.joinToString("
+")
+        val cachePath = writeM3U8ToCache(newM3u8) ?: return
+
+        callback(newExtractorLink(
+            source = name,
+            name   = "$name - DU",
+            url    = "file://$cachePath",
+            type   = ExtractorLinkType.M3U8
+        ) {
+            this.quality = Qualities.P1080.value
+            this.headers = mapOf("User-Agent" to UA)
+        })
     }
 
     override suspend fun loadLinks(

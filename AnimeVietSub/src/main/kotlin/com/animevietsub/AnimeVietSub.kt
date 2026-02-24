@@ -257,8 +257,7 @@ class AnimeVietSubProvider : MainAPI() {
             } else line
         }
 
-        val newM3u8 = newLines.joinToString("
-")
+        val newM3u8 = newLines.joinToString("\n")
         val cachePath = writeM3U8ToCache(newM3u8)
 
         if (cachePath != null && resolved) {

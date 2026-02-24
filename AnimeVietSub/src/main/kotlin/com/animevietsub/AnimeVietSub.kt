@@ -43,6 +43,9 @@ class AnimeVietSubProvider : MainAPI() {
         "Referer"         to "$mainUrl/"
     )
 
+    // Cache avs.watch.js để không fetch mỗi lần
+    private var avsJsCache: String? = null
+
     override val mainPage = mainPageOf(
         "$mainUrl/anime-moi/"                 to "Anime Mới Nhất",
         "$mainUrl/anime-bo/"                  to "Anime Bộ",
@@ -129,8 +132,34 @@ class AnimeVietSubProvider : MainAPI() {
         }
     }
 
-    // ── API: lấy fileHash + cookie ──────────────────────────────────────────
-    data class EpInfo(val fileHash: String, val filmId: String, val cookieStr: String)
+    // ── Lấy avs.watch.js qua OkHttp (có thể bypass Cloudflare vì có cookie) ─
+    private suspend fun fetchAvsJs(epUrl: String, cookie: String): String? {
+        if (avsJsCache != null) return avsJsCache
+        return try {
+            val js = app.get(
+                "$mainUrl/statics/default/js/avs.watch.js?v=6.1.6",
+                headers = mapOf(
+                    "User-Agent"      to UA,
+                    "Referer"         to epUrl,
+                    "Accept"          to "*/*",
+                    "Accept-Language" to "vi-VN,vi;q=0.9",
+                    "Cookie"          to cookie
+                )
+            ).text
+            if (js.contains("AnimeVsub") || js.length > 1000) {
+                avsJsCache = js
+                js
+            } else null
+        } catch (_: Exception) { null }
+    }
+
+    // ── API: lấy fileHash + filmId + cookie ──────────────────────────────────
+    data class EpInfo(
+        val fileHash:  String,
+        val filmId:    String,
+        val epId:      String,
+        val cookieStr: String
+    )
 
     private suspend fun fetchEpInfo(epUrl: String): EpInfo? {
         val pageText = app.get(epUrl, headers = baseHeaders).text
@@ -165,10 +194,10 @@ class AnimeVietSubProvider : MainAPI() {
         val fileHash = Regex("""<file>\s*([A-Za-z0-9_\-+/=]+)\s*</file>""")
                        .find(rss)?.groupValues?.get(1)?.trim() ?: return null
 
-        return EpInfo(fileHash, filmId, cookieStr)
+        return EpInfo(fileHash, filmId, epId, cookieStr)
     }
 
-    // ── WebView: chạy avs.watch.js trong clean HTML ──────────────────────────
+    // ── WebView bridge ────────────────────────────────────────────────────────
     inner class M3U8Bridge {
         @Volatile var result: String? = null
 
@@ -178,73 +207,74 @@ class AnimeVietSubProvider : MainAPI() {
         }
     }
 
-    // HTML tối giản, không có quảng cáo, không có ad-detector
-    // jQuery stub đủ để avs.watch.js hoạt động
-    private fun buildHtml(fileHash: String, filmId: String): String = """<!DOCTYPE html>
+    // HTML với avs.watch.js được INLINE (không load external)
+    private fun buildHtml(fileHash: String, filmId: String, avsJs: String): String {
+        // Escape backticks trong avsJs nếu có
+        val safeJs = avsJs.replace("</script>", "<\\/script>")
+        return """<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <script>
+// Bắt blob TRƯỚC khi avs.watch.js chạy
 (function(){
-// 1. Bắt blob M3U8 ngay từ đầu
-var _oc = URL.createObjectURL;
-URL.createObjectURL = function(b){
-  var u = _oc.apply(this,arguments);
-  try{ if(b&&b.type&&b.type.indexOf('mpegurl')!==-1){
+var _oc=URL.createObjectURL;
+URL.createObjectURL=function(b){
+  var u=_oc.apply(this,arguments);
+  try{if(b&&b.type&&b.type.indexOf('mpegurl')!==-1){
     var r=new FileReader();
     r.onload=function(e){try{Android.onM3U8(e.target.result);}catch(x){}};
     r.readAsText(b);
   }}catch(x){}
   return u;
 };
-// 2. Stub jQuery cho avs.watch.js
-function jqAjax(o){
-  var x=new XMLHttpRequest();
-  x.open((o.type||o.method||'GET').toUpperCase(),o.url,true);
+// jQuery stub
+function xhrAjax(o){
+  var x=new XMLHttpRequest(),m=(o.type||o.method||'GET').toUpperCase();
+  x.open(m,o.url,true);
   x.setRequestHeader('X-Requested-With','XMLHttpRequest');
-  if(o.data&&typeof o.data==='object'){
-    x.setRequestHeader('Content-Type','application/x-www-form-urlencoded');
-  }
-  x.onload=function(){if(x.status>=200&&x.status<300&&o.success)o.success(x.responseText);};
-  x.onerror=function(){if(o.error)o.error();};
+  x.onload=function(){if(x.status<400&&o.success)o.success(x.responseText);else if(o.error)o.error(x.status,x.responseText);};
+  x.onerror=function(){if(o.error)o.error(0,'');};
   var body=null;
-  if(o.data){
-    if(typeof o.data==='string') body=o.data;
-    else body=Object.keys(o.data).map(function(k){return encodeURIComponent(k)+'='+encodeURIComponent(o.data[k]);}).join('&');
-  }
-  x.send(body);
+  if(o.data){body=typeof o.data==='string'?o.data:Object.keys(o.data).map(function(k){return encodeURIComponent(k)+'='+encodeURIComponent(o.data[k]);}).join('&');
+    if(m==='POST')x.setRequestHeader('Content-Type','application/x-www-form-urlencoded');}
+  x.send(m==='POST'?body:null);
   var p={done:function(f){return p;},fail:function(f){return p;}};return p;
 }
 var jq=function(s){
-  var el=typeof s==='string'?document.querySelectorAll(s):[];
-  var obj={
-    html:function(v){if(v===undefined)return '';document.body.innerHTML=v;return obj;},
-    val:function(){return '';},
-    on:function(){return obj;},
-    ready:function(f){if(document.readyState==='complete')f();else window.addEventListener('load',f);return obj;},
-    each:function(){return obj;},length:el.length
+  var arr=[];
+  try{if(typeof s==='string')arr=Array.prototype.slice.call(document.querySelectorAll(s));}catch(e){}
+  var o={
+    ready:function(f){if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',f);else f();return o;},
+    html:function(v){return o;},val:function(){return '';},
+    on:function(){return o;},each:function(){return o;},
+    find:function(){return o;},length:arr.length,
+    addClass:function(){return o;},removeClass:function(){return o;}
   };
-  return obj;
+  return o;
 };
-jq.ajax=jqAjax;
-jq.fn={};
-jq.extend=function(a,b){return Object.assign(a||{},b||{});};
-jq.parseXML=function(s){return new DOMParser().parseFromString(s,'text/xml');};
+jq.ajax=xhrAjax;
+jq.fn={};jq.extend=function(a,b){return Object.assign(a||{},b||{});};
+jq.parseXML=function(s){return(new DOMParser()).parseFromString(s,'text/xml');};
+jq.isFunction=function(f){return typeof f==='function';};
+jq.noop=function(){};
 window.$=window.jQuery=jq;
-// 3. filmInfo
 window.filmInfo={filmID:$filmId};
 })();
 </script>
-<script src="$mainUrl/statics/default/js/avs.watch.js?v=6.1.6"></script>
+<script>
+// avs.watch.js inlined
+$safeJs
+</script>
 </head><body>
 <script>
 setTimeout(function(){
-  try{AnimeVsub('$fileHash',$filmId);}catch(e){console.error('AVS err:',e);}
-},500);
+  try{AnimeVsub('$fileHash',$filmId);}catch(e){}
+},800);
 </script>
 </body></html>"""
+    }
 
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun getM3U8(info: EpInfo): String? {
-        // WebView PHẢI chạy trên Main thread
+    private suspend fun getM3U8(info: EpInfo, avsJs: String): String? {
         return withContext(Dispatchers.Main) {
             withTimeoutOrNull(25_000L) {
                 suspendCancellableCoroutine { cont ->
@@ -254,7 +284,7 @@ setTimeout(function(){
 
                     val bridge = M3U8Bridge()
 
-                    // Sync cookie vào WebView store
+                    // Sync cookie vào WebView
                     android.webkit.CookieManager.getInstance().apply {
                         setAcceptCookie(true)
                         info.cookieStr.split(";").forEach { kv ->
@@ -277,16 +307,14 @@ setTimeout(function(){
                     wv.addJavascriptInterface(bridge, "Android")
                     wv.webViewClient = WebViewClient()
 
-                    // loadDataWithBaseURL → CORS đúng domain, cookie đúng domain
                     wv.loadDataWithBaseURL(
                         "$mainUrl/",
-                        buildHtml(info.fileHash, info.filmId),
+                        buildHtml(info.fileHash, info.filmId, avsJs),
                         "text/html", "utf-8", null
                     )
 
-                    // Poll kết quả - vẫn trên Main thread nhưng không block
-                    var elapsed = 0
                     val handler = android.os.Handler(android.os.Looper.getMainLooper())
+                    var elapsed = 0
                     val checker = object : Runnable {
                         override fun run() {
                             val m = bridge.result
@@ -299,7 +327,10 @@ setTimeout(function(){
                                     wv.stopLoading(); wv.destroy()
                                     if (cont.isActive) cont.resume(null)
                                 }
-                                else -> { elapsed += 300; handler.postDelayed(this, 300) }
+                                else -> {
+                                    elapsed += 300
+                                    handler.postDelayed(this, 300)
+                                }
                             }
                         }
                     }
@@ -315,12 +346,11 @@ setTimeout(function(){
 
     // ── Resolve videoN.html → lh3.googleusercontent.com ─────────────────────
     private suspend fun resolveAndCallback(
-        m3u8: String,
+        m3u8:     String,
         callback: (ExtractorLink) -> Unit
     ) {
-        val segHdr = mapOf("Referer" to "$mainUrl/", "User-Agent" to UA)
-        val lines  = m3u8.lines()
-
+        val segHdr   = mapOf("Referer" to "$mainUrl/", "User-Agent" to UA)
+        val lines    = m3u8.lines()
         val resolved = coroutineScope {
             lines.map { line ->
                 async {
@@ -343,8 +373,7 @@ setTimeout(function(){
         file.writeText(newM3u8, Charsets.UTF_8)
 
         callback(newExtractorLink(
-            source = name,
-            name   = "$name - DU",
+            source = name, name = "$name - DU",
             url    = "file://${file.absolutePath}",
             type   = ExtractorLinkType.M3U8
         ) {
@@ -361,14 +390,18 @@ setTimeout(function(){
         callback:         (ExtractorLink) -> Unit
     ): Boolean {
         val epUrl = data.substringBefore("|")
-        val info  = fetchEpInfo(epUrl) ?: return true
-        val m3u8  = getM3U8(info) ?: return true
+
+        // 1. Lấy thông tin episode từ API
+        val info = fetchEpInfo(epUrl) ?: return true
+
+        // 2. Fetch avs.watch.js qua OkHttp (inline vào HTML, bypass Cloudflare block trên WebView)
+        val avsJs = fetchAvsJs(epUrl, info.cookieStr) ?: return true
+
+        // 3. Chạy AnimeVsub trong WebView sạch, bắt blob M3U8
+        val m3u8 = getM3U8(info, avsJs) ?: return true
+
+        // 4. Resolve segments và callback
         resolveAndCallback(m3u8, callback)
         return true
     }
-
-    data class PlayerResponse(
-        @JsonProperty("success") val success: Int  = 0,
-        @JsonProperty("html")    val html: String? = null
-    )
 }

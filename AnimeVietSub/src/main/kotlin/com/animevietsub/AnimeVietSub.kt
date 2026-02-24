@@ -19,6 +19,7 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
+import java.io.ByteArrayInputStream
 import java.net.URLEncoder
 import java.util.EnumSet
 import kotlin.coroutines.resume
@@ -131,7 +132,19 @@ class AnimeVietSubProvider : MainAPI() {
         }
     }
 
-    // ── JavaScript bridge ────────────────────────────────────────────────────
+    // Script inject vào <head> để bắt blob TRƯỚC khi page scripts chạy
+    private val headScript = """<script>
+(function(){
+var _orig=URL.createObjectURL;
+URL.createObjectURL=function(b){
+var u=_orig.apply(this,arguments);
+try{if(b&&b.type&&b.type.indexOf('mpegurl')!==-1){
+var r=new FileReader();
+r.onload=function(e){try{if(window.Android)window.Android.onM3U8(e.target.result);}catch(x){}};
+r.readAsText(b);}}catch(x){}
+return u;};})();
+</script>"""
+
     inner class M3U8Bridge {
         @Volatile var m3u8Content: String? = null
 
@@ -140,28 +153,6 @@ class AnimeVietSubProvider : MainAPI() {
             if (content.contains("#EXTM3U")) m3u8Content = content
         }
     }
-
-    // Inject nhiều lần để đảm bảo bắt được blob
-    private fun makeInterceptJs(): String = """
-(function() {
-    if (window.__avsHooked) return;
-    window.__avsHooked = true;
-    var origCreate = URL.createObjectURL;
-    URL.createObjectURL = function(blob) {
-        var url = origCreate.apply(this, arguments);
-        try {
-            if (blob && blob.type && blob.type.indexOf('mpegurl') !== -1) {
-                var reader = new FileReader();
-                reader.onload = function(e) {
-                    try { if (window.Android) window.Android.onM3U8(e.target.result); } catch(ex) {}
-                };
-                reader.readAsText(blob);
-            }
-        } catch(ex) {}
-        return url;
-    };
-})();
-""".trimIndent()
 
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun getM3U8ViaWebView(epUrl: String): String? {
@@ -180,24 +171,32 @@ class AnimeVietSubProvider : MainAPI() {
                         mediaPlaybackRequiresUserGesture = false
                         userAgentString                  = UA
                         mixedContentMode                 = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                        allowFileAccess                  = true
                     }
                     wv.addJavascriptInterface(bridge, "Android")
 
-                    val jsCode = makeInterceptJs()
-
                     wv.webViewClient = object : WebViewClient() {
-                        override fun onPageStarted(view: WebView, url: String, favicon: android.graphics.Bitmap?) {
-                            // Inject sớm nhất có thể
-                            view.evaluateJavascript(jsCode, null)
-                        }
-                        override fun onPageFinished(view: WebView, url: String) {
-                            view.evaluateJavascript(jsCode, null)
-                        }
-                        override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
-                            // Inject lại sau mỗi request JS
-                            if (request.url.toString().endsWith(".js")) {
-                                view.post { view.evaluateJavascript(jsCode, null) }
+                        override fun shouldInterceptRequest(
+                            view: WebView,
+                            request: WebResourceRequest
+                        ): WebResourceResponse? {
+                            val url = request.url.toString()
+                            // Intercept HTML của episode page, inject script vào <head>
+                            if (url == epUrl || (url.contains(mainUrl) && url.endsWith(".html"))) {
+                                try {
+                                    val conn = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+                                    conn.setRequestProperty("User-Agent", UA)
+                                    conn.setRequestProperty("Referer", "$mainUrl/")
+                                    conn.setRequestProperty("Accept-Language", "vi-VN,vi;q=0.9")
+                                    conn.connect()
+                                    val html = conn.inputStream.bufferedReader().readText()
+                                    conn.disconnect()
+                                    // Inject script vào đầu <head>
+                                    val modified = html.replace("<head>", "<head>$headScript", ignoreCase = true)
+                                    return WebResourceResponse(
+                                        "text/html", "utf-8",
+                                        ByteArrayInputStream(modified.toByteArray(Charsets.UTF_8))
+                                    )
+                                } catch (_: Exception) {}
                             }
                             return null
                         }
@@ -224,10 +223,6 @@ class AnimeVietSubProvider : MainAPI() {
                                 }
                                 else -> {
                                     elapsed += 500
-                                    // Re-inject every 2s
-                                    if (elapsed % 2000 == 0) {
-                                        wv.evaluateJavascript(jsCode, null)
-                                    }
                                     handler.postDelayed(this, 500)
                                 }
                             }
@@ -240,7 +235,7 @@ class AnimeVietSubProvider : MainAPI() {
         }
     }
 
-    // ── Resolve videoN.html -> lh3.googleusercontent.com ────────────────────
+    // Resolve videoN.html -> lh3.googleusercontent.com
     private suspend fun parseM3U8AndCallback(
         m3u8Text: String,
         epUrl: String,
@@ -252,9 +247,7 @@ class AnimeVietSubProvider : MainAPI() {
             "Origin"     to mainUrl
         )
 
-        val lines = m3u8Text.lines()
-
-        // Resolve tất cả segment URLs song song
+        val lines    = m3u8Text.lines()
         val newLines = coroutineScope {
             lines.map { line ->
                 async {
@@ -262,9 +255,7 @@ class AnimeVietSubProvider : MainAPI() {
                         line.startsWith("https://storage.googleapis.com")) {
                         try {
                             val resp = app.get(
-                                line.trim(),
-                                headers        = segHdr,
-                                allowRedirects = false
+                                line.trim(), headers = segHdr, allowRedirects = false
                             )
                             resp.headers["location"]?.trim() ?: line
                         } catch (_: Exception) { line }
@@ -273,7 +264,6 @@ class AnimeVietSubProvider : MainAPI() {
             }.awaitAll()
         }
 
-        // Ghi M3U8 đã resolve vào cache
         val sep       = "\n"
         val newM3u8   = newLines.joinToString(sep)
         val cacheDir  = AcraApplication.context?.cacheDir ?: return
@@ -292,22 +282,21 @@ class AnimeVietSubProvider : MainAPI() {
         })
     }
 
-    // ── loadLinks ────────────────────────────────────────────────────────────
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val epUrl = data.substringBefore("|")
-
+        val epUrl    = data.substringBefore("|")
         val m3u8Text = getM3U8ViaWebView(epUrl)
+
         if (!m3u8Text.isNullOrBlank()) {
             parseM3U8AndCallback(m3u8Text, epUrl, callback)
             return true
         }
 
-        // Fallback: HDX embed -> abysscdn
+        // Fallback HDX embed
         val ajaxHdr = mapOf(
             "User-Agent"       to UA,
             "Accept-Language"  to "vi-VN,vi;q=0.9",
@@ -317,48 +306,34 @@ class AnimeVietSubProvider : MainAPI() {
             "Referer"          to epUrl,
             "Accept"           to "application/json, text/javascript, */*; q=0.01"
         )
-
         safeApiCall {
-            val playerResp = app.post(
-                "$mainUrl/ajax/player",
-                headers = ajaxHdr,
-                data    = mapOf("episodeId" to extractEpisodeId(epUrl), "backup" to "1")
-            )
-            val html = try { playerResp.parsed<PlayerResponse>().html }
-                       catch (_: Exception) { null } ?: return@safeApiCall
+            val html = try {
+                app.post(
+                    "$mainUrl/ajax/player",
+                    headers = ajaxHdr,
+                    data    = mapOf("episodeId" to extractEpisodeId(epUrl), "backup" to "1")
+                ).parsed<PlayerResponse>().html
+            } catch (_: Exception) { null } ?: return@safeApiCall
 
             Jsoup.parseBodyFragment(html)
-                .select("a.btn3dsv[data-play=embed]")
-                .firstOrNull()
-                ?.let { btn ->
-                    val href = btn.attr("data-href").trim()
+                .select("a.btn3dsv[data-play=embed]").firstOrNull()?.let { btn ->
+                    val href = btn.attr("data-href").trim().takeIf { it.isNotBlank() } ?: return@let
                     val id   = btn.attr("data-id").trim()
-                    if (href.isBlank()) return@let
                     val resp = app.post(
-                        "$mainUrl/ajax/player",
-                        headers = ajaxHdr,
-                        data    = mapOf(
-                            "link"        to href,
-                            "play"        to "embed",
-                            "id"          to id.ifBlank { "3" },
-                            "backuplinks" to "1"
-                        )
+                        "$mainUrl/ajax/player", headers = ajaxHdr,
+                        data = mapOf("link" to href, "play" to "embed",
+                                     "id" to id.ifBlank { "3" }, "backuplinks" to "1")
                     ).parsed<EmbedResponse>()
-                    val shortUrl = resp.link ?: return@let
                     val abyssUrl = app.get(
-                        shortUrl,
-                        headers        = mapOf("User-Agent" to UA, "Referer" to epUrl),
+                        resp.link ?: return@let,
+                        headers = mapOf("User-Agent" to UA, "Referer" to epUrl),
                         allowRedirects = true
                     ).url
                     if (abyssUrl.contains("abysscdn.com") || abyssUrl.contains("abyss.to")) {
-                        val hdxM3u8 = getM3U8ViaWebView(abyssUrl)
-                        if (!hdxM3u8.isNullOrBlank()) {
-                            parseM3U8AndCallback(hdxM3u8, epUrl, callback)
-                        }
+                        getM3U8ViaWebView(abyssUrl)?.let { parseM3U8AndCallback(it, epUrl, callback) }
                     }
                 }
         }
-
         return true
     }
 
@@ -369,7 +344,6 @@ class AnimeVietSubProvider : MainAPI() {
         @JsonProperty("success") val success: Int  = 0,
         @JsonProperty("html")    val html: String? = null
     )
-
     data class EmbedResponse(
         @JsonProperty("success")   val success: Int      = 0,
         @JsonProperty("link")      val link: String?     = null,

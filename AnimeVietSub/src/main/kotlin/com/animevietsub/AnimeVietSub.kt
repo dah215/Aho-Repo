@@ -214,27 +214,48 @@ class AnimeVietSubProvider : MainAPI() {
         }
     }
 
-    // Parse M3U8 text và tạo ExtractorLink từ segment đầu tiên để test quality
-    // Hoặc tạo m3u8 proxy nếu có thể
+    // Ghi M3U8 vào file tạm và trả về file:// URI cho ExoPlayer
+    private fun writeM3U8ToCache(m3u8Text: String): String? {
+        return try {
+            val context = AcraApplication.context ?: return null
+            val cacheDir = context.cacheDir
+            val file = java.io.File(cacheDir, "avs_stream_${System.currentTimeMillis()}.m3u8")
+            file.writeText(m3u8Text, Charsets.UTF_8)
+            file.absolutePath
+        } catch (_: Exception) { null }
+    }
+
     private suspend fun parseM3U8AndCallback(
         m3u8Text: String,
         epUrl: String,
         callback: (ExtractorLink) -> Unit
     ) {
-        // Tìm tất cả segment URLs (videoN.html) trong M3U8
-        val segmentUrls = Regex("""https?://[^\s#]+""").findAll(m3u8Text)
+        // Ghi blob M3U8 vào cache file để ExoPlayer đọc trực tiếp
+        val cachePath = writeM3U8ToCache(m3u8Text)
+        if (cachePath != null) {
+            callback(newExtractorLink(
+                source = name,
+                name   = "$name - DU",
+                url    = "file://$cachePath",
+                type   = ExtractorLinkType.M3U8
+            ) {
+                this.quality = Qualities.P1080.value
+                this.headers = mapOf(
+                    "Referer"    to epUrl,
+                    "User-Agent" to UA,
+                    "Origin"     to mainUrl
+                )
+            })
+            return
+        }
+
+        // Fallback: construct master.m3u8 URL từ segment đầu tiên
+        val firstSeg = Regex("""https?://[^\s#]+""").findAll(m3u8Text)
             .map { it.value.trim() }
             .filter { it.contains("storage.googleapiscdn.com") || it.contains("googleapis.com") }
-            .toList()
+            .firstOrNull() ?: return
 
-        if (segmentUrls.isEmpty()) return
-
-        // Lấy base URL từ segment đầu tiên để construct master URL
-        // Pattern: .../chunks/{id}/original/{TOKEN}/video0.html
-        val firstSeg = segmentUrls.first()
         val masterUrl = firstSeg.replace(Regex("""/video\d+\.html.*$"""), "/master.m3u8")
-
-        // Thử dùng master.m3u8 trước
         callback(newExtractorLink(
             source = name,
             name   = "$name - DU",

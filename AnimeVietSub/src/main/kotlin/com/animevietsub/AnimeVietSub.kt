@@ -13,6 +13,9 @@ import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withTimeoutOrNull
 import org.jsoup.nodes.Element
 import java.io.ByteArrayInputStream
@@ -313,9 +316,9 @@ window.adsbygoogle.push=function(){};
         // Resolve segments và callback
         val segHdr   = mapOf("Referer" to "$mainUrl/", "User-Agent" to UA)
         val lines    = m3u8.lines()
-        val resolved = kotlinx.coroutines.coroutineScope {
+        val resolved = coroutineScope {
             lines.map { line ->
-                kotlinx.coroutines.async {
+                async {
                     if (line.startsWith("https://storage.googleapiscdn.com") ||
                         line.startsWith("https://storage.googleapis.com")) {
                         try {

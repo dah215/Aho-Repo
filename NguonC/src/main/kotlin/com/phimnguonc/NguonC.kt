@@ -153,33 +153,23 @@ class PhimNguonCProvider : MainAPI() {
                        .parsedSafe<NguonCDetailResponse>()
         val movie = res?.movie ?: throw ErrorLoadingException("Không thể tải dữ liệu phim")
 
-        val subEpisodes = mutableListOf<Episode>()
-        val dubEpisodes = mutableListOf<Episode>()
-
-        movie.episodes?.forEachIndexed { serverIdx, server ->
-            val serverName = (server.server_name ?: server.name ?: server.group ?: server.title ?: "Server ${serverIdx + 1}").trim()
-            val isDub = serverName.contains("Thuyết Minh", ignoreCase = true) ||
-                        serverName.contains("Lồng Tiếng", ignoreCase = true) ||
-                        serverName.contains("TM", ignoreCase = false)
-            val items = server.items ?: server.list ?: emptyList()
-            items.forEach { ep ->
-                val embed = ep.embed?.replace("\\/", "/")
-                    ?: ep.m3u8?.replace("\\/", "/") ?: ""
+        val episodes = mutableListOf<Episode>()
+        movie.episodes?.forEach { server ->
+            val items = server.items ?: server.list
+            items?.forEach { ep ->
+                val embed = ep.embed?.replace("\\/", "/") ?: ""
                 if (embed.isNotBlank()) {
-                    val episode = newEpisode(embed) {
-                        this.name    = "[$serverName] Tập ${ep.name}"
+                    episodes.add(newEpisode(embed) {
+                        this.name    = "Tập ${ep.name}"
                         this.episode = ep.name?.toIntOrNull()
-                    }
-                    if (isDub) dubEpisodes.add(episode) else subEpisodes.add(episode)
+                    })
                 }
             }
         }
 
-        if (subEpisodes.isEmpty() && dubEpisodes.isEmpty())
-            throw ErrorLoadingException("Không tìm thấy tập phim")
+        if (episodes.isEmpty()) throw ErrorLoadingException("Không tìm thấy tập phim")
 
-        val allEpisodes = subEpisodes + dubEpisodes
-        return newTvSeriesLoadResponse(movie.name ?: "", url, TvType.TvSeries, allEpisodes) {
+        return newTvSeriesLoadResponse(movie.name ?: "", url, TvType.TvSeries, episodes) {
             this.posterUrl = movie.poster_url ?: movie.thumb_url
             this.plot      = movie.description
         }
@@ -218,7 +208,7 @@ class PhimNguonCProvider : MainAPI() {
                 val streamData = AppUtils.parseJson<StreamData>(jsonData)
                 val sUb        = streamData.sUb
                 if (!sUb.isNullOrBlank()) {
-                    val finalM3u8Url = "$embedDomain/$sUb.m3u9"
+                    val finalM3u8Url = "$embedDomain/$sUb.m3u8"
                     val videoHeaders = mapOf(
                         "User-Agent"      to USER_AGENT,
                         "Referer"         to embedUrl,
@@ -279,12 +269,8 @@ class PhimNguonCProvider : MainAPI() {
         @JsonProperty("episodes")    val episodes: List<NguonCServer>? = null
     )
     data class NguonCServer(
-        @JsonProperty("server_name") val server_name: String?              = null,
-        @JsonProperty("name")        val name:         String?              = null,
-        @JsonProperty("group")       val group:        String?              = null,
-        @JsonProperty("title")       val title:        String?              = null,
-        @JsonProperty("items")       val items:        List<NguonCEpisode>? = null,
-        @JsonProperty("list")        val list:          List<NguonCEpisode>? = null
+        @JsonProperty("items") val items: List<NguonCEpisode>? = null,
+        @JsonProperty("list")  val list:  List<NguonCEpisode>? = null
     )
     data class NguonCEpisode(
         @JsonProperty("name")  val name:  String? = null,

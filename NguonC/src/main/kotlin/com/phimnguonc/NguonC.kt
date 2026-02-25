@@ -156,17 +156,18 @@ class PhimNguonCProvider : MainAPI() {
         val subEpisodes = mutableListOf<Episode>()
         val dubEpisodes = mutableListOf<Episode>()
 
-        movie.episodes?.forEach { server ->
-            val serverName = (server.server_name ?: server.name ?: server.group ?: server.title ?: "").trim()
+        movie.episodes?.forEachIndexed { serverIdx, server ->
+            val serverName = (server.server_name ?: server.name ?: server.group ?: server.title ?: "Server ${serverIdx + 1}").trim()
             val isDub = serverName.contains("Thuyết Minh", ignoreCase = true) ||
-                        serverName.contains("TM #", ignoreCase = false) ||
-                        serverName.contains("Lồng Tiếng", ignoreCase = true)
-            val items = server.items ?: server.list
-            items?.forEach { ep ->
-                val embed = ep.embed?.replace("\\/", "/") ?: ep.m3u8?.replace("\\/", "/") ?: ""
+                        serverName.contains("Lồng Tiếng", ignoreCase = true) ||
+                        serverName.contains("TM", ignoreCase = false)
+            val items = server.items ?: server.list ?: emptyList()
+            items.forEach { ep ->
+                val embed = ep.embed?.replace("\/", "/")
+                    ?: ep.m3u8?.replace("\/", "/") ?: ""
                 if (embed.isNotBlank()) {
                     val episode = newEpisode(embed) {
-                        this.name    = "Tập ${ep.name}"
+                        this.name    = "[$serverName] Tập ${ep.name}"
                         this.episode = ep.name?.toIntOrNull()
                     }
                     if (isDub) dubEpisodes.add(episode) else subEpisodes.add(episode)
@@ -177,11 +178,10 @@ class PhimNguonCProvider : MainAPI() {
         if (subEpisodes.isEmpty() && dubEpisodes.isEmpty())
             throw ErrorLoadingException("Không tìm thấy tập phim")
 
-        return newAnimeLoadResponse(movie.name ?: "", url, TvType.TvSeries, true) {
+        val allEpisodes = subEpisodes + dubEpisodes
+        return newTvSeriesLoadResponse(movie.name ?: "", url, TvType.TvSeries, allEpisodes) {
             this.posterUrl = movie.poster_url ?: movie.thumb_url
             this.plot      = movie.description
-            if (subEpisodes.isNotEmpty()) addEpisodes(DubStatus.Subbed, subEpisodes)
-            if (dubEpisodes.isNotEmpty()) addEpisodes(DubStatus.Dubbed, dubEpisodes)
         }
     }
 
@@ -218,7 +218,7 @@ class PhimNguonCProvider : MainAPI() {
                 val streamData = AppUtils.parseJson<StreamData>(jsonData)
                 val sUb        = streamData.sUb
                 if (!sUb.isNullOrBlank()) {
-                    val finalM3u8Url = "$embedDomain/$sUb.m3u8"
+                    val finalM3u8Url = "$embedDomain/$sUb.m3u9"
                     val videoHeaders = mapOf(
                         "User-Agent"      to USER_AGENT,
                         "Referer"         to embedUrl,

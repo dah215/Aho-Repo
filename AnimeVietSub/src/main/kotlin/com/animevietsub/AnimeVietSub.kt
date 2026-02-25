@@ -5,6 +5,9 @@ import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.network.WebViewResolver
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
 import java.util.EnumSet
@@ -213,9 +216,9 @@ class AnimeVietSubProvider : MainAPI() {
         callback:  (ExtractorLink) -> Unit
     ) {
         val lines    = m3u8Text.lines()
-        val resolved = kotlinx.coroutines.coroutineScope {
+        val resolved = coroutineScope {
             lines.map { line ->
-                kotlinx.coroutines.async {
+                async {
                     val trimmed = line.trim()
                     when {
                         trimmed.startsWith("https://storage.googleapiscdn.com") ||
@@ -226,7 +229,6 @@ class AnimeVietSubProvider : MainAPI() {
                             } catch (_: Exception) { trimmed }
                         }
                         trimmed.startsWith("video") && trimmed.endsWith(".html") -> {
-                            // Relative URL
                             val absUrl = baseUrl.substringBeforeLast("/") + "/" + trimmed
                             try {
                                 app.get(absUrl, headers = segHdr, allowRedirects = false)

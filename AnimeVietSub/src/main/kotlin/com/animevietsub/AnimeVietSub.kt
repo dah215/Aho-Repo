@@ -226,12 +226,12 @@ Object.defineProperty(window, 'adsbygoogle', {
 
                         override fun onPageStarted(view: WebView, url: String, f: android.graphics.Bitmap?) {
                             // Inject sớm nhất
-                            view.evaluateJavascript(interceptScript, null)
+                            wv.evaluateJavascript(interceptScript, null)
                         }
 
                         override fun onPageFinished(view: WebView, url: String) {
                             // Inject lại sau khi page load xong
-                            view.evaluateJavascript(interceptScript, null)
+                            wv.evaluateJavascript(interceptScript, null)
                         }
                     }
 
@@ -258,7 +258,7 @@ Object.defineProperty(window, 'adsbygoogle', {
                                     elapsed += 300
                                     // Re-inject interceptor mỗi 3s phòng bị ghi đè
                                     if (elapsed % 3000 == 0)
-                                        view.evaluateJavascript(interceptScript, null)
+                                        wv.evaluateJavascript(interceptScript, null)
                                     handler.postDelayed(this, 300)
                                 }
                             }

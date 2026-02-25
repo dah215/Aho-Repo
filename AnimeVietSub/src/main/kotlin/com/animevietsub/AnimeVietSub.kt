@@ -277,6 +277,70 @@ window.adsbygoogle.push=function(){};
         }
     }
 
+    // ── Local HTTP server để serve M3U8 cho ExoPlayer ──────────────────────
+    // file:// không work Android 7+, dùng localhost thay thế
+    private var localServer: LocalM3U8Server? = null
+
+    inner class LocalM3U8Server(private val m3u8Content: String) {
+        private var serverSocket: java.net.ServerSocket? = null
+        val port: Int get() = serverSocket?.localPort ?: 0
+
+        fun start() {
+            serverSocket = java.net.ServerSocket(0) // random free port
+            Thread {
+                try {
+                    val ss = serverSocket ?: return@Thread
+                    // Serve một lần cho ExoPlayer parse
+                    repeat(3) {
+                        try {
+                            val client = ss.accept()
+                            client.getInputStream().bufferedReader().readLine() // consume request
+                            val body = m3u8Content.toByteArray(Charsets.UTF_8)
+                            val response = "HTTP/1.1 200 OK
+" +
+                                "Content-Type: application/vnd.apple.mpegurl
+" +
+                                "Content-Length: ${body.size}
+" +
+                                "Access-Control-Allow-Origin: *
+" +
+                                "
+"
+                            client.getOutputStream().write(response.toByteArray())
+                            client.getOutputStream().write(body)
+                            client.getOutputStream().flush()
+                            client.close()
+                        } catch (_: Exception) {}
+                    }
+                } catch (_: Exception) {}
+            }.also { it.isDaemon = true }.start()
+        }
+
+        fun stop() {
+            try { serverSocket?.close() } catch (_: Exception) {}
+        }
+    }
+
+    private fun serveM3U8AndCallback(m3u8: String, callback: (ExtractorLink) -> Unit) {
+        localServer?.stop()
+        val server = LocalM3U8Server(m3u8)
+        server.start()
+        localServer = server
+
+        callback(newExtractorLink(
+            source = name, name = "$name - DU",
+            url    = "http://127.0.0.1:${server.port}/stream.m3u8",
+            type   = ExtractorLinkType.M3U8
+        ) {
+            this.quality = Qualities.P1080.value
+            this.headers = mapOf(
+                "User-Agent" to UA,
+                "Referer"    to "$mainUrl/",
+                "Origin"     to mainUrl
+            )
+        })
+    }
+
     override suspend fun loadLinks(
         data:             String,
         isCasting:        Boolean,
@@ -310,25 +374,8 @@ window.adsbygoogle.push=function(){};
         // WebView load trang thật, serve patched avs.watch.js
         val m3u8 = getM3U8(epUrl, cookie, avsJs) ?: return true
 
-        // Ghi M3U8 gốc (giữ nguyên storage.googleapiscdn.com URLs)
-        // ExoPlayer sẽ fetch với headers Referer đúng
-        val cacheDir = AcraApplication.context?.cacheDir ?: return true
-        cacheDir.mkdirs()
-        val file = java.io.File(cacheDir, "avs_${System.currentTimeMillis()}.m3u8")
-        file.writeText(m3u8, Charsets.UTF_8)
-
-        callback(newExtractorLink(
-            source = name, name = "$name - DU",
-            url    = "file://${file.absolutePath}",
-            type   = ExtractorLinkType.M3U8
-        ) {
-            this.quality = Qualities.P1080.value
-            this.headers = mapOf(
-                "User-Agent" to UA,
-                "Referer"    to "$mainUrl/",
-                "Origin"     to mainUrl
-            )
-        })
+        // Serve M3U8 qua local HTTP server (file:// không work trên Android 7+)
+        serveM3U8AndCallback(m3u8, callback)
 
         return true
     }

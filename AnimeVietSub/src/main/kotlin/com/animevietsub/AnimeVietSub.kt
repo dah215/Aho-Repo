@@ -1,6 +1,7 @@
 package com.animevietsub
 
 import android.annotation.SuppressLint
+import android.webkit.JavascriptInterface
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
@@ -14,9 +15,9 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.jsoup.nodes.Element
+import java.io.ByteArrayInputStream
 import java.net.URLEncoder
 import java.util.EnumSet
-import java.util.concurrent.ConcurrentHashMap
 import kotlin.coroutines.resume
 
 @CloudstreamPlugin
@@ -40,6 +41,9 @@ class AnimeVietSubProvider : MainAPI() {
         "Accept-Language" to "vi-VN,vi;q=0.9",
         "Referer"         to "$mainUrl/"
     )
+
+    // Cache avs.watch.js
+    private var cachedAvsJs: String? = null
 
     override val mainPage = mainPageOf(
         "$mainUrl/anime-moi/"                 to "Anime Mới Nhất",
@@ -101,7 +105,6 @@ class AnimeVietSubProvider : MainAPI() {
         val year     = watchDoc.selectFirst("p.Info .Date a, p.Info .Date")
                        ?.text()?.filter { it.isDigit() }?.take(4)?.toIntOrNull()
         val tags     = watchDoc.select("p.Genre a").map { it.text().trim() }.filter { it.isNotBlank() }
-
         val seen     = mutableSetOf<String>()
         val episodes = watchDoc.select("#list-server .list-episode a.episode-link")
             .mapNotNull { a ->
@@ -127,21 +130,68 @@ class AnimeVietSubProvider : MainAPI() {
         }
     }
 
-    // Intercept videoN.html requests → collect redirect lh3 URLs → build M3U8
-    @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun collectSegmentsViaWebView(epUrl: String): Map<Int, String>? {
-        return withContext(Dispatchers.Main) {
-            // Collect: segmentIndex -> lh3.googleusercontent.com URL
-            val segments = ConcurrentHashMap<Int, String>()
+    // Blob interceptor prefix - inject vào đầu avs.watch.js
+    private val blobInterceptor = """
+;(function(){
+var _oc=URL.createObjectURL;
+URL.createObjectURL=function(b){
+var u=_oc.apply(this,arguments);
+try{if(b&&b.type&&b.type.indexOf('mpegurl')!==-1){
+var r=new FileReader();
+r.onload=function(e){try{Android.onM3U8(e.target.result);}catch(x){}};
+r.readAsText(b);}}catch(x){}
+return u;};
+})();
+""".trimIndent()
 
-            withTimeoutOrNull(35_000L) {
+    // Fake adsbygoogle để qua ad detector
+    private val fakeAds = """
+window.adsbygoogle=window.adsbygoogle||[];
+window.adsbygoogle.loaded=true;
+window.adsbygoogle.push=function(){};
+""".trimIndent()
+
+    inner class M3U8Bridge {
+        @Volatile var result: String? = null
+        @JavascriptInterface
+        fun onM3U8(content: String) {
+            if (content.contains("#EXTM3U")) result = content
+        }
+    }
+
+    // Fetch JS qua OkHttp (với cookie để bypass Cloudflare)
+    private suspend fun fetchJs(url: String, cookie: String): String? {
+        return try {
+            val resp = app.get(url, headers = mapOf(
+                "User-Agent"      to UA,
+                "Referer"         to "$mainUrl/",
+                "Accept"          to "*/*",
+                "Accept-Language" to "vi-VN,vi;q=0.9",
+                "Cookie"          to cookie
+            ))
+            if (resp.text.length > 500) resp.text else null
+        } catch (_: Exception) { null }
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private suspend fun getM3U8(epUrl: String, cookie: String, avsJs: String): String? {
+        return withContext(Dispatchers.Main) {
+            withTimeoutOrNull(30_000L) {
                 suspendCancellableCoroutine { cont ->
                     val ctx = try { AcraApplication.context }
                               catch (_: Exception) { null }
                     if (ctx == null) { cont.resume(null); return@suspendCancellableCoroutine }
 
+                    val bridge = M3U8Bridge()
+
+                    // Sync cookie
                     android.webkit.CookieManager.getInstance().apply {
                         setAcceptCookie(true)
+                        cookie.split(";").forEach { kv ->
+                            val t = kv.trim()
+                            if (t.isNotBlank()) setCookie(mainUrl, t)
+                        }
+                        flush()
                     }
 
                     val wv = WebView(ctx)
@@ -154,6 +204,12 @@ class AnimeVietSubProvider : MainAPI() {
                     }
                     android.webkit.CookieManager.getInstance()
                         .setAcceptThirdPartyCookies(wv, true)
+                    wv.addJavascriptInterface(bridge, "Android")
+
+                    // Interceptor có avs.watch.js đã được inject blob interceptor
+                    val patchedAvsJs = blobInterceptor + "\n" + avsJs
+                    val avsJsBytes   = patchedAvsJs.toByteArray(Charsets.UTF_8)
+                    val fakeAdsBytes = fakeAds.toByteArray(Charsets.UTF_8)
 
                     wv.webViewClient = object : WebViewClient() {
                         override fun shouldInterceptRequest(
@@ -161,54 +217,25 @@ class AnimeVietSubProvider : MainAPI() {
                             request: WebResourceRequest
                         ): WebResourceResponse? {
                             val url = request.url.toString()
-
-                            // Intercept videoN.html requests
-                            // Pattern: .../chunks/.../original/.../videoN.html
-                            if (url.contains("storage.googleapiscdn.com") &&
-                                url.contains("/video") && url.endsWith(".html")) {
-                                // Extract segment index from videoN.html
-                                val idx = Regex("""/video(\d+)\.html""")
-                                    .find(url)?.groupValues?.get(1)?.toIntOrNull() ?: 0
-
-                                // Fetch redirect URL via background thread
-                                Thread {
-                                    try {
-                                        val conn = java.net.URL(url).openConnection()
-                                            as java.net.HttpURLConnection
-                                        conn.instanceFollowRedirects = false
-                                        conn.setRequestProperty("User-Agent", UA)
-                                        conn.setRequestProperty("Referer", "$mainUrl/")
-                                        conn.connect()
-                                        val location = conn.getHeaderField("Location")
-                                        conn.disconnect()
-                                        if (!location.isNullOrBlank()) {
-                                            segments[idx] = location.trim()
-                                        }
-                                    } catch (_: Exception) {}
-                                }.start()
-
-                                // Return empty response - trang sẽ xử lý redirect tự nhiên
-                                return null
-                            }
-
-                            // Block ads để player hoạt động
                             return when {
+                                // Serve patched avs.watch.js (blob interceptor đã inject)
+                                url.contains("avs.watch.js") -> WebResourceResponse(
+                                    "application/javascript", "utf-8",
+                                    ByteArrayInputStream(avsJsBytes)
+                                )
+                                // Fake adsbygoogle → bypass ad detector
                                 url.contains("adsbygoogle") ||
-                                url.contains("googlesyndication") -> {
-                                    WebResourceResponse(
-                                        "application/javascript", "utf-8",
-                                        java.io.ByteArrayInputStream(
-                                            "window.adsbygoogle=window.adsbygoogle||[];".toByteArray()
-                                        )
-                                    )
-                                }
+                                url.contains("googlesyndication") -> WebResourceResponse(
+                                    "application/javascript", "utf-8",
+                                    ByteArrayInputStream(fakeAdsBytes)
+                                )
+                                // Block trackers
                                 url.contains("google-analytics") ||
-                                url.contains("doubleclick") -> {
-                                    WebResourceResponse(
-                                        "application/javascript", "utf-8",
-                                        java.io.ByteArrayInputStream("".toByteArray())
-                                    )
-                                }
+                                url.contains("doubleclick") ||
+                                url.contains("googletagmanager") -> WebResourceResponse(
+                                    "application/javascript", "utf-8",
+                                    ByteArrayInputStream("".toByteArray())
+                                )
                                 else -> null
                             }
                         }
@@ -220,37 +247,24 @@ class AnimeVietSubProvider : MainAPI() {
                     ))
 
                     val handler = android.os.Handler(android.os.Looper.getMainLooper())
-                    var elapsed    = 0
-                    var lastCount  = 0
-                    var stableTime = 0
-
+                    var elapsed = 0
                     val checker = object : Runnable {
                         override fun run() {
-                            val count = segments.size
+                            val m = bridge.result
                             when {
-                                // Đủ segments và stable 3s → done
-                                count > 0 && count == lastCount -> {
-                                    stableTime += 500
-                                    if (stableTime >= 3000) {
-                                        wv.stopLoading(); wv.destroy()
-                                        if (cont.isActive) cont.resume(segments)
-                                        return
-                                    }
+                                m != null -> {
+                                    wv.stopLoading(); wv.destroy()
+                                    if (cont.isActive) cont.resume(m)
+                                }
+                                elapsed >= 28_000 -> {
+                                    wv.stopLoading(); wv.destroy()
+                                    if (cont.isActive) cont.resume(null)
                                 }
                                 else -> {
-                                    lastCount  = count
-                                    stableTime = 0
+                                    elapsed += 500
+                                    handler.postDelayed(this, 500)
                                 }
                             }
-                            elapsed += 500
-                            if (elapsed >= 33_000) {
-                                wv.stopLoading(); wv.destroy()
-                                if (cont.isActive) cont.resume(
-                                    if (segments.isNotEmpty()) segments else null
-                                )
-                                return
-                            }
-                            handler.postDelayed(this, 500)
                         }
                     }
                     handler.postDelayed(checker, 3_000)
@@ -269,32 +283,56 @@ class AnimeVietSubProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback:         (ExtractorLink) -> Unit
     ): Boolean {
-        val epUrl    = data.substringBefore("|")
-        val segments = collectSegmentsViaWebView(epUrl)
+        val epUrl = data.substringBefore("|")
 
-        if (segments.isNullOrEmpty()) return true
+        // Lấy cookie từ /ajax/player
+        val epId = Regex("""-(\d+)\.html""").find(epUrl)?.groupValues?.get(1) ?: return true
+        val ajaxHdr = mapOf(
+            "User-Agent"       to UA,
+            "X-Requested-With" to "XMLHttpRequest",
+            "Content-Type"     to "application/x-www-form-urlencoded; charset=UTF-8",
+            "Referer"          to epUrl,
+            "Origin"           to mainUrl
+        )
+        val playerResp = app.post(
+            "$mainUrl/ajax/player",
+            headers = ajaxHdr,
+            data    = mapOf("episodeId" to epId, "backup" to "1")
+        )
+        val cookie = playerResp.cookies.entries
+            .joinToString("; ") { "${it.key}=${it.value}" }
 
-        // Build M3U8 từ segments đã collect
-        val sb = StringBuilder()
-        sb.append("#EXTM3U\n")
-        sb.append("#EXT-X-VERSION:3\n")
-        sb.append("#EXT-X-PLAYLIST-TYPE:VOD\n")
-        sb.append("#EXT-X-TARGETDURATION:10\n")
-        sb.append("#EXT-X-MEDIA-SEQUENCE:0\n")
+        // Fetch avs.watch.js (cache lại)
+        val avsJs = cachedAvsJs ?: fetchJs(
+            "$mainUrl/statics/default/js/avs.watch.js?v=6.1.6", cookie
+        )?.also { cachedAvsJs = it } ?: return true
 
-        val maxIdx = segments.keys.maxOrNull() ?: 0
-        for (i in 0..maxIdx) {
-            val url = segments[i] ?: continue
-            sb.append("#EXTINF:10.0,\n")
-            sb.append("$url\n")
+        // WebView load trang thật, serve patched avs.watch.js
+        val m3u8 = getM3U8(epUrl, cookie, avsJs) ?: return true
+
+        // Resolve segments và callback
+        val segHdr   = mapOf("Referer" to "$mainUrl/", "User-Agent" to UA)
+        val lines    = m3u8.lines()
+        val resolved = kotlinx.coroutines.coroutineScope {
+            lines.map { line ->
+                kotlinx.coroutines.async {
+                    if (line.startsWith("https://storage.googleapiscdn.com") ||
+                        line.startsWith("https://storage.googleapis.com")) {
+                        try {
+                            app.get(line.trim(), headers = segHdr, allowRedirects = false)
+                               .headers["location"]?.trim() ?: line
+                        } catch (_: Exception) { line }
+                    } else line
+                }
+            }.awaitAll()
         }
-        sb.append("#EXT-X-ENDLIST\n")
 
-        val m3u8     = sb.toString()
+        val sep      = "\n"
+        val newM3u8  = resolved.joinToString(sep)
         val cacheDir = AcraApplication.context?.cacheDir ?: return true
         cacheDir.mkdirs()
         val file = java.io.File(cacheDir, "avs_${System.currentTimeMillis()}.m3u8")
-        file.writeText(m3u8, Charsets.UTF_8)
+        file.writeText(newM3u8, Charsets.UTF_8)
 
         callback(newExtractorLink(
             source = name, name = "$name - DU",

@@ -163,8 +163,8 @@ class PhimNguonCProvider : MainAPI() {
                         serverName.contains("TM", ignoreCase = false)
             val items = server.items ?: server.list ?: emptyList()
             items.forEach { ep ->
-                val embed = ep.embed?.replace("\/", "/")
-                    ?: ep.m3u8?.replace("\/", "/") ?: ""
+                val embed = ep.embed?.replace("\\/", "/")
+                    ?: ep.m3u8?.replace("\\/", "/") ?: ""
                 if (embed.isNotBlank()) {
                     val episode = newEpisode(embed) {
                         this.name    = "[$serverName] Tập ${ep.name}"

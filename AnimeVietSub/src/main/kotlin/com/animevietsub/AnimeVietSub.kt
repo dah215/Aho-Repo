@@ -4,7 +4,6 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
-import com.lagradost.cloudstream3.network.WebViewResolver
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -128,115 +127,112 @@ class AnimeVietSubProvider : MainAPI() {
     ): Boolean {
         val epUrl = data.substringBefore("|")
 
-        // Strategy: WebViewResolver bắt video0.html request
-        // video0.html -> 302 -> lh3.googleusercontent.com/TOKEN=d (segment thật)
-        // Từ video0.html URL ta biết được chunk_id và segment_token
-        // -> tự build M3U8 với tất cả segments
+        // Step 1: parse page lấy filmId, episodeId, fileHash từ HTML
+        val pageText  = app.get(epUrl, headers = baseHeaders).text
+        val filmId    = Regex("""filmInfo\.filmID\s*=\s*parseInt\('(\d+)'\)""")
+                        .find(pageText)?.groupValues?.get(1) ?: return true
+        val episodeId = Regex("""filmInfo\.episodeID\s*=\s*parseInt\('(\d+)'\)""")
+                        .find(pageText)?.groupValues?.get(1)
+                        ?: Regex("""-(\d+)\.html""").find(epUrl)?.groupValues?.get(1)
+                        ?: return true
 
-        val resolver = WebViewResolver(
-            // Bắt request đến storage.googleapiscdn.com (videoN.html)
-            Regex("""storage\.googleapiscdn\.com/chunks/[a-f0-9]+/original/[^/]+/video0\.html""")
+        // DU server hash từ data-href của button
+        val duHash = Regex("""data-play="api"[^>]+data-href="([^"]+)"""")
+                     .find(pageText)?.groupValues?.get(1)
+                     ?: Regex("""data-href="([^"]+)"[^>]+data-play="api"""")
+                     .find(pageText)?.groupValues?.get(1)
+
+        val ajaxHdr = mapOf(
+            "User-Agent"       to UA,
+            "Accept"           to "application/json, text/javascript, */*; q=0.01",
+            "Accept-Language"  to "vi-VN,vi;q=0.9",
+            "X-Requested-With" to "XMLHttpRequest",
+            "Content-Type"     to "application/x-www-form-urlencoded; charset=UTF-8",
+            "Origin"           to mainUrl,
+            "Referer"          to epUrl
         )
 
-        val video0Req = app.get(
-            epUrl,
-            interceptor = resolver,
-            headers     = baseHeaders,
-            timeout     = 60
+        // Step 2: POST /ajax/player → lấy cookie
+        val playerResp = app.post(
+            "$mainUrl/ajax/player",
+            headers = ajaxHdr,
+            data    = mapOf("episodeId" to episodeId, "backup" to "1")
         )
+        val cookieStr = playerResp.cookies.entries
+                        .joinToString("; ") { "${it.key}=${it.value}" }
+        if (cookieStr.isBlank()) return true
 
-        val video0Url = video0Req.url
-        if (!video0Url.contains("storage.googleapiscdn.com")) return true
+        val ajaxHdrWithCookie = ajaxHdr + mapOf("Cookie" to cookieStr) - "Content-Type"
 
-        // Từ video0.html URL, extract chunk_id và token
-        // Pattern: https://storage.googleapiscdn.com/chunks/{CHUNK_ID}/original/{TOKEN}/video0.html
-        val match = Regex(
-            """storage\.googleapiscdn\.com/chunks/([a-f0-9]+)/original/([^/]+)/video0\.html"""
-        ).find(video0Url) ?: return true
+        // Step 3: GET /ajax/get_episode → fileHash
+        val rssText  = app.get(
+            "$mainUrl/ajax/get_episode?filmId=$filmId&episodeId=$episodeId",
+            headers = ajaxHdrWithCookie
+        ).text
+        val fileHash = Regex("""<file>\s*([A-Za-z0-9_\-+/=]+)\s*</file>""")
+                       .find(rssText)?.groupValues?.get(1)?.trim() ?: return true
 
-        val chunkId = match.groupValues[1]
-        val token0  = match.groupValues[2]
+        // Step 4: POST /ajax/all với đúng params: EpisodeMess=1&EpisodeID={id}
+        val allHdr = ajaxHdr + mapOf("Cookie" to cookieStr)
 
-        val segHdr = mapOf(
-            "Referer"    to "$mainUrl/",
-            "User-Agent" to UA
+        val allResp = app.post(
+            "$mainUrl/ajax/all",
+            headers = allHdr,
+            data    = mapOf("EpisodeMess" to "1", "EpisodeID" to episodeId)
         )
-
-        // Resolve video0.html -> lh3 để verify và lấy duration pattern
-        val seg0Resp = app.get(video0Url, headers = segHdr, allowRedirects = false)
-        val seg0Lh3  = seg0Resp.headers["location"]?.trim() ?: return true
-
-        // Probe tổng số segments bằng cách check video1, video2... cho đến 404
-        // Mỗi segment ~10s, thường 100-200 segments cho 1 tập 20-40 phút
-        // Ta cần fetch M3U8 master để biết tất cả token
-
-        // Thử fetch master.m3u8 trực tiếp
-        val masterUrl = "https://storage.googleapiscdn.com/chunks/$chunkId/original/$token0/master.m3u8"
-        val masterResp = try {
-            app.get(masterUrl, headers = segHdr + mapOf("Origin" to mainUrl))
-        } catch (_: Exception) { null }
-
-        if (masterResp != null && masterResp.text.contains("#EXTM3U")) {
-            // Master M3U8 tồn tại - parse và resolve
-            val masterText = masterResp.text
-            buildM3U8AndCallback(masterText, masterUrl, segHdr, callback)
-            return true
+        if (allResp.text.contains("storage.googleapiscdn.com") || allResp.text.contains("#EXTM3U")) {
+            return handleM3U8Response(allResp.text, epUrl, callback)
         }
-
-        // Không có master.m3u8 - thử fetch playlist.m3u8
-        val playlistUrl = "https://storage.googleapiscdn.com/chunks/$chunkId/original/$token0/playlist.m3u8"
-        val playlistResp = try {
-            app.get(playlistUrl, headers = segHdr + mapOf("Origin" to mainUrl))
-        } catch (_: Exception) { null }
-
-        if (playlistResp != null && playlistResp.text.contains("#EXTM3U")) {
-            buildM3U8AndCallback(playlistResp.text, playlistUrl, segHdr, callback)
-            return true
-        }
-
-        // Fallback: resolve video0 thành công -> feed trực tiếp lh3 URL
-        // ExoPlayer có thể play single segment
-        callback(newExtractorLink(
-            source = name,
-            name   = "$name - DU",
-            url    = seg0Lh3,
-            type   = ExtractorLinkType.M3U8
-        ) {
-            this.quality = Qualities.P1080.value
-            this.headers = mapOf("User-Agent" to UA)
-        })
 
         return true
     }
 
-    private suspend fun buildM3U8AndCallback(
-        m3u8Text:  String,
-        baseUrl:   String,
-        segHdr:    Map<String, String>,
-        callback:  (ExtractorLink) -> Unit
+    private suspend fun handleM3U8Response(
+        text:     String,
+        epUrl:    String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val segHdr = mapOf("Referer" to "$mainUrl/", "User-Agent" to UA)
+
+        // Nếu là M3U8 text
+        if (text.contains("#EXTM3U")) {
+            resolveM3U8AndCallback(text, segHdr, callback)
+            return true
+        }
+
+        // Nếu là JSON chứa URLs
+        val urls = Regex("""https://storage\.googleapiscdn\.com[^"'\s<>]+""")
+                   .findAll(text).map { it.value }.toList()
+        if (urls.isEmpty()) return true
+
+        // Build M3U8 từ danh sách URLs
+        val sb = StringBuilder("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-PLAYLIST-TYPE:VOD\n")
+        sb.append("#EXT-X-TARGETDURATION:10\n#EXT-X-MEDIA-SEQUENCE:0\n")
+        urls.forEachIndexed { _, url ->
+            sb.append("#EXTINF:10.0,\n$url\n")
+        }
+        sb.append("#EXT-X-ENDLIST\n")
+        resolveM3U8AndCallback(sb.toString(), segHdr, callback)
+        return true
+    }
+
+    private suspend fun resolveM3U8AndCallback(
+        m3u8:     String,
+        segHdr:   Map<String, String>,
+        callback: (ExtractorLink) -> Unit
     ) {
-        val lines    = m3u8Text.lines()
+        val lines    = m3u8.lines()
         val resolved = coroutineScope {
             lines.map { line ->
                 async {
                     val trimmed = line.trim()
-                    when {
-                        trimmed.startsWith("https://storage.googleapiscdn.com") ||
-                        trimmed.startsWith("https://storage.googleapis.com") -> {
-                            try {
-                                app.get(trimmed, headers = segHdr, allowRedirects = false)
-                                   .headers["location"]?.trim() ?: trimmed
-                            } catch (_: Exception) { trimmed }
-                        }
-                        trimmed.startsWith("video") && trimmed.endsWith(".html") -> {
-                            val absUrl = baseUrl.substringBeforeLast("/") + "/" + trimmed
-                            try {
-                                app.get(absUrl, headers = segHdr, allowRedirects = false)
-                                   .headers["location"]?.trim() ?: trimmed
-                            } catch (_: Exception) { trimmed }
-                        }
-                        else -> line
-                    }
+                    if (trimmed.startsWith("https://storage.googleapiscdn.com") ||
+                        trimmed.startsWith("https://storage.googleapis.com")) {
+                        try {
+                            app.get(trimmed, headers = segHdr, allowRedirects = false)
+                               .headers["location"]?.trim() ?: trimmed
+                        } catch (_: Exception) { trimmed }
+                    } else line
                 }
             }.awaitAll()
         }

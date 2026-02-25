@@ -157,9 +157,10 @@ class PhimNguonCProvider : MainAPI() {
         val dubEpisodes = mutableListOf<Episode>()
 
         movie.episodes?.forEach { server ->
-            val serverName = server.server_name ?: ""
+            val serverName = (server.server_name ?: server.name ?: server.group ?: server.title ?: "").trim()
             val isDub = serverName.contains("Thuyết Minh", ignoreCase = true) ||
-                        serverName.contains("TM", ignoreCase = false)
+                        serverName.contains("TM #", ignoreCase = false) ||
+                        serverName.contains("Lồng Tiếng", ignoreCase = true)
             val items = server.items ?: server.list
             items?.forEach { ep ->
                 val embed = ep.embed?.replace("\\/", "/") ?: ep.m3u8?.replace("\\/", "/") ?: ""
@@ -279,8 +280,11 @@ class PhimNguonCProvider : MainAPI() {
     )
     data class NguonCServer(
         @JsonProperty("server_name") val server_name: String?              = null,
-        @JsonProperty("items")       val items:       List<NguonCEpisode>? = null,
-        @JsonProperty("list")        val list:         List<NguonCEpisode>? = null
+        @JsonProperty("name")        val name:         String?              = null,
+        @JsonProperty("group")       val group:        String?              = null,
+        @JsonProperty("title")       val title:        String?              = null,
+        @JsonProperty("items")       val items:        List<NguonCEpisode>? = null,
+        @JsonProperty("list")        val list:          List<NguonCEpisode>? = null
     )
     data class NguonCEpisode(
         @JsonProperty("name")  val name:  String? = null,

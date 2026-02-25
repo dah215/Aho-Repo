@@ -42,22 +42,12 @@ class AnimeVietSubProvider : MainAPI() {
         "Referer"         to "$mainUrl/"
     )
 
-    // Cache avs.watch.js
     private var cachedAvsJs: String? = null
 
     override val mainPage = mainPageOf(
-        "$mainUrl/anime-moi/"                 to "Anime Mới Nhất",
-        "$mainUrl/anime-bo/"                  to "Anime Bộ",
+        "$mainUrl/anime-moi/"                 to "Anime Mới",
         "$mainUrl/anime-le/"                  to "Anime Lẻ",
-        "$mainUrl/hoat-hinh-trung-quoc/"      to "Hoạt Hình TQ",
-        "$mainUrl/danh-sach/list-dang-chieu/" to "Đang Chiếu",
-        "$mainUrl/danh-sach/list-tron-bo/"    to "Trọn Bộ",
-        "$mainUrl/the-loai/hanh-dong/"        to "Action",
-        "$mainUrl/the-loai/tinh-cam/"         to "Romance",
-        "$mainUrl/the-loai/phep-thuat/"       to "Fantasy",
-        "$mainUrl/the-loai/kinh-di/"          to "Horror",
-        "$mainUrl/the-loai/hai-huoc/"         to "Comedy",
-        "$mainUrl/the-loai/shounen/"          to "Shounen"
+        "$mainUrl/anime-bo/"                  to "Anime Bộ"
     )
 
     private fun pageUrl(base: String, page: Int) =
@@ -130,7 +120,6 @@ class AnimeVietSubProvider : MainAPI() {
         }
     }
 
-    // Blob interceptor prefix - inject vào đầu avs.watch.js
     private val blobInterceptor = """
 ;(function(){
 var _oc=URL.createObjectURL;
@@ -144,7 +133,6 @@ return u;};
 })();
 """.trimIndent()
 
-    // Fake adsbygoogle để qua ad detector
     private val fakeAds = """
 window.adsbygoogle=window.adsbygoogle||[];
 window.adsbygoogle.loaded=true;
@@ -159,7 +147,6 @@ window.adsbygoogle.push=function(){};
         }
     }
 
-    // Fetch JS qua OkHttp (với cookie để bypass Cloudflare)
     private suspend fun fetchJs(url: String, cookie: String): String? {
         return try {
             val resp = app.get(url, headers = mapOf(
@@ -184,7 +171,6 @@ window.adsbygoogle.push=function(){};
 
                     val bridge = M3U8Bridge()
 
-                    // Sync cookie
                     android.webkit.CookieManager.getInstance().apply {
                         setAcceptCookie(true)
                         cookie.split(";").forEach { kv ->
@@ -206,7 +192,6 @@ window.adsbygoogle.push=function(){};
                         .setAcceptThirdPartyCookies(wv, true)
                     wv.addJavascriptInterface(bridge, "Android")
 
-                    // Interceptor có avs.watch.js đã được inject blob interceptor
                     val patchedAvsJs = blobInterceptor + "\n" + avsJs
                     val avsJsBytes   = patchedAvsJs.toByteArray(Charsets.UTF_8)
                     val fakeAdsBytes = fakeAds.toByteArray(Charsets.UTF_8)
@@ -218,18 +203,15 @@ window.adsbygoogle.push=function(){};
                         ): WebResourceResponse? {
                             val url = request.url.toString()
                             return when {
-                                // Serve patched avs.watch.js (blob interceptor đã inject)
                                 url.contains("avs.watch.js") -> WebResourceResponse(
                                     "application/javascript", "utf-8",
                                     ByteArrayInputStream(avsJsBytes)
                                 )
-                                // Fake adsbygoogle → bypass ad detector
                                 url.contains("adsbygoogle") ||
                                 url.contains("googlesyndication") -> WebResourceResponse(
                                     "application/javascript", "utf-8",
                                     ByteArrayInputStream(fakeAdsBytes)
                                 )
-                                // Block trackers
                                 url.contains("google-analytics") ||
                                 url.contains("doubleclick") ||
                                 url.contains("googletagmanager") -> WebResourceResponse(
@@ -276,9 +258,7 @@ window.adsbygoogle.push=function(){};
             }
         }
     }
-
-    // ── Local HTTP server để serve M3U8 cho ExoPlayer ──────────────────────
-    // file:// không work Android 7+, dùng localhost thay thế
+    
     private var localServer: LocalM3U8Server? = null
 
     inner class LocalM3U8Server(private val m3u8Content: String) {
@@ -286,15 +266,14 @@ window.adsbygoogle.push=function(){};
         val port: Int get() = serverSocket?.localPort ?: 0
 
         fun start() {
-            serverSocket = java.net.ServerSocket(0) // random free port
+            serverSocket = java.net.ServerSocket(0)
             Thread {
                 try {
                     val ss = serverSocket ?: return@Thread
-                    // Serve một lần cho ExoPlayer parse
                     repeat(3) {
                         try {
                             val client = ss.accept()
-                            client.getInputStream().bufferedReader().readLine() // consume request
+                            client.getInputStream().bufferedReader().readLine()
                             val body = m3u8Content.toByteArray(Charsets.UTF_8)
                             val crlf = "\r\n"
                             val response = "HTTP/1.1 200 OK${crlf}" +
@@ -344,8 +323,6 @@ window.adsbygoogle.push=function(){};
         callback:         (ExtractorLink) -> Unit
     ): Boolean {
         val epUrl = data.substringBefore("|")
-
-        // Lấy cookie từ /ajax/player
         val epId = Regex("""-(\d+)\.html""").find(epUrl)?.groupValues?.get(1) ?: return true
         val ajaxHdr = mapOf(
             "User-Agent"       to UA,
@@ -361,16 +338,10 @@ window.adsbygoogle.push=function(){};
         )
         val cookie = playerResp.cookies.entries
             .joinToString("; ") { "${it.key}=${it.value}" }
-
-        // Fetch avs.watch.js (cache lại)
         val avsJs = cachedAvsJs ?: fetchJs(
             "$mainUrl/statics/default/js/avs.watch.js?v=6.1.6", cookie
         )?.also { cachedAvsJs = it } ?: return true
-
-        // WebView load trang thật, serve patched avs.watch.js
         val m3u8 = getM3U8(epUrl, cookie, avsJs) ?: return true
-
-        // Serve M3U8 qua local HTTP server (file:// không work trên Android 7+)
         serveM3U8AndCallback(m3u8, callback)
 
         return true

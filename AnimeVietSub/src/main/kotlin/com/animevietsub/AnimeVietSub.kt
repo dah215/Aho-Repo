@@ -296,16 +296,12 @@ window.adsbygoogle.push=function(){};
                             val client = ss.accept()
                             client.getInputStream().bufferedReader().readLine() // consume request
                             val body = m3u8Content.toByteArray(Charsets.UTF_8)
-                            val response = "HTTP/1.1 200 OK
-" +
-                                "Content-Type: application/vnd.apple.mpegurl
-" +
-                                "Content-Length: ${body.size}
-" +
-                                "Access-Control-Allow-Origin: *
-" +
-                                "
-"
+                            val crlf = "\r\n"
+                            val response = "HTTP/1.1 200 OK${crlf}" +
+                                "Content-Type: application/vnd.apple.mpegurl${crlf}" +
+                                "Content-Length: ${body.size}${crlf}" +
+                                "Access-Control-Allow-Origin: *${crlf}" +
+                                crlf
                             client.getOutputStream().write(response.toByteArray())
                             client.getOutputStream().write(body)
                             client.getOutputStream().flush()
@@ -321,7 +317,7 @@ window.adsbygoogle.push=function(){};
         }
     }
 
-    private fun serveM3U8AndCallback(m3u8: String, callback: (ExtractorLink) -> Unit) {
+    private suspend fun serveM3U8AndCallback(m3u8: String, callback: (ExtractorLink) -> Unit) {
         localServer?.stop()
         val server = LocalM3U8Server(m3u8)
         server.start()

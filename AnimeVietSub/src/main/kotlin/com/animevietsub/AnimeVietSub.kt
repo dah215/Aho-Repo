@@ -13,9 +13,6 @@ import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withTimeoutOrNull
 import org.jsoup.nodes.Element
 import java.io.ByteArrayInputStream
@@ -313,29 +310,12 @@ window.adsbygoogle.push=function(){};
         // WebView load trang thật, serve patched avs.watch.js
         val m3u8 = getM3U8(epUrl, cookie, avsJs) ?: return true
 
-        // Resolve segments và callback
-        val segHdr   = mapOf("Referer" to "$mainUrl/", "User-Agent" to UA)
-        val lines    = m3u8.lines()
-        val resolved = coroutineScope {
-            lines.map { line ->
-                async {
-                    if (line.startsWith("https://storage.googleapiscdn.com") ||
-                        line.startsWith("https://storage.googleapis.com")) {
-                        try {
-                            app.get(line.trim(), headers = segHdr, allowRedirects = false)
-                               .headers["location"]?.trim() ?: line
-                        } catch (_: Exception) { line }
-                    } else line
-                }
-            }.awaitAll()
-        }
-
-        val sep      = "\n"
-        val newM3u8  = resolved.joinToString(sep)
+        // Ghi M3U8 gốc (giữ nguyên storage.googleapiscdn.com URLs)
+        // ExoPlayer sẽ fetch với headers Referer đúng
         val cacheDir = AcraApplication.context?.cacheDir ?: return true
         cacheDir.mkdirs()
         val file = java.io.File(cacheDir, "avs_${System.currentTimeMillis()}.m3u8")
-        file.writeText(newM3u8, Charsets.UTF_8)
+        file.writeText(m3u8, Charsets.UTF_8)
 
         callback(newExtractorLink(
             source = name, name = "$name - DU",
@@ -343,7 +323,11 @@ window.adsbygoogle.push=function(){};
             type   = ExtractorLinkType.M3U8
         ) {
             this.quality = Qualities.P1080.value
-            this.headers = mapOf("User-Agent" to UA)
+            this.headers = mapOf(
+                "User-Agent" to UA,
+                "Referer"    to "$mainUrl/",
+                "Origin"     to mainUrl
+            )
         })
 
         return true

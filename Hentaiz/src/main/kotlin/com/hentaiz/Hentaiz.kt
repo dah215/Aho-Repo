@@ -21,17 +21,19 @@ class HentaiZProvider : MainAPI() {
     override val supportedTypes = setOf(TvType.NSFW)
 
     private val headers = mapOf(
-        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
-        "Referer" to "$mainUrl/"
+        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+        "Referer" to "$mainUrl/",
+        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
     )
 
+    // Cập nhật lại đường dẫn chuẩn của HentaiZ
     override val mainPage = mainPageOf(
-        "/" to "Mới Cập Nhật",
-        "/the-loai/3d/" to "Hentai 3D",
-        "/the-loai/khong-che/" to "Không Che",
-        "/the-loai/co-che/" to "Có Che",
-        "/the-loai/nhat-ban/" to "Nhật Bản",
-        "/the-loai/trung-quoc/" to "Trung Quốc"
+        "danh-sach/phim-moi" to "Mới Cập Nhật",
+        "the-loai/hentai-3d" to "Hentai 3D",
+        "the-loai/khong-che" to "Không Che",
+        "the-loai/co-che" to "Có Che",
+        "the-loai/hentai-vietsub" to "Hentai Vietsub",
+        "the-loai/hentai-trung-quoc" to "Trung Quốc"
     )
 
     private fun fixUrl(url: String): String {
@@ -44,24 +46,25 @@ class HentaiZProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        // Xử lý URL để tránh bị double slash //
+        val path = request.data.removePrefix("/").removeSuffix("/")
         val url = if (page == 1) {
-            "$mainUrl${request.data}"
+            "$mainUrl/$path/"
         } else {
-            "$mainUrl${request.data}page/$page/"
+            "$mainUrl/$path/page/$page/"
         }
         
-        val doc = app.get(url, headers = headers).document
+        val res = app.get(url, headers = headers)
+        val doc = res.document
         
-        val items = doc.select("article, .item, .halim-item, .movie-item, .film-item, .post, .box, .card").mapNotNull { el ->
+        // Selector đặc trưng của theme Halim trên HentaiZ
+        val items = doc.select(".halim-item, article.item, .movie-item").mapNotNull { el ->
             val linkEl = el.selectFirst("a") ?: return@mapNotNull null
             val href = fixUrl(linkEl.attr("href"))
-            if (!href.contains(mainUrl)) return@mapNotNull null
             
             val title = linkEl.attr("title").ifBlank { 
-                el.selectFirst("h2, h3, .title, .name, .entry-title")?.text() ?: linkEl.text() 
-            }.trim()
-            
-            if (title.isBlank()) return@mapNotNull null
+                el.selectFirst(".entry-title, .title")?.text() 
+            }?.trim() ?: return@mapNotNull null
             
             val poster = el.selectFirst("img")?.let { img ->
                 img.attr("data-src").ifBlank { img.attr("src") }
@@ -70,25 +73,19 @@ class HentaiZProvider : MainAPI() {
             newMovieSearchResponse(title, href, TvType.NSFW) {
                 this.posterUrl = poster
             }
-        }.distinctBy { it.url }
+        }
         
-        return newHomePageResponse(request.name, items, true)
+        return newHomePageResponse(request.name, items, items.isNotEmpty())
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/?s=$query"
         val doc = app.get(url, headers = headers).document
         
-        return doc.select("article, .item, .halim-item, .movie-item, .film-item, .post, .box, .card").mapNotNull { el ->
+        return doc.select(".halim-item, article.item").mapNotNull { el ->
             val linkEl = el.selectFirst("a") ?: return@mapNotNull null
             val href = fixUrl(linkEl.attr("href"))
-            if (!href.contains(mainUrl)) return@mapNotNull null
-            
-            val title = linkEl.attr("title").ifBlank { 
-                el.selectFirst("h2, h3, .title, .name, .entry-title")?.text() ?: linkEl.text() 
-            }.trim()
-            
-            if (title.isBlank()) return@mapNotNull null
+            val title = linkEl.attr("title").ifBlank { el.selectFirst(".entry-title")?.text() }?.trim() ?: ""
             
             val poster = el.selectFirst("img")?.let { img ->
                 img.attr("data-src").ifBlank { img.attr("src") }
@@ -97,38 +94,43 @@ class HentaiZProvider : MainAPI() {
             newMovieSearchResponse(title, href, TvType.NSFW) {
                 this.posterUrl = poster
             }
-        }.distinctBy { it.url }
+        }
     }
 
     override suspend fun load(url: String): LoadResponse {
         val doc = app.get(url, headers = headers).document
-        val title = doc.selectFirst("h1, .title, .name, .entry-title")?.text()?.trim() ?: "Untitled"
-        val poster = doc.selectFirst("meta[property=og:image]")?.attr("content") ?: doc.selectFirst(".poster img, .thumb img")?.attr("src")
-        val desc = doc.selectFirst(".description, .summary, .content, article p, .entry-content p")?.text()?.trim()
+        val title = doc.selectFirst("h1.entry-title, .title")?.text()?.trim() 
+            ?: doc.selectFirst("meta[property=og:title]")?.attr("content")?.split("-")?.get(0)?.trim()
+            ?: "Untitled"
+            
+        val poster = doc.selectFirst("meta[property=og:image]")?.attr("content") 
+            ?: doc.selectFirst(".poster img, .thumb img")?.attr("src")
+            
+        val desc = doc.selectFirst(".entry-content, .video-content, #film-content")?.text()?.trim()
         
         val episodes = mutableListOf<Episode>()
-        doc.select(".episodes a, .list-episode a, .server a, .btn-episode, .halim-list-eps a").forEach { epEl ->
+        // Tìm tập phim trong các server
+        doc.select(".halim-list-eps li a, .list-episode li a").forEach { epEl ->
             val epHref = fixUrl(epEl.attr("href"))
             val epName = epEl.text().trim()
             if (epHref.isNotBlank()) {
-                // Đã sửa lỗi ở đây: Sử dụng newEpisode thay vì Episode()
                 episodes.add(newEpisode(epHref) {
                     this.name = epName
                 })
             }
         }
 
-        if (episodes.isEmpty()) {
-            return newMovieLoadResponse(title, url, TvType.NSFW, url) {
+        return if (episodes.isEmpty()) {
+            newMovieLoadResponse(title, url, TvType.NSFW, url) {
                 this.posterUrl = poster
                 this.plot = desc
-                this.tags = doc.select(".categories a, .tags a, .genres a").map { it.text() }
+                this.tags = doc.select(".category a, .tags a").map { it.text() }
             }
         } else {
-            return newTvSeriesLoadResponse(title, url, TvType.NSFW, episodes) {
+            newTvSeriesLoadResponse(title, url, TvType.NSFW, episodes) {
                 this.posterUrl = poster
                 this.plot = desc
-                this.tags = doc.select(".categories a, .tags a, .genres a").map { it.text() }
+                this.tags = doc.select(".category a, .tags a").map { it.text() }
             }
         }
     }
@@ -140,55 +142,33 @@ class HentaiZProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val res = app.get(data, headers = headers)
-        val doc = res.document
         val html = res.text
+        val doc = res.document
 
         val potentialUrls = mutableSetOf<String>()
         
+        // Lấy link từ iframe (phổ biến nhất)
         doc.select("iframe").forEach { iframe ->
             val src = iframe.attr("src").ifBlank { iframe.attr("data-src") }
-            if (src.isNotBlank()) {
-                potentialUrls.add(src)
-            }
+            if (src.isNotBlank()) potentialUrls.add(fixUrl(src))
         }
         
-        doc.allElements.forEach { el ->
-            el.attributes().forEach { attr ->
-                val value = attr.value
-                if (value.contains("dfplayer") || value.contains(".m3u8") || value.contains("bf.html") || value.contains("dood") || value.contains("tape") || value.contains("voe")) {
-                    potentialUrls.add(value)
-                }
+        // Quét link trong script
+        Regex("""https?[:\\]+[/\\/]+[^\s"'<>]+""").findAll(html).forEach { 
+            val link = it.value.replace("\\/", "/")
+            if (link.contains(".m3u8") || link.contains("google") || link.contains("player")) {
+                potentialUrls.add(link)
             }
         }
-        
-        Regex("""https?[:\\]+[/\\/]+[^\s"'<>]+""").findAll(html).forEach { potentialUrls.add(it.value.replace("\\/", "/")) }
 
-        potentialUrls.filter { it.isNotBlank() }.distinct().forEach { rawUrl ->
-            val fullUrl = fixUrl(rawUrl)
-            
-            if (fullUrl.contains("dfplayer")) {
-                val id = Regex("""(?:did|id|v|s)[=/](\d+)""").find(fullUrl)?.groupValues?.get(1)
-                val host = Regex("""https?://([^/]+)""").find(fullUrl)?.groupValues?.get(1)
-                
-                if (id != null && host != null) {
-                    val m3u8Link = "https://$host/v2/s/$id.m3u8"
-                    callback(
-                        newExtractorLink("DFPlayer", "DFPlayer", m3u8Link, type = ExtractorLinkType.M3U8) {
-                            this.referer = "https://$host/"
-                            this.quality = Qualities.P1080.value
-                        }
-                    )
-                }
-            } 
-            else if (fullUrl.contains(".m3u8")) {
+        potentialUrls.distinct().forEach { fullUrl ->
+            if (fullUrl.contains(".m3u8")) {
                 callback(
                     newExtractorLink(name, "Server VIP", fullUrl, type = ExtractorLinkType.M3U8) {
                         this.referer = data
-                        this.quality = Qualities.Unknown.value
                     }
                 )
-            }
-            else if (fullUrl.contains("dood") || fullUrl.contains("tape") || fullUrl.contains("voe") || fullUrl.contains("streamwish") || fullUrl.contains("filemoon")) {
+            } else if (fullUrl.contains("dood") || fullUrl.contains("streamwish") || fullUrl.contains("filemoon") || fullUrl.contains("voe")) {
                 loadExtractor(fullUrl, data, subtitleCallback, callback)
             }
         }

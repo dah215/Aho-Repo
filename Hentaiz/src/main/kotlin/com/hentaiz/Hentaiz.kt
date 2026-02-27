@@ -25,7 +25,6 @@ class HentaiZProvider : MainAPI() {
         "Referer" to "$mainUrl/"
     )
 
-    // Bạn có thể tuỳ chỉnh lại các đường dẫn thể loại này cho khớp với menu của web
     override val mainPage = mainPageOf(
         "/" to "Mới Cập Nhật",
         "/the-loai/3d/" to "Hentai 3D",
@@ -53,7 +52,6 @@ class HentaiZProvider : MainAPI() {
         
         val doc = app.get(url, headers = headers).document
         
-        // Sử dụng các class phổ biến để bắt item phim
         val items = doc.select("article, .item, .halim-item, .movie-item, .film-item, .post, .box, .card").mapNotNull { el ->
             val linkEl = el.selectFirst("a") ?: return@mapNotNull null
             val href = fixUrl(linkEl.attr("href"))
@@ -108,25 +106,25 @@ class HentaiZProvider : MainAPI() {
         val poster = doc.selectFirst("meta[property=og:image]")?.attr("content") ?: doc.selectFirst(".poster img, .thumb img")?.attr("src")
         val desc = doc.selectFirst(".description, .summary, .content, article p, .entry-content p")?.text()?.trim()
         
-        // Tìm danh sách tập phim (nếu có)
         val episodes = mutableListOf<Episode>()
         doc.select(".episodes a, .list-episode a, .server a, .btn-episode, .halim-list-eps a").forEach { epEl ->
             val epHref = fixUrl(epEl.attr("href"))
             val epName = epEl.text().trim()
             if (epHref.isNotBlank()) {
-                episodes.add(Episode(epHref, epName))
+                // Đã sửa lỗi ở đây: Sử dụng newEpisode thay vì Episode()
+                episodes.add(newEpisode(epHref) {
+                    this.name = epName
+                })
             }
         }
 
         if (episodes.isEmpty()) {
-            // Nếu không có danh sách tập, coi như đây là phim lẻ hoặc trang hiện tại chính là trang xem phim
             return newMovieLoadResponse(title, url, TvType.NSFW, url) {
                 this.posterUrl = poster
                 this.plot = desc
                 this.tags = doc.select(".categories a, .tags a, .genres a").map { it.text() }
             }
         } else {
-            // Nếu có nhiều tập, trả về dạng TvSeries
             return newTvSeriesLoadResponse(title, url, TvType.NSFW, episodes) {
                 this.posterUrl = poster
                 this.plot = desc
@@ -147,7 +145,6 @@ class HentaiZProvider : MainAPI() {
 
         val potentialUrls = mutableSetOf<String>()
         
-        // 1. Quét tìm các thẻ iframe chứa link video (rất phổ biến)
         doc.select("iframe").forEach { iframe ->
             val src = iframe.attr("src").ifBlank { iframe.attr("data-src") }
             if (src.isNotBlank()) {
@@ -155,7 +152,6 @@ class HentaiZProvider : MainAPI() {
             }
         }
         
-        // 2. Quét toàn bộ thuộc tính của các thẻ HTML để tìm link ẩn
         doc.allElements.forEach { el ->
             el.attributes().forEach { attr ->
                 val value = attr.value
@@ -165,7 +161,6 @@ class HentaiZProvider : MainAPI() {
             }
         }
         
-        // 3. Dùng Regex để bắt các link nằm trong mã JavaScript
         Regex("""https?[:\\]+[/\\/]+[^\s"'<>]+""").findAll(html).forEach { potentialUrls.add(it.value.replace("\\/", "/")) }
 
         potentialUrls.filter { it.isNotBlank() }.distinct().forEach { rawUrl ->
@@ -193,7 +188,6 @@ class HentaiZProvider : MainAPI() {
                     }
                 )
             }
-            // Hỗ trợ thêm các host phổ biến khác thường dùng trên các web phim
             else if (fullUrl.contains("dood") || fullUrl.contains("tape") || fullUrl.contains("voe") || fullUrl.contains("streamwish") || fullUrl.contains("filemoon")) {
                 loadExtractor(fullUrl, data, subtitleCallback, callback)
             }

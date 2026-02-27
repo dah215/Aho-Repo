@@ -20,6 +20,25 @@
         "name": "AnimeVietSub"
     },
     {
+        "iconUrl": "https://hentaiz.lol/favicon.ico",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/dah215/Aho-Repo",
+        "fileSize": 16066,
+        "status": 1,
+        "language": "vi",
+        "authors": [
+            "Hentaiz"
+        ],
+        "tvTypes": [
+            "NSFW"
+        ],
+        "version": 1,
+        "internalName": "Hentaiz",
+        "description": "Vietnamese anime streaming site",
+        "url": "https://raw.githubusercontent.com/dah215/Aho-Repo/builds/Hentaiz.cs3",
+        "name": "Hentaiz"
+    },
+    {
         "iconUrl": "https://nangcuc.cv/favicon.ico",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/dah215/Aho-Repo",

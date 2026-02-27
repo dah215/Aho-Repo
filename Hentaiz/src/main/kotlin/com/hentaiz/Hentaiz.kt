@@ -26,7 +26,6 @@ class HentaiZProvider : MainAPI() {
         "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
     )
 
-    // Cập nhật lại đường dẫn chuẩn theo cấu trúc SvelteKit của web
     override val mainPage = mainPageOf(
         "/browse" to "Mới Cập Nhật",
         "/browse?animationType=THREE_D" to "Hentai 3D",
@@ -44,7 +43,6 @@ class HentaiZProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        // Xử lý URL có chứa tham số query (?)
         val url = if (request.data.contains("?")) {
             "$mainUrl${request.data}&page=$page"
         } else {
@@ -53,13 +51,11 @@ class HentaiZProvider : MainAPI() {
         
         val doc = app.get(url, headers = headers).document
         
-        // Bắt chính xác thẻ <a> chứa link phim dựa trên HTML bạn cung cấp
         val items = doc.select("a[href^=/watch/]").mapNotNull { el ->
             val href = fixUrl(el.attr("href"))
             val title = el.selectFirst("h3")?.text()?.trim() ?: return@mapNotNull null
             val poster = el.selectFirst("img")?.attr("src")
             
-            // Lấy số tập (VD: Tập 4) để ghép vào tên phim cho dễ nhìn
             val epText = el.selectFirst("div.absolute.bottom-2.left-2")?.text()?.trim()
             val fullTitle = if (!epText.isNullOrBlank()) "$title - $epText" else title
 
@@ -101,7 +97,6 @@ class HentaiZProvider : MainAPI() {
         val desc = doc.selectFirst("meta[property=og:description]")?.attr("content")
             ?: doc.selectFirst("meta[name=description]")?.attr("content")
 
-        // Vì mỗi URL /watch/... tương ứng với 1 tập cụ thể, ta trả về dạng Movie luôn để Cloudstream phát ngay lập tức
         return newMovieLoadResponse(title, url, TvType.NSFW, url) {
             this.posterUrl = poster
             this.plot = desc
@@ -118,42 +113,47 @@ class HentaiZProvider : MainAPI() {
         val doc = res.document
         val html = res.text
 
-        // 1. Quét tìm iframe chứa video (Dựa trên dữ liệu bạn cung cấp: play.sonar-cdn.com)
         doc.select("iframe").forEach { iframe ->
             val src = fixUrl(iframe.attr("src").ifBlank { iframe.attr("data-src") })
             if (src.isNotBlank()) {
                 if (src.contains("sonar-cdn.com")) {
-                    // Truy cập vào iframe để lấy link m3u8 thực sự
                     val iframeRes = app.get(src, headers = mapOf("Referer" to "$mainUrl/"))
                     val iframeHtml = iframeRes.text
                     
-                    // Tìm link m3u8 (Hỗ trợ cả trường hợp link bị escape \/)
+                    // Đã sửa lỗi newExtractorLink tại đây
                     Regex("""https?[:\\]+[/\\/]+[^"']+\.m3u8[^"']*""").findAll(iframeHtml).forEach {
                         val cleanUrl = it.value.replace("\\/", "/")
                         callback(
-                            newExtractorLink(name, "Sonar CDN", cleanUrl, src, Qualities.Unknown.value, true)
+                            newExtractorLink(name, "Sonar CDN", cleanUrl, type = ExtractorLinkType.M3U8) {
+                                this.referer = src
+                                this.quality = Qualities.Unknown.value
+                            }
                         )
                     }
                     
-                    // Tìm link mp4 dự phòng
                     Regex("""https?[:\\]+[/\\/]+[^"']+\.mp4[^"']*""").findAll(iframeHtml).forEach {
                         val cleanUrl = it.value.replace("\\/", "/")
                         callback(
-                            newExtractorLink(name, "Sonar CDN (MP4)", cleanUrl, src, Qualities.Unknown.value, false)
+                            newExtractorLink(name, "Sonar CDN (MP4)", cleanUrl, type = ExtractorLinkType.VIDEO) {
+                                this.referer = src
+                                this.quality = Qualities.Unknown.value
+                            }
                         )
                     }
                 } else {
-                    // Nếu là các server khác (dood, streamwish...)
                     loadExtractor(src, data, subtitleCallback, callback)
                 }
             }
         }
 
-        // 2. Quét dự phòng link m3u8 nằm trực tiếp trong mã nguồn trang
+        // Đã sửa lỗi newExtractorLink tại đây
         Regex("""https?[:\\]+[/\\/]+[^"']+\.m3u8[^"']*""").findAll(html).forEach {
             val cleanUrl = it.value.replace("\\/", "/")
             callback(
-                newExtractorLink(name, "HentaiZ VIP", cleanUrl, data, Qualities.Unknown.value, true)
+                newExtractorLink(name, "HentaiZ VIP", cleanUrl, type = ExtractorLinkType.M3U8) {
+                    this.referer = data
+                    this.quality = Qualities.Unknown.value
+                }
             )
         }
 

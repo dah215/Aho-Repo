@@ -23,10 +23,9 @@ class HentaiZProvider : MainAPI() {
     private val imageBaseUrl = "https://storage.haiten.org"
 
     private val headers = mapOf(
-        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
         "Referer" to "$mainUrl/",
-        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-        "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7"
+        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
     )
 
     override val mainPage = mainPageOf(
@@ -46,98 +45,46 @@ class HentaiZProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = if (request.data.contains("?")) {
-            "$mainUrl${request.data}&page=$page"
-        } else {
-            "$mainUrl${request.data}?page=$page"
-        }
-        
+        val url = if (request.data.contains("?")) "$mainUrl${request.data}&page=$page" else "$mainUrl${request.data}?page=$page"
         val res = app.get(url, headers = headers)
-        val doc = res.document
         val html = res.text
         
-        // Cách 1: Thử lấy từ HTML (DOM)
-        var items = doc.select("a[href*='/watch/']").mapNotNull { el ->
-            val href = fixUrl(el.attr("href"))
-            val title = el.selectFirst("h3")?.text()?.trim() ?: return@mapNotNull null
-            val poster = el.selectFirst("img")?.attr("src")
-            
-            val epText = el.selectFirst("div.absolute.bottom-2.left-2")?.text()?.trim()
-            val fullTitle = if (!epText.isNullOrBlank()) "$title - $epText" else title
-
-            newMovieSearchResponse(fullTitle, href, TvType.NSFW) {
-                this.posterUrl = poster
+        val regex = """title:"([^"]+)",slug:"([^"]+)",episodeNumber:(\d+|null).*?posterImage:\{filePath:"([^"]+)"""".toRegex()
+        val items = regex.findAll(html).map { match ->
+            val (title, slug, ep, posterPath) = match.destructured
+            val fullTitle = if (ep != "null") "$title - Tập $ep" else title
+            newMovieSearchResponse(fullTitle, "$mainUrl/watch/$slug", TvType.NSFW) {
+                this.posterUrl = "$imageBaseUrl$posterPath"
             }
-        }.distinctBy { it.url }
-
-        // Cách 2: Nếu HTML trống, dùng Regex quét dữ liệu thô trong Script (SvelteKit data)
-        if (items.isEmpty()) {
-            val regex = """title:"([^"]+)",slug:"([^"]+)",episodeNumber:(\d+|null).*?posterImage:\{filePath:"([^"]+)"""".toRegex()
-            
-            items = regex.findAll(html).map { match ->
-                val (title, slug, ep, posterPath) = match.destructured
-                val fullTitle = if (ep != "null" && ep.isNotBlank()) "$title - Tập $ep" else title
-                val href = "$mainUrl/watch/$slug"
-                val poster = "$imageBaseUrl$posterPath"
-                
-                newMovieSearchResponse(fullTitle, href, TvType.NSFW) {
-                    this.posterUrl = poster
-                }
-            }.toList().distinctBy { it.url }
-        }
+        }.toList().distinctBy { it.url }
         
         return newHomePageResponse(request.name, items, items.isNotEmpty())
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/browse?q=$query"
-        val res = app.get(url, headers = headers)
-        val doc = res.document
-        val html = res.text
-        
-        var items = doc.select("a[href*='/watch/']").mapNotNull { el ->
-            val href = fixUrl(el.attr("href"))
-            val title = el.selectFirst("h3")?.text()?.trim() ?: return@mapNotNull null
-            val poster = el.selectFirst("img")?.attr("src")
-            val epText = el.selectFirst("div.absolute.bottom-2.left-2")?.text()?.trim()
-            val fullTitle = if (!epText.isNullOrBlank()) "$title - $epText" else title
-
-            newMovieSearchResponse(fullTitle, href, TvType.NSFW) {
-                this.posterUrl = poster
+        val html = app.get(url, headers = headers).text
+        val regex = """title:"([^"]+)",slug:"([^"]+)",episodeNumber:(\d+|null).*?posterImage:\{filePath:"([^"]+)"""".toRegex()
+        return regex.findAll(html).map { match ->
+            val (title, slug, ep, posterPath) = match.destructured
+            val fullTitle = if (ep != "null") "$title - Tập $ep" else title
+            newMovieSearchResponse(fullTitle, "$mainUrl/watch/$slug", TvType.NSFW) {
+                this.posterUrl = "$imageBaseUrl$posterPath"
             }
-        }.distinctBy { it.url }
-
-        if (items.isEmpty()) {
-            val regex = """title:"([^"]+)",slug:"([^"]+)",episodeNumber:(\d+|null).*?posterImage:\{filePath:"([^"]+)"""".toRegex()
-            items = regex.findAll(html).map { match ->
-                val (title, slug, ep, posterPath) = match.destructured
-                val fullTitle = if (ep != "null" && ep.isNotBlank()) "$title - Tập $ep" else title
-                val href = "$mainUrl/watch/$slug"
-                val poster = "$imageBaseUrl$posterPath"
-                
-                newMovieSearchResponse(fullTitle, href, TvType.NSFW) {
-                    this.posterUrl = poster
-                }
-            }.toList().distinctBy { it.url }
-        }
-        
-        return items
+        }.toList().distinctBy { it.url }
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val doc = app.get(url, headers = headers).document
+        val res = app.get(url, headers = headers)
+        val html = res.text
         
-        val title = doc.selectFirst("h1")?.text()?.trim() 
-            ?: doc.selectFirst("meta[property=og:title]")?.attr("content")?.trim()
-            ?: "Untitled"
-            
-        val poster = doc.selectFirst("meta[property=og:image]")?.attr("content") 
-            
-        val desc = doc.selectFirst("meta[property=og:description]")?.attr("content")
-            ?: doc.selectFirst("meta[name=description]")?.attr("content")
+        // Lấy thông tin phim từ dữ liệu SvelteKit trong Script
+        val title = Regex("""title:"([^"]+)"""").find(html)?.groupValues?.get(1) ?: "HentaiZ Video"
+        val posterPath = Regex("""posterImage:\{filePath:"([^"]+)"""").find(html)?.groupValues?.get(1)
+        val desc = Regex("""description:"([^"]+)"""").find(html)?.groupValues?.get(1)?.replace(Regex("<[^>]*>"), "")
 
         return newMovieLoadResponse(title, url, TvType.NSFW, url) {
-            this.posterUrl = poster
+            this.posterUrl = if (posterPath != null) "$imageBaseUrl$posterPath" else null
             this.plot = desc
         }
     }
@@ -149,64 +96,42 @@ class HentaiZProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val res = app.get(data, headers = headers)
-        val doc = res.document
         val html = res.text
 
-        // 1. Xử lý iframe Sonar CDN
-        doc.select("iframe").forEach { iframe ->
-            val src = fixUrl(iframe.attr("src").ifBlank { iframe.attr("data-src") })
-            if (src.isNotBlank()) {
-                if (src.contains("sonar-cdn.com")) {
-                    val iframeRes = app.get(src, headers = mapOf("Referer" to "$mainUrl/"))
-                    val iframeHtml = iframeRes.text
-                    
-                    // Tìm link m3u8
-                    Regex("""https?[:\\]+[/\\/]+[^"']+\.m3u8[^"']*""").findAll(iframeHtml).forEach {
-                        val cleanUrl = it.value.replace("\\/", "/")
-                        callback(
-                            newExtractorLink(
-                                source = name,
-                                name = "Sonar CDN",
-                                url = cleanUrl,
-                                type = ExtractorLinkType.M3U8
-                            ) {
-                                this.referer = src
-                            }
-                        )
+        // 1. Tìm URL của Sonar Player trong trang xem phim
+        val sonarRegex = """https?://play\.sonar-cdn\.com/watch\?v=[a-zA-Z0-9-]+""".toRegex()
+        val sonarUrl = sonarRegex.find(html)?.value ?: sonarRegex.find(res.document.html())?.value
+
+        if (sonarUrl != null) {
+            // 2. Truy cập vào Sonar Player với Referer của HentaiZ
+            val sonarRes = app.get(sonarUrl, headers = mapOf("Referer" to "$mainUrl/"))
+            val sonarHtml = sonarRes.text
+
+            // 3. Quét link m3u8 bên trong Sonar Player
+            val m3u8Regex = """https?://[^"']+\.m3u8[^"']*""".toRegex()
+            m3u8Regex.findAll(sonarHtml).forEach { match ->
+                val videoUrl = match.value.replace("\\/", "/")
+                callback(
+                    newExtractorLink(
+                        source = "Sonar CDN",
+                        name = "Server VIP",
+                        url = videoUrl,
+                        type = ExtractorLinkType.M3U8
+                    ) {
+                        // Quan trọng: Referer phải là URL của player
+                        this.referer = sonarUrl
+                        this.quality = Qualities.P1080.value
                     }
-                    // Tìm link mp4
-                    Regex("""https?[:\\]+[/\\/]+[^"']+\.mp4[^"']*""").findAll(iframeHtml).forEach {
-                        val cleanUrl = it.value.replace("\\/", "/")
-                        callback(
-                            newExtractorLink(
-                                source = name,
-                                name = "Sonar CDN (MP4)",
-                                url = cleanUrl,
-                                type = ExtractorLinkType.VIDEO
-                            ) {
-                                this.referer = src
-                            }
-                        )
-                    }
-                } else {
-                    loadExtractor(src, data, subtitleCallback, callback)
-                }
+                )
             }
         }
 
-        // 2. Quét dự phòng link m3u8 trong mã nguồn trang chính
-        Regex("""https?[:\\]+[/\\/]+[^"']+\.m3u8[^"']*""").findAll(html).forEach {
-            val cleanUrl = it.value.replace("\\/", "/")
-            callback(
-                newExtractorLink(
-                    source = name,
-                    name = "HentaiZ VIP",
-                    url = cleanUrl,
-                    type = ExtractorLinkType.M3U8
-                ) {
-                    this.referer = data
-                }
-            )
+        // Quét dự phòng các host khác nếu có
+        val otherIframe = res.document.select("iframe").map { it.attr("src") }
+        otherIframe.forEach { src ->
+            if (src.isNotBlank() && !src.contains("sonar-cdn")) {
+                loadExtractor(fixUrl(src), data, subtitleCallback, callback)
+            }
         }
 
         return true

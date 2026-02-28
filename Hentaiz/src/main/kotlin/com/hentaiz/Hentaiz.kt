@@ -5,7 +5,6 @@ import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Element
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 
 @CloudstreamPlugin
 class HentaiZPlugin : Plugin() {
@@ -22,8 +21,8 @@ class HentaiZProvider : MainAPI() {
     override val supportedTypes = setOf(TvType.NSFW)
     
     private val imageBaseUrl = "https://storage.haiten.org"
-    private val mapper = jacksonObjectMapper()
 
+    // Header giả lập trình duyệt
     private val headers = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
         "Referer" to "$mainUrl/",
@@ -47,7 +46,7 @@ class HentaiZProvider : MainAPI() {
         return if (cleanUrl.startsWith("/")) "$base$cleanUrl" else "$base/$cleanUrl"
     }
 
-    // Hàm giải mã Unicode (\u003C -> <)
+    // Hàm giải mã Unicode cho mô tả phim
     private fun decodeUnicode(input: String): String {
         var res = input
         val regex = "\\\\u([0-9a-fA-F]{4})".toRegex()
@@ -94,7 +93,6 @@ class HentaiZProvider : MainAPI() {
         
         val title = Regex("""title:"([^"]+)"""").find(html)?.groupValues?.get(1) ?: "HentaiZ Video"
         val posterPath = Regex("""posterImage:\{filePath:"([^"]+)"""").find(html)?.groupValues?.get(1)
-        // Sửa lỗi hiển thị mô tả bị mã hóa Unicode
         val rawDesc = Regex("""description:"([^"]+)"""").find(html)?.groupValues?.get(1) ?: ""
         val desc = decodeUnicode(rawDesc).replace(Regex("<[^>]*>"), "").trim()
 
@@ -117,75 +115,45 @@ class HentaiZProvider : MainAPI() {
         val sonarRegex = """https?://play\.sonar-cdn\.com/watch\?v=([a-zA-Z0-9-]+)""".toRegex()
         val sonarMatch = sonarRegex.find(html) ?: sonarRegex.find(res.document.html())
         val sonarUrl = sonarMatch?.value
-        val videoId = sonarMatch?.groupValues?.get(1)
 
-        if (!sonarUrl.isNullOrBlank() && videoId != null) {
+        if (!sonarUrl.isNullOrBlank()) {
             val fixedSonarUrl = fixUrl(sonarUrl)
             
-            // 2. Gọi API trực tiếp của Sonar (Giả lập hành động của Player)
-            // Thay vì quét HTML, ta gọi API để lấy JSON cấu hình chuẩn
-            val apiUrl = "https://play.sonar-cdn.com/api/source/$videoId"
-            
-            try {
-                val apiHeaders = mapOf(
-                    "User-Agent" to headers["User-Agent"]!!,
-                    "Referer" to fixedSonarUrl,
-                    "Origin" to "https://play.sonar-cdn.com",
-                    "X-Requested-With" to "XMLHttpRequest", // Quan trọng: Giả lập AJAX request
-                    "Content-Type" to "application/x-www-form-urlencoded"
+            // 2. Truy cập vào trang Player
+            val sonarRes = app.get(fixedSonarUrl, headers = mapOf("Referer" to "$mainUrl/"))
+            val sonarHtml = sonarRes.text
+
+            // 3. Quét link video bằng Regex mạnh nhất
+            val videoLinkRegex = """https?[:\\/]+[^"']+\.(?:m3u8|mp4)[^"']*""".toRegex()
+            val links = videoLinkRegex.findAll(sonarHtml).map { it.value.replace("\\/", "/") }.toMutableSet()
+
+            links.forEach { videoUrl ->
+                val isM3u8 = videoUrl.contains(".m3u8")
+                val type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                
+                // --- SERVER 1: Dùng Referer là trang Player (Thường là đúng nhất) ---
+                callback(
+                    newExtractorLink(
+                        source = "Sonar CDN",
+                        name = "Server VIP (Player Ref)",
+                        url = videoUrl,
+                        referer = fixedSonarUrl, // Quan trọng: Referer là link iframe
+                        quality = Qualities.P1080.value,
+                        type = type
+                    )
                 )
 
-                // Gửi POST request để lấy link (thường các player dùng POST)
-                val apiRes = app.post(apiUrl, headers = apiHeaders, data = mapOf("r" to "$mainUrl/", "d" to "hentaiz.lol"))
-                
-                if (apiRes.code == 200) {
-                    val json = mapper.readTree(apiRes.text)
-                    val dataArray = json.get("data")
-                    
-                    if (dataArray != null && dataArray.isArray) {
-                        dataArray.forEach { item ->
-                            val file = item.get("file")?.asText() ?: return@forEach
-                            val label = item.get("label")?.asText() ?: "Auto"
-                            val type = item.get("type")?.asText() ?: ""
-                            
-                            val isM3u8 = file.contains(".m3u8") || type.contains("hls")
-                            
-                            callback(
-                                newExtractorLink(
-                                    source = "Sonar CDN",
-                                    name = "Server VIP ($label)",
-                                    url = file,
-                                    type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                                ) {
-                                    this.referer = fixedSonarUrl // Referer phải là trang Player
-                                    this.quality = Qualities.P1080.value
-                                }
-                            )
-                        }
-                    }
-                } else {
-                    // Fallback: Nếu API POST thất bại, thử quét Regex trong trang Player như cũ
-                    val sonarPageRes = app.get(fixedSonarUrl, headers = mapOf("Referer" to "$mainUrl/"))
-                    val sonarHtml = sonarPageRes.text
-                    
-                    // Regex tìm file: "..." (Cấu hình JW Player)
-                    val fileRegex = """file\s*:\s*["']([^"']+)["']""".toRegex()
-                    fileRegex.findAll(sonarHtml).forEach { match ->
-                        val videoUrl = match.groupValues[1].replace("\\/", "/")
-                        callback(
-                            newExtractorLink(
-                                source = "Sonar CDN",
-                                name = "Server VIP (Backup)",
-                                url = videoUrl,
-                                type = ExtractorLinkType.M3U8
-                            ) {
-                                this.referer = fixedSonarUrl
-                            }
-                        )
-                    }
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
+                // --- SERVER 2: Dùng Referer là trang Web chính (Dự phòng) ---
+                callback(
+                    newExtractorLink(
+                        source = "Sonar CDN",
+                        name = "Server VIP (Site Ref)",
+                        url = videoUrl,
+                        referer = "$mainUrl/", // Referer là hentaiz.lol
+                        quality = Qualities.P720.value,
+                        type = type
+                    )
+                )
             }
         }
 

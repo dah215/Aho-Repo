@@ -22,7 +22,6 @@ class HentaiZProvider : MainAPI() {
     
     private val imageBaseUrl = "https://storage.haiten.org"
 
-    // Header giả lập trình duyệt
     private val headers = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
         "Referer" to "$mainUrl/",
@@ -46,7 +45,6 @@ class HentaiZProvider : MainAPI() {
         return if (cleanUrl.startsWith("/")) "$base$cleanUrl" else "$base/$cleanUrl"
     }
 
-    // Hàm giải mã Unicode cho mô tả phim
     private fun decodeUnicode(input: String): String {
         var res = input
         val regex = "\\\\u([0-9a-fA-F]{4})".toRegex()
@@ -123,7 +121,7 @@ class HentaiZProvider : MainAPI() {
             val sonarRes = app.get(fixedSonarUrl, headers = mapOf("Referer" to "$mainUrl/"))
             val sonarHtml = sonarRes.text
 
-            // 3. Quét link video bằng Regex mạnh nhất
+            // 3. Quét link video bằng Regex
             val videoLinkRegex = """https?[:\\/]+[^"']+\.(?:m3u8|mp4)[^"']*""".toRegex()
             val links = videoLinkRegex.findAll(sonarHtml).map { it.value.replace("\\/", "/") }.toMutableSet()
 
@@ -137,10 +135,11 @@ class HentaiZProvider : MainAPI() {
                         source = "Sonar CDN",
                         name = "Server VIP (Player Ref)",
                         url = videoUrl,
-                        referer = fixedSonarUrl, // Quan trọng: Referer là link iframe
-                        quality = Qualities.P1080.value,
                         type = type
-                    )
+                    ) {
+                        this.referer = fixedSonarUrl // Đặt referer ở đây
+                        this.quality = Qualities.P1080.value // Đặt quality ở đây
+                    }
                 )
 
                 // --- SERVER 2: Dùng Referer là trang Web chính (Dự phòng) ---
@@ -149,10 +148,11 @@ class HentaiZProvider : MainAPI() {
                         source = "Sonar CDN",
                         name = "Server VIP (Site Ref)",
                         url = videoUrl,
-                        referer = "$mainUrl/", // Referer là hentaiz.lol
-                        quality = Qualities.P720.value,
                         type = type
-                    )
+                    ) {
+                        this.referer = "$mainUrl/" // Đặt referer ở đây
+                        this.quality = Qualities.P720.value // Đặt quality ở đây
+                    }
                 )
             }
         }

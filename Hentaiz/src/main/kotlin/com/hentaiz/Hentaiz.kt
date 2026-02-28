@@ -98,9 +98,11 @@ class HentaiZProvider : MainAPI() {
         val res = app.get(data, headers = headers)
         val html = res.text
 
-        // 1. Tìm URL của Sonar Player
-        val sonarRegex = """https?://play\.sonar-cdn\.com/watch\?v=[a-zA-Z0-9-]+""".toRegex()
-        val sonarUrl = sonarRegex.find(html)?.value ?: res.document.select("iframe[src*='sonar-cdn']").attr("src")
+        // 1. Tìm URL của Sonar Player (play.sonar-cdn.com)
+        val sonarRegex = """https?://play\.sonar-cdn\.com/watch\?v=([a-zA-Z0-9-]+)""".toRegex()
+        val sonarMatch = sonarRegex.find(html) ?: sonarRegex.find(res.document.html())
+        val sonarUrl = sonarMatch?.value
+        val videoId = sonarMatch?.groupValues?.get(1)
 
         if (!sonarUrl.isNullOrBlank()) {
             val fixedSonarUrl = fixUrl(sonarUrl)
@@ -108,13 +110,17 @@ class HentaiZProvider : MainAPI() {
             val sonarRes = app.get(fixedSonarUrl, headers = mapOf("Referer" to "$mainUrl/"))
             val sonarHtml = sonarRes.text
 
-            // 3. Bóc tách link video từ cấu trúc JW Player setup
-            val videoRegex = """["'](https?://[^"']+\.(?:m3u8|mp4)[^"']*)["']""".toRegex()
-            videoRegex.findAll(sonarHtml).forEach { match ->
-                val videoUrl = match.groupValues[1].replace("\\/", "/")
+            // 3. Quét tất cả các link video tiềm năng (m3u8, mp4) trong JS của Sonar
+            val videoLinkRegex = """https?[:\\/]+[^"']+\.(?:m3u8|mp4)[^"']*""".toRegex()
+            val links = videoLinkRegex.findAll(sonarHtml).map { it.value.replace("\\/", "/") }.toMutableSet()
+            
+            // Fallback: Nếu không tìm thấy link, thử đoán cấu trúc manifest của Sonar
+            if (links.isEmpty() && videoId != null) {
+                links.add("https://play.sonar-cdn.com/hls/$videoId/index.m3u8")
+            }
+
+            links.forEach { videoUrl ->
                 val isM3u8 = videoUrl.contains(".m3u8")
-                
-                // Sửa lỗi biên dịch: Đưa quality và referer vào trong khối lệnh { }
                 callback(
                     newExtractorLink(
                         source = "Sonar CDN",
@@ -123,13 +129,18 @@ class HentaiZProvider : MainAPI() {
                         type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                     ) {
                         this.quality = Qualities.P1080.value
+                        // Quan trọng: Referer phải là URL của player và Origin là domain của player
                         this.referer = fixedSonarUrl
+                        this.headers = mapOf(
+                            "Origin" to "https://play.sonar-cdn.com",
+                            "Accept" to "*/*"
+                        )
                     }
                 )
             }
         }
 
-        // Quét dự phòng các host khác
+        // Quét các iframe khác (dood, streamwish...)
         res.document.select("iframe").forEach { iframe ->
             val src = iframe.attr("src")
             if (src.isNotBlank() && !src.contains("sonar-cdn")) {

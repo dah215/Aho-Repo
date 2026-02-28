@@ -25,7 +25,8 @@ class HentaiZProvider : MainAPI() {
     private val headers = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
         "Referer" to "$mainUrl/",
-        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
+        "Origin" to mainUrl,
+        "Accept" to "*/*"
     )
 
     override val mainPage = mainPageOf(
@@ -78,7 +79,6 @@ class HentaiZProvider : MainAPI() {
         val res = app.get(url, headers = headers)
         val html = res.text
         
-        // Lấy thông tin phim từ dữ liệu SvelteKit trong Script
         val title = Regex("""title:"([^"]+)"""").find(html)?.groupValues?.get(1) ?: "HentaiZ Video"
         val posterPath = Regex("""posterImage:\{filePath:"([^"]+)"""").find(html)?.groupValues?.get(1)
         val desc = Regex("""description:"([^"]+)"""").find(html)?.groupValues?.get(1)?.replace(Regex("<[^>]*>"), "")
@@ -98,37 +98,39 @@ class HentaiZProvider : MainAPI() {
         val res = app.get(data, headers = headers)
         val html = res.text
 
-        // 1. Tìm URL của Sonar Player trong trang xem phim
+        // 1. Tìm URL của Sonar Player (play.sonar-cdn.com)
         val sonarRegex = """https?://play\.sonar-cdn\.com/watch\?v=[a-zA-Z0-9-]+""".toRegex()
-        val sonarUrl = sonarRegex.find(html)?.value ?: sonarRegex.find(res.document.html())?.value
+        val sonarUrl = sonarRegex.find(html)?.value ?: res.document.select("iframe[src*='sonar-cdn']").attr("src")
 
-        if (sonarUrl != null) {
-            // 2. Truy cập vào Sonar Player với Referer của HentaiZ
-            val sonarRes = app.get(sonarUrl, headers = mapOf("Referer" to "$mainUrl/"))
+        if (!sonarUrl.isNullOrBlank()) {
+            val fixedSonarUrl = fixUrl(sonarUrl)
+            // 2. Lấy nội dung player với Referer từ HentaiZ
+            val sonarRes = app.get(fixedSonarUrl, headers = mapOf("Referer" to "$mainUrl/"))
             val sonarHtml = sonarRes.text
 
-            // 3. Quét link m3u8 bên trong Sonar Player
-            val m3u8Regex = """https?://[^"']+\.m3u8[^"']*""".toRegex()
-            m3u8Regex.findAll(sonarHtml).forEach { match ->
-                val videoUrl = match.value.replace("\\/", "/")
+            // 3. Bóc tách link video từ cấu trúc JW Player setup
+            // Tìm các chuỗi có đuôi .m3u8 hoặc .mp4
+            val videoRegex = """["'](https?://[^"']+\.(?:m3u8|mp4)[^"']*)["']""".toRegex()
+            videoRegex.findAll(sonarHtml).forEach { match ->
+                val videoUrl = match.groupValues[1].replace("\\/", "/")
+                
+                val isM3u8 = videoUrl.contains(".m3u8")
                 callback(
                     newExtractorLink(
                         source = "Sonar CDN",
-                        name = "Server VIP",
+                        name = if (isM3u8) "Server VIP (HLS)" else "Server VIP (MP4)",
                         url = videoUrl,
-                        type = ExtractorLinkType.M3U8
-                    ) {
-                        // Quan trọng: Referer phải là URL của player
-                        this.referer = sonarUrl
-                        this.quality = Qualities.P1080.value
-                    }
+                        referer = fixedSonarUrl,
+                        quality = Qualities.P1080.value,
+                        type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                    )
                 )
             }
         }
 
-        // Quét dự phòng các host khác nếu có
-        val otherIframe = res.document.select("iframe").map { it.attr("src") }
-        otherIframe.forEach { src ->
+        // Quét các iframe khác nếu có (dự phòng)
+        res.document.select("iframe").forEach { iframe ->
+            val src = iframe.attr("src")
             if (src.isNotBlank() && !src.contains("sonar-cdn")) {
                 loadExtractor(fixUrl(src), data, subtitleCallback, callback)
             }

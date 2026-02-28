@@ -120,7 +120,7 @@ class HentaiZProvider : MainAPI() {
         if (!sonarUrl.isNullOrBlank() && videoId != null) {
             val fixedSonarUrl = fixUrl(sonarUrl)
             
-            // 2. Gọi API trực tiếp để lấy link
+            // 2. Gọi API trực tiếp để lấy link (Phương pháp mạnh nhất)
             val apiUrl = "https://play.sonar-cdn.com/api/source/$videoId"
             
             try {
@@ -145,24 +145,24 @@ class HentaiZProvider : MainAPI() {
                             val type = item.get("type")?.asText() ?: ""
                             
                             val isM3u8 = file.contains(".m3u8") || type.contains("hls")
-                            
-                            // SỬ DỤNG THAM SỐ VỊ TRÍ (POSITIONAL ARGUMENTS) ĐỂ TRÁNH LỖI BIÊN DỊCH
-                            // Thứ tự: source, name, url, referer, quality, isM3u8, headers
+                            val linkType = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+
+                            // CÚ PHÁP CHUẨN: (source, name, url, type) { initializer }
                             callback(
                                 newExtractorLink(
-                                    "Sonar CDN",
-                                    "Server VIP ($label)",
-                                    file,
-                                    fixedSonarUrl,
-                                    Qualities.P1080.value,
-                                    isM3u8,
-                                    mapOf("Origin" to "https://play.sonar-cdn.com")
-                                )
+                                    source = "Sonar CDN",
+                                    name = "Server VIP ($label)",
+                                    url = file,
+                                    type = linkType
+                                ) {
+                                    this.referer = fixedSonarUrl
+                                    this.quality = Qualities.P1080.value
+                                }
                             )
                         }
                     }
                 } else {
-                    // Fallback: Quét Regex
+                    // Fallback: Quét Regex nếu API lỗi
                     val sonarPageRes = app.get(fixedSonarUrl, headers = mapOf("Referer" to "$mainUrl/"))
                     val sonarHtml = sonarPageRes.text
                     
@@ -170,18 +170,18 @@ class HentaiZProvider : MainAPI() {
                     bruteForceRegex.findAll(sonarHtml).forEach { match ->
                         val videoUrl = match.value.replace("\\/", "/")
                         val isM3u8 = videoUrl.contains(".m3u8")
+                        val linkType = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                         
-                        // SỬ DỤNG THAM SỐ VỊ TRÍ
                         callback(
                             newExtractorLink(
-                                "Sonar CDN",
-                                "Server VIP (Backup)",
-                                videoUrl,
-                                fixedSonarUrl,
-                                Qualities.Unknown.value,
-                                isM3u8,
-                                mapOf("Origin" to "https://play.sonar-cdn.com")
-                            )
+                                source = "Sonar CDN",
+                                name = "Server VIP (Backup)",
+                                url = videoUrl,
+                                type = linkType
+                            ) {
+                                this.referer = fixedSonarUrl
+                                this.quality = Qualities.Unknown.value
+                            }
                         )
                     }
                 }

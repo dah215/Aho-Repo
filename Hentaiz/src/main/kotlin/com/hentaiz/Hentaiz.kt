@@ -120,7 +120,7 @@ class HentaiZProvider : MainAPI() {
         if (!sonarUrl.isNullOrBlank() && videoId != null) {
             val fixedSonarUrl = fixUrl(sonarUrl)
             
-            // 2. GIẢ LẬP SCRIPT: Gọi API trực tiếp để lấy link (Bỏ qua bước render HTML)
+            // 2. Gọi API trực tiếp để lấy link
             val apiUrl = "https://play.sonar-cdn.com/api/source/$videoId"
             
             try {
@@ -128,11 +128,10 @@ class HentaiZProvider : MainAPI() {
                     "User-Agent" to headers["User-Agent"]!!,
                     "Referer" to fixedSonarUrl,
                     "Origin" to "https://play.sonar-cdn.com",
-                    "X-Requested-With" to "XMLHttpRequest", // Giả danh là script của trình duyệt
+                    "X-Requested-With" to "XMLHttpRequest",
                     "Content-Type" to "application/x-www-form-urlencoded"
                 )
 
-                // Gửi yêu cầu POST y hệt như script của trang web làm
                 val apiRes = app.post(apiUrl, headers = apiHeaders, data = mapOf("r" to "$mainUrl/", "d" to "hentaiz.lol"))
                 
                 if (apiRes.code == 200) {
@@ -147,38 +146,41 @@ class HentaiZProvider : MainAPI() {
                             
                             val isM3u8 = file.contains(".m3u8") || type.contains("hls")
                             
-                            // Sử dụng Constructor trực tiếp để tránh lỗi biên dịch
+                            // SỬ DỤNG THAM SỐ VỊ TRÍ (POSITIONAL ARGUMENTS) ĐỂ TRÁNH LỖI BIÊN DỊCH
+                            // Thứ tự: source, name, url, referer, quality, isM3u8, headers
                             callback(
-                                ExtractorLink(
-                                    source = "Sonar CDN",
-                                    name = "Server VIP ($label)",
-                                    url = file,
-                                    referer = fixedSonarUrl,
-                                    quality = Qualities.P1080.value,
-                                    type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                                newExtractorLink(
+                                    "Sonar CDN",
+                                    "Server VIP ($label)",
+                                    file,
+                                    fixedSonarUrl,
+                                    Qualities.P1080.value,
+                                    isM3u8,
+                                    mapOf("Origin" to "https://play.sonar-cdn.com")
                                 )
                             )
                         }
                     }
                 } else {
-                    // Fallback: Nếu API thất bại, quét Regex thô bạo trên trang Player
+                    // Fallback: Quét Regex
                     val sonarPageRes = app.get(fixedSonarUrl, headers = mapOf("Referer" to "$mainUrl/"))
                     val sonarHtml = sonarPageRes.text
                     
-                    // Regex tìm mọi chuỗi bắt đầu bằng http và kết thúc bằng m3u8/mp4
                     val bruteForceRegex = """(https?://[^"'\s]+\.(?:m3u8|mp4)[^"'\s]*)""".toRegex()
                     bruteForceRegex.findAll(sonarHtml).forEach { match ->
                         val videoUrl = match.value.replace("\\/", "/")
                         val isM3u8 = videoUrl.contains(".m3u8")
                         
+                        // SỬ DỤNG THAM SỐ VỊ TRÍ
                         callback(
-                            ExtractorLink(
-                                source = "Sonar CDN",
-                                name = "Server VIP (Backup)",
-                                url = videoUrl,
-                                referer = fixedSonarUrl,
-                                quality = Qualities.Unknown.value,
-                                type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                            newExtractorLink(
+                                "Sonar CDN",
+                                "Server VIP (Backup)",
+                                videoUrl,
+                                fixedSonarUrl,
+                                Qualities.Unknown.value,
+                                isM3u8,
+                                mapOf("Origin" to "https://play.sonar-cdn.com")
                             )
                         )
                     }

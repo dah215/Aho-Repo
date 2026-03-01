@@ -28,14 +28,78 @@ class HentaiZProvider : MainAPI() {
     private val imageBaseUrl = "https://storage.haiten.org"
     private val UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
-    // Khôi phục đầy đủ các danh mục phim
+    // Tích hợp toàn bộ thể loại từ dữ liệu bạn cung cấp
     override val mainPage = mainPageOf(
         "/browse" to "Mới Cập Nhật",
-        "/browse?animationType=THREE_D" to "Hentai 3D",
-        "/browse?animationType=TWO_D" to "Hentai 2D",
-        "/browse?contentRating=UNCENSORED" to "Không Che",
-        "/browse?contentRating=CENSORED" to "Có Che",
-        "/browse?isTrailer=false" to "Phim Đầy Đủ"
+        "/genres/big-boobs" to "Big Boobs",
+        "/genres/bu-liem" to "Bú liếm",
+        "/genres/hiep-dam" to "Hiếp dâm",
+        "/genres/nu-sinh" to "Nữ sinh",
+        "/genres/du-vu" to "Đụ Vú",
+        "/genres/anal" to "Anal",
+        "/genres/stocking" to "Stocking",
+        "/genres/virgin" to "Virgin",
+        "/genres/mind-break" to "Mind Break",
+        "/genres/femdom" to "Femdom",
+        "/genres/ahegao" to "Ahegao",
+        "/genres/threesome" to "Threesome",
+        "/genres/vanilla" to "Vanilla",
+        "/genres/milf" to "MILF",
+        "/genres/sex-toy" to "Sex Toy",
+        "/genres/harem" to "Harem",
+        "/genres/plot" to "Plot",
+        "/genres/thu-dam" to "Thủ Dâm",
+        "/genres/gang-bang" to "Gang Bang",
+        "/genres/loan-luan" to "Loạn luân",
+        "/genres/bondage" to "Bondage",
+        "/genres/tsundere" to "Tsundere",
+        "/genres/ntr" to "NTR",
+        "/genres/double-penetration" to "Double Penetration",
+        "/genres/giao-vien" to "Giáo viên",
+        "/genres/loli" to "Loli",
+        "/genres/megane" to "Megane",
+        "/genres/yuri" to "Yuri",
+        "/genres/do-boi" to "Đồ Bơi",
+        "/genres/thac-loan" to "Thác loạn",
+        "/genres/ugly-bastard" to "Ugly Bastard",
+        "/genres/maid" to "Maid",
+        "/genres/bao-dam" to "Bạo dâm",
+        "/genres/thoi-mien" to "Thôi miên",
+        "/genres/sua-me" to "Sữa mẹ",
+        "/genres/tong-tinh" to "Tống tình",
+        "/genres/da-ngam" to "Da ngăm",
+        "/genres/3d" to "3D",
+        "/genres/bao-cao-su" to "Bao cao su",
+        "/genres/monster" to "Monster",
+        "/genres/y-ta" to "Y Tá",
+        "/genres/fantasy" to "Fantasy",
+        "/genres/xuc-tu" to "Xúc tu",
+        "/genres/foot-job" to "Foot Job",
+        "/genres/guro" to "Guro",
+        "/genres/kemonomimi" to "Kemonomimi",
+        "/genres/shota" to "Shota",
+        "/genres/x-ray" to "X-Ray",
+        "/genres/futanari" to "Futanari",
+        "/genres/wafuku" to "Wafuku",
+        "/genres/elf" to "Elf",
+        "/genres/softcore" to "Softcore",
+        "/genres/tieu-tien" to "Tiểu tiện",
+        "/genres/josei" to "Josei",
+        "/genres/cong-cong" to "Công cộng",
+        "/genres/gai-quay" to "Gái quậy",
+        "/genres/scat" to "Scat",
+        "/genres/idol" to "Idol",
+        "/genres/thuoc-kich-duc" to "Thuốc kích dục",
+        "/genres/succubus" to "Succubus",
+        "/genres/cosplay" to "Cosplay",
+        "/genres/mang-thai" to "Mang thai",
+        "/genres/ngu" to "Ngủ",
+        "/genres/trap" to "Trap",
+        "/genres/yaoi" to "Yaoi",
+        "/genres/vu-lep" to "Vú lép",
+        "/genres/de-con" to "Đẻ con",
+        "/genres/goblin" to "Goblin",
+        "/genres/furry" to "Furry"
     )
 
     private fun fixUrl(url: String): String {
@@ -47,10 +111,7 @@ class HentaiZProvider : MainAPI() {
         return if (cleanUrl.startsWith("/")) "$base$cleanUrl" else "$base/$cleanUrl"
     }
 
-    // --- PHẦN HIỂN THỊ DANH MỤC PHIM ---
-
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        // Xử lý URL để nối thêm tham số page chuẩn xác (?page= hoặc &page=)
         val url = if (request.data.contains("?")) {
             "$mainUrl${request.data}&page=$page"
         } else {
@@ -59,7 +120,7 @@ class HentaiZProvider : MainAPI() {
         
         val html = app.get(url, headers = mapOf("User-Agent" to UA)).text
         
-        // Regex quét dữ liệu phim từ script SvelteKit
+        // Quét phim từ dữ liệu SvelteKit
         val regex = """title:"([^"]+)",slug:"([^"]+)",episodeNumber:(\d+|null).*?posterImage:\{filePath:"([^"]+)"""".toRegex()
         val items = regex.findAll(html).map { match ->
             val (title, slug, ep, posterPath) = match.destructured
@@ -81,7 +142,7 @@ class HentaiZProvider : MainAPI() {
             newMovieSearchResponse(if (ep != "null") "$title - Tập $ep" else title, "$mainUrl/watch/$slug", TvType.NSFW) {
                 this.posterUrl = "$imageBaseUrl$posterPath"
             }
-        }.toList().distinctBy { it.url }
+        }.toList()
     }
 
     override suspend fun load(url: String): LoadResponse {
@@ -89,7 +150,6 @@ class HentaiZProvider : MainAPI() {
         val title = Regex("""title:"([^"]+)"""").find(html)?.groupValues?.get(1) ?: "HentaiZ Video"
         val posterPath = Regex("""posterImage:\{filePath:"([^"]+)"""").find(html)?.groupValues?.get(1)
         
-        // Lấy thêm mô tả phim nếu có
         val desc = Regex("""description:"([^"]+)"""").find(html)?.groupValues?.get(1)
             ?.replace(Regex("\\\\u([0-9a-fA-F]{4})")) { it.groupValues[1].toInt(16).toChar().toString() }
             ?.replace(Regex("<[^>]*>"), "")
@@ -100,7 +160,7 @@ class HentaiZProvider : MainAPI() {
         }
     }
 
-    // --- BỘ LỌC "SHADOW INTERCEPTOR" (GIỮ NGUYÊN VÌ ĐÃ PHÁT ĐƯỢC VIDEO) ---
+    // --- GIỮ NGUYÊN LOGIC VIDEO SHADOW INTERCEPTOR ---
 
     private val masterScript = """
         (function() {

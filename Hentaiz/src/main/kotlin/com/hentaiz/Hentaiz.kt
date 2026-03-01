@@ -33,8 +33,6 @@ class HentaiZProvider : MainAPI() {
     override val supportedTypes = setOf(TvType.NSFW)
     
     private val imageBaseUrl = "https://storage.haiten.org"
-
-    // User-Agent giả lập Mobile để Sonar CDN trả về player HTML5
     private val UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36"
 
     private val headers = mapOf(
@@ -50,8 +48,6 @@ class HentaiZProvider : MainAPI() {
         "/browse?contentRating=CENSORED" to "Có Che"
     )
 
-    // --- PHẦN PARSING CƠ BẢN ---
-    
     private fun fixUrl(url: String): String {
         if (url.isBlank()) return ""
         var cleanUrl = url.trim().replace("\\/", "/")
@@ -112,44 +108,60 @@ class HentaiZProvider : MainAPI() {
         }
     }
 
-    // ─── KỸ THUẬT CAO: WEBVIEW + BLOB INTERCEPTOR + LOCAL SERVER ───
+    // ─── PHẦN XỬ LÝ MẠNH: INTERCEPTOR + LOCAL SERVER ───
 
-    // 1. Đoạn mã JS dùng để tiêm vào trang web
-    // Nó sẽ ghi đè hàm URL.createObjectURL để bắt lấy nội dung Blob
-    private val blobInterceptor = """
-        ;(function(){
-            console.log("HentaiZ: Injector started");
+    // JS Interceptor: Bắt cả XHR, Fetch và Blob
+    private val jsInterceptor = """
+        <script>
+        (function() {
+            console.log("HentaiZ: Interceptor Active");
+            
+            function checkAndSend(content, url) {
+                if (content && (content.includes('#EXTM3U') || url.includes('.m3u8'))) {
+                    Android.onM3U8(content, url);
+                }
+            }
+
+            // 1. Hook XMLHttpRequest
+            var origOpen = XMLHttpRequest.prototype.open;
+            XMLHttpRequest.prototype.open = function(method, url) {
+                this.addEventListener('load', function() {
+                    checkAndSend(this.responseText, url);
+                });
+                origOpen.apply(this, arguments);
+            };
+
+            // 2. Hook Fetch
+            var origFetch = window.fetch;
+            window.fetch = async (...args) => {
+                const response = await origFetch(...args);
+                const clone = response.clone();
+                clone.text().then(text => {
+                    checkAndSend(text, response.url);
+                });
+                return response;
+            };
+            
+            // 3. Hook Blob (Dự phòng)
             var _oc = URL.createObjectURL;
             URL.createObjectURL = function(b) {
                 var u = _oc.apply(this, arguments);
-                try {
-                    // Kiểm tra nếu blob là mpegurl (m3u8)
-                    if (b && (b.type === 'application/vnd.apple.mpegurl' || b.type === 'application/x-mpegurl' || (b.size > 0))) {
-                        var r = new FileReader();
-                        r.onload = function(e) {
-                            try {
-                                var content = e.target.result;
-                                if (content.indexOf('#EXTM3U') !== -1) {
-                                    // Gửi nội dung về Kotlin qua Interface
-                                    Android.onM3U8(content, window.location.href);
-                                }
-                            } catch(x) {}
-                        };
-                        r.readAsText(b);
-                    }
-                } catch(x) {}
+                if (b && (b.type === 'application/vnd.apple.mpegurl' || b.type === 'application/x-mpegurl')) {
+                    var r = new FileReader();
+                    r.onload = function(e) { checkAndSend(e.target.result, window.location.href); };
+                    r.readAsText(b);
+                }
                 return u;
             };
         })();
+        </script>
     """.trimIndent()
 
-    // 2. Interface để nhận dữ liệu từ JS
     inner class M3U8Bridge(val onResult: (String) -> Unit) {
         @JavascriptInterface
-        fun onM3U8(content: String, pageUrl: String) {
-            // Xử lý đường dẫn tương đối thành tuyệt đối ngay tại đây
-            // Sonar CDN thường dùng link tương đối cho segment
-            val baseUrl = pageUrl.substringBeforeLast("/") + "/"
+        fun onM3U8(content: String, url: String) {
+            // Xử lý link segment: Biến link tương đối thành tuyệt đối
+            val baseUrl = url.substringBeforeLast("/") + "/"
             val fixedContent = content.lines().joinToString("\n") { line ->
                 if (line.isNotBlank() && !line.startsWith("#") && !line.startsWith("http")) {
                     "$baseUrl$line"
@@ -161,8 +173,7 @@ class HentaiZProvider : MainAPI() {
         }
     }
 
-    // 3. Local HTTP Server (Chạy trên 127.0.0.1)
-    // Dùng để phục vụ file M3U8 cho ExoPlayer, bypass lỗi file://
+    // Local Server để serve M3U8 cho ExoPlayer
     private var localServer: LocalM3U8Server? = null
 
     inner class LocalM3U8Server(private val m3u8Content: String) {
@@ -177,29 +188,22 @@ class HentaiZProvider : MainAPI() {
                     while (!ss.isClosed) {
                         try {
                             val client = ss.accept()
-                            // Đọc request (để clear buffer)
-                            client.getInputStream().bufferedReader().readLine()
+                            client.getInputStream().bufferedReader().readLine() // Đọc request
                             
                             val body = m3u8Content.toByteArray(Charsets.UTF_8)
-                            val crlf = "\r\n"
-                            val response = "HTTP/1.1 200 OK$crlf" +
-                                    "Content-Type: application/vnd.apple.mpegurl$crlf" +
-                                    "Content-Length: ${body.size}$crlf" +
-                                    "Access-Control-Allow-Origin: *$crlf" +
-                                    "Connection: close$crlf" +
-                                    crlf
+                            val response = "HTTP/1.1 200 OK\r\n" +
+                                    "Content-Type: application/vnd.apple.mpegurl\r\n" +
+                                    "Content-Length: ${body.size}\r\n" +
+                                    "Access-Control-Allow-Origin: *\r\n" +
+                                    "Connection: close\r\n\r\n"
                             
                             client.getOutputStream().write(response.toByteArray())
                             client.getOutputStream().write(body)
                             client.getOutputStream().flush()
                             client.close()
-                        } catch (e: Exception) {
-                            // Ignore connection errors
-                        }
+                        } catch (e: Exception) {}
                     }
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                }
+                } catch (e: Exception) {}
             }.also { it.isDaemon = true }.start()
         }
 
@@ -208,31 +212,24 @@ class HentaiZProvider : MainAPI() {
         }
     }
 
-    // 4. Hàm khởi chạy WebView và bắt link
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun getM3U8FromWebView(url: String): String? {
+    private suspend fun captureM3U8(url: String): String? {
         return withContext(Dispatchers.Main) {
-            withTimeoutOrNull(30_000L) { // Timeout 30s
+            withTimeoutOrNull(20_000L) { // Timeout 20s
                 suspendCancellableCoroutine { cont ->
                     val ctx = try { AcraApplication.context } catch (e: Exception) { null }
-                    if (ctx == null) {
-                        cont.resume(null)
-                        return@suspendCancellableCoroutine
-                    }
+                    if (ctx == null) { cont.resume(null); return@suspendCancellableCoroutine }
 
                     val webView = WebView(ctx)
                     var hasResumed = false
 
-                    // Cài đặt WebView
                     webView.settings.apply {
                         javaScriptEnabled = true
                         domStorageEnabled = true
                         userAgentString = UA
-                        // Cho phép nội dung hỗn hợp (quan trọng cho CDN)
                         mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                     }
 
-                    // Bridge nhận kết quả
                     val bridge = M3U8Bridge { content ->
                         if (!hasResumed) {
                             hasResumed = true
@@ -244,26 +241,38 @@ class HentaiZProvider : MainAPI() {
                     webView.addJavascriptInterface(bridge, "Android")
 
                     webView.webViewClient = object : WebViewClient() {
-                        // Intercept request để tiêm JS vào đầu file
+                        // Can thiệp vào request để chèn JS ngay đầu trang
                         override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                             val reqUrl = request.url.toString()
-                            
-                            // HentaiZ không dùng avs.watch.js, nhưng ta sẽ tiêm vào bất kỳ file JS nào
-                            // hoặc tiêm vào chính trang HTML nếu cần.
-                            // Ở đây ta dùng onPageFinished để tiêm cho chắc chắn với mọi loại player.
-                            return super.shouldInterceptRequest(view, request)
-                        }
+                            // Chỉ can thiệp vào trang HTML chính của Sonar
+                            if (reqUrl.contains("play.sonar-cdn.com/watch")) {
+                                try {
+                                    // Tự tải nội dung trang web
+                                    val response = app.get(reqUrl, headers = mapOf("Referer" to "$mainUrl/"))
+                                    val html = response.text
+                                    
+                                    // Chèn JS Interceptor vào ngay sau thẻ <head> hoặc <body>
+                                    val injectedHtml = if (html.contains("<head>")) {
+                                        html.replaceFirst("<head>", "<head>$jsInterceptor")
+                                    } else {
+                                        jsInterceptor + html
+                                    }
 
-                        override fun onPageFinished(view: WebView?, url: String?) {
-                            super.onPageFinished(view, url)
-                            // Tiêm Blob Interceptor ngay khi trang tải xong
-                            view?.evaluateJavascript(blobInterceptor, null)
+                                    return WebResourceResponse(
+                                        "text/html",
+                                        "utf-8",
+                                        ByteArrayInputStream(injectedHtml.toByteArray())
+                                    )
+                                } catch (e: Exception) {
+                                    e.printStackTrace()
+                                }
+                            }
+                            return super.shouldInterceptRequest(view, request)
                         }
                     }
 
                     webView.loadUrl(url, mapOf("Referer" to "$mainUrl/"))
 
-                    // Hủy nếu quá lâu
                     cont.invokeOnCancellation {
                         webView.stopLoading()
                         webView.destroy()
@@ -282,7 +291,6 @@ class HentaiZProvider : MainAPI() {
         val res = app.get(data, headers = headers)
         val html = res.text
 
-        // 1. Tìm URL của Sonar Player
         val sonarRegex = """https?://play\.sonar-cdn\.com/watch\?v=([a-zA-Z0-9-]+)""".toRegex()
         val sonarMatch = sonarRegex.find(html) ?: sonarRegex.find(res.document.html())
         val sonarUrl = sonarMatch?.value
@@ -290,17 +298,17 @@ class HentaiZProvider : MainAPI() {
         if (!sonarUrl.isNullOrBlank()) {
             val fixedSonarUrl = fixUrl(sonarUrl)
             
-            // 2. Dùng WebView để bắt nội dung M3U8 (Blob)
-            val m3u8Content = getM3U8FromWebView(fixedSonarUrl)
+            // 1. Bắt nội dung M3U8 bằng WebView Interceptor
+            val m3u8Content = captureM3U8(fixedSonarUrl)
 
             if (m3u8Content != null) {
-                // 3. Khởi động Local Server để phục vụ file M3U8 này
+                // 2. Khởi động Local Server
                 localServer?.stop()
                 val server = LocalM3U8Server(m3u8Content)
                 server.start()
                 localServer = server
 
-                // 4. Trả về link localhost
+                // 3. Trả về link localhost
                 callback(
                     newExtractorLink(
                         source = "Sonar CDN",
@@ -308,14 +316,12 @@ class HentaiZProvider : MainAPI() {
                         url = "http://127.0.0.1:${server.port}/video.m3u8",
                         type = ExtractorLinkType.M3U8
                     ) {
-                        // Quan trọng: Giữ nguyên Referer để tải Segment
                         this.referer = fixedSonarUrl
                         this.quality = Qualities.P1080.value
                     }
                 )
             }
         }
-
         return true
     }
 }

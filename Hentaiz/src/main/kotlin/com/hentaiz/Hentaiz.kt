@@ -28,65 +28,119 @@ class HentaiZProvider : MainAPI() {
     private val imageBaseUrl = "https://storage.haiten.org"
     private val UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
-    // --- SCRIPT "HACKER" - TIÊM VÀO NHÂN TRÌNH DUYỆT ---
+    // Khôi phục đầy đủ các danh mục phim
+    override val mainPage = mainPageOf(
+        "/browse" to "Mới Cập Nhật",
+        "/browse?animationType=THREE_D" to "Hentai 3D",
+        "/browse?animationType=TWO_D" to "Hentai 2D",
+        "/browse?contentRating=UNCENSORED" to "Không Che",
+        "/browse?contentRating=CENSORED" to "Có Che",
+        "/browse?isTrailer=false" to "Phim Đầy Đủ"
+    )
+
+    private fun fixUrl(url: String): String {
+        if (url.isBlank()) return ""
+        var cleanUrl = url.trim().replace("\\/", "/")
+        if (cleanUrl.startsWith("http")) return cleanUrl
+        if (cleanUrl.startsWith("//")) return "https:$cleanUrl"
+        val base = mainUrl.removeSuffix("/")
+        return if (cleanUrl.startsWith("/")) "$base$cleanUrl" else "$base/$cleanUrl"
+    }
+
+    // --- PHẦN HIỂN THỊ DANH MỤC PHIM ---
+
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        // Xử lý URL để nối thêm tham số page chuẩn xác (?page= hoặc &page=)
+        val url = if (request.data.contains("?")) {
+            "$mainUrl${request.data}&page=$page"
+        } else {
+            "$mainUrl${request.data}?page=$page"
+        }
+        
+        val html = app.get(url, headers = mapOf("User-Agent" to UA)).text
+        
+        // Regex quét dữ liệu phim từ script SvelteKit
+        val regex = """title:"([^"]+)",slug:"([^"]+)",episodeNumber:(\d+|null).*?posterImage:\{filePath:"([^"]+)"""".toRegex()
+        val items = regex.findAll(html).map { match ->
+            val (title, slug, ep, posterPath) = match.destructured
+            val displayTitle = if (ep != "null" && ep.isNotBlank()) "$title - Tập $ep" else title
+            newMovieSearchResponse(displayTitle, "$mainUrl/watch/$slug", TvType.NSFW) {
+                this.posterUrl = "$imageBaseUrl$posterPath"
+            }
+        }.toList().distinctBy { it.url }
+        
+        return newHomePageResponse(request.name, items, items.isNotEmpty())
+    }
+
+    override suspend fun search(query: String): List<SearchResponse> {
+        val url = "$mainUrl/browse?q=$query"
+        val html = app.get(url, headers = mapOf("User-Agent" to UA)).text
+        val regex = """title:"([^"]+)",slug:"([^"]+)",episodeNumber:(\d+|null).*?posterImage:\{filePath:"([^"]+)"""".toRegex()
+        return regex.findAll(html).map { match ->
+            val (title, slug, ep, posterPath) = match.destructured
+            newMovieSearchResponse(if (ep != "null") "$title - Tập $ep" else title, "$mainUrl/watch/$slug", TvType.NSFW) {
+                this.posterUrl = "$imageBaseUrl$posterPath"
+            }
+        }.toList().distinctBy { it.url }
+    }
+
+    override suspend fun load(url: String): LoadResponse {
+        val html = app.get(url, headers = mapOf("User-Agent" to UA)).text
+        val title = Regex("""title:"([^"]+)"""").find(html)?.groupValues?.get(1) ?: "HentaiZ Video"
+        val posterPath = Regex("""posterImage:\{filePath:"([^"]+)"""").find(html)?.groupValues?.get(1)
+        
+        // Lấy thêm mô tả phim nếu có
+        val desc = Regex("""description:"([^"]+)"""").find(html)?.groupValues?.get(1)
+            ?.replace(Regex("\\\\u([0-9a-fA-F]{4})")) { it.groupValues[1].toInt(16).toChar().toString() }
+            ?.replace(Regex("<[^>]*>"), "")
+
+        return newMovieLoadResponse(title, url, TvType.NSFW, url) {
+            this.posterUrl = if (posterPath != null) "$imageBaseUrl$posterPath" else null
+            this.plot = desc
+        }
+    }
+
+    // --- BỘ LỌC "SHADOW INTERCEPTOR" (GIỮ NGUYÊN VÌ ĐÃ PHÁT ĐƯỢC VIDEO) ---
+
     private val masterScript = """
         (function() {
-            console.log("Shadow Interceptor: Engaged");
-            
-            // 1. Bypass Anti-DevTools & Debugger
             var _constructor = window.Function.prototype.constructor;
             window.Function.prototype.constructor = function(s) {
                 if (s === "debugger") return function() {};
                 return _constructor.apply(this, arguments);
             };
-
-            // 2. Ngụy trang môi trường (Stealth)
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
             window.chrome = { runtime: {} };
-
             function sendToAndroid(content, sourceUrl) {
-                if (content && content.includes("#EXTM3U")) {
-                    Android.onM3U8Captured(content, sourceUrl);
-                }
+                if (content && content.includes("#EXTM3U")) { Android.onM3U8Captured(content, sourceUrl); }
             }
-
-            // 3. Hook URL.createObjectURL (Bắt Blob M3U8)
             var _createObjectURL = URL.createObjectURL;
             URL.createObjectURL = function(obj) {
                 var url = _createObjectURL.apply(this, arguments);
-                if (obj instanceof Blob && (obj.type.includes('mpegurl') || obj.type === '')) {
+                if (obj instanceof Blob) {
                     var reader = new FileReader();
                     reader.onload = function() { sendToAndroid(reader.result, window.location.href); };
                     reader.readAsText(obj);
                 }
                 return url;
             };
-
-            // 4. Hook Fetch API
             var _fetch = window.fetch;
             window.fetch = function() {
                 return _fetch.apply(this, arguments).then(res => {
-                    if (res.url.includes(".m3u8")) {
-                        res.clone().text().then(t => sendToAndroid(t, res.url));
-                    }
+                    if (res.url.includes(".m3u8")) { res.clone().text().then(t => sendToAndroid(t, res.url)); }
                     return res;
                 });
             };
-
-            // 5. Hook XMLHttpRequest
             var _open = XMLHttpRequest.prototype.open;
             XMLHttpRequest.prototype.open = function(method, url) {
                 this.addEventListener('load', function() {
-                    if (url.includes(".m3u8") || this.responseText.includes("#EXTM3U")) {
-                        sendToAndroid(this.responseText, url);
-                    }
+                    if (url.includes(".m3u8") || this.responseText.includes("#EXTM3U")) { sendToAndroid(this.responseText, url); }
                 });
                 _open.apply(this, arguments);
             };
         })();
     """.trimIndent()
 
-    // --- SERVER NỘI BỘ ĐỂ PHỤC VỤ VIDEO ---
     private var localServer: LocalM3U8Server? = null
     inner class LocalM3U8Server(private val content: String) {
         private var socket: ServerSocket? = null
@@ -114,9 +168,7 @@ class HentaiZProvider : MainAPI() {
 
     inner class AndroidBridge(val onCaptured: (String, String) -> Unit) {
         @JavascriptInterface
-        fun onM3U8Captured(content: String, url: String) {
-            onCaptured(content, url)
-        }
+        fun onM3U8Captured(content: String, url: String) { onCaptured(content, url) }
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -126,10 +178,8 @@ class HentaiZProvider : MainAPI() {
                 suspendCancellableCoroutine { cont ->
                     val ctx = try { AcraApplication.context } catch (e: Exception) { null }
                     if (ctx == null) { cont.resume(null); return@suspendCancellableCoroutine }
-
                     val wv = WebView(ctx)
                     var isFinished = false
-
                     wv.settings.apply {
                         javaScriptEnabled = true
                         domStorageEnabled = true
@@ -137,11 +187,9 @@ class HentaiZProvider : MainAPI() {
                         userAgentString = UA
                         mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                     }
-
                     wv.addJavascriptInterface(AndroidBridge { content, url ->
                         if (!isFinished) {
                             isFinished = true
-                            // Xử lý link segment tương đối thành tuyệt đối
                             val baseUrl = url.substringBeforeLast("/") + "/"
                             val fixed = content.lines().joinToString("\n") { 
                                 if (it.isNotBlank() && !it.startsWith("#") && !it.startsWith("http")) "$baseUrl$it" else it 
@@ -150,17 +198,14 @@ class HentaiZProvider : MainAPI() {
                             if (cont.isActive) cont.resume(fixed)
                         }
                     }, "Android")
-
                     wv.webViewClient = object : WebViewClient() {
                         override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                             val reqUrl = request.url.toString()
                             if (reqUrl.contains("play.sonar-cdn.com/watch")) {
                                 try {
-                                    // Tải HTML thô bằng OkHttp (Chạy đồng bộ trong thread của WebView)
                                     val response = runBlocking(Dispatchers.IO) {
                                         app.get(reqUrl, headers = mapOf("Referer" to "$mainUrl/")).text
                                     }
-                                    // Tiêm Master Script vào ngay đầu HTML
                                     val injectedHtml = "<html><head><script>$masterScript</script></head><body>$response</body></html>"
                                     return WebResourceResponse("text/html", "utf-8", ByteArrayInputStream(injectedHtml.toByteArray()))
                                 } catch (e: Exception) { e.printStackTrace() }
@@ -168,47 +213,10 @@ class HentaiZProvider : MainAPI() {
                             return super.shouldInterceptRequest(view, request)
                         }
                     }
-
                     wv.loadUrl(targetUrl, mapOf("Referer" to "$mainUrl/"))
                     cont.invokeOnCancellation { wv.destroy() }
                 }
             }
-        }
-    }
-
-    // --- CÁC HÀM PHỤ TRỢ (GIỮ NGUYÊN) ---
-
-    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = if (request.data.contains("?")) "$mainUrl${request.data}&page=$page" else "$mainUrl${request.data}?page=$page"
-        val html = app.get(url, headers = mapOf("User-Agent" to UA)).text
-        val regex = """title:"([^"]+)",slug:"([^"]+)",episodeNumber:(\d+|null).*?posterImage:\{filePath:"([^"]+)"""".toRegex()
-        val items = regex.findAll(html).map { match ->
-            val (title, slug, ep, posterPath) = match.destructured
-            newMovieSearchResponse(if (ep != "null") "$title - Tập $ep" else title, "$mainUrl/watch/$slug", TvType.NSFW) {
-                this.posterUrl = "$imageBaseUrl$posterPath"
-            }
-        }.toList()
-        return newHomePageResponse(request.name, items, items.isNotEmpty())
-    }
-
-    override suspend fun search(query: String): List<SearchResponse> {
-        val url = "$mainUrl/browse?q=$query"
-        val html = app.get(url, headers = mapOf("User-Agent" to UA)).text
-        val regex = """title:"([^"]+)",slug:"([^"]+)",episodeNumber:(\d+|null).*?posterImage:\{filePath:"([^"]+)"""".toRegex()
-        return regex.findAll(html).map { match ->
-            val (title, slug, ep, posterPath) = match.destructured
-            newMovieSearchResponse(if (ep != "null") "$title - Tập $ep" else title, "$mainUrl/watch/$slug", TvType.NSFW) {
-                this.posterUrl = "$imageBaseUrl$posterPath"
-            }
-        }.toList()
-    }
-
-    override suspend fun load(url: String): LoadResponse {
-        val html = app.get(url, headers = mapOf("User-Agent" to UA)).text
-        val title = Regex("""title:"([^"]+)"""").find(html)?.groupValues?.get(1) ?: "HentaiZ Video"
-        val posterPath = Regex("""posterImage:\{filePath:"([^"]+)"""").find(html)?.groupValues?.get(1)
-        return newMovieLoadResponse(title, url, TvType.NSFW, url) {
-            this.posterUrl = if (posterPath != null) "$imageBaseUrl$posterPath" else null
         }
     }
 
@@ -223,7 +231,6 @@ class HentaiZProvider : MainAPI() {
                 val server = LocalM3U8Server(m3u8Content)
                 server.start()
                 localServer = server
-
                 callback(newExtractorLink("Sonar CDN", "Server VIP (Shadow)", "http://127.0.0.1:${server.port}/video.m3u8", ExtractorLinkType.M3U8) {
                     this.referer = sonarUrl
                     this.quality = Qualities.P1080.value

@@ -15,7 +15,9 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.ByteArrayInputStream
+import java.net.HttpURLConnection
 import java.net.ServerSocket
+import java.net.URL
 import kotlin.coroutines.resume
 
 @CloudstreamPlugin
@@ -33,6 +35,7 @@ class HentaiZProvider : MainAPI() {
     override val supportedTypes = setOf(TvType.NSFW)
     
     private val imageBaseUrl = "https://storage.haiten.org"
+    // User-Agent giả lập điện thoại để lấy player HTML5 nhẹ
     private val UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36"
 
     private val headers = mapOf(
@@ -108,47 +111,51 @@ class HentaiZProvider : MainAPI() {
         }
     }
 
-    // ─── PHẦN XỬ LÝ MẠNH: INTERCEPTOR + LOCAL SERVER ───
+    // ─── PHẦN QUAN TRỌNG: BYPASS ADBLOCK & INTERCEPTOR ───
 
-    // JS Interceptor: Bắt cả XHR, Fetch và Blob
-    private val jsInterceptor = """
+    // 1. Script giả lập quảng cáo (Fake Ads) để lừa trang web
+    private val fakeAdsScript = """
+        <script>
+        // Giả lập Google Ads
+        window.adsbygoogle = window.adsbygoogle || [];
+        window.adsbygoogle.loaded = true;
+        window.adsbygoogle.push = function() {};
+        
+        // Giả lập các biến phát hiện bot
+        Object.defineProperty(navigator, 'webdriver', { get: () => false });
+        </script>
+    """.trimIndent()
+
+    // 2. Script bắt link video (XHR, Fetch, Blob)
+    private val videoSnifferScript = """
         <script>
         (function() {
-            console.log("HentaiZ: Interceptor Active");
+            console.log("HentaiZ: Sniffer Active");
+            function send(c, u) { if(c && (c.includes('#EXTM3U') || u.includes('.m3u8'))) Android.onM3U8(c, u); }
             
-            function checkAndSend(content, url) {
-                if (content && (content.includes('#EXTM3U') || url.includes('.m3u8'))) {
-                    Android.onM3U8(content, url);
-                }
-            }
-
-            // 1. Hook XMLHttpRequest
-            var origOpen = XMLHttpRequest.prototype.open;
-            XMLHttpRequest.prototype.open = function(method, url) {
-                this.addEventListener('load', function() {
-                    checkAndSend(this.responseText, url);
-                });
-                origOpen.apply(this, arguments);
-            };
-
-            // 2. Hook Fetch
-            var origFetch = window.fetch;
-            window.fetch = async (...args) => {
-                const response = await origFetch(...args);
-                const clone = response.clone();
-                clone.text().then(text => {
-                    checkAndSend(text, response.url);
-                });
-                return response;
+            // Hook XHR
+            var xo = XMLHttpRequest.prototype.open;
+            XMLHttpRequest.prototype.open = function(m, u) {
+                this.addEventListener('load', function() { send(this.responseText, u); });
+                xo.apply(this, arguments);
             };
             
-            // 3. Hook Blob (Dự phòng)
-            var _oc = URL.createObjectURL;
+            // Hook Fetch
+            var of = window.fetch;
+            window.fetch = async (...a) => {
+                var r = await of(...a);
+                var c = r.clone();
+                c.text().then(t => send(t, r.url));
+                return r;
+            };
+            
+            // Hook Blob
+            var oc = URL.createObjectURL;
             URL.createObjectURL = function(b) {
-                var u = _oc.apply(this, arguments);
-                if (b && (b.type === 'application/vnd.apple.mpegurl' || b.type === 'application/x-mpegurl')) {
+                var u = oc.apply(this, arguments);
+                if (b && b.type && b.type.includes('mpegurl')) {
                     var r = new FileReader();
-                    r.onload = function(e) { checkAndSend(e.target.result, window.location.href); };
+                    r.onload = function(e) { send(e.target.result, window.location.href); };
                     r.readAsText(b);
                 }
                 return u;
@@ -160,156 +167,111 @@ class HentaiZProvider : MainAPI() {
     inner class M3U8Bridge(val onResult: (String) -> Unit) {
         @JavascriptInterface
         fun onM3U8(content: String, url: String) {
-            // Xử lý link segment: Biến link tương đối thành tuyệt đối
             val baseUrl = url.substringBeforeLast("/") + "/"
             val fixedContent = content.lines().joinToString("\n") { line ->
-                if (line.isNotBlank() && !line.startsWith("#") && !line.startsWith("http")) {
-                    "$baseUrl$line"
-                } else {
-                    line
-                }
+                if (line.isNotBlank() && !line.startsWith("#") && !line.startsWith("http")) "$baseUrl$line" else line
             }
             onResult(fixedContent)
         }
     }
 
-    // Local Server để serve M3U8 cho ExoPlayer
+    // Local Server
     private var localServer: LocalM3U8Server? = null
-
-    inner class LocalM3U8Server(private val m3u8Content: String) {
-        private var serverSocket: ServerSocket? = null
-        val port: Int get() = serverSocket?.localPort ?: 0
-
+    inner class LocalM3U8Server(private val content: String) {
+        private var socket: ServerSocket? = null
+        val port: Int get() = socket?.localPort ?: 0
         fun start() {
-            serverSocket = ServerSocket(0)
+            socket = ServerSocket(0)
             Thread {
                 try {
-                    val ss = serverSocket ?: return@Thread
-                    while (!ss.isClosed) {
-                        try {
-                            val client = ss.accept()
-                            client.getInputStream().bufferedReader().readLine() // Đọc request
-                            
-                            val body = m3u8Content.toByteArray(Charsets.UTF_8)
-                            val response = "HTTP/1.1 200 OK\r\n" +
-                                    "Content-Type: application/vnd.apple.mpegurl\r\n" +
-                                    "Content-Length: ${body.size}\r\n" +
-                                    "Access-Control-Allow-Origin: *\r\n" +
-                                    "Connection: close\r\n\r\n"
-                            
-                            client.getOutputStream().write(response.toByteArray())
-                            client.getOutputStream().write(body)
-                            client.getOutputStream().flush()
-                            client.close()
-                        } catch (e: Exception) {}
+                    val s = socket ?: return@Thread
+                    while (!s.isClosed) {
+                        val c = s.accept()
+                        c.getInputStream().bufferedReader().readLine()
+                        val b = content.toByteArray()
+                        val h = "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: ${b.size}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
+                        c.getOutputStream().write(h.toByteArray())
+                        c.getOutputStream().write(b)
+                        c.getOutputStream().flush()
+                        c.close()
                     }
-                } catch (e: Exception) {}
+                } catch (_: Exception) {}
             }.also { it.isDaemon = true }.start()
         }
-
-        fun stop() {
-            try { serverSocket?.close() } catch (e: Exception) {}
-        }
+        fun stop() { try { socket?.close() } catch (_: Exception) {} }
     }
 
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun captureM3U8(url: String): String? {
-        // 1. Tải nội dung HTML và chèn Script (Chạy trên IO thread để tránh lỗi NetworkOnMainThread)
-        val injectedHtml = withContext(Dispatchers.IO) {
-            try {
-                val response = app.get(url, headers = mapOf("Referer" to "$mainUrl/"))
-                val html = response.text
-                if (html.contains("<head>")) {
-                    html.replaceFirst("<head>", "<head>$jsInterceptor")
-                } else {
-                    jsInterceptor + html
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
-                null
-            }
-        }
-
-        if (injectedHtml == null) return null
-
-        // 2. Mở WebView để chạy HTML đã chỉnh sửa (Chạy trên Main thread)
         return withContext(Dispatchers.Main) {
-            withTimeoutOrNull(20_000L) { // Timeout 20s
+            withTimeoutOrNull(30_000L) {
                 suspendCancellableCoroutine { cont ->
                     val ctx = try { AcraApplication.context } catch (e: Exception) { null }
                     if (ctx == null) { cont.resume(null); return@suspendCancellableCoroutine }
 
-                    val webView = WebView(ctx)
-                    var hasResumed = false
-
-                    webView.settings.apply {
+                    val wv = WebView(ctx)
+                    var resumed = false
+                    
+                    wv.settings.apply {
                         javaScriptEnabled = true
                         domStorageEnabled = true
                         userAgentString = UA
                         mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                     }
 
-                    val bridge = M3U8Bridge { content ->
-                        if (!hasResumed) {
-                            hasResumed = true
-                            webView.stopLoading()
-                            webView.destroy()
-                            if (cont.isActive) cont.resume(content)
+                    wv.addJavascriptInterface(M3U8Bridge { c ->
+                        if (!resumed) { resumed = true; wv.destroy(); if (cont.isActive) cont.resume(c) }
+                    }, "Android")
+
+                    wv.webViewClient = object : WebViewClient() {
+                        // Dùng shouldInterceptRequest để chèn script TRƯỚC KHI trang web chạy
+                        override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
+                            if (request.url.toString().contains("play.sonar-cdn.com/watch")) {
+                                try {
+                                    // Tải trang bằng Java thuần (Blocking) để tránh lỗi Coroutine
+                                    val conn = URL(request.url.toString()).openConnection() as HttpURLConnection
+                                    conn.setRequestProperty("Referer", "$mainUrl/")
+                                    conn.setRequestProperty("User-Agent", UA)
+                                    
+                                    val html = conn.inputStream.bufferedReader().use { it.readText() }
+                                    
+                                    // Chèn Fake Ads + Sniffer vào ngay đầu thẻ <head>
+                                    val injected = if (html.contains("<head>")) {
+                                        html.replaceFirst("<head>", "<head>$fakeAdsScript$videoSnifferScript")
+                                    } else {
+                                        fakeAdsScript + videoSnifferScript + html
+                                    }
+                                    
+                                    return WebResourceResponse("text/html", "utf-8", ByteArrayInputStream(injected.toByteArray()))
+                                } catch (e: Exception) { e.printStackTrace() }
+                            }
+                            return super.shouldInterceptRequest(view, request)
                         }
                     }
-                    webView.addJavascriptInterface(bridge, "Android")
-
-                    // Load nội dung đã chèn thuốc
-                    // Dùng loadDataWithBaseURL để các file .js, .css tương đối vẫn tải được từ server gốc
-                    webView.loadDataWithBaseURL(url, injectedHtml, "text/html", "utf-8", null)
-
-                    cont.invokeOnCancellation {
-                        webView.stopLoading()
-                        webView.destroy()
-                    }
+                    
+                    wv.loadUrl(url, mapOf("Referer" to "$mainUrl/"))
+                    cont.invokeOnCancellation { wv.destroy() }
                 }
             }
         }
     }
 
-    override suspend fun loadLinks(
-        data: String,
-        isCasting: Boolean,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
+    override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         val res = app.get(data, headers = headers)
-        val html = res.text
-
-        val sonarRegex = """https?://play\.sonar-cdn\.com/watch\?v=([a-zA-Z0-9-]+)""".toRegex()
-        val sonarMatch = sonarRegex.find(html) ?: sonarRegex.find(res.document.html())
-        val sonarUrl = sonarMatch?.value
+        val sonarUrl = Regex("""https?://play\.sonar-cdn\.com/watch\?v=([a-zA-Z0-9-]+)""").find(res.text)?.value
+            ?: Regex("""https?://play\.sonar-cdn\.com/watch\?v=([a-zA-Z0-9-]+)""").find(res.document.html())?.value
 
         if (!sonarUrl.isNullOrBlank()) {
-            val fixedSonarUrl = fixUrl(sonarUrl)
-            
-            // 1. Bắt nội dung M3U8 bằng WebView Interceptor
-            val m3u8Content = captureM3U8(fixedSonarUrl)
-
-            if (m3u8Content != null) {
-                // 2. Khởi động Local Server
+            val m3u8 = captureM3U8(fixUrl(sonarUrl))
+            if (m3u8 != null) {
                 localServer?.stop()
-                val server = LocalM3U8Server(m3u8Content)
-                server.start()
-                localServer = server
-
-                // 3. Trả về link localhost
-                callback(
-                    newExtractorLink(
-                        source = "Sonar CDN",
-                        name = "Server VIP (Localhost)",
-                        url = "http://127.0.0.1:${server.port}/video.m3u8",
-                        type = ExtractorLinkType.M3U8
-                    ) {
-                        this.referer = fixedSonarUrl
-                        this.quality = Qualities.P1080.value
-                    }
-                )
+                val s = LocalM3U8Server(m3u8)
+                s.start()
+                localServer = s
+                callback(newExtractorLink("Sonar CDN", "Server VIP (Localhost)", "http://127.0.0.1:${s.port}/video.m3u8", ExtractorLinkType.M3U8) {
+                    this.referer = fixUrl(sonarUrl)
+                    this.quality = Qualities.P1080.value
+                })
             }
         }
         return true

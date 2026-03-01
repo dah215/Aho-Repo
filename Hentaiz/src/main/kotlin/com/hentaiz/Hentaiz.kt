@@ -1,7 +1,6 @@
 package com.hentaiz
 
 import android.annotation.SuppressLint
-import android.webkit.CookieManager
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
@@ -14,6 +13,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import java.io.ByteArrayInputStream
 import kotlin.coroutines.resume
 
 @CloudstreamPlugin
@@ -32,14 +32,13 @@ class HentaiZProvider : MainAPI() {
     
     private val imageBaseUrl = "https://storage.haiten.org"
     
-    // User-Agent của Chrome thật trên Android (Không dùng UA cũ nữa)
-    private val STEALTH_UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+    // User-Agent chuẩn của Chrome Android
+    private val UA = "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
 
     private val headers = mapOf(
-        "User-Agent" to STEALTH_UA,
+        "User-Agent" to UA,
         "Referer" to "$mainUrl/",
-        "Origin" to mainUrl,
-        "Upgrade-Insecure-Requests" to "1"
+        "Origin" to mainUrl
     )
 
     override val mainPage = mainPageOf(
@@ -109,117 +108,121 @@ class HentaiZProvider : MainAPI() {
         }
     }
 
-    // ─── PHẦN QUAN TRỌNG: STEALTH WEBVIEW ───
+    // ─── PHẦN QUYỀN LỰC TỐI CAO: GOD MODE INTERCEPTOR ───
 
-    // Script ngụy trang (Anti-Detection)
-    // Xóa dấu vết của WebView/Automation
-    private val stealthScript = """
-        <script>
-        (function() {
-            // 1. Xóa webdriver
-            delete navigator.webdriver;
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            
-            // 2. Giả lập Chrome
-            window.chrome = { runtime: {} };
-            
-            // 3. Giả lập Plugins
-            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-            Object.defineProperty(navigator, 'languages', { get: () => ['vi-VN', 'vi', 'en-US', 'en'] });
-            
-            // 4. Fake Ads (Để tránh lỗi Adblock)
-            window.adsbygoogle = { loaded: true, push: function(){} };
-        })();
-        </script>
-    """.trimIndent()
+    data class CapturedLink(val url: String, val headers: Map<String, String>)
 
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun sniffLinkWithStealth(url: String): String? {
+    private suspend fun captureRealRequest(url: String): CapturedLink? {
         return withContext(Dispatchers.Main) {
-            withTimeoutOrNull(30_000L) { // Chờ 30s
+            withTimeoutOrNull(25_000L) { // Cho phép trang web load tối đa 25s để giải mã
                 suspendCancellableCoroutine { cont ->
                     val ctx = try { AcraApplication.context } catch (e: Exception) { null }
                     if (ctx == null) { cont.resume(null); return@suspendCancellableCoroutine }
 
                     val wv = WebView(ctx)
-                    var found = false
-                    
-                    // Cấu hình WebView như trình duyệt thật
+                    var isCaptured = false
+
                     wv.settings.apply {
                         javaScriptEnabled = true
-                        domStorageEnabled = true // Quan trọng: Để lưu Token/Cookie
+                        domStorageEnabled = true
                         databaseEnabled = true
-                        userAgentString = STEALTH_UA
+                        userAgentString = UA
+                        mediaPlaybackRequiresUserGesture = false // Cho phép video tự chạy để bắt link
                         mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                     }
 
-                    // Đồng bộ Cookie (Nếu có)
-                    CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
+                    // Bật Cookie để lưu Token của Sonar
+                    android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
 
                     wv.webViewClient = object : WebViewClient() {
-                        // Chỉ nghe lén URL, KHÔNG can thiệp vào nội dung (để tránh bị phát hiện)
+                        // ĐÂY LÀ TRÁI TIM CỦA THUẬT TOÁN
+                        // Chúng ta đứng ở cổng mạng, kiểm tra MỌI request mà trang web gửi đi
                         override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                             val reqUrl = request.url.toString()
-                            
-                            // Nếu thấy link .m3u8 -> BẮT NGAY
-                            if (reqUrl.contains(".m3u8") && !reqUrl.contains("favicon")) {
-                                if (!found) {
-                                    found = true
-                                    // Trả về kết quả và hủy WebView
-                                    view.post { view.destroy() }
-                                    if (cont.isActive) cont.resume(reqUrl)
-                                }
+
+                            // Nếu phát hiện trình duyệt đang cố tải file m3u8
+                            if (reqUrl.contains(".m3u8") && !isCaptured) {
+                                isCaptured = true
+                                
+                                // Lấy toàn bộ Header (Cookie, Token, Referer) mà trình duyệt vừa tạo ra
+                                val reqHeaders = request.requestHeaders ?: emptyMap()
+                                
+                                // Trả kết quả về cho Kotlin
+                                view.post { view.destroy() }
+                                if (cont.isActive) cont.resume(CapturedLink(reqUrl, reqHeaders))
+                                
+                                // Chặn request này lại để video không phát ngầm trong WebView
+                                return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream("".toByteArray()))
                             }
                             
-                            // Nếu là trang chính Sonar -> Tiêm mã ngụy trang
-                            // Lưu ý: Ta không dùng app.get ở đây mà để WebView tự tải, ta chỉ inject JS
-                            // Tuy nhiên, để inject vào luồng tải tự nhiên rất khó trên Android cũ.
-                            // Nên ta sẽ dùng onPageStarted để inject JS (kém hiệu quả hơn nhưng an toàn hơn)
+                            // Để cho các request khác (JS, CSS, API xác thực) chạy bình thường
                             return super.shouldInterceptRequest(view, request)
                         }
-
-                        override fun onPageFinished(view: WebView?, url: String?) {
-                            super.onPageFinished(view, url)
-                            // Tiêm mã ngụy trang sau khi trang tải (Backup)
-                            view?.evaluateJavascript(stealthScript.replace("<script>", "").replace("</script>", ""), null)
-                        }
                     }
-                    
-                    // Load URL với Referer chuẩn
+
+                    // Tải trang Player với Referer chuẩn
                     wv.loadUrl(url, mapOf("Referer" to "$mainUrl/"))
-                    
-                    cont.invokeOnCancellation { wv.destroy() }
+
+                    cont.invokeOnCancellation {
+                        wv.destroy()
+                    }
                 }
             }
         }
     }
 
-    override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
+    override suspend fun loadLinks(
+        data: String,
+        isCasting: Boolean,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
         val res = app.get(data, headers = headers)
-        
-        // Tìm link Iframe Sonar
-        val sonarUrl = Regex("""https?://play\.sonar-cdn\.com/watch\?v=([a-zA-Z0-9-]+)""").find(res.text)?.value
-            ?: Regex("""https?://play\.sonar-cdn\.com/watch\?v=([a-zA-Z0-9-]+)""").find(res.document.html())?.value
+        val html = res.text
+
+        // 1. Tìm URL của Sonar Player
+        val sonarRegex = """https?://play\.sonar-cdn\.com/watch\?v=([a-zA-Z0-9-]+)""".toRegex()
+        val sonarMatch = sonarRegex.find(html) ?: sonarRegex.find(res.document.html())
+        val sonarUrl = sonarMatch?.value
 
         if (!sonarUrl.isNullOrBlank()) {
             val fixedSonarUrl = fixUrl(sonarUrl)
             
-            // Kích hoạt chế độ ẩn danh để bắt link
-            val m3u8Link = sniffLinkWithStealth(fixedSonarUrl)
+            // 2. Kích hoạt God Mode: Mở WebView ẩn và cướp request
+            val captured = captureRealRequest(fixedSonarUrl)
 
-            if (m3u8Link != null) {
-                // Trả về link bắt được
-                // Quan trọng: Referer phải là trang Sonar Player
-                callback(newExtractorLink("Sonar CDN", "Server VIP (Stealth)", m3u8Link, ExtractorLinkType.M3U8) {
-                    this.referer = fixedSonarUrl
-                    this.quality = Qualities.P1080.value
-                    this.headers = mapOf(
-                        "Origin" to "https://play.sonar-cdn.com",
-                        "User-Agent" to STEALTH_UA
-                    )
-                })
+            if (captured != null) {
+                // 3. Trả về link với CHÍNH XÁC những Header mà trình duyệt đã dùng
+                val finalHeaders = captured.headers.toMutableMap()
+                // Đảm bảo luôn có Origin chuẩn
+                if (!finalHeaders.containsKey("Origin")) {
+                    finalHeaders["Origin"] = "https://play.sonar-cdn.com"
+                }
+
+                callback(
+                    newExtractorLink(
+                        source = "Sonar CDN",
+                        name = "Server VIP (God Mode)",
+                        url = captured.url,
+                        type = ExtractorLinkType.M3U8
+                    ) {
+                        this.referer = fixedSonarUrl
+                        this.quality = Qualities.P1080.value
+                        this.headers = finalHeaders // Truyền toàn bộ Header cướp được vào đây
+                    }
+                )
             }
         }
+
+        // Quét các iframe khác (nếu có)
+        res.document.select("iframe").forEach { iframe ->
+            val src = iframe.attr("src")
+            if (src.isNotBlank() && !src.contains("sonar-cdn")) {
+                loadExtractor(fixUrl(src), data, subtitleCallback, callback)
+            }
+        }
+
         return true
     }
 }

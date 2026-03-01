@@ -214,6 +214,25 @@ class HentaiZProvider : MainAPI() {
 
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun captureM3U8(url: String): String? {
+        // 1. Tải nội dung HTML và chèn Script (Chạy trên IO thread để tránh lỗi NetworkOnMainThread)
+        val injectedHtml = withContext(Dispatchers.IO) {
+            try {
+                val response = app.get(url, headers = mapOf("Referer" to "$mainUrl/"))
+                val html = response.text
+                if (html.contains("<head>")) {
+                    html.replaceFirst("<head>", "<head>$jsInterceptor")
+                } else {
+                    jsInterceptor + html
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                null
+            }
+        }
+
+        if (injectedHtml == null) return null
+
+        // 2. Mở WebView để chạy HTML đã chỉnh sửa (Chạy trên Main thread)
         return withContext(Dispatchers.Main) {
             withTimeoutOrNull(20_000L) { // Timeout 20s
                 suspendCancellableCoroutine { cont ->
@@ -240,38 +259,9 @@ class HentaiZProvider : MainAPI() {
                     }
                     webView.addJavascriptInterface(bridge, "Android")
 
-                    webView.webViewClient = object : WebViewClient() {
-                        // Can thiệp vào request để chèn JS ngay đầu trang
-                        override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
-                            val reqUrl = request.url.toString()
-                            // Chỉ can thiệp vào trang HTML chính của Sonar
-                            if (reqUrl.contains("play.sonar-cdn.com/watch")) {
-                                try {
-                                    // Tự tải nội dung trang web
-                                    val response = app.get(reqUrl, headers = mapOf("Referer" to "$mainUrl/"))
-                                    val html = response.text
-                                    
-                                    // Chèn JS Interceptor vào ngay sau thẻ <head> hoặc <body>
-                                    val injectedHtml = if (html.contains("<head>")) {
-                                        html.replaceFirst("<head>", "<head>$jsInterceptor")
-                                    } else {
-                                        jsInterceptor + html
-                                    }
-
-                                    return WebResourceResponse(
-                                        "text/html",
-                                        "utf-8",
-                                        ByteArrayInputStream(injectedHtml.toByteArray())
-                                    )
-                                } catch (e: Exception) {
-                                    e.printStackTrace()
-                                }
-                            }
-                            return super.shouldInterceptRequest(view, request)
-                        }
-                    }
-
-                    webView.loadUrl(url, mapOf("Referer" to "$mainUrl/"))
+                    // Load nội dung đã chèn thuốc
+                    // Dùng loadDataWithBaseURL để các file .js, .css tương đối vẫn tải được từ server gốc
+                    webView.loadDataWithBaseURL(url, injectedHtml, "text/html", "utf-8", null)
 
                     cont.invokeOnCancellation {
                         webView.stopLoading()

@@ -1,7 +1,7 @@
 package com.hentaiz
 
 import android.annotation.SuppressLint
-import android.webkit.JavascriptInterface
+import android.webkit.CookieManager
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
@@ -14,9 +14,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
-import java.io.ByteArrayInputStream
-import java.net.HttpURLConnection
-import java.net.URL
 import kotlin.coroutines.resume
 
 @CloudstreamPlugin
@@ -34,13 +31,15 @@ class HentaiZProvider : MainAPI() {
     override val supportedTypes = setOf(TvType.NSFW)
     
     private val imageBaseUrl = "https://storage.haiten.org"
-    // User-Agent cực quan trọng: Giả lập Chrome trên Android để lấy player HTML5
-    private val UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+    
+    // User-Agent của Chrome thật trên Android (Không dùng UA cũ nữa)
+    private val STEALTH_UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
     private val headers = mapOf(
-        "User-Agent" to UA,
+        "User-Agent" to STEALTH_UA,
         "Referer" to "$mainUrl/",
-        "Origin" to mainUrl
+        "Origin" to mainUrl,
+        "Upgrade-Insecure-Requests" to "1"
     )
 
     override val mainPage = mainPageOf(
@@ -110,54 +109,34 @@ class HentaiZProvider : MainAPI() {
         }
     }
 
-    // ─── PHẦN QUAN TRỌNG: SPYWARE INTERCEPTOR ───
+    // ─── PHẦN QUAN TRỌNG: STEALTH WEBVIEW ───
 
-    // Script này sẽ "nghe lén" mọi yêu cầu mạng mà trình duyệt gửi đi
-    // Ngay khi thấy link .m3u8, nó sẽ báo về ngay lập tức (kể cả khi request đó sau này bị lỗi)
-    private val spyScript = """
+    // Script ngụy trang (Anti-Detection)
+    // Xóa dấu vết của WebView/Automation
+    private val stealthScript = """
         <script>
         (function() {
-            console.log("HentaiZ Spy: Activated");
+            // 1. Xóa webdriver
+            delete navigator.webdriver;
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
             
-            function report(url) {
-                if (url && (url.includes('.m3u8') || url.includes('master.m3u8') || url.includes('index.m3u8'))) {
-                    console.log("HentaiZ Spy: Found " + url);
-                    Android.foundLink(url);
-                }
-            }
-
-            // 1. Nghe lén XMLHttpRequest (Cách JW Player thường dùng)
-            var origOpen = XMLHttpRequest.prototype.open;
-            XMLHttpRequest.prototype.open = function(method, url) {
-                report(url); // Báo cáo URL ngay khi lệnh mở kết nối được gọi
-                origOpen.apply(this, arguments);
-            };
-
-            // 2. Nghe lén Fetch API
-            var origFetch = window.fetch;
-            window.fetch = async (...args) => {
-                if (args[0]) report(args[0].toString());
-                return origFetch(...args);
-            };
+            // 2. Giả lập Chrome
+            window.chrome = { runtime: {} };
             
-            // 3. Fake Ads để tránh bị chặn sớm
+            // 3. Giả lập Plugins
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            Object.defineProperty(navigator, 'languages', { get: () => ['vi-VN', 'vi', 'en-US', 'en'] });
+            
+            // 4. Fake Ads (Để tránh lỗi Adblock)
             window.adsbygoogle = { loaded: true, push: function(){} };
         })();
         </script>
     """.trimIndent()
 
-    inner class LinkBridge(val onLinkFound: (String) -> Unit) {
-        @JavascriptInterface
-        fun foundLink(url: String) {
-            // Xử lý link: Nếu là link tương đối, ghép với domain
-            onLinkFound(url)
-        }
-    }
-
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun spyOnWebView(url: String): String? {
+    private suspend fun sniffLinkWithStealth(url: String): String? {
         return withContext(Dispatchers.Main) {
-            withTimeoutOrNull(25_000L) { // Chờ tối đa 25s
+            withTimeoutOrNull(30_000L) { // Chờ 30s
                 suspendCancellableCoroutine { cont ->
                     val ctx = try { AcraApplication.context } catch (e: Exception) { null }
                     if (ctx == null) { cont.resume(null); return@suspendCancellableCoroutine }
@@ -165,52 +144,48 @@ class HentaiZProvider : MainAPI() {
                     val wv = WebView(ctx)
                     var found = false
                     
+                    // Cấu hình WebView như trình duyệt thật
                     wv.settings.apply {
                         javaScriptEnabled = true
-                        domStorageEnabled = true
-                        userAgentString = UA
-                        // Cho phép nội dung hỗn hợp để tải quảng cáo/script
+                        domStorageEnabled = true // Quan trọng: Để lưu Token/Cookie
+                        databaseEnabled = true
+                        userAgentString = STEALTH_UA
                         mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                     }
 
-                    // Cầu nối nhận link từ JS
-                    wv.addJavascriptInterface(LinkBridge { link ->
-                        if (!found) {
-                            found = true
-                            // Ngay khi tìm thấy link, hủy WebView và trả kết quả
-                            wv.post { wv.destroy() }
-                            if (cont.isActive) cont.resume(link)
-                        }
-                    }, "Android")
+                    // Đồng bộ Cookie (Nếu có)
+                    CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
 
                     wv.webViewClient = object : WebViewClient() {
-                        // Chặn request tải trang Sonar để tiêm thuốc
+                        // Chỉ nghe lén URL, KHÔNG can thiệp vào nội dung (để tránh bị phát hiện)
                         override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                             val reqUrl = request.url.toString()
-                            if (reqUrl.contains("play.sonar-cdn.com/watch")) {
-                                try {
-                                    // Tải trang thủ công
-                                    val conn = URL(reqUrl).openConnection() as HttpURLConnection
-                                    conn.setRequestProperty("Referer", "$mainUrl/")
-                                    conn.setRequestProperty("User-Agent", UA)
-                                    
-                                    val html = conn.inputStream.bufferedReader().use { it.readText() }
-                                    
-                                    // Tiêm Spy Script vào đầu thẻ <head>
-                                    val injected = if (html.contains("<head>")) {
-                                        html.replaceFirst("<head>", "<head>$spyScript")
-                                    } else {
-                                        spyScript + html
-                                    }
-                                    
-                                    return WebResourceResponse("text/html", "utf-8", ByteArrayInputStream(injected.toByteArray()))
-                                } catch (e: Exception) { e.printStackTrace() }
+                            
+                            // Nếu thấy link .m3u8 -> BẮT NGAY
+                            if (reqUrl.contains(".m3u8") && !reqUrl.contains("favicon")) {
+                                if (!found) {
+                                    found = true
+                                    // Trả về kết quả và hủy WebView
+                                    view.post { view.destroy() }
+                                    if (cont.isActive) cont.resume(reqUrl)
+                                }
                             }
+                            
+                            // Nếu là trang chính Sonar -> Tiêm mã ngụy trang
+                            // Lưu ý: Ta không dùng app.get ở đây mà để WebView tự tải, ta chỉ inject JS
+                            // Tuy nhiên, để inject vào luồng tải tự nhiên rất khó trên Android cũ.
+                            // Nên ta sẽ dùng onPageStarted để inject JS (kém hiệu quả hơn nhưng an toàn hơn)
                             return super.shouldInterceptRequest(view, request)
+                        }
+
+                        override fun onPageFinished(view: WebView?, url: String?) {
+                            super.onPageFinished(view, url)
+                            // Tiêm mã ngụy trang sau khi trang tải (Backup)
+                            view?.evaluateJavascript(stealthScript.replace("<script>", "").replace("</script>", ""), null)
                         }
                     }
                     
-                    // Bắt đầu tải trang
+                    // Load URL với Referer chuẩn
                     wv.loadUrl(url, mapOf("Referer" to "$mainUrl/"))
                     
                     cont.invokeOnCancellation { wv.destroy() }
@@ -229,27 +204,19 @@ class HentaiZProvider : MainAPI() {
         if (!sonarUrl.isNullOrBlank()) {
             val fixedSonarUrl = fixUrl(sonarUrl)
             
-            // Thả điệp viên vào WebView
-            val m3u8Link = spyOnWebView(fixedSonarUrl)
+            // Kích hoạt chế độ ẩn danh để bắt link
+            val m3u8Link = sniffLinkWithStealth(fixedSonarUrl)
 
             if (m3u8Link != null) {
-                // Xử lý link tương đối nếu cần
-                val finalLink = if (m3u8Link.startsWith("http")) m3u8Link else "https://play.sonar-cdn.com$m3u8Link"
-                
-                // Trả về link cho Cloudstream
-                // Quan trọng: Thử cả 2 loại Referer để xem cái nào ăn
-                
-                // Option 1: Referer là trang Player (Thường đúng nhất)
-                callback(newExtractorLink("Sonar CDN", "Server VIP (Player Ref)", finalLink, ExtractorLinkType.M3U8) {
+                // Trả về link bắt được
+                // Quan trọng: Referer phải là trang Sonar Player
+                callback(newExtractorLink("Sonar CDN", "Server VIP (Stealth)", m3u8Link, ExtractorLinkType.M3U8) {
                     this.referer = fixedSonarUrl
                     this.quality = Qualities.P1080.value
-                    this.headers = mapOf("Origin" to "https://play.sonar-cdn.com")
-                })
-                
-                // Option 2: Referer là trang Web chính
-                callback(newExtractorLink("Sonar CDN", "Server VIP (Site Ref)", finalLink, ExtractorLinkType.M3U8) {
-                    this.referer = "$mainUrl/"
-                    this.quality = Qualities.P720.value
+                    this.headers = mapOf(
+                        "Origin" to "https://play.sonar-cdn.com",
+                        "User-Agent" to STEALTH_UA
+                    )
                 })
             }
         }

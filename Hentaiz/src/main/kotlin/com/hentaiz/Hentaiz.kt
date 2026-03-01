@@ -1,19 +1,14 @@
 package com.hentaiz
 
 import android.annotation.SuppressLint
-import android.webkit.WebResourceRequest
-import android.webkit.WebResourceResponse
-import android.webkit.WebView
-import android.webkit.WebViewClient
+import android.webkit.*
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.*
 import java.io.ByteArrayInputStream
+import java.net.ServerSocket
 import kotlin.coroutines.resume
 
 @CloudstreamPlugin
@@ -31,198 +26,210 @@ class HentaiZProvider : MainAPI() {
     override val supportedTypes = setOf(TvType.NSFW)
     
     private val imageBaseUrl = "https://storage.haiten.org"
-    
-    // User-Agent chuẩn của Chrome Android
-    private val UA = "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+    private val UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
-    private val headers = mapOf(
-        "User-Agent" to UA,
-        "Referer" to "$mainUrl/",
-        "Origin" to mainUrl
-    )
+    // --- SCRIPT "HACKER" - TIÊM VÀO NHÂN TRÌNH DUYỆT ---
+    private val masterScript = """
+        (function() {
+            console.log("Shadow Interceptor: Engaged");
+            
+            // 1. Bypass Anti-DevTools & Debugger
+            var _constructor = window.Function.prototype.constructor;
+            window.Function.prototype.constructor = function(s) {
+                if (s === "debugger") return function() {};
+                return _constructor.apply(this, arguments);
+            };
 
-    override val mainPage = mainPageOf(
-        "/browse" to "Mới Cập Nhật",
-        "/browse?animationType=THREE_D" to "Hentai 3D",
-        "/browse?contentRating=UNCENSORED" to "Không Che",
-        "/browse?contentRating=CENSORED" to "Có Che"
-    )
+            // 2. Ngụy trang môi trường (Stealth)
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            window.chrome = { runtime: {} };
 
-    private fun fixUrl(url: String): String {
-        if (url.isBlank()) return ""
-        var cleanUrl = url.trim().replace("\\/", "/")
-        if (cleanUrl.startsWith("http")) return cleanUrl
-        if (cleanUrl.startsWith("//")) return "https:$cleanUrl"
-        val base = mainUrl.removeSuffix("/")
-        return if (cleanUrl.startsWith("/")) "$base$cleanUrl" else "$base/$cleanUrl"
-    }
-
-    private fun decodeUnicode(input: String): String {
-        var res = input
-        val regex = "\\\\u([0-9a-fA-F]{4})".toRegex()
-        regex.findAll(input).forEach { match ->
-            val charCode = match.groupValues[1].toInt(16).toChar()
-            res = res.replace(match.value, charCode.toString())
-        }
-        return res
-    }
-
-    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = if (request.data.contains("?")) "$mainUrl${request.data}&page=$page" else "$mainUrl${request.data}?page=$page"
-        val res = app.get(url, headers = headers)
-        val html = res.text
-        val regex = """title:"([^"]+)",slug:"([^"]+)",episodeNumber:(\d+|null).*?posterImage:\{filePath:"([^"]+)"""".toRegex()
-        val items = regex.findAll(html).map { match ->
-            val (title, slug, ep, posterPath) = match.destructured
-            val fullTitle = if (ep != "null") "$title - Tập $ep" else title
-            newMovieSearchResponse(fullTitle, "$mainUrl/watch/$slug", TvType.NSFW) {
-                this.posterUrl = "$imageBaseUrl$posterPath"
+            function sendToAndroid(content, sourceUrl) {
+                if (content && content.includes("#EXTM3U")) {
+                    Android.onM3U8Captured(content, sourceUrl);
+                }
             }
-        }.toList().distinctBy { it.url }
-        return newHomePageResponse(request.name, items, items.isNotEmpty())
+
+            // 3. Hook URL.createObjectURL (Bắt Blob M3U8)
+            var _createObjectURL = URL.createObjectURL;
+            URL.createObjectURL = function(obj) {
+                var url = _createObjectURL.apply(this, arguments);
+                if (obj instanceof Blob && (obj.type.includes('mpegurl') || obj.type === '')) {
+                    var reader = new FileReader();
+                    reader.onload = function() { sendToAndroid(reader.result, window.location.href); };
+                    reader.readAsText(obj);
+                }
+                return url;
+            };
+
+            // 4. Hook Fetch API
+            var _fetch = window.fetch;
+            window.fetch = function() {
+                return _fetch.apply(this, arguments).then(res => {
+                    if (res.url.includes(".m3u8")) {
+                        res.clone().text().then(t => sendToAndroid(t, res.url));
+                    }
+                    return res;
+                });
+            };
+
+            // 5. Hook XMLHttpRequest
+            var _open = XMLHttpRequest.prototype.open;
+            XMLHttpRequest.prototype.open = function(method, url) {
+                this.addEventListener('load', function() {
+                    if (url.includes(".m3u8") || this.responseText.includes("#EXTM3U")) {
+                        sendToAndroid(this.responseText, url);
+                    }
+                });
+                _open.apply(this, arguments);
+            };
+        })();
+    """.trimIndent()
+
+    // --- SERVER NỘI BỘ ĐỂ PHỤC VỤ VIDEO ---
+    private var localServer: LocalM3U8Server? = null
+    inner class LocalM3U8Server(private val content: String) {
+        private var socket: ServerSocket? = null
+        val port: Int get() = socket?.localPort ?: 0
+        fun start() {
+            socket = ServerSocket(0)
+            Thread {
+                try {
+                    val s = socket ?: return@Thread
+                    while (!s.isClosed) {
+                        val client = s.accept()
+                        client.getInputStream().bufferedReader().readLine()
+                        val body = content.toByteArray()
+                        val header = "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: ${body.size}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
+                        client.getOutputStream().write(header.toByteArray())
+                        client.getOutputStream().write(body)
+                        client.getOutputStream().flush()
+                        client.close()
+                    }
+                } catch (e: Exception) {}
+            }.also { it.isDaemon = true }.start()
+        }
+        fun stop() { try { socket?.close() } catch (e: Exception) {} }
     }
 
-    override suspend fun search(query: String): List<SearchResponse> {
-        val url = "$mainUrl/browse?q=$query"
-        val html = app.get(url, headers = headers).text
-        val regex = """title:"([^"]+)",slug:"([^"]+)",episodeNumber:(\d+|null).*?posterImage:\{filePath:"([^"]+)"""".toRegex()
-        return regex.findAll(html).map { match ->
-            val (title, slug, ep, posterPath) = match.destructured
-            val fullTitle = if (ep != "null") "$title - Tập $ep" else title
-            newMovieSearchResponse(fullTitle, "$mainUrl/watch/$slug", TvType.NSFW) {
-                this.posterUrl = "$imageBaseUrl$posterPath"
-            }
-        }.toList().distinctBy { it.url }
-    }
-
-    override suspend fun load(url: String): LoadResponse {
-        val res = app.get(url, headers = headers)
-        val html = res.text
-        val title = Regex("""title:"([^"]+)"""").find(html)?.groupValues?.get(1) ?: "HentaiZ Video"
-        val posterPath = Regex("""posterImage:\{filePath:"([^"]+)"""").find(html)?.groupValues?.get(1)
-        val rawDesc = Regex("""description:"([^"]+)"""").find(html)?.groupValues?.get(1) ?: ""
-        val desc = decodeUnicode(rawDesc).replace(Regex("<[^>]*>"), "").trim()
-        return newMovieLoadResponse(title, url, TvType.NSFW, url) {
-            this.posterUrl = if (posterPath != null) "$imageBaseUrl$posterPath" else null
-            this.plot = desc
+    inner class AndroidBridge(val onCaptured: (String, String) -> Unit) {
+        @JavascriptInterface
+        fun onM3U8Captured(content: String, url: String) {
+            onCaptured(content, url)
         }
     }
-
-    // ─── PHẦN QUYỀN LỰC TỐI CAO: GOD MODE INTERCEPTOR ───
-
-    data class CapturedLink(val url: String, val headers: Map<String, String>)
 
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun captureRealRequest(url: String): CapturedLink? {
+    private suspend fun shadowCapture(targetUrl: String): String? {
         return withContext(Dispatchers.Main) {
-            withTimeoutOrNull(25_000L) { // Cho phép trang web load tối đa 25s để giải mã
+            withTimeoutOrNull(35_000L) {
                 suspendCancellableCoroutine { cont ->
                     val ctx = try { AcraApplication.context } catch (e: Exception) { null }
                     if (ctx == null) { cont.resume(null); return@suspendCancellableCoroutine }
 
                     val wv = WebView(ctx)
-                    var isCaptured = false
+                    var isFinished = false
 
                     wv.settings.apply {
                         javaScriptEnabled = true
                         domStorageEnabled = true
                         databaseEnabled = true
                         userAgentString = UA
-                        mediaPlaybackRequiresUserGesture = false // Cho phép video tự chạy để bắt link
-                        mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                        mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                     }
 
-                    // Bật Cookie để lưu Token của Sonar
-                    android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
+                    wv.addJavascriptInterface(AndroidBridge { content, url ->
+                        if (!isFinished) {
+                            isFinished = true
+                            // Xử lý link segment tương đối thành tuyệt đối
+                            val baseUrl = url.substringBeforeLast("/") + "/"
+                            val fixed = content.lines().joinToString("\n") { 
+                                if (it.isNotBlank() && !it.startsWith("#") && !it.startsWith("http")) "$baseUrl$it" else it 
+                            }
+                            wv.post { wv.destroy() }
+                            if (cont.isActive) cont.resume(fixed)
+                        }
+                    }, "Android")
 
                     wv.webViewClient = object : WebViewClient() {
-                        // ĐÂY LÀ TRÁI TIM CỦA THUẬT TOÁN
-                        // Chúng ta đứng ở cổng mạng, kiểm tra MỌI request mà trang web gửi đi
                         override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                             val reqUrl = request.url.toString()
-
-                            // Nếu phát hiện trình duyệt đang cố tải file m3u8
-                            if (reqUrl.contains(".m3u8") && !isCaptured) {
-                                isCaptured = true
-                                
-                                // Lấy toàn bộ Header (Cookie, Token, Referer) mà trình duyệt vừa tạo ra
-                                val reqHeaders = request.requestHeaders ?: emptyMap()
-                                
-                                // Trả kết quả về cho Kotlin
-                                view.post { view.destroy() }
-                                if (cont.isActive) cont.resume(CapturedLink(reqUrl, reqHeaders))
-                                
-                                // Chặn request này lại để video không phát ngầm trong WebView
-                                return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream("".toByteArray()))
+                            if (reqUrl.contains("play.sonar-cdn.com/watch")) {
+                                try {
+                                    // Tải HTML thô bằng OkHttp (Chạy đồng bộ trong thread của WebView)
+                                    val response = runBlocking(Dispatchers.IO) {
+                                        app.get(reqUrl, headers = mapOf("Referer" to "$mainUrl/")).text
+                                    }
+                                    // Tiêm Master Script vào ngay đầu HTML
+                                    val injectedHtml = "<html><head><script>$masterScript</script></head><body>$response</body></html>"
+                                    return WebResourceResponse("text/html", "utf-8", ByteArrayInputStream(injectedHtml.toByteArray()))
+                                } catch (e: Exception) { e.printStackTrace() }
                             }
-                            
-                            // Để cho các request khác (JS, CSS, API xác thực) chạy bình thường
                             return super.shouldInterceptRequest(view, request)
                         }
                     }
 
-                    // Tải trang Player với Referer chuẩn
-                    wv.loadUrl(url, mapOf("Referer" to "$mainUrl/"))
-
-                    cont.invokeOnCancellation {
-                        wv.destroy()
-                    }
+                    wv.loadUrl(targetUrl, mapOf("Referer" to "$mainUrl/"))
+                    cont.invokeOnCancellation { wv.destroy() }
                 }
             }
         }
     }
 
-    override suspend fun loadLinks(
-        data: String,
-        isCasting: Boolean,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        val res = app.get(data, headers = headers)
-        val html = res.text
+    // --- CÁC HÀM PHỤ TRỢ (GIỮ NGUYÊN) ---
 
-        // 1. Tìm URL của Sonar Player
-        val sonarRegex = """https?://play\.sonar-cdn\.com/watch\?v=([a-zA-Z0-9-]+)""".toRegex()
-        val sonarMatch = sonarRegex.find(html) ?: sonarRegex.find(res.document.html())
-        val sonarUrl = sonarMatch?.value
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        val url = if (request.data.contains("?")) "$mainUrl${request.data}&page=$page" else "$mainUrl${request.data}?page=$page"
+        val html = app.get(url, headers = mapOf("User-Agent" to UA)).text
+        val regex = """title:"([^"]+)",slug:"([^"]+)",episodeNumber:(\d+|null).*?posterImage:\{filePath:"([^"]+)"""".toRegex()
+        val items = regex.findAll(html).map { match ->
+            val (title, slug, ep, posterPath) = match.destructured
+            newMovieSearchResponse(if (ep != "null") "$title - Tập $ep" else title, "$mainUrl/watch/$slug", TvType.NSFW) {
+                this.posterUrl = "$imageBaseUrl$posterPath"
+            }
+        }.toList()
+        return newHomePageResponse(request.name, items, items.isNotEmpty())
+    }
+
+    override suspend fun search(query: String): List<SearchResponse> {
+        val url = "$mainUrl/browse?q=$query"
+        val html = app.get(url, headers = mapOf("User-Agent" to UA)).text
+        val regex = """title:"([^"]+)",slug:"([^"]+)",episodeNumber:(\d+|null).*?posterImage:\{filePath:"([^"]+)"""".toRegex()
+        return regex.findAll(html).map { match ->
+            val (title, slug, ep, posterPath) = match.destructured
+            newMovieSearchResponse(if (ep != "null") "$title - Tập $ep" else title, "$mainUrl/watch/$slug", TvType.NSFW) {
+                this.posterUrl = "$imageBaseUrl$posterPath"
+            }
+        }.toList()
+    }
+
+    override suspend fun load(url: String): LoadResponse {
+        val html = app.get(url, headers = mapOf("User-Agent" to UA)).text
+        val title = Regex("""title:"([^"]+)"""").find(html)?.groupValues?.get(1) ?: "HentaiZ Video"
+        val posterPath = Regex("""posterImage:\{filePath:"([^"]+)"""").find(html)?.groupValues?.get(1)
+        return newMovieLoadResponse(title, url, TvType.NSFW, url) {
+            this.posterUrl = if (posterPath != null) "$imageBaseUrl$posterPath" else null
+        }
+    }
+
+    override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
+        val res = app.get(data, headers = mapOf("User-Agent" to UA))
+        val sonarUrl = Regex("""https?://play\.sonar-cdn\.com/watch\?v=([a-zA-Z0-9-]+)""").find(res.text)?.value
 
         if (!sonarUrl.isNullOrBlank()) {
-            val fixedSonarUrl = fixUrl(sonarUrl)
-            
-            // 2. Kích hoạt God Mode: Mở WebView ẩn và cướp request
-            val captured = captureRealRequest(fixedSonarUrl)
+            val m3u8Content = shadowCapture(sonarUrl)
+            if (m3u8Content != null) {
+                localServer?.stop()
+                val server = LocalM3U8Server(m3u8Content)
+                server.start()
+                localServer = server
 
-            if (captured != null) {
-                // 3. Trả về link với CHÍNH XÁC những Header mà trình duyệt đã dùng
-                val finalHeaders = captured.headers.toMutableMap()
-                // Đảm bảo luôn có Origin chuẩn
-                if (!finalHeaders.containsKey("Origin")) {
-                    finalHeaders["Origin"] = "https://play.sonar-cdn.com"
-                }
-
-                callback(
-                    newExtractorLink(
-                        source = "Sonar CDN",
-                        name = "Server VIP (God Mode)",
-                        url = captured.url,
-                        type = ExtractorLinkType.M3U8
-                    ) {
-                        this.referer = fixedSonarUrl
-                        this.quality = Qualities.P1080.value
-                        this.headers = finalHeaders // Truyền toàn bộ Header cướp được vào đây
-                    }
-                )
+                callback(newExtractorLink("Sonar CDN", "Server VIP (Shadow)", "http://127.0.0.1:${server.port}/video.m3u8", ExtractorLinkType.M3U8) {
+                    this.referer = sonarUrl
+                    this.quality = Qualities.P1080.value
+                })
             }
         }
-
-        // Quét các iframe khác (nếu có)
-        res.document.select("iframe").forEach { iframe ->
-            val src = iframe.attr("src")
-            if (src.isNotBlank() && !src.contains("sonar-cdn")) {
-                loadExtractor(fixUrl(src), data, subtitleCallback, callback)
-            }
-        }
-
         return true
     }
 }

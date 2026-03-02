@@ -1,6 +1,6 @@
 {
   "name": "Hentaiz",
-  "pluginClassName": "com.hentaiz.Hentaiz",
+  "pluginClassName": "com.heovl.Heovl",
   "version": 1,
   "requiresResources": false,
   "description": "Vietnamese anime streaming site",
@@ -9,6 +9,6 @@
   "status": 1,
   "tvTypes": ["NSFW"],
   "language": "vi",
-  "iconUrl": "https://hentaiz.lol/favicon.ico"
+  "iconUrl": "https://heovl.moe/favicon.ico"
 }
  

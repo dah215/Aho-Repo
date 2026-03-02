@@ -7,7 +7,7 @@ cloudstream {
 
     description = "Vietnamese anime streaming site"
     language    = "vi"
-    authors = listOf("Hentaiz")
+    authors = listOf("Heovl")
 
     /**
     * Status int as the following:
@@ -22,7 +22,7 @@ cloudstream {
     // You can find a list of available types here:
     // https://recloudstream.github.io/cloudstream/html/app/com.lagradost.cloudstream3/-tv-type/index.html
     tvTypes = listOf("NSFW")
-    iconUrl = "https://hentaiz.lol/favicon.ico"
+    iconUrl = "https://heovl.moe/favicon.ico"
 
     isCrossPlatform = false
 }

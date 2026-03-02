@@ -1,10 +1,23 @@
 package com.heovl
 
+import android.annotation.SuppressLint
+import android.webkit.JavascriptInterface
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
-import org.jsoup.nodes.Element
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import java.io.ByteArrayInputStream
+import java.net.HttpURLConnection
+import java.net.URL
+import kotlin.coroutines.resume
 
 @CloudstreamPlugin
 class HeoVLPlugin : Plugin() {
@@ -60,7 +73,7 @@ class HeoVLProvider : MainAPI() {
         return if (cleanUrl.startsWith("/")) "$base$cleanUrl" else "$base/$cleanUrl"
     }
 
-    // --- PHẦN GIAO DIỆN ---
+    // --- PHẦN GIAO DIỆN (GIỮ NGUYÊN) ---
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page == 1) {
@@ -114,7 +127,97 @@ class HeoVLProvider : MainAPI() {
         }
     }
 
-    // --- PHẦN XỬ LÝ VIDEO: STREAMQQ HUNTER ---
+    // --- PHẦN XỬ LÝ VIDEO: WEBVIEW HUNTER ---
+
+    // Script nghe lén request mạng (XHR/Fetch)
+    private val snifferScript = """
+        <script>
+        (function() {
+            console.log("HeoVL Sniffer: Active");
+            function check(url) {
+                if (url && (url.includes('.m3u8') || url.includes('master'))) {
+                    Android.foundLink(url);
+                }
+            }
+            
+            // Hook XHR
+            var xo = XMLHttpRequest.prototype.open;
+            XMLHttpRequest.prototype.open = function(m, u) {
+                check(u);
+                xo.apply(this, arguments);
+            };
+            
+            // Hook Fetch
+            var of = window.fetch;
+            window.fetch = async (...a) => {
+                if (a[0]) check(a[0].toString());
+                return of(...a);
+            };
+        })();
+        </script>
+    """.trimIndent()
+
+    inner class LinkBridge(val onLinkFound: (String) -> Unit) {
+        @JavascriptInterface
+        fun foundLink(url: String) {
+            onLinkFound(url)
+        }
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private suspend fun sniffM3u8(iframeUrl: String): String? {
+        return withContext(Dispatchers.Main) {
+            withTimeoutOrNull(20_000L) { // Chờ tối đa 20s
+                suspendCancellableCoroutine { cont ->
+                    val ctx = try { AcraApplication.context } catch (e: Exception) { null }
+                    if (ctx == null) { cont.resume(null); return@suspendCancellableCoroutine }
+
+                    val wv = WebView(ctx)
+                    var found = false
+                    
+                    wv.settings.apply {
+                        javaScriptEnabled = true
+                        domStorageEnabled = true
+                        userAgentString = UA
+                        mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                    }
+
+                    wv.addJavascriptInterface(LinkBridge { link ->
+                        if (!found) {
+                            found = true
+                            wv.post { wv.destroy() }
+                            if (cont.isActive) cont.resume(link)
+                        }
+                    }, "Android")
+
+                    wv.webViewClient = object : WebViewClient() {
+                        override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
+                            // Nếu là request tải trang chính của Iframe -> Tiêm thuốc
+                            if (request.url.toString() == iframeUrl) {
+                                try {
+                                    val conn = URL(iframeUrl).openConnection() as HttpURLConnection
+                                    conn.setRequestProperty("Referer", "$mainUrl/") // Fake Referer từ HeoVL
+                                    conn.setRequestProperty("User-Agent", UA)
+                                    
+                                    val html = conn.inputStream.bufferedReader().use { it.readText() }
+                                    // Chèn script vào đầu
+                                    val injected = snifferScript + html
+                                    
+                                    return WebResourceResponse("text/html", "utf-8", ByteArrayInputStream(injected.toByteArray()))
+                                } catch (e: Exception) { e.printStackTrace() }
+                            }
+                            return super.shouldInterceptRequest(view, request)
+                        }
+                    }
+                    
+                    // Load Iframe với Referer giả lập
+                    wv.loadUrl(iframeUrl, mapOf("Referer" to "$mainUrl/"))
+                    
+                    cont.invokeOnCancellation { wv.destroy() }
+                }
+            }
+        }
+    }
 
     override suspend fun loadLinks(
         data: String,
@@ -126,56 +229,35 @@ class HeoVLProvider : MainAPI() {
         val html = res.text
         val doc = res.document
 
-        // 1. Tìm Iframe chứa video (Ưu tiên streamqq và spexliu)
+        // 1. Tìm Iframe chứa video
         var iframeUrl = Regex("""src=["'](https?://[^"']*(?:streamqq|spexliu)[^"']*)["']""").find(html)?.groupValues?.get(1)
-        
-        // Nếu không tìm thấy bằng Regex, thử tìm bằng Selector
         if (iframeUrl == null) {
-             iframeUrl = doc.select("iframe[src*='streamqq'], iframe[src*='spexliu']").attr("src")
-        }
-        
-        // Fallback: Lấy iframe đầu tiên nếu không tìm thấy tên miền cụ thể
-        if (iframeUrl.isNullOrBlank()) {
-            iframeUrl = doc.select("iframe").attr("src")
+             iframeUrl = doc.select("iframe").attr("src")
         }
 
-        // 2. Nếu tìm thấy Iframe, truy cập vào nó để lấy link gốc
         if (!iframeUrl.isNullOrBlank()) {
             val fixedIframeUrl = fixUrl(iframeUrl)
-            try {
-                // Gọi request vào trang Iframe (Giả lập Referer từ HeoVL)
-                val iframeRes = app.get(fixedIframeUrl, headers = mapOf("Referer" to "$mainUrl/"))
-                val iframeHtml = iframeRes.text
-                
-                // Quét link m3u8 trong mã nguồn Iframe
-                // Regex bắt: "https://...m3u8..." hoặc 'https://...m3u8...'
-                val m3u8Regex = """["'](https?://[^"']+\.m3u8[^"']*)["']""".toRegex()
-                m3u8Regex.findAll(iframeHtml).forEach { match ->
-                    val link = match.groupValues[1].replace("\\/", "/")
-                    
-                    // Trả về link với Referer là link của Iframe (Quan trọng!)
-                    callback(
-                        newExtractorLink(
-                            source = "HeoVL VIP",
-                            name = "Server VIP (StreamQQ)",
-                            url = link,
-                            type = ExtractorLinkType.M3U8
-                        ) {
-                            this.referer = fixedIframeUrl 
-                            this.quality = Qualities.P1080.value
-                            this.headers = mapOf(
-                                "Origin" to "https://e.streamqq.com", // Thêm Origin cho chắc ăn
-                                "User-Agent" to UA
-                            )
-                        }
-                    )
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
+            
+            // 2. Dùng WebView để bắt link m3u8 từ Iframe
+            val m3u8Link = sniffM3u8(fixedIframeUrl)
+
+            if (m3u8Link != null) {
+                callback(
+                    newExtractorLink(
+                        source = "HeoVL VIP",
+                        name = "Server VIP (Sniffed)",
+                        url = m3u8Link,
+                        type = ExtractorLinkType.M3U8
+                    ) {
+                        this.referer = fixedIframeUrl // Referer là link của Iframe
+                        this.quality = Qualities.P1080.value
+                        this.headers = mapOf("Origin" to "https://e.streamqq.com") // Thử Origin
+                    }
+                )
             }
         }
         
-        // 3. Fallback: Các host khác (Dood, StreamWish...)
+        // Fallback: Các host khác
         Regex("""https?[:\\]+[/\\/]+[^\s"'<>]+""").findAll(html).forEach { 
             val link = it.value.replace("\\/", "/")
             if (link.contains("dood") || link.contains("streamwish") || link.contains("filemoon") || link.contains("voe")) {

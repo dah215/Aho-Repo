@@ -14,7 +14,7 @@ class HeoVLPlugin : Plugin() {
 }
 
 class HeoVLProvider : MainAPI() {
-    override var mainUrl = "https://heovl.moe" // Bạn có thể đổi thành .moe nếu cần
+    override var mainUrl = "https://heovl.moe"
     override var name = "HeoVL"
     override var lang = "vi"
     override val hasMainPage = true
@@ -26,16 +26,18 @@ class HeoVLProvider : MainAPI() {
         "Origin" to mainUrl
     )
 
+    // Cập nhật danh sách thể loại chính xác từ trang chủ heovl.moe
     override val mainPage = mainPageOf(
-        "/" to "Phim Mới Cập Nhật",
-        "/the-loai/phim-bo/" to "Phim Bộ (Nhiều Tập)",
-        "/the-loai/phim-le/" to "Phim Lẻ",
-        "/the-loai/phim-sex-han-quoc/" to "Hàn Quốc 18+",
-        "/the-loai/phim-sex-nhat-ban/" to "Nhật Bản (JAV)",
+        "/the-loai/phim-sex-viet-nam/" to "Việt Nam",
+        "/the-loai/phim-sex-vietsub/" to "Vietsub",
+        "/the-loai/phim-sex-khong-che/" to "Không Che",
+        "/the-loai/phim-sex-jav-hd/" to "JAV HD",
+        "/the-loai/phim-sex-trung-quoc/" to "Trung Quốc",
         "/the-loai/phim-sex-au-my/" to "Âu Mỹ",
-        "/the-loai/phim-sex-trung-quoc/" to "Trung Quốc / Em Gái Tàu",
-        "/the-loai/phim-sex-loan-luan/" to "Loạn Luân",
-        "/the-loai/phim-sex-hiep-dam/" to "Cưỡng Chế / Hiếp Dâm"
+        "/the-loai/phim-sex-tap-the/" to "Tập Thể",
+        "/the-loai/phim-sex-vlxx/" to "VLXX",
+        "/the-loai/phim-sex-hiep-dam/" to "Hiếp Dâm",
+        "/the-loai/phim-sex-loan-luan/" to "Loạn Luân"
     )
 
     private fun fixUrl(url: String): String {
@@ -48,18 +50,29 @@ class HeoVLProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = if (page == 1) "$mainUrl${request.data}" else "$mainUrl${request.data}page/$page/"
+        // Xử lý phân trang: heovl.moe thường dùng /page/2/
+        val url = if (page == 1) {
+            "$mainUrl${request.data}"
+        } else {
+            "$mainUrl${request.data}page/$page/"
+        }
+        
         val doc = app.get(url, headers = headers).document
         
-        val items = doc.select(".halim-item, .item, article").mapNotNull { el ->
+        // Selector chuẩn cho Halim Theme trên HeoVL
+        val items = doc.select(".halim-item, article.item, .movie-item").mapNotNull { el ->
             val linkEl = el.selectFirst("a") ?: return@mapNotNull null
             val href = fixUrl(linkEl.attr("href"))
-            val title = linkEl.attr("title").ifBlank { el.selectFirst(".entry-title, h2, h3")?.text() } ?: ""
+            
+            val title = linkEl.attr("title").ifBlank { 
+                el.selectFirst(".entry-title, .title, h2")?.text() 
+            }?.trim() ?: return@mapNotNull null
+            
             val poster = el.selectFirst("img")?.let { img ->
-                img.attr("data-src").ifBlank { img.attr("src") }.ifBlank { img.attr("data-original") }
+                img.attr("data-src").ifBlank { img.attr("src") }
             }?.let { fixUrl(it) }
 
-            newMovieSearchResponse(title.trim(), href, TvType.NSFW) {
+            newMovieSearchResponse(title, href, TvType.NSFW) {
                 this.posterUrl = poster
             }
         }.distinctBy { it.url }
@@ -71,15 +84,16 @@ class HeoVLProvider : MainAPI() {
         val url = "$mainUrl/?s=$query"
         val doc = app.get(url, headers = headers).document
         
-        return doc.select(".halim-item, .item, article").mapNotNull { el ->
+        return doc.select(".halim-item, article.item").mapNotNull { el ->
             val linkEl = el.selectFirst("a") ?: return@mapNotNull null
             val href = fixUrl(linkEl.attr("href"))
-            val title = linkEl.attr("title").ifBlank { el.selectFirst(".entry-title, h2, h3")?.text() } ?: ""
+            val title = linkEl.attr("title").ifBlank { el.selectFirst(".entry-title")?.text() }?.trim() ?: ""
+            
             val poster = el.selectFirst("img")?.let { img ->
                 img.attr("data-src").ifBlank { img.attr("src") }
             }?.let { fixUrl(it) }
 
-            newMovieSearchResponse(title.trim(), href, TvType.NSFW) {
+            newMovieSearchResponse(title, href, TvType.NSFW) {
                 this.posterUrl = poster
             }
         }.distinctBy { it.url }
@@ -87,30 +101,39 @@ class HeoVLProvider : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse {
         val doc = app.get(url, headers = headers).document
-        val title = doc.selectFirst("h1.entry-title, .title, h1")?.text()?.trim() ?: "HeoVL Video"
-        val poster = doc.selectFirst("meta[property=og:image]")?.attr("content") ?: doc.selectFirst(".poster img, .thumb img")?.attr("src")
-        val desc = doc.selectFirst(".entry-content, .video-content, #film-content")?.text()?.trim()
+        
+        val title = doc.selectFirst("h1.entry-title, .title, h1")?.text()?.trim() 
+            ?: doc.selectFirst("meta[property=og:title]")?.attr("content")
+            ?: "HeoVL Video"
+            
+        val poster = doc.selectFirst("meta[property=og:image]")?.attr("content") 
+            ?: doc.selectFirst(".poster img, .thumb img")?.attr("src")
+            
+        val desc = doc.selectFirst(".entry-content, .video-content, #film-content, .description")?.text()?.trim()
         
         val episodes = mutableListOf<Episode>()
-        // Tìm danh sách tập phim (thường nằm trong các thẻ li của server)
-        doc.select(".halim-list-eps li a, .list-episode li a, #list-server li a").forEach { epEl ->
+        
+        // Tìm danh sách tập phim (Halim Theme thường dùng .halim-list-eps)
+        // HeoVL có thể có nhiều server, ta quét tất cả
+        doc.select(".halim-list-eps li a, .list-episode li a, #server-list li a").forEach { epEl ->
             val epHref = fixUrl(epEl.attr("href"))
             val epName = epEl.text().trim()
             if (epHref.isNotBlank()) {
                 episodes.add(newEpisode(epHref) {
-                    this.name = if (epName.contains("Tập")) epName else "Tập $epName"
+                    this.name = epName
                 })
             }
         }
 
-        return if (episodes.isEmpty()) {
-            newMovieLoadResponse(title, url, TvType.NSFW, url) {
+        // Nếu không tìm thấy list tập, có thể là phim lẻ 1 tập, lấy chính URL hiện tại
+        if (episodes.isEmpty()) {
+            return newMovieLoadResponse(title, url, TvType.NSFW, url) {
                 this.posterUrl = poster
                 this.plot = desc
                 this.tags = doc.select(".category a, .tags a").map { it.text() }
             }
         } else {
-            newTvSeriesLoadResponse(title, url, TvType.NSFW, episodes) {
+            return newTvSeriesLoadResponse(title, url, TvType.NSFW, episodes) {
                 this.posterUrl = poster
                 this.plot = desc
                 this.tags = doc.select(".category a, .tags a").map { it.text() }
@@ -130,37 +153,23 @@ class HeoVLProvider : MainAPI() {
 
         val potentialUrls = mutableSetOf<String>()
         
-        // 1. Lấy link từ các thẻ iframe (Rất phổ biến trên HeoVL)
+        // 1. Quét iframe (Phổ biến nhất trên HeoVL)
         doc.select("iframe").forEach { iframe ->
             val src = iframe.attr("src").ifBlank { iframe.attr("data-src") }
             if (src.isNotBlank()) potentialUrls.add(fixUrl(src))
         }
         
-        // 2. Quét link video ẩn trong mã nguồn JavaScript (Regex)
-        val regex = """https?[:\\]+[/\\/]+[^\s"'<>]+""".toRegex()
-        regex.findAll(html).forEach { 
+        // 2. Quét link ẩn trong script (Dood, StreamWish, v.v.)
+        Regex("""https?[:\\]+[/\\/]+[^\s"'<>]+""").findAll(html).forEach { 
             val link = it.value.replace("\\/", "/")
-            if (link.contains(".m3u8") || link.contains("dood") || link.contains("streamwish") || link.contains("filemoon") || link.contains("voe")) {
+            if (link.contains("dood") || link.contains("streamwish") || link.contains("filemoon") || link.contains("voe") || link.contains("tape")) {
                 potentialUrls.add(link)
             }
         }
 
         potentialUrls.distinct().forEach { fullUrl ->
-            if (fullUrl.contains(".m3u8")) {
-                callback(
-                    newExtractorLink(
-                        source = name,
-                        name = "Server VIP",
-                        url = fullUrl,
-                        type = ExtractorLinkType.M3U8
-                    ) {
-                        this.referer = data
-                    }
-                )
-            } else {
-                // Tự động gọi các bộ giải mã (Extractors) có sẵn của Cloudstream
-                loadExtractor(fullUrl, data, subtitleCallback, callback)
-            }
+            // Tự động xử lý các host phổ biến
+            loadExtractor(fullUrl, data, subtitleCallback, callback)
         }
 
         return true

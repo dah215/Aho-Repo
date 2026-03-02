@@ -14,7 +14,7 @@ class HeoVLPlugin : Plugin() {
 }
 
 class HeoVLProvider : MainAPI() {
-    override var mainUrl = "https://heovl.lol" // Bạn có thể đổi thành .moe nếu cần
+    override var mainUrl = "https://heovl.moe" // Bạn có thể đổi thành .moe nếu cần
     override var name = "HeoVL"
     override var lang = "vi"
     override val hasMainPage = true

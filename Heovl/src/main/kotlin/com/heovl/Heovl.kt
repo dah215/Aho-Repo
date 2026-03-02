@@ -9,6 +9,8 @@ import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.*
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import com.fasterxml.jackson.module.kotlin.readValue
 
 @CloudstreamPlugin
 class HeoVLPlugin : Plugin() {
@@ -24,13 +26,8 @@ class HeoVLProvider : MainAPI() {
     override val hasMainPage = true
     override val supportedTypes = setOf(TvType.NSFW)
 
+    private val mapper = jacksonObjectMapper()
     private val UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
-
-    private val headers = mapOf(
-        "User-Agent" to UA,
-        "Referer" to "$mainUrl/",
-        "Origin" to mainUrl
-    )
 
     override val mainPage = mainPageOf(
         "/" to "Mới Cập Nhật",
@@ -64,11 +61,9 @@ class HeoVLProvider : MainAPI() {
         return if (cleanUrl.startsWith("/")) "$base$cleanUrl" else "$base/$cleanUrl"
     }
 
-    // --- PHẦN GIAO DIỆN ---
-
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page == 1) "$mainUrl${request.data}" else if (request.data == "/") "$mainUrl/?page=$page" else "$mainUrl${request.data}?page=$page"
-        val doc = app.get(url, headers = headers).document
+        val doc = app.get(url, headers = mapOf("User-Agent" to UA)).document
         val items = doc.select("div.video-box").mapNotNull { el ->
             val linkEl = el.selectFirst("a.video-box__thumbnail__link") ?: return@mapNotNull null
             val href = fixUrl(linkEl.attr("href"))
@@ -81,7 +76,7 @@ class HeoVLProvider : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/search?q=$query"
-        val doc = app.get(url, headers = headers).document
+        val doc = app.get(url, headers = mapOf("User-Agent" to UA)).document
         return doc.select("div.video-box").mapNotNull { el ->
             val linkEl = el.selectFirst("a.video-box__thumbnail__link") ?: return@mapNotNull null
             val href = fixUrl(linkEl.attr("href"))
@@ -92,128 +87,96 @@ class HeoVLProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val doc = app.get(url, headers = headers).document
+        val doc = app.get(url, headers = mapOf("User-Agent" to UA)).document
         val title = doc.selectFirst("h1")?.text()?.trim() ?: doc.selectFirst("meta[property=og:title]")?.attr("content") ?: "HeoVL Video"
         val poster = doc.selectFirst("meta[property=og:image]")?.attr("content") ?: doc.selectFirst("div.video-player-container img")?.attr("src")
         val desc = doc.selectFirst("meta[property=og:description]")?.attr("content")
         return newMovieLoadResponse(title, url, TvType.NSFW, url) {
             this.posterUrl = poster
             this.plot = desc
-            this.tags = doc.select(".video-info__tags a").map { it.text() }
         }
     }
 
-    // --- PHẦN XỬ LÝ VIDEO: PASSIVE SNIFFER + DOM SCANNER ---
+    // --- PHẦN XỬ LÝ VIDEO: STEALTH SNIFFER ---
 
-    // Script quét DOM sau khi trang tải xong
-    private val scannerScript = """
+    private val snifferScript = """
         (function() {
-            function findLinks() {
-                var links = [];
-                // 1. Quét thẻ Video
-                var videos = document.getElementsByTagName('video');
-                for (var i = 0; i < videos.length; i++) {
-                    if (videos[i].src && videos[i].src.includes('.m3u8')) links.push(videos[i].src);
-                }
-                // 2. Quét nội dung HTML
-                var html = document.body.innerHTML;
-                var regex = /["'](https?:\/\/[^"']+\.m3u8[^"']*)["']/g;
-                var match;
-                while ((match = regex.exec(html)) !== null) {
-                    links.push(match[1]);
-                }
-                // 3. Quét JW Player
-                if (window.jwplayer) {
-                    try {
-                        var player = window.jwplayer();
-                        var item = player.getPlaylistItem();
-                        if (item && item.file) links.push(item.file);
-                    } catch(e) {}
-                }
-                
-                if (links.length > 0) {
-                    Android.onLinksFound(JSON.stringify([...new Set(links)])); // Gửi danh sách link duy nhất
+            console.log("HeoVL Stealth: Active");
+            // Ngụy trang trình duyệt
+            try { delete navigator.webdriver; } catch(e) {}
+            window.adsbygoogle = { loaded: true, push: function(){} };
+
+            function report(u) {
+                if (u && (u.includes('.m3u8') || u.includes('master'))) {
+                    Android.onLinkFound(u);
                 }
             }
-            // Chạy ngay và chạy lại sau 2s để chắc chắn
-            findLinks();
-            setTimeout(findLinks, 2000);
+            
+            // Hook XHR
+            var xo = XMLHttpRequest.prototype.open;
+            XMLHttpRequest.prototype.open = function(m, u) {
+                this.addEventListener('load', function() { report(u); });
+                xo.apply(this, arguments);
+            };
+            
+            // Hook Fetch
+            var of = window.fetch;
+            window.fetch = async (...a) => {
+                if (a[0]) report(a[0].toString());
+                return of(...a);
+            };
         })();
     """.trimIndent()
 
-    inner class SnifferBridge(val onResult: (List<String>) -> Unit) {
+    inner class WebBridge(val latch: CountDownLatch, var result: MutableSet<String>) {
         @JavascriptInterface
-        fun onLinksFound(jsonLinks: String) {
-            try {
-                val links = AppUtils.parseJson<List<String>>(jsonLinks)
-                onResult(links)
-            } catch (e: Exception) { }
+        fun onLinkFound(url: String) {
+            result.add(url)
+            latch.countDown() // Giải phóng khi tìm thấy link
         }
     }
 
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun sniffVideoLinks(iframeUrl: String): List<String> {
+    private suspend fun getLinksViaWebView(iframeUrl: String): List<String> {
         return withContext(Dispatchers.Main) {
-            withTimeoutOrNull(25_000L) {
-                suspendCancellableCoroutine { cont ->
-                    val ctx = try { AcraApplication.context } catch (e: Exception) { null }
-                    if (ctx == null) { cont.resume(emptyList()); return@suspendCancellableCoroutine }
+            val latch = CountDownLatch(1)
+            val foundLinks = mutableSetOf<String>()
+            val ctx = try { AcraApplication.context } catch (e: Exception) { null } ?: return@withContext emptyList<String>()
+            
+            val wv = WebView(ctx)
+            wv.settings.apply {
+                javaScriptEnabled = true
+                domStorageEnabled = true
+                userAgentString = UA
+                mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+            }
 
-                    val wv = WebView(ctx)
-                    val foundLinks = mutableSetOf<String>()
-                    var hasResumed = false
+            wv.addJavascriptInterface(WebBridge(latch, foundLinks), "Android")
 
-                    fun finish() {
-                        if (!hasResumed) {
-                            hasResumed = true
-                            wv.stopLoading()
-                            wv.destroy()
-                            if (cont.isActive) cont.resume(foundLinks.toList())
-                        }
+            wv.webViewClient = object : WebViewClient() {
+                override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
+                    val reqUrl = request.url.toString()
+                    if (reqUrl.contains(".m3u8")) {
+                        foundLinks.add(reqUrl)
+                        latch.countDown()
                     }
-
-                    wv.settings.apply {
-                        javaScriptEnabled = true
-                        domStorageEnabled = true
-                        userAgentString = UA
-                        mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                    }
-
-                    wv.addJavascriptInterface(SnifferBridge { links ->
-                        foundLinks.addAll(links)
-                        if (foundLinks.isNotEmpty()) finish()
-                    }, "Android")
-
-                    wv.webViewClient = object : WebViewClient() {
-                        // 1. Nghe lén mạng (Passive Sniffing)
-                        override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
-                            val url = request.url.toString()
-                            if (url.contains(".m3u8") || url.contains("master")) {
-                                foundLinks.add(url)
-                                // Nếu tìm thấy link mạng, có thể dừng sớm hoặc đợi thêm DOM scan
-                                // Ở đây ta đợi thêm chút để chắc chắn
-                            }
-                            return super.shouldInterceptRequest(view, request)
-                        }
-
-                        // 2. Quét DOM khi tải xong
-                        override fun onPageFinished(view: WebView?, url: String?) {
-                            super.onPageFinished(view, url)
-                            view?.evaluateJavascript(scannerScript, null)
-                        }
-                    }
-
-                    // Load Iframe với Referer giả lập
-                    wv.loadUrl(iframeUrl, mapOf("Referer" to "$mainUrl/"))
-
-                    // Timeout an toàn
-                    android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                        finish()
-                    }, 20000)
-                    
-                    cont.invokeOnCancellation { wv.destroy() }
+                    return super.shouldInterceptRequest(view, request)
                 }
-            } ?: emptyList()
+
+                override fun onPageFinished(view: WebView?, url: String?) {
+                    view?.evaluateJavascript(snifferScript, null)
+                }
+            }
+
+            wv.loadUrl(iframeUrl, mapOf("Referer" to "$mainUrl/"))
+
+            // Chạy ngầm và đợi kết quả (tối đa 20s)
+            withContext(Dispatchers.IO) {
+                latch.await(20, TimeUnit.SECONDS)
+            }
+
+            wv.post { wv.destroy() }
+            foundLinks.toList()
         }
     }
 
@@ -223,42 +186,33 @@ class HeoVLProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val res = app.get(data, headers = headers)
+        val res = app.get(data, headers = mapOf("User-Agent" to UA))
         val html = res.text
-        val doc = res.document
 
-        // 1. Tìm Iframe chứa video
+        // Tìm Iframe
         var iframeUrl = Regex("""src=["'](https?://[^"']*(?:streamqq|spexliu|flimora)[^"']*)["']""").find(html)?.groupValues?.get(1)
-        if (iframeUrl == null) iframeUrl = doc.select("iframe").attr("src")
+        if (iframeUrl == null) iframeUrl = res.document.select("iframe").attr("src")
 
         if (!iframeUrl.isNullOrBlank()) {
             val fixedIframeUrl = fixUrl(iframeUrl)
-            
-            // 2. Dùng WebView để săn link (Cả mạng và DOM)
-            val links = sniffVideoLinks(fixedIframeUrl)
+            val links = getLinksViaWebView(fixedIframeUrl)
 
             links.forEach { link ->
-                val fixedLink = link.replace("\\/", "/")
-                
-                // Trả về link với Referer là Iframe
                 callback(
                     newExtractorLink(
                         source = "HeoVL VIP",
-                        name = "Server VIP (Sniffed)",
-                        url = fixedLink,
+                        name = "Server VIP (Stealth)",
+                        url = link.replace("\\/", "/"),
                         type = ExtractorLinkType.M3U8
                     ) {
                         this.referer = fixedIframeUrl
                         this.quality = Qualities.P1080.value
-                        // Thêm Origin của server video
-                        val origin = "https://${java.net.URI(fixedIframeUrl).host}"
-                        this.headers = mapOf("Origin" to origin)
                     }
                 )
             }
         }
         
-        // Fallback: Các host khác
+        // Fallback
         Regex("""https?[:\\]+[/\\/]+[^\s"'<>]+""").findAll(html).forEach { 
             val link = it.value.replace("\\/", "/")
             if (link.contains("dood") || link.contains("streamwish") || link.contains("filemoon") || link.contains("voe")) {

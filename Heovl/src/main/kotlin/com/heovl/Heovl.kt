@@ -1,21 +1,15 @@
 package com.heovl
 
 import android.annotation.SuppressLint
-import android.webkit.JavascriptInterface
-import android.webkit.WebResourceRequest
-import android.webkit.WebResourceResponse
-import android.webkit.WebView
-import android.webkit.WebViewClient
+import android.webkit.*
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.*
 import java.io.ByteArrayInputStream
 import java.net.HttpURLConnection
+import java.net.ServerSocket
 import java.net.URL
 import kotlin.coroutines.resume
 
@@ -33,6 +27,7 @@ class HeoVLProvider : MainAPI() {
     override val hasMainPage = true
     override val supportedTypes = setOf(TvType.NSFW)
 
+    private val imageBaseUrl = "https://storage.haiten.org"
     private val UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
     private val headers = mapOf(
@@ -73,44 +68,30 @@ class HeoVLProvider : MainAPI() {
         return if (cleanUrl.startsWith("/")) "$base$cleanUrl" else "$base/$cleanUrl"
     }
 
-    // --- PHẦN GIAO DIỆN (GIỮ NGUYÊN) ---
+    // --- PHẦN GIAO DIỆN ---
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = if (page == 1) {
-            "$mainUrl${request.data}"
-        } else {
-            if (request.data == "/") "$mainUrl/?page=$page" else "$mainUrl${request.data}?page=$page"
-        }
-        
+        val url = if (page == 1) "$mainUrl${request.data}" else if (request.data == "/") "$mainUrl/?page=$page" else "$mainUrl${request.data}?page=$page"
         val doc = app.get(url, headers = headers).document
-        
         val items = doc.select("div.video-box").mapNotNull { el ->
             val linkEl = el.selectFirst("a.video-box__thumbnail__link") ?: return@mapNotNull null
             val href = fixUrl(linkEl.attr("href"))
             val title = linkEl.attr("title").ifBlank { el.selectFirst("h3.video-box__heading")?.text() }?.trim() ?: return@mapNotNull null
             val poster = el.selectFirst("img")?.attr("src")?.let { fixUrl(it) }
-
-            newMovieSearchResponse(title, href, TvType.NSFW) {
-                this.posterUrl = poster
-            }
+            newMovieSearchResponse(title, href, TvType.NSFW) { this.posterUrl = poster }
         }.distinctBy { it.url }
-        
         return newHomePageResponse(request.name, items, items.isNotEmpty())
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/search?q=$query"
         val doc = app.get(url, headers = headers).document
-        
         return doc.select("div.video-box").mapNotNull { el ->
             val linkEl = el.selectFirst("a.video-box__thumbnail__link") ?: return@mapNotNull null
             val href = fixUrl(linkEl.attr("href"))
             val title = linkEl.attr("title").ifBlank { el.selectFirst("h3.video-box__heading")?.text() }?.trim() ?: ""
             val poster = el.selectFirst("img")?.attr("src")?.let { fixUrl(it) }
-
-            newMovieSearchResponse(title, href, TvType.NSFW) {
-                this.posterUrl = poster
-            }
+            newMovieSearchResponse(title, href, TvType.NSFW) { this.posterUrl = poster }
         }.distinctBy { it.url }
     }
 
@@ -119,7 +100,6 @@ class HeoVLProvider : MainAPI() {
         val title = doc.selectFirst("h1")?.text()?.trim() ?: doc.selectFirst("meta[property=og:title]")?.attr("content") ?: "HeoVL Video"
         val poster = doc.selectFirst("meta[property=og:image]")?.attr("content") ?: doc.selectFirst("div.video-player-container img")?.attr("src")
         val desc = doc.selectFirst("meta[property=og:description]")?.attr("content")
-        
         return newMovieLoadResponse(title, url, TvType.NSFW, url) {
             this.posterUrl = poster
             this.plot = desc
@@ -127,144 +107,235 @@ class HeoVLProvider : MainAPI() {
         }
     }
 
-    // --- PHẦN XỬ LÝ VIDEO: WEBVIEW HUNTER ---
+    // --- PHẦN XỬ LÝ VIDEO: ULTIMATE SHADOW INTERCEPTOR ---
 
-    // Script nghe lén request mạng (XHR/Fetch)
-    private val snifferScript = """
+    // Script "Hacker" tiêm vào nhân trình duyệt
+    private val masterScript = """
         <script>
         (function() {
-            console.log("HeoVL Sniffer: Active");
-            function check(url) {
-                if (url && (url.includes('.m3u8') || url.includes('master'))) {
-                    Android.foundLink(url);
+            console.log("Shadow Interceptor: Engaged");
+            
+            // 1. Bypass Anti-DevTools & Debugger
+            var _constructor = window.Function.prototype.constructor;
+            window.Function.prototype.constructor = function(s) {
+                if (s === "debugger") return function() {};
+                return _constructor.apply(this, arguments);
+            };
+
+            // 2. Ngụy trang môi trường
+            try {
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            } catch(e) {}
+
+            function sendToAndroid(content, sourceUrl) {
+                if (content && (content.includes("#EXTM3U") || sourceUrl.includes(".m3u8"))) {
+                    Android.onM3U8Captured(content, sourceUrl);
                 }
             }
-            
-            // Hook XHR
-            var xo = XMLHttpRequest.prototype.open;
-            XMLHttpRequest.prototype.open = function(m, u) {
-                check(u);
-                xo.apply(this, arguments);
+
+            // 3. Hook URL.createObjectURL (Bắt Blob)
+            var _createObjectURL = URL.createObjectURL;
+            URL.createObjectURL = function(obj) {
+                var url = _createObjectURL.apply(this, arguments);
+                if (obj instanceof Blob && (obj.type.includes('mpegurl') || obj.type === '')) {
+                    var reader = new FileReader();
+                    reader.onload = function() { sendToAndroid(reader.result, window.location.href); };
+                    reader.readAsText(obj);
+                }
+                return url;
+            };
+
+            // 4. Hook Fetch API
+            var _fetch = window.fetch;
+            window.fetch = function() {
+                return _fetch.apply(this, arguments).then(res => {
+                    if (res.url.includes(".m3u8") || res.url.includes("master")) {
+                        res.clone().text().then(t => sendToAndroid(t, res.url));
+                    }
+                    return res;
+                });
+            };
+
+            // 5. Hook XMLHttpRequest
+            var _open = XMLHttpRequest.prototype.open;
+            XMLHttpRequest.prototype.open = function(method, url) {
+                this.addEventListener('load', function() {
+                    if (url.includes(".m3u8") || this.responseText.includes("#EXTM3U")) {
+                        sendToAndroid(this.responseText, url);
+                    }
+                });
+                _open.apply(this, arguments);
             };
             
-            // Hook Fetch
-            var of = window.fetch;
-            window.fetch = async (...a) => {
-                if (a[0]) check(a[0].toString());
-                return of(...a);
-            };
+            // 6. Hook Video Tag (Trường hợp gán src trực tiếp)
+            document.addEventListener('DOMContentLoaded', function() {
+                var observer = new MutationObserver(function(mutations) {
+                    mutations.forEach(function(mutation) {
+                        if (mutation.type === 'attributes' && mutation.attributeName === 'src') {
+                            var target = mutation.target;
+                            if (target.tagName === 'VIDEO' || target.tagName === 'SOURCE') {
+                                if (target.src.includes('.m3u8')) {
+                                    // Nếu bắt được link trực tiếp, gửi link về (nội dung rỗng để báo hiệu là link)
+                                    Android.onLinkCaptured(target.src);
+                                }
+                            }
+                        }
+                    });
+                });
+                observer.observe(document.body, { attributes: true, subtree: true, childList: true });
+            });
         })();
         </script>
     """.trimIndent()
 
-    inner class LinkBridge(val onLinkFound: (String) -> Unit) {
-        @JavascriptInterface
-        fun foundLink(url: String) {
-            onLinkFound(url)
+    // Server nội bộ để phục vụ video từ bộ nhớ
+    private var localServer: LocalM3U8Server? = null
+    inner class LocalM3U8Server(private val content: String) {
+        private var socket: ServerSocket? = null
+        val port: Int get() = socket?.localPort ?: 0
+        fun start() {
+            socket = ServerSocket(0)
+            Thread {
+                try {
+                    val s = socket ?: return@Thread
+                    while (!s.isClosed) {
+                        val client = s.accept()
+                        client.getInputStream().bufferedReader().readLine()
+                        val body = content.toByteArray()
+                        val header = "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: ${body.size}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
+                        client.getOutputStream().write(header.toByteArray())
+                        client.getOutputStream().write(body)
+                        client.getOutputStream().flush()
+                        client.close()
+                    }
+                } catch (e: Exception) {}
+            }.also { it.isDaemon = true }.start()
         }
+        fun stop() { try { socket?.close() } catch (e: Exception) {} }
+    }
+
+    inner class AndroidBridge(val onCaptured: (String, String) -> Unit, val onLinkFound: (String) -> Unit) {
+        @JavascriptInterface
+        fun onM3U8Captured(content: String, url: String) { onCaptured(content, url) }
+        @JavascriptInterface
+        fun onLinkCaptured(url: String) { onLinkFound(url) }
     }
 
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun sniffM3u8(iframeUrl: String): String? {
+    private suspend fun shadowCapture(targetUrl: String): Any? {
         return withContext(Dispatchers.Main) {
-            withTimeoutOrNull(20_000L) { // Chờ tối đa 20s
+            withTimeoutOrNull(35_000L) {
                 suspendCancellableCoroutine { cont ->
                     val ctx = try { AcraApplication.context } catch (e: Exception) { null }
                     if (ctx == null) { cont.resume(null); return@suspendCancellableCoroutine }
-
                     val wv = WebView(ctx)
-                    var found = false
-                    
+                    var isFinished = false
+
                     wv.settings.apply {
                         javaScriptEnabled = true
                         domStorageEnabled = true
+                        databaseEnabled = true
                         userAgentString = UA
-                        mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                        mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                     }
 
-                    wv.addJavascriptInterface(LinkBridge { link ->
-                        if (!found) {
-                            found = true
-                            wv.post { wv.destroy() }
-                            if (cont.isActive) cont.resume(link)
+                    wv.addJavascriptInterface(AndroidBridge(
+                        onCaptured = { content, url ->
+                            if (!isFinished) {
+                                isFinished = true
+                                // Xử lý link segment tương đối -> tuyệt đối
+                                val baseUrl = url.substringBeforeLast("/") + "/"
+                                val fixed = content.lines().joinToString("\n") { 
+                                    if (it.isNotBlank() && !it.startsWith("#") && !it.startsWith("http")) "$baseUrl$it" else it 
+                                }
+                                wv.post { wv.destroy() }
+                                if (cont.isActive) cont.resume(fixed) // Trả về nội dung M3U8
+                            }
+                        },
+                        onLinkFound = { url ->
+                            if (!isFinished) {
+                                isFinished = true
+                                wv.post { wv.destroy() }
+                                if (cont.isActive) cont.resume(url) // Trả về Link M3U8
+                            }
                         }
-                    }, "Android")
+                    ), "Android")
 
                     wv.webViewClient = object : WebViewClient() {
                         override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
-                            // Nếu là request tải trang chính của Iframe -> Tiêm thuốc
-                            if (request.url.toString() == iframeUrl) {
+                            val reqUrl = request.url.toString()
+                            // Chặn request tải trang Iframe để tiêm thuốc
+                            if (reqUrl == targetUrl || reqUrl.contains("streamqq") || reqUrl.contains("spexliu")) {
                                 try {
-                                    val conn = URL(iframeUrl).openConnection() as HttpURLConnection
-                                    conn.setRequestProperty("Referer", "$mainUrl/") // Fake Referer từ HeoVL
+                                    val conn = URL(reqUrl).openConnection() as HttpURLConnection
+                                    conn.setRequestProperty("Referer", "$mainUrl/")
                                     conn.setRequestProperty("User-Agent", UA)
                                     
                                     val html = conn.inputStream.bufferedReader().use { it.readText() }
-                                    // Chèn script vào đầu
-                                    val injected = snifferScript + html
-                                    
-                                    return WebResourceResponse("text/html", "utf-8", ByteArrayInputStream(injected.toByteArray()))
+                                    // Tiêm Master Script vào ngay đầu HTML
+                                    val injectedHtml = if (html.contains("<head>")) {
+                                        html.replaceFirst("<head>", "<head>$masterScript")
+                                    } else {
+                                        masterScript + html
+                                    }
+                                    return WebResourceResponse("text/html", "utf-8", ByteArrayInputStream(injectedHtml.toByteArray()))
                                 } catch (e: Exception) { e.printStackTrace() }
                             }
                             return super.shouldInterceptRequest(view, request)
                         }
                     }
                     
-                    // Load Iframe với Referer giả lập
-                    wv.loadUrl(iframeUrl, mapOf("Referer" to "$mainUrl/"))
-                    
+                    wv.loadUrl(targetUrl, mapOf("Referer" to "$mainUrl/"))
                     cont.invokeOnCancellation { wv.destroy() }
                 }
             }
         }
     }
 
-    override suspend fun loadLinks(
-        data: String,
-        isCasting: Boolean,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
+    override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         val res = app.get(data, headers = headers)
         val html = res.text
         val doc = res.document
 
         // 1. Tìm Iframe chứa video
         var iframeUrl = Regex("""src=["'](https?://[^"']*(?:streamqq|spexliu)[^"']*)["']""").find(html)?.groupValues?.get(1)
-        if (iframeUrl == null) {
-             iframeUrl = doc.select("iframe").attr("src")
-        }
+        if (iframeUrl == null) iframeUrl = doc.select("iframe").attr("src")
 
         if (!iframeUrl.isNullOrBlank()) {
             val fixedIframeUrl = fixUrl(iframeUrl)
             
-            // 2. Dùng WebView để bắt link m3u8 từ Iframe
-            val m3u8Link = sniffM3u8(fixedIframeUrl)
+            // 2. Kích hoạt Shadow Capture
+            val result = shadowCapture(fixedIframeUrl)
 
-            if (m3u8Link != null) {
-                callback(
-                    newExtractorLink(
-                        source = "HeoVL VIP",
-                        name = "Server VIP (Sniffed)",
-                        url = m3u8Link,
-                        type = ExtractorLinkType.M3U8
-                    ) {
-                        this.referer = fixedIframeUrl // Referer là link của Iframe
+            if (result != null) {
+                if (result is String && result.contains("#EXTM3U")) {
+                    // Case 1: Bắt được nội dung -> Dùng Local Server
+                    localServer?.stop()
+                    val server = LocalM3U8Server(result)
+                    server.start()
+                    localServer = server
+                    callback(newExtractorLink("HeoVL VIP", "Server VIP (Shadow)", "http://127.0.0.1:${server.port}/video.m3u8", ExtractorLinkType.M3U8) {
+                        this.referer = fixedIframeUrl
                         this.quality = Qualities.P1080.value
-                        this.headers = mapOf("Origin" to "https://e.streamqq.com") // Thử Origin
-                    }
-                )
+                    })
+                } else if (result is String && result.startsWith("http")) {
+                    // Case 2: Bắt được link trực tiếp
+                    callback(newExtractorLink("HeoVL VIP", "Server VIP (Direct)", result, ExtractorLinkType.M3U8) {
+                        this.referer = fixedIframeUrl
+                        this.quality = Qualities.P1080.value
+                        this.headers = mapOf("Origin" to "https://e.streamqq.com")
+                    })
+                }
             }
         }
         
-        // Fallback: Các host khác
+        // Fallback
         Regex("""https?[:\\]+[/\\/]+[^\s"'<>]+""").findAll(html).forEach { 
             val link = it.value.replace("\\/", "/")
             if (link.contains("dood") || link.contains("streamwish") || link.contains("filemoon") || link.contains("voe")) {
                 loadExtractor(link, data, subtitleCallback, callback)
             }
         }
-
         return true
     }
 }

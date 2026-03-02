@@ -20,6 +20,25 @@
         "name": "AnimeVietSub"
     },
     {
+        "iconUrl": "https://heovl.moe/favicon.ico",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/dah215/Aho-Repo",
+        "fileSize": 14437,
+        "status": 1,
+        "language": "vi",
+        "authors": [
+            "Heovl"
+        ],
+        "tvTypes": [
+            "NSFW"
+        ],
+        "version": 1,
+        "internalName": "Heovl",
+        "description": "Vietnamese anime streaming site",
+        "url": "https://raw.githubusercontent.com/dah215/Aho-Repo/builds/Heovl.cs3",
+        "name": "Heovl"
+    },
+    {
         "iconUrl": "https://nangcuc.cv/favicon.ico",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/dah215/Aho-Repo",

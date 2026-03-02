@@ -58,6 +58,8 @@ class HeoVLProvider : MainAPI() {
         return if (cleanUrl.startsWith("/")) "$base$cleanUrl" else "$base/$cleanUrl"
     }
 
+    // --- PHẦN GIAO DIỆN ---
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page == 1) "$mainUrl${request.data}" else if (request.data == "/") "$mainUrl/?page=$page" else "$mainUrl${request.data}?page=$page"
         val doc = app.get(url, headers = mapOf("User-Agent" to UA)).document
@@ -71,52 +73,58 @@ class HeoVLProvider : MainAPI() {
         return newHomePageResponse(request.name, items, items.isNotEmpty())
     }
 
+    override suspend fun search(query: String): List<SearchResponse> {
+        val url = "$mainUrl/search?q=$query"
+        val doc = app.get(url, headers = mapOf("User-Agent" to UA)).document
+        return doc.select("div.video-box").mapNotNull { el ->
+            val linkEl = el.selectFirst("a.video-box__thumbnail__link") ?: return@mapNotNull null
+            val href = fixUrl(linkEl.attr("href"))
+            val title = linkEl.attr("title").ifBlank { el.selectFirst("h3.video-box__heading")?.text() }?.trim() ?: ""
+            val poster = el.selectFirst("img")?.attr("src")?.let { fixUrl(it) }
+            newMovieSearchResponse(title, href, TvType.NSFW) { this.posterUrl = poster }
+        }.distinctBy { it.url }
+    }
+
     override suspend fun load(url: String): LoadResponse {
         val doc = app.get(url, headers = mapOf("User-Agent" to UA)).document
         val title = doc.selectFirst("h1")?.text()?.trim() ?: "HeoVL Video"
         val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
+        val desc = doc.selectFirst("meta[property=og:description]")?.attr("content")
         return newMovieLoadResponse(title, url, TvType.NSFW, url) {
             this.posterUrl = poster
-            this.plot = doc.selectFirst("meta[property=og:description]")?.attr("content")
+            this.plot = desc
         }
     }
 
-    // --- PHẦN QUAN TRỌNG: PHANTOM CLICKER ---
+    // --- PHẦN QUAN TRỌNG: NETWORK SNIFFER ---
 
-    // Script tự động tìm và bấm nút Play, đồng thời xóa các lớp phủ lỗi
-    private val autoPlayScript = """
+    // Class chứa thông tin link bắt được
+    data class SniffedData(
+        val url: String,
+        val headers: Map<String, String>
+    )
+
+    // Script tự động bấm Play để kích hoạt tải video
+    private val autoClickScript = """
         (function() {
-            console.log("Phantom Clicker: Active");
-            function doClick() {
-                // 1. Xóa các thông báo lỗi nếu có
-                var errorOverlays = document.querySelectorAll('.jw-error, .error-display');
-                errorOverlays.forEach(el => el.remove());
-
-                // 2. Tìm và bấm nút Play của JW Player hoặc Video tag
-                var playBtn = document.querySelector('.jw-display-icon-display, .vjs-big-play-button, button[aria-label="Play"]');
-                if (playBtn) {
-                    playBtn.click();
-                    console.log("Phantom Clicker: Clicked Play Button");
+            var attempts = 0;
+            var interval = setInterval(function() {
+                var btn = document.querySelector('.jw-display-icon-display') || document.querySelector('button[aria-label="Play"]');
+                if (btn) {
+                    btn.click();
+                    clearInterval(interval);
                 }
-                
-                var video = document.querySelector('video');
-                if (video) {
-                    video.play();
-                    console.log("Phantom Clicker: Triggered Video Play");
-                }
-            }
-            // Thử bấm nhiều lần để chắc chắn
-            setTimeout(doClick, 1000);
-            setTimeout(doClick, 3000);
-            setTimeout(doClick, 5000);
+                attempts++;
+                if (attempts > 20) clearInterval(interval);
+            }, 500);
         })();
     """.trimIndent()
 
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun phantomCapture(iframeUrl: String): String? {
+    private suspend fun sniffNetwork(iframeUrl: String): SniffedData? {
         return withContext(Dispatchers.Main) {
             val latch = CountDownLatch(1)
-            var capturedUrl: String? = null
+            var result: SniffedData? = null
             val ctx = try { AcraApplication.context } catch (e: Exception) { null } ?: return@withContext null
 
             val wv = WebView(ctx)
@@ -124,40 +132,46 @@ class HeoVLProvider : MainAPI() {
                 javaScriptEnabled = true
                 domStorageEnabled = true
                 userAgentString = UA
-                mediaPlaybackRequiresUserGesture = false // Quan trọng: Cho phép script tự chạy video
+                mediaPlaybackRequiresUserGesture = false // Cho phép tự phát
                 mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
             }
 
-            // Bật Cookie để vượt qua xác thực
+            // Bật Cookie
             CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
 
             wv.webViewClient = object : WebViewClient() {
-                // Bắt link ngay khi nó vừa xuất hiện trong luồng tải tài nguyên
-                override fun onLoadResource(view: WebView?, url: String?) {
-                    if (url != null && (url.contains(".m3u8") || url.contains("master.m3u8"))) {
-                        if (capturedUrl == null) {
-                            capturedUrl = url
+                // ĐÂY LÀ CHÌA KHÓA: Bắt mọi request mạng
+                override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
+                    val url = request.url.toString()
+                    
+                    // Kiểm tra nếu URL là m3u8 hoặc là link elifros.top mà bạn cung cấp
+                    if (url.contains("master.m3u8") || url.contains("index.m3u8") || url.contains("elifros.top/s/")) {
+                        if (result == null) {
+                            // Copy toàn bộ Header mà WebView đang dùng
+                            val requestHeaders = request.requestHeaders ?: emptyMap()
+                            result = SniffedData(url, requestHeaders)
                             latch.countDown()
                         }
+                        // Chặn request lại để không tốn băng thông (Cloudstream sẽ tải sau)
+                        return WebResourceResponse("text/plain", "utf-8", null)
                     }
-                    super.onLoadResource(view, url)
+                    return super.shouldInterceptRequest(view, request)
                 }
 
                 override fun onPageFinished(view: WebView?, url: String?) {
-                    // Khi trang load xong, bắt đầu "bấm" Play
-                    view?.evaluateJavascript(autoPlayScript, null)
+                    // Tự động bấm Play
+                    view?.evaluateJavascript(autoClickScript, null)
                 }
             }
 
             wv.loadUrl(iframeUrl, mapOf("Referer" to "$mainUrl/"))
 
-            // Đợi tối đa 25s để Phantom Clicker làm việc
             withContext(Dispatchers.IO) {
                 latch.await(25, TimeUnit.SECONDS)
             }
 
             wv.post { wv.destroy() }
-            capturedUrl
+            result
         }
     }
 
@@ -165,30 +179,31 @@ class HeoVLProvider : MainAPI() {
         val res = app.get(data, headers = mapOf("User-Agent" to UA))
         val html = res.text
 
-        // Tìm Iframe Sonar/StreamQQ
+        // Tìm Iframe (StreamQQ, Spexliu, Flimora...)
         val sonarUrl = Regex("""src=["'](https?://[^"']*(?:streamqq|spexliu|flimora)[^"']*)["']""").find(html)?.groupValues?.get(1)
+            ?: res.document.select("iframe").attr("src")
 
         if (!sonarUrl.isNullOrBlank()) {
             val fixedSonarUrl = fixUrl(sonarUrl)
             
-            // Kích hoạt Phantom Clicker
-            val m3u8Link = phantomCapture(fixedSonarUrl)
+            // Kích hoạt Network Sniffer
+            val sniffed = sniffNetwork(fixedSonarUrl)
 
-            if (m3u8Link != null) {
-                val finalLink = m3u8Link.replace("\\/", "/")
-                
-                // Trả về link với Referer là Iframe
-                callback(newExtractorLink("HeoVL VIP", "Server VIP (Phantom)", finalLink, ExtractorLinkType.M3U8) {
-                    this.referer = fixedSonarUrl
+            if (sniffed != null) {
+                // Tạo bộ Header chuẩn từ dữ liệu bắt được
+                val videoHeaders = sniffed.headers.toMutableMap()
+                // Đảm bảo có Origin và Referer đúng
+                if (!videoHeaders.containsKey("Origin")) videoHeaders["Origin"] = "https://${java.net.URI(fixedSonarUrl).host}"
+                if (!videoHeaders.containsKey("Referer")) videoHeaders["Referer"] = fixedSonarUrl
+
+                callback(newExtractorLink("HeoVL VIP", "Server VIP (Sniffed)", sniffed.url, ExtractorLinkType.M3U8) {
+                    this.headers = videoHeaders
                     this.quality = Qualities.P1080.value
-                    // Thêm Origin của server video để tránh lỗi 403/3002
-                    val host = java.net.URL(finalLink).host
-                    this.headers = mapOf("Origin" to "https://$host")
                 })
             }
         }
         
-        // Fallback cho các host khác
+        // Fallback
         Regex("""https?[:\\]+[/\\/]+[^\s"'<>]+""").findAll(html).forEach { 
             val link = it.value.replace("\\/", "/")
             if (link.contains("dood") || link.contains("streamwish") || link.contains("filemoon") || link.contains("voe")) {

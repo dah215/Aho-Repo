@@ -93,122 +93,90 @@ class HeoVLProvider : MainAPI() {
         return newMovieLoadResponse(title, url, TvType.NSFW, url) {
             this.posterUrl = poster
             this.plot = desc
+            this.tags = doc.select(".video-info__tags a").map { it.text() }
         }
     }
 
-    // --- PHẦN XỬ LÝ VIDEO: AD-BUSTER & CONTENT-TYPE SNIFFER ---
+    // --- PHẦN XỬ LÝ VIDEO: NATIVE INTERCEPTOR ---
 
-    // Script này làm 2 việc:
-    // 1. Tự động bấm Play và Skip Ad
-    // 2. Kiểm tra Content-Type của mọi request để tìm video thật
-    private val snifferScript = """
-        <script>
+    data class CapturedLink(val url: String, val headers: Map<String, String>)
+
+    // Script tự động bấm Play
+    private val autoClickScript = """
         (function() {
-            console.log("HeoVL Ad-Buster: Active");
-            
-            // --- PHẦN 1: CLICKER ---
-            function clickPlay() {
-                // Tìm nút Play
-                var playBtns = document.querySelectorAll('.jw-display-icon-display, .vjs-big-play-button, button[aria-label="Play"], .plyr__control--overlaid');
-                playBtns.forEach(btn => btn.click());
+            var attempts = 0;
+            var interval = setInterval(function() {
+                // Bấm mọi nút có vẻ là nút Play
+                var btns = document.querySelectorAll('.jw-display-icon-display, .vjs-big-play-button, button[aria-label="Play"], .plyr__control--overlaid, #play-button');
+                btns.forEach(b => b.click());
                 
-                // Tìm nút Skip Ad (nếu có)
-                var skipBtns = document.querySelectorAll('.jw-skip, .videoAdUiSkipButton, .skip-ad');
-                skipBtns.forEach(btn => btn.click());
-                
-                // Click thẳng vào video nếu cần
-                var video = document.querySelector('video');
-                if (video && video.paused) video.play();
-            }
-            // Click liên tục mỗi giây để vượt qua các lớp quảng cáo
-            setInterval(clickPlay, 1000);
+                // Bấm vào video
+                var vid = document.querySelector('video');
+                if(vid && vid.paused) vid.play();
 
-            // --- PHẦN 2: SNIFFER ---
-            function check(url, type) {
-                // Nếu Content-Type là video hoặc mpegurl -> BẮT NGAY
-                if (type && (type.includes('mpegurl') || type.includes('video/mp4'))) {
-                    Android.foundLink(url, type);
-                }
-                // Fallback: Kiểm tra đuôi file nếu không có type
-                else if (url && (url.includes('.m3u8') || url.includes('master'))) {
-                    Android.foundLink(url, 'application/x-mpegurl');
-                }
-            }
-
-            // Hook Fetch để lấy Content-Type
-            var of = window.fetch;
-            window.fetch = async (...args) => {
-                var response = await of(...args);
-                var type = response.headers.get('Content-Type');
-                check(response.url, type);
-                return response;
-            };
-
-            // Hook XHR để lấy Content-Type
-            var xo = XMLHttpRequest.prototype.open;
-            XMLHttpRequest.prototype.open = function(method, url) {
-                this.addEventListener('readystatechange', function() {
-                    if (this.readyState === 4) { // Khi request hoàn tất
-                        var type = this.getResponseHeader('Content-Type');
-                        check(this.responseURL || url, type);
-                    }
-                });
-                xo.apply(this, arguments);
-            };
+                attempts++;
+                if (attempts > 20) clearInterval(interval);
+            }, 1000);
         })();
-        </script>
     """.trimIndent()
 
-    inner class LinkBridge(val onLinkFound: (String, String) -> Unit) {
-        @JavascriptInterface
-        fun foundLink(url: String, type: String) {
-            onLinkFound(url, type)
-        }
-    }
-
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun sniffWithAdBuster(iframeUrl: String): List<Pair<String, String>> {
+    private suspend fun nativeSniff(iframeUrl: String): List<CapturedLink> {
         return withContext(Dispatchers.Main) {
-            val latch = CountDownLatch(1)
-            val foundLinks = mutableSetOf<Pair<String, String>>() // Lưu URL và Type
+            val foundLinks = mutableListOf<CapturedLink>()
+            val latch = CountDownLatch(1) // Dùng để đợi, nhưng không chặn luồng chính
+            
             val ctx = try { AcraApplication.context } catch (e: Exception) { null } ?: return@withContext emptyList()
-
             val wv = WebView(ctx)
+
             wv.settings.apply {
                 javaScriptEnabled = true
                 domStorageEnabled = true
                 userAgentString = UA
-                mediaPlaybackRequiresUserGesture = false // Cho phép tự phát
+                mediaPlaybackRequiresUserGesture = false
                 mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
             }
             
             CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
 
-            wv.addJavascriptInterface(LinkBridge { url, type ->
-                // Lọc bỏ các link quảng cáo (nếu biết pattern)
-                // Nhưng tốt nhất cứ lấy hết, Cloudstream sẽ tự test
-                if (foundLinks.add(url to type)) {
-                    // Nếu tìm thấy nhiều link, đợi thêm chút rồi dừng
-                    // latch.countDown() // Không dừng ngay, để bắt thêm link thật sau quảng cáo
-                }
-            }, "Android")
-
             wv.webViewClient = object : WebViewClient() {
+                // CỔNG KIỂM SOÁT MẠNG CẤP THẤP
+                override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
+                    val url = request.url.toString()
+                    
+                    // Kiểm tra các từ khóa quan trọng: m3u8, elifros, master
+                    if (url.contains(".m3u8") || url.contains("elifros.top") || url.contains("master")) {
+                        // Bắt link và Header
+                        val headers = request.requestHeaders ?: emptyMap()
+                        foundLinks.add(CapturedLink(url, headers))
+                    }
+                    
+                    // Cho phép request đi qua bình thường để video chạy tiếp (và hiện quảng cáo nếu có)
+                    return super.shouldInterceptRequest(view, request)
+                }
+
                 override fun onPageFinished(view: WebView?, url: String?) {
-                    // Tiêm thuốc ngay khi trang load
-                    view?.evaluateJavascript(snifferScript, null)
+                    // Tiêm script bấm Play
+                    view?.evaluateJavascript(autoClickScript, null)
                 }
             }
 
             wv.loadUrl(iframeUrl, mapOf("Referer" to "$mainUrl/"))
 
-            // Đợi 30 giây để quảng cáo chạy xong và video thật hiện ra
+            // Đợi 20 giây để bắt hết các link (bao gồm cả link sau quảng cáo)
             withContext(Dispatchers.IO) {
-                latch.await(30, TimeUnit.SECONDS)
+                try {
+                    // Chúng ta không dùng latch.await() để chặn, mà dùng delay để cho phép WebView hoạt động
+                    // Tuy nhiên trong coroutine, delay là non-blocking
+                    delay(20000) 
+                } catch (e: Exception) {}
             }
 
-            wv.post { wv.destroy() }
-            foundLinks.toList()
+            wv.stopLoading()
+            wv.destroy()
+            
+            // Lọc trùng và trả về
+            foundLinks.distinctBy { it.url }
         }
     }
 
@@ -223,21 +191,30 @@ class HeoVLProvider : MainAPI() {
         if (!sonarUrl.isNullOrBlank()) {
             val fixedSonarUrl = fixUrl(sonarUrl)
             
-            // Chạy Ad-Buster
-            val links = sniffWithAdBuster(fixedSonarUrl)
+            // Chạy Native Sniffer
+            val capturedLinks = nativeSniff(fixedSonarUrl)
 
-            links.forEachIndexed { index, (url, type) ->
-                val fixedLink = url.replace("\\/", "/")
-                val isM3u8 = type.contains("mpegurl") || url.contains(".m3u8")
+            capturedLinks.forEachIndexed { index, captured ->
+                val url = captured.url
+                // Xác định loại link
+                val isM3u8 = url.contains(".m3u8") || url.contains("mpegurl")
                 
-                // Đặt tên để phân biệt
-                val name = if (index == 0) "Server VIP (Có thể là QC)" else "Server VIP (Video $index)"
-                
-                callback(newExtractorLink("HeoVL VIP", name, fixedLink, if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
-                    this.referer = fixedSonarUrl
+                // Tạo Header chuẩn
+                val videoHeaders = captured.headers.toMutableMap()
+                if (!videoHeaders.containsKey("Origin")) {
+                    val host = java.net.URL(fixedSonarUrl).host
+                    videoHeaders["Origin"] = "https://$host"
+                }
+                if (!videoHeaders.containsKey("Referer")) {
+                    videoHeaders["Referer"] = fixedSonarUrl
+                }
+
+                // Đặt tên server
+                val name = if (url.contains("elifros")) "Server VIP (Elifros)" else "Server VIP (Link $index)"
+
+                callback(newExtractorLink("HeoVL VIP", name, url, if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
+                    this.headers = videoHeaders
                     this.quality = Qualities.P1080.value
-                    val host = java.net.URL(fixedLink).host
-                    this.headers = mapOf("Origin" to "https://$host")
                 })
             }
         }

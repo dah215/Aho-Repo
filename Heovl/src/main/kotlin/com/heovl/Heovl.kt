@@ -7,8 +7,11 @@ import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.*
+import java.io.ByteArrayInputStream
+import java.net.ServerSocket
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.CopyOnWriteArrayList
 
 @CloudstreamPlugin
 class HeoVLPlugin : Plugin() {
@@ -96,35 +99,86 @@ class HeoVLProvider : MainAPI() {
         }
     }
 
-    // --- PHẦN XỬ LÝ VIDEO: HEADER CLONING ---
+    // --- PHẦN XỬ LÝ VIDEO: LOCAL PROXY SERVER ---
 
-    data class CapturedData(
-        val url: String,
-        val headers: Map<String, String>
-    )
-
-    // Script tự động bấm Play
-    private val autoClickScript = """
+    // Script JS: Bắt link, tải nội dung m3u8 và gửi về Android
+    private val proxyScript = """
         (function() {
-            var attempts = 0;
-            var interval = setInterval(function() {
-                var btns = document.querySelectorAll('.jw-display-icon-display, .vjs-big-play-button, button[aria-label="Play"], .plyr__control--overlaid');
+            console.log("HeoVL Proxy: Active");
+            
+            function processM3U8(url, content) {
+                if (content && content.includes("#EXTM3U")) {
+                    Android.onM3U8Content(url, content);
+                }
+            }
+
+            // Hook Fetch
+            var of = window.fetch;
+            window.fetch = async (...args) => {
+                var response = await of(...args);
+                if (response.url && (response.url.includes('.m3u8') || response.url.includes('elifros.top'))) {
+                    var clone = response.clone();
+                    clone.text().then(t => processM3U8(response.url, t));
+                }
+                return response;
+            };
+
+            // Hook XHR
+            var xo = XMLHttpRequest.prototype.open;
+            XMLHttpRequest.prototype.open = function(method, url) {
+                this.addEventListener('load', function() {
+                    if (url.includes('.m3u8') || url.includes('elifros.top')) {
+                        processM3U8(this.responseURL || url, this.responseText);
+                    }
+                });
+                xo.apply(this, arguments);
+            };
+
+            // Auto Clicker
+            setInterval(() => {
+                var btns = document.querySelectorAll('.jw-display-icon-display, .vjs-big-play-button, button[aria-label="Play"]');
                 btns.forEach(b => b.click());
                 var vid = document.querySelector('video');
                 if(vid && vid.paused) vid.play();
-                attempts++;
-                if (attempts > 10) clearInterval(interval);
-            }, 800);
+            }, 1000);
         })();
     """.trimIndent()
 
+    // Server nội bộ
+    private var localServer: LocalM3U8Server? = null
+    inner class LocalM3U8Server(private val content: String) {
+        private var socket: ServerSocket? = null
+        val port: Int get() = socket?.localPort ?: 0
+        fun start() {
+            socket = ServerSocket(0)
+            Thread {
+                try {
+                    val s = socket ?: return@Thread
+                    while (!s.isClosed) {
+                        val client = s.accept()
+                        client.getInputStream().bufferedReader().readLine()
+                        val body = content.toByteArray()
+                        val header = "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: ${body.size}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
+                        client.getOutputStream().write(header.toByteArray())
+                        client.getOutputStream().write(body)
+                        client.getOutputStream().flush()
+                        client.close()
+                    }
+                } catch (e: Exception) {}
+            }.also { it.isDaemon = true }.start()
+        }
+        fun stop() { try { socket?.close() } catch (e: Exception) {} }
+    }
+
+    data class CapturedM3U8(val originalUrl: String, val content: String)
+
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun sniffBestLink(iframeUrl: String): CapturedData? {
+    private suspend fun captureContent(iframeUrl: String): List<CapturedM3U8> {
         return withContext(Dispatchers.Main) {
             val latch = CountDownLatch(1)
-            var result: CapturedData? = null
-            val ctx = try { AcraApplication.context } catch (e: Exception) { null } ?: return@withContext null
-
+            val results = CopyOnWriteArrayList<CapturedM3U8>()
+            val ctx = try { AcraApplication.context } catch (e: Exception) { null } ?: return@withContext emptyList()
+            
             val wv = WebView(ctx)
             wv.settings.apply {
                 javaScriptEnabled = true
@@ -136,45 +190,41 @@ class HeoVLProvider : MainAPI() {
             
             CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
 
-            wv.webViewClient = object : WebViewClient() {
-                override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
-                    val url = request.url.toString()
-                    
-                    // CHỈ BẮT LINK ELIFROS (Link xịn)
-                    if (url.contains("elifros.top") || (url.contains(".m3u8") && !url.contains("master"))) {
-                        if (result == null) {
-                            // COPY TOÀN BỘ HEADER CỦA WEBVIEW
-                            val headers = request.requestHeaders?.toMutableMap() ?: mutableMapOf()
-                            
-                            // Bổ sung nếu thiếu
-                            if (!headers.containsKey("Referer")) headers["Referer"] = iframeUrl
-                            if (!headers.containsKey("Origin")) headers["Origin"] = "https://${java.net.URI(iframeUrl).host}"
-                            if (!headers.containsKey("User-Agent")) headers["User-Agent"] = UA
-                            
-                            result = CapturedData(url, headers)
-                            latch.countDown() // Dừng chờ ngay lập tức
+            wv.addJavascriptInterface(object {
+                @JavascriptInterface
+                fun onM3U8Content(url: String, content: String) {
+                    // Xử lý nội dung: Chuyển link segment thành tuyệt đối
+                    val baseUrl = url.substringBeforeLast("/") + "/"
+                    val fixedContent = content.lines().joinToString("\n") { line ->
+                        if (line.isNotBlank() && !line.startsWith("#") && !line.startsWith("http")) {
+                            "$baseUrl$line"
+                        } else {
+                            line
                         }
-                        // Chặn request để tiết kiệm băng thông
-                        return WebResourceResponse("text/plain", "utf-8", null)
                     }
-                    return super.shouldInterceptRequest(view, request)
+                    
+                    // Chỉ lấy link elifros hoặc link có nội dung hợp lệ
+                    if (url.contains("elifros") || content.contains("#EXTINF")) {
+                        results.add(CapturedM3U8(url, fixedContent))
+                        latch.countDown() // Dừng ngay khi bắt được
+                    }
                 }
+            }, "Android")
 
+            wv.webViewClient = object : WebViewClient() {
                 override fun onPageFinished(view: WebView?, url: String?) {
-                    view?.evaluateJavascript(autoClickScript, null)
+                    view?.evaluateJavascript(proxyScript, null)
                 }
             }
 
             wv.loadUrl(iframeUrl, mapOf("Referer" to "$mainUrl/"))
 
-            // Đợi tối đa 25s, nhưng nếu bắt được elifros sẽ dừng ngay
             withContext(Dispatchers.IO) {
                 latch.await(25, TimeUnit.SECONDS)
             }
 
-            wv.stopLoading()
-            wv.destroy()
-            result
+            wv.post { wv.destroy() }
+            results.toList()
         }
     }
 
@@ -182,7 +232,6 @@ class HeoVLProvider : MainAPI() {
         val html = app.get(data, headers = mapOf("User-Agent" to UA)).text
         val doc = org.jsoup.Jsoup.parse(html)
 
-        // Lấy danh sách Server
         val sources = doc.select("button.set-player-source").map { 
             it.attr("data-source") to it.attr("data-cdn-name") 
         }.filter { it.first.isNotBlank() }
@@ -195,15 +244,21 @@ class HeoVLProvider : MainAPI() {
         targets.forEach { (sourceUrl, serverName) ->
             val fixedUrl = fixUrl(sourceUrl)
             
-            // Chạy Sniffer
-            val captured = sniffBestLink(fixedUrl)
+            // Bắt nội dung M3U8
+            val capturedList = captureContent(fixedUrl)
 
-            if (captured != null) {
-                val name = "$serverName (Video Chính)"
+            capturedList.forEachIndexed { index, captured ->
+                // Khởi động Local Server cho mỗi link bắt được
+                val server = LocalM3U8Server(captured.content)
+                server.start()
                 
-                // Truyền bộ Header đã copy vào Cloudstream
-                callback(newExtractorLink("HeoVL VIP", name, captured.url, ExtractorLinkType.M3U8) {
-                    this.headers = captured.headers
+                // Link localhost sẽ không bao giờ bị lỗi 3002
+                val localUrl = "http://127.0.0.1:${server.port}/video.m3u8"
+                val label = if (index == 0) "$serverName (Video Chính)" else "$serverName (Link $index)"
+
+                callback(newExtractorLink("HeoVL VIP", label, localUrl, ExtractorLinkType.M3U8) {
+                    // Vẫn giữ Referer gốc để tải segment
+                    this.referer = captured.originalUrl
                     this.quality = Qualities.P1080.value
                 })
             }

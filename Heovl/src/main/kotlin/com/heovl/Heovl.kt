@@ -99,65 +99,39 @@ class HeoVLProvider : MainAPI() {
 
     // --- PHẦN XỬ LÝ VIDEO: BRUTE FORCE SNIFFER ---
 
-    // Script này sẽ "cướp" mọi request mạng
     private val bruteForceScript = """
         (function() {
             console.log("Brute Force: Active");
-            
             function check(url) {
-                // Bắt tất cả link có vẻ là video
                 if (url && (url.includes('.m3u8') || url.includes('elifros.top') || url.includes('master'))) {
-                    // Loại bỏ các domain quảng cáo rác nếu biết
                     if (!url.includes('google') && !url.includes('facebook')) {
                         Android.onLinkFound(url);
                     }
                 }
             }
-
-            // 1. Hook XHR (XMLHttpRequest)
             var xo = XMLHttpRequest.prototype.open;
             XMLHttpRequest.prototype.open = function(method, url) {
                 check(url);
                 this.addEventListener('load', function() {
-                    // Kiểm tra nội dung trả về nếu URL không rõ ràng
-                    if (this.responseText && this.responseText.includes('#EXTM3U')) {
-                        check(this.responseURL);
-                    }
+                    if (this.responseText && this.responseText.includes('#EXTM3U')) check(this.responseURL);
                 });
                 xo.apply(this, arguments);
             };
-
-            // 2. Hook Fetch API
             var of = window.fetch;
             window.fetch = async (...args) => {
                 var url = args[0] ? args[0].toString() : '';
                 check(url);
                 return of(...args);
             };
-
-            // 3. Auto Clicker (Bấm loạn xạ để kích hoạt video)
             setInterval(() => {
-                var targets = [
-                    '.jw-display-icon-display', 
-                    '.vjs-big-play-button', 
-                    'button[aria-label="Play"]',
-                    'video',
-                    '#play-button',
-                    '.plyr__control--overlaid'
-                ];
-                targets.forEach(t => {
-                    var el = document.querySelector(t);
-                    if (el) el.click();
-                });
-                
-                // Thử play video trực tiếp
+                var targets = ['.jw-display-icon-display', '.vjs-big-play-button', 'button[aria-label="Play"]', 'video', '#play-button', '.plyr__control--overlaid'];
+                targets.forEach(t => { var el = document.querySelector(t); if (el) el.click(); });
                 var v = document.querySelector('video');
                 if (v && v.paused) v.play();
             }, 800);
         })();
     """.trimIndent()
 
-    // Dùng ConcurrentHashMap để lưu link an toàn trong đa luồng
     private val capturedLinks = ConcurrentHashMap<String, String>()
 
     inner class SnifferBridge {
@@ -194,7 +168,6 @@ class HeoVLProvider : MainAPI() {
 
                 override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                     val url = request.url.toString()
-                    // Bắt thêm ở tầng Network cho chắc
                     if (url.contains("elifros.top") || url.contains(".m3u8")) {
                         capturedLinks[url] = url
                     }
@@ -204,7 +177,6 @@ class HeoVLProvider : MainAPI() {
 
             wv.loadUrl(iframeUrl, mapOf("Referer" to "$mainUrl/"))
 
-            // Đợi 25 giây để vét cạn link
             withContext(Dispatchers.IO) {
                 latch.await(25, TimeUnit.SECONDS)
             }
@@ -220,12 +192,10 @@ class HeoVLProvider : MainAPI() {
         val html = app.get(data, headers = mapOf("User-Agent" to UA)).text
         val doc = org.jsoup.Jsoup.parse(html)
 
-        // Lấy tất cả nguồn phát
         val sources = doc.select("button.set-player-source").map { 
             it.attr("data-source") to it.attr("data-cdn-name") 
         }.filter { it.first.isNotBlank() }
         
-        // Nếu không có nút, lấy iframe
         val targets = if (sources.isNotEmpty()) sources else {
             val iframe = doc.select("iframe").attr("src")
             if (iframe.isNotBlank()) listOf(iframe to "Default Server") else emptyList()
@@ -233,26 +203,25 @@ class HeoVLProvider : MainAPI() {
 
         targets.forEach { (sourceUrl, serverName) ->
             val fixedUrl = fixUrl(sourceUrl)
-            
-            // Chạy Brute Force Sniffer
             val links = bruteForceSniff(fixedUrl)
 
             links.forEachIndexed { index, link ->
-                // Lọc link rác (quảng cáo thường có chữ ads, vast, doubleclick)
                 if (!link.contains("googleads") && !link.contains("doubleclick")) {
                     val isElifros = link.contains("elifros.top")
                     val label = if (isElifros) "$serverName (Video Chính)" else "$serverName (Link $index)"
+                    val type = if (link.contains(".m3u8") || link.contains("mpegurl")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                     
-                    // Sử dụng ExtractorLink trực tiếp để tránh lỗi biên dịch
+                    // SỬ DỤNG newExtractorLink VỚI CÚ PHÁP CHUẨN
                     callback(
-                        ExtractorLink(
+                        newExtractorLink(
                             source = "HeoVL VIP",
                             name = label,
                             url = link,
-                            referer = fixedUrl,
-                            quality = Qualities.P1080.value,
-                            type = ExtractorLinkType.M3U8
-                        )
+                            type = type
+                        ) {
+                            this.referer = fixedUrl
+                            this.quality = Qualities.P1080.value
+                        }
                     )
                 }
             }

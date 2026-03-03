@@ -9,7 +9,6 @@ import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.*
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.ConcurrentHashMap
 
 @CloudstreamPlugin
 class HeoVLPlugin : Plugin() {
@@ -97,59 +96,36 @@ class HeoVLProvider : MainAPI() {
         }
     }
 
-    // --- PHẦN XỬ LÝ VIDEO: BRUTE FORCE SNIFFER ---
+    // --- PHẦN XỬ LÝ VIDEO: HEADER CLONING ---
 
-    private val bruteForceScript = """
+    data class CapturedData(
+        val url: String,
+        val headers: Map<String, String>
+    )
+
+    // Script tự động bấm Play
+    private val autoClickScript = """
         (function() {
-            console.log("Brute Force: Active");
-            function check(url) {
-                if (url && (url.includes('.m3u8') || url.includes('elifros.top') || url.includes('master'))) {
-                    if (!url.includes('google') && !url.includes('facebook')) {
-                        Android.onLinkFound(url);
-                    }
-                }
-            }
-            var xo = XMLHttpRequest.prototype.open;
-            XMLHttpRequest.prototype.open = function(method, url) {
-                check(url);
-                this.addEventListener('load', function() {
-                    if (this.responseText && this.responseText.includes('#EXTM3U')) check(this.responseURL);
-                });
-                xo.apply(this, arguments);
-            };
-            var of = window.fetch;
-            window.fetch = async (...args) => {
-                var url = args[0] ? args[0].toString() : '';
-                check(url);
-                return of(...args);
-            };
-            setInterval(() => {
-                var targets = ['.jw-display-icon-display', '.vjs-big-play-button', 'button[aria-label="Play"]', 'video', '#play-button', '.plyr__control--overlaid'];
-                targets.forEach(t => { var el = document.querySelector(t); if (el) el.click(); });
-                var v = document.querySelector('video');
-                if (v && v.paused) v.play();
+            var attempts = 0;
+            var interval = setInterval(function() {
+                var btns = document.querySelectorAll('.jw-display-icon-display, .vjs-big-play-button, button[aria-label="Play"], .plyr__control--overlaid');
+                btns.forEach(b => b.click());
+                var vid = document.querySelector('video');
+                if(vid && vid.paused) vid.play();
+                attempts++;
+                if (attempts > 10) clearInterval(interval);
             }, 800);
         })();
     """.trimIndent()
 
-    private val capturedLinks = ConcurrentHashMap<String, String>()
-
-    inner class SnifferBridge {
-        @JavascriptInterface
-        fun onLinkFound(url: String) {
-            capturedLinks[url] = url
-        }
-    }
-
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun bruteForceSniff(iframeUrl: String): List<String> {
+    private suspend fun sniffBestLink(iframeUrl: String): CapturedData? {
         return withContext(Dispatchers.Main) {
             val latch = CountDownLatch(1)
-            capturedLinks.clear()
-            
-            val ctx = try { AcraApplication.context } catch (e: Exception) { null } ?: return@withContext emptyList()
-            val wv = WebView(ctx)
+            var result: CapturedData? = null
+            val ctx = try { AcraApplication.context } catch (e: Exception) { null } ?: return@withContext null
 
+            val wv = WebView(ctx)
             wv.settings.apply {
                 javaScriptEnabled = true
                 domStorageEnabled = true
@@ -159,32 +135,46 @@ class HeoVLProvider : MainAPI() {
             }
             
             CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
-            wv.addJavascriptInterface(SnifferBridge(), "Android")
 
             wv.webViewClient = object : WebViewClient() {
-                override fun onPageFinished(view: WebView?, url: String?) {
-                    view?.evaluateJavascript(bruteForceScript, null)
-                }
-
                 override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                     val url = request.url.toString()
-                    if (url.contains("elifros.top") || url.contains(".m3u8")) {
-                        capturedLinks[url] = url
+                    
+                    // CHỈ BẮT LINK ELIFROS (Link xịn)
+                    if (url.contains("elifros.top") || (url.contains(".m3u8") && !url.contains("master"))) {
+                        if (result == null) {
+                            // COPY TOÀN BỘ HEADER CỦA WEBVIEW
+                            val headers = request.requestHeaders?.toMutableMap() ?: mutableMapOf()
+                            
+                            // Bổ sung nếu thiếu
+                            if (!headers.containsKey("Referer")) headers["Referer"] = iframeUrl
+                            if (!headers.containsKey("Origin")) headers["Origin"] = "https://${java.net.URI(iframeUrl).host}"
+                            if (!headers.containsKey("User-Agent")) headers["User-Agent"] = UA
+                            
+                            result = CapturedData(url, headers)
+                            latch.countDown() // Dừng chờ ngay lập tức
+                        }
+                        // Chặn request để tiết kiệm băng thông
+                        return WebResourceResponse("text/plain", "utf-8", null)
                     }
                     return super.shouldInterceptRequest(view, request)
+                }
+
+                override fun onPageFinished(view: WebView?, url: String?) {
+                    view?.evaluateJavascript(autoClickScript, null)
                 }
             }
 
             wv.loadUrl(iframeUrl, mapOf("Referer" to "$mainUrl/"))
 
+            // Đợi tối đa 25s, nhưng nếu bắt được elifros sẽ dừng ngay
             withContext(Dispatchers.IO) {
                 latch.await(25, TimeUnit.SECONDS)
             }
 
             wv.stopLoading()
             wv.destroy()
-            
-            capturedLinks.keys.toList()
+            result
         }
     }
 
@@ -192,6 +182,7 @@ class HeoVLProvider : MainAPI() {
         val html = app.get(data, headers = mapOf("User-Agent" to UA)).text
         val doc = org.jsoup.Jsoup.parse(html)
 
+        // Lấy danh sách Server
         val sources = doc.select("button.set-player-source").map { 
             it.attr("data-source") to it.attr("data-cdn-name") 
         }.filter { it.first.isNotBlank() }
@@ -203,27 +194,18 @@ class HeoVLProvider : MainAPI() {
 
         targets.forEach { (sourceUrl, serverName) ->
             val fixedUrl = fixUrl(sourceUrl)
-            val links = bruteForceSniff(fixedUrl)
+            
+            // Chạy Sniffer
+            val captured = sniffBestLink(fixedUrl)
 
-            links.forEachIndexed { index, link ->
-                if (!link.contains("googleads") && !link.contains("doubleclick")) {
-                    val isElifros = link.contains("elifros.top")
-                    val label = if (isElifros) "$serverName (Video Chính)" else "$serverName (Link $index)"
-                    val type = if (link.contains(".m3u8") || link.contains("mpegurl")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                    
-                    // SỬ DỤNG newExtractorLink VỚI CÚ PHÁP CHUẨN
-                    callback(
-                        newExtractorLink(
-                            source = "HeoVL VIP",
-                            name = label,
-                            url = link,
-                            type = type
-                        ) {
-                            this.referer = fixedUrl
-                            this.quality = Qualities.P1080.value
-                        }
-                    )
-                }
+            if (captured != null) {
+                val name = "$serverName (Video Chính)"
+                
+                // Truyền bộ Header đã copy vào Cloudstream
+                callback(newExtractorLink("HeoVL VIP", name, captured.url, ExtractorLinkType.M3U8) {
+                    this.headers = captured.headers
+                    this.quality = Qualities.P1080.value
+                })
             }
         }
         

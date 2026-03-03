@@ -81,15 +81,17 @@ class HeoVLProvider : MainAPI() {
         }
     }
 
-    // --- PHẦN XỬ LÝ VIDEO: HYBRID HUNTER ---
+    // --- PHẦN QUAN TRỌNG: GHOST PROTOCOL SNIFFER ---
+
+    data class SniffedResult(val url: String, val headers: Map<String, String>)
 
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun sniffWithWebView(iframeUrl: String): Set<String> {
+    private suspend fun ghostSniff(iframeUrl: String): SniffedResult? {
         return withContext(Dispatchers.Main) {
             val latch = CountDownLatch(1)
-            val links = mutableSetOf<String>()
-            val ctx = try { AcraApplication.context } catch (e: Exception) { null } ?: return@withContext emptySet()
-            
+            var result: SniffedResult? = null
+            val ctx = try { AcraApplication.context } catch (e: Exception) { null } ?: return@withContext null
+
             val wv = WebView(ctx)
             wv.settings.apply {
                 javaScriptEnabled = true
@@ -101,26 +103,47 @@ class HeoVLProvider : MainAPI() {
             wv.webViewClient = object : WebViewClient() {
                 override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                     val url = request.url.toString()
-                    // Bắt link elifros hoặc m3u8, bỏ qua quảng cáo
-                    if ((url.contains("elifros.top/s/") || url.contains(".m3u8")) && !url.contains("ads") && !url.contains("vast")) {
-                        links.add(url)
-                        // Nếu bắt được link elifros thì có thể dừng sớm vì đó là link thật
-                        if (url.contains("elifros.top/s/")) latch.countDown()
+                    
+                    // CHỈ BẮT LINK ELIFROS (Link video thật theo manh mối của bạn)
+                    if (url.contains("elifros.top/s/")) {
+                        if (result == null) {
+                            result = SniffedResult(url, request.requestHeaders ?: emptyMap())
+                            latch.countDown()
+                        }
                     }
                     return super.shouldInterceptRequest(view, request)
+                }
+
+                override fun onPageFinished(view: WebView?, url: String?) {
+                    // Script tự động phá quảng cáo và bấm Play video thật
+                    view?.evaluateJavascript("""
+                        (function() {
+                            setInterval(function() {
+                                // 1. Bấm nút Play
+                                var play = document.querySelector('.jw-display-icon-display') || document.querySelector('video');
+                                if (play) play.click();
+                                
+                                // 2. Bỏ qua quảng cáo (Skip Ads)
+                                var skip = document.querySelector('.jw-skip, .skip-ad, [class*="skip"]');
+                                if (skip) skip.click();
+                                
+                                // 3. Xóa các thông báo lỗi giả
+                                var err = document.querySelector('.jw-error');
+                                if (err) err.remove();
+                            }, 1000);
+                        })();
+                    """.trimIndent(), null)
                 }
             }
 
             wv.loadUrl(iframeUrl, mapOf("Referer" to "$mainUrl/"))
-            
-            // Tự động bấm Play sau 3s
-            wv.postDelayed({
-                wv.evaluateJavascript("(function(){ var b = document.querySelector('.jw-display-icon-display') || document.querySelector('video'); if(b) b.click(); if(b && b.play) b.play(); })();", null)
-            }, 3000)
 
-            withContext(Dispatchers.IO) { latch.await(15, TimeUnit.SECONDS) }
+            withContext(Dispatchers.IO) {
+                latch.await(25, TimeUnit.SECONDS) // Đợi tối đa 25s để vượt qua quảng cáo
+            }
+
             wv.post { wv.destroy() }
-            links
+            result
         }
     }
 
@@ -128,51 +151,37 @@ class HeoVLProvider : MainAPI() {
         val html = app.get(data, headers = mapOf("User-Agent" to UA)).text
         val doc = org.jsoup.Jsoup.parse(html)
 
-        // 1. Lấy danh sách các Server Source
-        val serverSources = doc.select("button.set-player-source").map { 
+        // Lấy link từ các nút Server (Server 1, 2, 3)
+        val sources = doc.select("button.set-player-source").map { 
             it.attr("data-source") to it.attr("data-cdn-name") 
         }.filter { it.first.isNotBlank() }
 
-        val allCapturedLinks = mutableSetOf<Pair<String, String>>() // Link to ServerName
-
-        // 2. Quét từng Server
-        serverSources.forEach { (source, name) ->
+        sources.forEach { (source, cdnName) ->
             val fixedSource = fixUrl(source)
             
-            // Bước A: Quét thô bằng Regex (Siêu nhanh)
-            try {
-                val rawHtml = app.get(fixedSource, headers = mapOf("Referer" to "$mainUrl/")).text
-                // Tìm link elifros hoặc m3u8 trong mã nguồn
-                val regex = """https?://[^"']*(?:elifros\.top/s/|master\.m3u8)[^"']*""".toRegex()
-                regex.findAll(rawHtml).forEach { 
-                    allCapturedLinks.add(it.value.replace("\\/", "/") to name)
-                }
-            } catch (e: Exception) {}
+            // Kích hoạt Ghost Protocol cho từng server
+            val sniffed = ghostSniff(fixedSource)
 
-            // Bước B: Nếu quét thô không ra, dùng WebView (Chắc chắn)
-            if (allCapturedLinks.none { it.second == name }) {
-                val sniffed = sniffWithWebView(fixedSource)
-                sniffed.forEach { allCapturedLinks.add(it to name) }
+            if (sniffed != null) {
+                val videoHeaders = sniffed.headers.toMutableMap()
+                // Thiết lập Referer là link Iframe để server video chấp nhận
+                videoHeaders["Referer"] = fixedSource
+                videoHeaders["Origin"] = "https://elifros.top"
+
+                callback(newExtractorLink("HeoVL VIP", "$cdnName (Video Chính)", sniffed.url, ExtractorLinkType.M3U8) {
+                    this.headers = videoHeaders
+                    this.quality = Qualities.P1080.value
+                })
             }
         }
-
-        // 3. Trả kết quả
-        allCapturedLinks.forEachIndexed { index, (link, serverName) ->
-            val isM3u8 = link.contains(".m3u8") || link.contains("master")
-            val isElifros = link.contains("elifros.top")
-            
-            // Ưu tiên link Elifros vì bạn nói nó là video thật
-            val displayName = if (isElifros) "$serverName (Video Chính)" else "$serverName (Link $index)"
-            
-            callback(newExtractorLink("HeoVL VIP", displayName, link, if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
-                this.referer = data
-                this.quality = Qualities.P1080.value
-                // Thêm Origin để tránh lỗi 403
-                val host = java.net.URL(link).host
-                this.headers = mapOf("Origin" to "https://$host")
-            })
+        
+        // Fallback cho các host phụ
+        Regex("""https?[:\\]+[/\\/]+[^\s"'<>]+""").findAll(html).forEach { 
+            val link = it.value.replace("\\/", "/")
+            if (link.contains("dood") || link.contains("streamwish") || link.contains("filemoon") || link.contains("voe")) {
+                loadExtractor(link, data, subtitleCallback, callback)
+            }
         }
-
         return true
     }
 }

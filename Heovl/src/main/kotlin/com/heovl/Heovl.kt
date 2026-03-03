@@ -7,8 +7,7 @@ import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.*
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.ConcurrentLinkedQueue
 
 @CloudstreamPlugin
 class HeoVLPlugin : Plugin() {
@@ -87,7 +86,7 @@ class HeoVLProvider : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse {
         val doc = app.get(url, headers = mapOf("User-Agent" to UA)).document
-        val title = doc.selectFirst("h1")?.text()?.trim() ?: "HeoVL Video"
+        val title = doc.selectFirst("h1")?.text()?.trim() ?: doc.selectFirst("meta[property=og:title]")?.attr("content") ?: "HeoVL Video"
         val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
         val desc = doc.selectFirst("meta[property=og:description]")?.attr("content")
         return newMovieLoadResponse(title, url, TvType.NSFW, url) {
@@ -97,35 +96,15 @@ class HeoVLProvider : MainAPI() {
         }
     }
 
-    // --- PHẦN XỬ LÝ VIDEO: NATIVE INTERCEPTOR ---
+    // --- PHẦN XỬ LÝ VIDEO: ULTIMATE SNIFFER ---
 
     data class CapturedLink(val url: String, val headers: Map<String, String>)
 
-    // Script tự động bấm Play
-    private val autoClickScript = """
-        (function() {
-            var attempts = 0;
-            var interval = setInterval(function() {
-                // Bấm mọi nút có vẻ là nút Play
-                var btns = document.querySelectorAll('.jw-display-icon-display, .vjs-big-play-button, button[aria-label="Play"], .plyr__control--overlaid, #play-button');
-                btns.forEach(b => b.click());
-                
-                // Bấm vào video
-                var vid = document.querySelector('video');
-                if(vid && vid.paused) vid.play();
-
-                attempts++;
-                if (attempts > 20) clearInterval(interval);
-            }, 1000);
-        })();
-    """.trimIndent()
-
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun nativeSniff(iframeUrl: String): List<CapturedLink> {
+    private suspend fun ultimateSniff(iframeUrl: String): List<CapturedLink> {
         return withContext(Dispatchers.Main) {
-            val foundLinks = mutableListOf<CapturedLink>()
-            val latch = CountDownLatch(1) // Dùng để đợi, nhưng không chặn luồng chính
-            
+            // Sử dụng ConcurrentLinkedQueue để tránh lỗi đa luồng khi WebView trả kết quả liên tục
+            val foundLinks = ConcurrentLinkedQueue<CapturedLink>()
             val ctx = try { AcraApplication.context } catch (e: Exception) { null } ?: return@withContext emptyList()
             val wv = WebView(ctx)
 
@@ -139,44 +118,95 @@ class HeoVLProvider : MainAPI() {
             
             CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
 
+            // Cầu nối nhận link trực tiếp từ JW Player
+            val jsBridge = object {
+                @JavascriptInterface
+                fun onLinkFound(url: String) {
+                    if (url.contains(".m3u8") || url.contains("master")) {
+                        foundLinks.add(CapturedLink(url, mapOf(
+                            "Origin" to "https://${java.net.URI(iframeUrl).host}",
+                            "Referer" to iframeUrl,
+                            "User-Agent" to UA
+                        )))
+                    }
+                }
+            }
+            wv.addJavascriptInterface(jsBridge, "Android")
+
+            // Script "Hủy diệt quảng cáo" và ép JW Player nôn link ra
+            val injectScript = """
+                (function() {
+                    // Nghe lén XHR
+                    var xo = XMLHttpRequest.prototype.open;
+                    XMLHttpRequest.prototype.open = function(m, u) {
+                        if(u && (u.includes('.m3u8') || u.includes('master'))) Android.onLinkFound(u);
+                        xo.apply(this, arguments);
+                    };
+                    
+                    // Nghe lén Fetch
+                    var of = window.fetch;
+                    window.fetch = async (...a) => {
+                        if(a[0] && (a[0].includes('.m3u8') || a[0].includes('master'))) Android.onLinkFound(a[0].toString());
+                        return of(...a);
+                    };
+                    
+                    // Vòng lặp phá quảng cáo và lấy playlist
+                    setInterval(() => {
+                        // Xóa sạch các lớp phủ quảng cáo
+                        document.querySelectorAll('div[style*="z-index: 9999"], .overlay-ad, .chat-button, iframe[src*="chat"]').forEach(e => e.remove());
+                        
+                        // Ép JW Player
+                        if (window.jwplayer) {
+                            try {
+                                var p = window.jwplayer();
+                                if (p.getState() !== 'playing') p.play();
+                                
+                                // Lấy trực tiếp danh sách phát (Bỏ qua quảng cáo)
+                                var playlist = p.getPlaylist();
+                                if (playlist) {
+                                    playlist.forEach(item => {
+                                        if (item.file) Android.onLinkFound(item.file);
+                                    });
+                                }
+                            } catch(e){}
+                        }
+                        
+                        // Bấm mọi nút Play có thể thấy
+                        var vids = document.querySelectorAll('video');
+                        vids.forEach(v => { if(v.paused) v.play(); });
+                        document.querySelectorAll('.jw-display-icon-display, .vjs-big-play-button').forEach(b => b.click());
+                    }, 1000);
+                })();
+            """.trimIndent()
+
             wv.webViewClient = object : WebViewClient() {
-                // CỔNG KIỂM SOÁT MẠNG CẤP THẤP
+                // Nghe lén ở tầng Network
                 override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                     val url = request.url.toString()
-                    
-                    // Kiểm tra các từ khóa quan trọng: m3u8, elifros, master
-                    if (url.contains(".m3u8") || url.contains("elifros.top") || url.contains("master")) {
-                        // Bắt link và Header
+                    if (url.contains(".m3u8") || url.contains("master")) {
                         val headers = request.requestHeaders ?: emptyMap()
                         foundLinks.add(CapturedLink(url, headers))
                     }
-                    
-                    // Cho phép request đi qua bình thường để video chạy tiếp (và hiện quảng cáo nếu có)
                     return super.shouldInterceptRequest(view, request)
                 }
 
                 override fun onPageFinished(view: WebView?, url: String?) {
-                    // Tiêm script bấm Play
-                    view?.evaluateJavascript(autoClickScript, null)
+                    view?.evaluateJavascript(injectScript, null)
                 }
             }
 
             wv.loadUrl(iframeUrl, mapOf("Referer" to "$mainUrl/"))
 
-            // Đợi 20 giây để bắt hết các link (bao gồm cả link sau quảng cáo)
+            // Đợi 20s để JW Player load xong playlist và quảng cáo chạy qua
             withContext(Dispatchers.IO) {
-                try {
-                    // Chúng ta không dùng latch.await() để chặn, mà dùng delay để cho phép WebView hoạt động
-                    // Tuy nhiên trong coroutine, delay là non-blocking
-                    delay(20000) 
-                } catch (e: Exception) {}
+                delay(20000) 
             }
 
             wv.stopLoading()
             wv.destroy()
             
-            // Lọc trùng và trả về
-            foundLinks.distinctBy { it.url }
+            // Lọc bỏ các link trùng lặp
+            foundLinks.toList().distinctBy { it.url }
         }
     }
 
@@ -191,28 +221,27 @@ class HeoVLProvider : MainAPI() {
         if (!sonarUrl.isNullOrBlank()) {
             val fixedSonarUrl = fixUrl(sonarUrl)
             
-            // Chạy Native Sniffer
-            val capturedLinks = nativeSniff(fixedSonarUrl)
+            // Chạy Ultimate Sniffer
+            val capturedLinks = ultimateSniff(fixedSonarUrl)
 
-            capturedLinks.forEachIndexed { index, captured ->
+            // Lọc ra các link m3u8
+            val m3u8Links = capturedLinks.filter { it.url.contains(".m3u8") || it.url.contains("master") }
+
+            m3u8Links.forEachIndexed { index, captured ->
                 val url = captured.url
-                // Xác định loại link
-                val isM3u8 = url.contains(".m3u8") || url.contains("mpegurl")
                 
-                // Tạo Header chuẩn
                 val videoHeaders = captured.headers.toMutableMap()
                 if (!videoHeaders.containsKey("Origin")) {
-                    val host = java.net.URL(fixedSonarUrl).host
-                    videoHeaders["Origin"] = "https://$host"
+                    videoHeaders["Origin"] = "https://${java.net.URI(fixedSonarUrl).host}"
                 }
                 if (!videoHeaders.containsKey("Referer")) {
                     videoHeaders["Referer"] = fixedSonarUrl
                 }
 
-                // Đặt tên server
-                val name = if (url.contains("elifros")) "Server VIP (Elifros)" else "Server VIP (Link $index)"
+                // Đặt tên server. Link đầu tiên thường là quảng cáo, link thứ 2 là video thật.
+                val name = if (index == 0) "Server VIP (Có thể là QC)" else "Server VIP (Video Chính $index)"
 
-                callback(newExtractorLink("HeoVL VIP", name, url, if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
+                callback(newExtractorLink("HeoVL VIP", name, url, ExtractorLinkType.M3U8) {
                     this.headers = videoHeaders
                     this.quality = Qualities.P1080.value
                 })

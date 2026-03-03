@@ -9,8 +9,9 @@ import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.*
 import java.io.ByteArrayInputStream
 import java.net.ServerSocket
-import java.util.concurrent.ConcurrentLinkedQueue
-import kotlin.coroutines.resume
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.CopyOnWriteArrayList
 
 @CloudstreamPlugin
 class HeoVLPlugin : Plugin() {
@@ -60,8 +61,6 @@ class HeoVLProvider : MainAPI() {
         return if (cleanUrl.startsWith("/")) "$base$cleanUrl" else "$base/$cleanUrl"
     }
 
-    // --- PHẦN GIAO DIỆN (GIỮ NGUYÊN) ---
-
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page == 1) "$mainUrl${request.data}" else if (request.data == "/") "$mainUrl/?page=$page" else "$mainUrl${request.data}?page=$page"
         val doc = app.get(url, headers = mapOf("User-Agent" to UA)).document
@@ -85,13 +84,11 @@ class HeoVLProvider : MainAPI() {
         }
     }
 
-    // --- PHẦN XỬ LÝ VIDEO: MULTI-SERVER SHADOW SNIFFER ---
+    // --- PHẦN XỬ LÝ VIDEO: SHADOW SNIFFER ---
 
     private val masterScript = """
         (function() {
-            console.log("HeoVL Master: Sniffer Active");
             function send(c, u) { if (c && c.includes("#EXTM3U")) Android.onM3U8Captured(c, u); }
-            
             var _fetch = window.fetch;
             window.fetch = function() {
                 return _fetch.apply(this, arguments).then(res => {
@@ -99,18 +96,13 @@ class HeoVLProvider : MainAPI() {
                     return res;
                 });
             };
-
             var _open = XMLHttpRequest.prototype.open;
             XMLHttpRequest.prototype.open = function(method, url) {
                 this.addEventListener('load', function() {
-                    if (url.includes(".m3u8") || (this.responseText && this.responseText.includes("#EXTM3U"))) {
-                        send(this.responseText, url);
-                    }
+                    if (url.includes(".m3u8") || (this.responseText && this.responseText.includes("#EXTM3U"))) send(this.responseText, url);
                 });
                 _open.apply(this, arguments);
             };
-
-            // Tự động bấm Play để kích hoạt video
             setInterval(() => {
                 var btn = document.querySelector('.jw-display-icon-display, .vjs-big-play-button, button[aria-label="Play"]');
                 if (btn) btn.click();
@@ -120,16 +112,15 @@ class HeoVLProvider : MainAPI() {
         })();
     """.trimIndent()
 
-    private var localServer: LocalM3U8Server? = null
+    // Server nội bộ phục vụ M3U8
     inner class LocalM3U8Server(private val content: String) {
-        private var socket: ServerSocket? = null
+        private var socket: ServerSocket? = ServerSocket(0)
         val port: Int get() = socket?.localPort ?: 0
         fun start() {
-            socket = ServerSocket(0)
             Thread {
                 try {
                     val s = socket ?: return@Thread
-                    while (!s.isClosed) {
+                    repeat(5) { // Phục vụ tối đa 5 request
                         val client = s.accept()
                         client.getInputStream().bufferedReader().readLine()
                         val body = content.toByteArray()
@@ -139,24 +130,23 @@ class HeoVLProvider : MainAPI() {
                         client.getOutputStream().flush()
                         client.close()
                     }
+                    s.close()
                 } catch (e: Exception) {}
             }.also { it.isDaemon = true }.start()
         }
-        fun stop() { try { socket?.close() } catch (e: Exception) {} }
     }
 
-    inner class AndroidBridge(val onCaptured: (String, String) -> Unit) {
-        @JavascriptInterface
-        fun onM3U8Captured(content: String, url: String) { onCaptured(content, url) }
-    }
+    // Dữ liệu tạm thời để lưu link bắt được
+    data class TempM3U8(val content: String, val sourceUrl: String)
 
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun captureFromSource(targetUrl: String, serverName: String, callback: (ExtractorLink) -> Unit) {
-        withContext(Dispatchers.Main) {
-            val ctx = try { AcraApplication.context } catch (e: Exception) { null } ?: return@withContext
+    private suspend fun captureFromSource(targetUrl: String): List<TempM3U8> {
+        return withContext(Dispatchers.Main) {
+            val latch = CountDownLatch(1)
+            val results = CopyOnWriteArrayList<TempM3U8>()
+            val ctx = try { AcraApplication.context } catch (e: Exception) { null } ?: return@withContext emptyList()
+            
             val wv = WebView(ctx)
-            var capturedCount = 0
-
             wv.settings.apply {
                 javaScriptEnabled = true
                 domStorageEnabled = true
@@ -165,25 +155,17 @@ class HeoVLProvider : MainAPI() {
                 mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
             }
 
-            wv.addJavascriptInterface(AndroidBridge { content, url ->
-                capturedCount++
-                // Xử lý link segment
-                val baseUrl = url.substringBeforeLast("/") + "/"
-                val fixed = content.lines().joinToString("\n") { 
-                    if (it.isNotBlank() && !it.startsWith("#") && !it.startsWith("http")) "$baseUrl$it" else it 
+            wv.addJavascriptInterface(object {
+                @JavascriptInterface
+                fun onM3U8Captured(content: String, url: String) {
+                    // Xử lý link segment tương đối -> tuyệt đối
+                    val baseUrl = url.substringBeforeLast("/") + "/"
+                    val fixed = content.lines().joinToString("\n") { 
+                        if (it.isNotBlank() && !it.startsWith("#") && !it.startsWith("http")) "$baseUrl$it" else it 
+                    }
+                    results.add(TempM3U8(fixed, url))
+                    if (results.size >= 2) latch.countDown() // Thường link 2 là phim thật
                 }
-                
-                // Dựng server cho từng link bắt được
-                val server = LocalM3U8Server(fixed)
-                server.start()
-                
-                // Trả về link. Link đầu tiên (capturedCount=1) thường là QC, link sau là phim.
-                val label = if (capturedCount == 1) "$serverName (Có thể là QC)" else "$serverName (Video $capturedCount)"
-                
-                callback(newExtractorLink("HeoVL VIP", label, "http://127.0.0.1:${server.port}/video.m3u8", ExtractorLinkType.M3U8) {
-                    this.referer = targetUrl
-                    this.quality = Qualities.P1080.value
-                })
             }, "Android")
 
             wv.webViewClient = object : WebViewClient() {
@@ -194,35 +176,49 @@ class HeoVLProvider : MainAPI() {
 
             wv.loadUrl(targetUrl, mapOf("Referer" to "$mainUrl/"))
             
-            // Đợi 25s cho mỗi server để bắt link
-            delay(25000)
-            wv.stopLoading()
-            wv.destroy()
+            withContext(Dispatchers.IO) {
+                latch.await(20, TimeUnit.SECONDS) // Đợi tối đa 20s
+            }
+            
+            wv.post { wv.destroy() }
+            results.toList()
         }
     }
 
-    override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
+    override suspend fun loadLinks(
+        data: String,
+        isCasting: Boolean,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
         val html = app.get(data, headers = mapOf("User-Agent" to UA)).text
         val doc = org.jsoup.Jsoup.parse(html)
 
-        // 1. Tìm tất cả các nút Server dựa trên manh mối bạn cung cấp
+        // Lấy tất cả các server từ nút bấm
         val serverButtons = doc.select("button.set-player-source")
-        
-        if (serverButtons.isNotEmpty()) {
-            serverButtons.forEach { btn ->
-                val sourceUrl = btn.attr("data-source")
-                val cdnName = btn.attr("data-cdn-name").ifBlank { "Server VIP" }
+        val sources = serverButtons.map { it.attr("data-source") to it.attr("data-cdn-name") }
+            .filter { it.first.isNotBlank() }
+
+        sources.forEach { (sourceUrl, cdnName) ->
+            val captured = captureFromSource(fixUrl(sourceUrl))
+            captured.forEachIndexed { index, temp ->
+                val server = LocalM3U8Server(temp.content)
+                server.start()
                 
-                if (sourceUrl.isNotBlank()) {
-                    // Chạy WebView cho từng server tìm được
-                    captureFromSource(fixUrl(sourceUrl), cdnName, callback)
-                }
-            }
-        } else {
-            // Fallback nếu không thấy nút bấm (tìm iframe như cũ)
-            val iframeUrl = doc.select("iframe").attr("src")
-            if (iframeUrl.isNotBlank()) {
-                captureFromSource(fixUrl(iframeUrl), "Default Server", callback)
+                val label = if (index == 0) "$cdnName (QC?)" else "$cdnName (Video $index)"
+                
+                // Gọi callback với newExtractorLink (Hợp lệ vì đang ở trong loadLinks suspend)
+                callback(
+                    newExtractorLink(
+                        source = "HeoVL VIP",
+                        name = label,
+                        url = "http://127.0.0.1:${server.port}/video.m3u8",
+                        type = ExtractorLinkType.M3U8
+                    ) {
+                        this.referer = temp.sourceUrl
+                        this.quality = Qualities.P1080.value
+                    }
+                )
             }
         }
         

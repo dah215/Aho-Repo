@@ -7,13 +7,8 @@ import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.*
-import java.io.InputStream
-import java.net.ServerSocket
-import java.net.Socket
-import java.net.URL
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
-import javax.net.ssl.HttpsURLConnection
 
 @CloudstreamPlugin
 class HeoVLPlugin : Plugin() {
@@ -29,6 +24,7 @@ class HeoVLProvider : MainAPI() {
     override val hasMainPage = true
     override val supportedTypes = setOf(TvType.NSFW)
 
+    // User-Agent mới nhất của Chrome Android để tránh bị phát hiện là Bot cũ
     private val UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
     override val mainPage = mainPageOf(
@@ -64,6 +60,7 @@ class HeoVLProvider : MainAPI() {
     }
 
     // --- PHẦN GIAO DIỆN ---
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page == 1) "$mainUrl${request.data}" else if (request.data == "/") "$mainUrl/?page=$page" else "$mainUrl${request.data}?page=$page"
         val doc = app.get(url, headers = mapOf("User-Agent" to UA)).document
@@ -100,106 +97,38 @@ class HeoVLProvider : MainAPI() {
         }
     }
 
-    // --- PHẦN XỬ LÝ VIDEO: FULL PROXY SERVER ---
+    // --- PHẦN XỬ LÝ VIDEO: HEADER HIJACKING ---
 
-    data class CapturedInfo(val url: String, val headers: Map<String, String>)
+    data class HijackedData(val url: String, val headers: Map<String, String>)
 
-    // Server trung gian: Nhận request từ ExoPlayer -> Gắn Header -> Tải từ Elifros -> Trả về ExoPlayer
-    inner class ProxyServer(private val targetUrl: String, private val headers: Map<String, String>) {
-        private var serverSocket: ServerSocket? = null
-        val port: Int get() = serverSocket?.localPort ?: 0
-
-        fun start() {
-            serverSocket = ServerSocket(0)
-            Thread {
-                try {
-                    val ss = serverSocket ?: return@Thread
-                    while (!ss.isClosed) {
-                        val client = ss.accept()
-                        Thread { handleClient(client) }.start()
-                    }
-                } catch (e: Exception) {}
-            }.also { it.isDaemon = true }.start()
-        }
-
-        private fun handleClient(client: Socket) {
-            try {
-                val input = client.getInputStream().bufferedReader()
-                val requestLine = input.readLine() ?: return
-                val parts = requestLine.split(" ")
-                if (parts.size < 2) return
-
-                val path = parts[1] // Ví dụ: /playlist.m3u8 hoặc /segment?url=...
-
-                if (path.contains("/playlist")) {
-                    // Xử lý file M3U8: Tải về và Rewrite link
-                    val conn = URL(targetUrl).openConnection() as HttpsURLConnection
-                    headers.forEach { (k, v) -> conn.setRequestProperty(k, v) }
-                    
-                    val content = conn.inputStream.bufferedReader().use { it.readText() }
-                    val baseUrl = targetUrl.substringBeforeLast("/") + "/"
-                    
-                    // Rewrite: Biến mọi link .ts thành link qua Proxy
-                    val rewritten = content.lines().joinToString("\n") { line ->
-                        if (line.isNotBlank() && !line.startsWith("#")) {
-                            val absUrl = if (line.startsWith("http")) line else "$baseUrl$line"
-                            val encodedUrl = java.net.URLEncoder.encode(absUrl, "UTF-8")
-                            "http://127.0.0.1:$port/segment?url=$encodedUrl"
-                        } else {
-                            line
-                        }
-                    }
-                    
-                    val body = rewritten.toByteArray()
-                    val response = "HTTP/1.1 200 OK\r\n" +
-                            "Content-Type: application/vnd.apple.mpegurl\r\n" +
-                            "Content-Length: ${body.size}\r\n" +
-                            "Connection: close\r\n\r\n"
-                    client.getOutputStream().write(response.toByteArray())
-                    client.getOutputStream().write(body)
-
-                } else if (path.contains("/segment")) {
-                    // Xử lý file Segment: Tải từ server gốc với Header xịn
-                    val segmentUrlParam = path.substringAfter("url=")
-                    val segmentUrl = java.net.URLDecoder.decode(segmentUrlParam, "UTF-8")
-                    
-                    val conn = URL(segmentUrl).openConnection() as HttpsURLConnection
-                    headers.forEach { (k, v) -> conn.setRequestProperty(k, v) }
-                    
-                    val inputStream = conn.inputStream
-                    val responseHeaders = "HTTP/1.1 200 OK\r\n" +
-                            "Content-Type: video/mp2t\r\n" +
-                            "Connection: close\r\n\r\n"
-                    
-                    client.getOutputStream().write(responseHeaders.toByteArray())
-                    
-                    val buffer = ByteArray(4096)
-                    var bytesRead: Int
-                    while (inputStream.read(buffer).also { bytesRead = it } != -1) {
-                        client.getOutputStream().write(buffer, 0, bytesRead)
-                    }
+    // Script bấm Play cực mạnh, chạy liên tục
+    private val autoClickScript = """
+        (function() {
+            var interval = setInterval(function() {
+                // Bấm nút Play của JW Player, VideoJS, Plyr...
+                var btns = document.querySelectorAll('.jw-display-icon-display, .vjs-big-play-button, button[aria-label="Play"], .plyr__control--overlaid, #play-button');
+                for (var i = 0; i < btns.length; i++) {
+                    btns[i].click();
                 }
-                client.close()
-            } catch (e: Exception) {
-                e.printStackTrace()
-                try { client.close() } catch (e: Exception) {}
-            }
-        }
-
-        fun stop() { try { serverSocket?.close() } catch (e: Exception) {} }
-    }
-
-    // Biến toàn cục để giữ server sống
-    companion object {
-        var currentServer: Any? = null
-    }
+                
+                // Bấm trực tiếp vào thẻ video
+                var vids = document.querySelectorAll('video');
+                for (var i = 0; i < vids.length; i++) {
+                    if (vids[i].paused) vids[i].play();
+                }
+            }, 500); // Lặp lại mỗi 0.5s
+            
+            // Dừng sau 15s để tiết kiệm tài nguyên
+            setTimeout(function() { clearInterval(interval); }, 15000);
+        })();
+    """.trimIndent()
 
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun sniffHeaders(iframeUrl: String): CapturedInfo? {
+    private suspend fun hijackLink(iframeUrl: String): List<HijackedData> {
         return withContext(Dispatchers.Main) {
             val latch = CountDownLatch(1)
-            var result: CapturedInfo? = null
-            val ctx = try { AcraApplication.context } catch (e: Exception) { null } ?: return@withContext null
+            val results = mutableListOf<HijackedData>()
+            val ctx = try { AcraApplication.context } catch (e: Exception) { null } ?: return@withContext emptyList()
 
             val wv = WebView(ctx)
             wv.settings.apply {
@@ -209,47 +138,51 @@ class HeoVLProvider : MainAPI() {
                 mediaPlaybackRequiresUserGesture = false
                 mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
             }
+            
             CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
 
             wv.webViewClient = object : WebViewClient() {
                 override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                     val url = request.url.toString()
-                    // Bắt link elifros
-                    if (url.contains("elifros.top/s/")) {
-                        if (result == null) {
-                            val headers = request.requestHeaders?.toMutableMap() ?: mutableMapOf()
-                            // Bổ sung header bắt buộc
-                            headers["Referer"] = iframeUrl
-                            headers["Origin"] = "https://${java.net.URI(iframeUrl).host}"
-                            headers["User-Agent"] = UA
-                            
-                            result = CapturedInfo(url, headers)
+                    
+                    // Bắt TẤT CẢ các link .m3u8 (Không lọc tên miền nữa để tránh sót)
+                    // Loại bỏ các link quảng cáo Google/Doubleclick
+                    if (url.contains(".m3u8") && !url.contains("google") && !url.contains("doubleclick")) {
+                        
+                        val headers = request.requestHeaders?.toMutableMap() ?: mutableMapOf()
+                        
+                        // Bổ sung Header nếu thiếu (Quan trọng!)
+                        if (!headers.containsKey("Referer")) headers["Referer"] = iframeUrl
+                        if (!headers.containsKey("Origin")) headers["Origin"] = "https://${java.net.URI(iframeUrl).host}"
+                        if (!headers.containsKey("User-Agent")) headers["User-Agent"] = UA
+                        
+                        results.add(HijackedData(url, headers))
+                        
+                        // Nếu bắt được link có vẻ là link thật (không phải master.m3u8 ngắn ngủn), thì dừng sớm
+                        if (url.contains("elifros") || url.length > 100) {
                             latch.countDown()
                         }
-                        return WebResourceResponse("text/plain", "utf-8", null)
                     }
                     return super.shouldInterceptRequest(view, request)
                 }
 
                 override fun onPageFinished(view: WebView?, url: String?) {
-                    // Auto Clicker
-                    view?.evaluateJavascript("""
-                        setInterval(function() {
-                            var b = document.querySelector('.jw-display-icon-display') || document.querySelector('video');
-                            if(b) b.click();
-                            if(b && b.play) b.play();
-                            var s = document.querySelector('.jw-skip');
-                            if(s) s.click();
-                        }, 1000);
-                    """.trimIndent(), null)
+                    view?.evaluateJavascript(autoClickScript, null)
                 }
             }
 
             wv.loadUrl(iframeUrl, mapOf("Referer" to "$mainUrl/"))
-            withContext(Dispatchers.IO) { latch.await(25, TimeUnit.SECONDS) }
+
+            // Đợi tối đa 20s
+            withContext(Dispatchers.IO) {
+                try { latch.await(20, TimeUnit.SECONDS) } catch (e: Exception) {}
+            }
+
             wv.stopLoading()
             wv.destroy()
-            result
+            
+            // Trả về danh sách link duy nhất
+            results.distinctBy { it.url }
         }
     }
 
@@ -257,6 +190,7 @@ class HeoVLProvider : MainAPI() {
         val html = app.get(data, headers = mapOf("User-Agent" to UA)).text
         val doc = org.jsoup.Jsoup.parse(html)
 
+        // Lấy danh sách Server
         val sources = doc.select("button.set-player-source").map { 
             it.attr("data-source") to it.attr("data-cdn-name") 
         }.filter { it.first.isNotBlank() }
@@ -268,25 +202,23 @@ class HeoVLProvider : MainAPI() {
 
         targets.forEach { (sourceUrl, serverName) ->
             val fixedUrl = fixUrl(sourceUrl)
-            val captured = sniffHeaders(fixedUrl)
+            
+            // Chạy Hijacker
+            val hijackedList = hijackLink(fixedUrl)
 
-            if (captured != null) {
-                // Dừng server cũ nếu có
-                (currentServer as? ProxyServer)?.stop()
+            hijackedList.forEachIndexed { index, data ->
+                // Đặt tên server
+                val isElifros = data.url.contains("elifros")
+                val label = if (isElifros) "$serverName (Video Chính)" else "$serverName (Link $index)"
                 
-                // Khởi động Proxy Server mới
-                val server = ProxyServer(captured.url, captured.headers)
-                server.start()
-                currentServer = server
-
-                val proxyUrl = "http://127.0.0.1:${server.port}/playlist"
-                val label = "$serverName (Proxy VIP)"
-
-                callback(newExtractorLink("HeoVL VIP", label, proxyUrl, ExtractorLinkType.M3U8) {
+                // Trả về link trực tiếp kèm Header xịn
+                callback(newExtractorLink("HeoVL VIP", label, data.url, ExtractorLinkType.M3U8) {
+                    this.headers = data.headers
                     this.quality = Qualities.P1080.value
                 })
             }
         }
+        
         return true
     }
 }

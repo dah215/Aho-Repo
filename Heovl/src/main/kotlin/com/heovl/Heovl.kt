@@ -1,10 +1,15 @@
 package com.heovl
 
+import android.annotation.SuppressLint
+import android.webkit.*
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
-import org.jsoup.Jsoup
+import kotlinx.coroutines.*
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.ConcurrentHashMap
 
 @CloudstreamPlugin
 class HeoVLPlugin : Plugin() {
@@ -45,37 +50,62 @@ class HeoVLProvider : MainAPI() {
         }
     }
 
-    // --- PHẦN QUAN TRỌNG: ÉP MỞ TRÌNH PHÁT NGOÀI ---
+    // --- PHẦN XỬ LÝ VIDEO: FILTERED SNIFFER ---
 
-    override suspend fun loadLinks(
-        data: String,
-        isCasting: Boolean,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        val html = app.get(data, headers = mapOf("User-Agent" to UA)).text
-        val doc = Jsoup.parse(html)
+    @SuppressLint("SetJavaScriptEnabled")
+    private suspend fun sniffVideoOnly(iframeUrl: String): String? {
+        return withContext(Dispatchers.Main) {
+            val latch = CountDownLatch(1)
+            var videoUrl: String? = null
+            val ctx = try { AcraApplication.context } catch (e: Exception) { null } ?: return@withContext null
 
-        // Lấy link Iframe
-        val iframeUrl = doc.select("iframe").attr("src")
-        if (iframeUrl.isNullOrBlank()) return false
-
-        // Thay vì bắt link m3u8 (gây lỗi 2004), ta trả về link trang web
-        // Cloudstream sẽ nhận diện đây là link web và cho phép bạn chọn "Mở bằng trình duyệt"
-        // hoặc "Mở bằng trình phát ngoài" (nếu bạn cài VLC/MX Player)
-        
-        callback(
-            newExtractorLink(
-                source = "HeoVL",
-                name = "Xem bằng Trình phát ngoài (VLC/MX)",
-                url = iframeUrl,
-                type = ExtractorLinkType.VIDEO
-            ) {
-                this.referer = "$mainUrl/"
-                this.quality = Qualities.P1080.value
+            val wv = WebView(ctx)
+            wv.settings.apply {
+                javaScriptEnabled = true
+                userAgentString = UA
             }
-        )
-        
+
+            wv.webViewClient = object : WebViewClient() {
+                override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
+                    val url = request.url.toString()
+                    
+                    // BỘ LỌC DỨT KHOÁT:
+                    // 1. Phải chứa elifros hoặc m3u8
+                    // 2. KHÔNG ĐƯỢC chứa .jpg, .png, .gif (Loại bỏ ảnh)
+                    // 3. KHÔNG ĐƯỢC chứa 'ads', 'vast' (Loại bỏ quảng cáo)
+                    if ((url.contains("elifros") || url.contains(".m3u8")) && 
+                        !url.contains(Regex("\\.(jpg|png|gif|jpeg)$")) && 
+                        !url.contains("ads") && !url.contains("vast")) {
+                        
+                        if (videoUrl == null) {
+                            videoUrl = url
+                            latch.countDown()
+                        }
+                    }
+                    return super.shouldInterceptRequest(view, request)
+                }
+            }
+            wv.loadUrl(iframeUrl, mapOf("Referer" to "$mainUrl/"))
+            withContext(Dispatchers.IO) { try { latch.await(20, TimeUnit.SECONDS) } catch (e: Exception) {} }
+            wv.post { wv.destroy() }
+            videoUrl
+        }
+    }
+
+    override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
+        val html = app.get(data, headers = mapOf("User-Agent" to UA)).text
+        val iframeUrl = Regex("""src=["'](https?://[^"']*(?:streamqq|spexliu|flimora)[^"']*)["']""").find(html)?.groupValues?.get(1)
+            ?: org.jsoup.Jsoup.parse(html).select("iframe").attr("src")
+
+        if (!iframeUrl.isNullOrBlank()) {
+            val link = sniffVideoOnly(fixUrl(iframeUrl))
+            if (link != null) {
+                callback(newExtractorLink("HeoVL VIP", "Server VIP (Clean)", link, ExtractorLinkType.M3U8) {
+                    this.referer = fixUrl(iframeUrl)
+                    this.quality = Qualities.P1080.value
+                })
+            }
+        }
         return true
     }
     

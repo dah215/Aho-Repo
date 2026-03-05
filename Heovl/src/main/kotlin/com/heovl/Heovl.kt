@@ -23,8 +23,8 @@ class HeoVLProvider : MainAPI() {
     private val UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
     // Cookie bạn cung cấp, được định dạng lại để gửi kèm request
-    private val COOKIES = "__cf_bm=igDu3NVyWHJxG_DYAkYAQvx0F8gInb3ErDiI7hQK9Ps-1772718773-1.0.1.1-XCwFoJsn1rDY2702X9pAzccgo8ElE_ZBMFGtWsIfbU.6sSNIDC3rQnM_bschhLaee95RhN_0EQNf0SuxHQ3YxSb6OSSLDcGPCbLq0PNd9Fo; _ga=GA1.1.1737587921.1772718764; _ga_GR0GKQ8JBK=GS2.1.s1772718763$o1$g1$t1772718829$j60$l0$h0"
-
+    // Thay thế dòng cũ bằng dòng này (đã thêm \ trước mỗi dấu $)
+private val COOKIES = "__cf_bm=igDu3NVyWHJxG_DYAkYAQvx0F8gInb3ErDiI7hQK9Ps-1772718773-1.0.1.1-XCwFoJsn1rDY2702X9pAzccgo8ElE_ZBMFGtWsIfbU.6sSNIDC3rQnM_bschhLaee95RhN_0EQNf0SuxHQ3YxSb6OSSLDcGPCbLq0PNd9Fo; _ga=GA1.1.1737587921.1772718764; _ga_GR0GKQ8JBK=GS2.1.s1772718763\$o1\$g1\$t1772718829\$j60\$l0\$h0"
     private val baseHeaders = mapOf(
         "User-Agent" to UA,
         "Referer" to "$mainUrl/",

@@ -1,20 +1,11 @@
 package com.heovl
 
 import android.annotation.SuppressLint
-import android.net.http.SslError
 import android.webkit.*
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
-import kotlinx.coroutines.*
-import java.io.InputStream
-import java.net.ServerSocket
-import java.net.Socket
-import java.net.URL
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
-import javax.net.ssl.HttpsURLConnection
 
 @CloudstreamPlugin
 class HeoVLPlugin : Plugin() {
@@ -39,20 +30,7 @@ class HeoVLProvider : MainAPI() {
         "/categories/trung-quoc" to "Trung Quốc",
         "/categories/au-my" to "Âu - Mỹ",
         "/categories/khong-che" to "Không Che",
-        "/categories/jav-hd" to "JAV HD",
-        "/categories/gai-xinh" to "Gái Xinh",
-        "/categories/nghiep-du" to "Nghiệp Dư",
-        "/categories/xnxx" to "Xnxx",
-        "/categories/vlxx" to "Vlxx",
-        "/categories/tap-the" to "Tập Thể",
-        "/categories/nhat-ban" to "Nhật Bản",
-        "/categories/han-quoc" to "Hàn Quốc",
-        "/categories/vung-trom" to "Vụng Trộm",
-        "/categories/vu-to" to "Vú To",
-        "/categories/tu-the-69" to "Tư Thế 69",
-        "/categories/hoc-sinh" to "Học Sinh",
-        "/categories/quay-len" to "Quay Lén",
-        "/categories/tu-suong" to "Tự Sướng"
+        "/categories/jav-hd" to "JAV HD"
     )
 
     private fun fixUrl(url: String): String {
@@ -64,7 +42,6 @@ class HeoVLProvider : MainAPI() {
         return if (cleanUrl.startsWith("/")) "$base$cleanUrl" else "$base/$cleanUrl"
     }
 
-    // --- PHẦN GIAO DIỆN ---
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page == 1) "$mainUrl${request.data}" else if (request.data == "/") "$mainUrl/?page=$page" else "$mainUrl${request.data}?page=$page"
         val doc = app.get(url, headers = mapOf("User-Agent" to UA)).document
@@ -78,235 +55,36 @@ class HeoVLProvider : MainAPI() {
         return newHomePageResponse(request.name, items, items.isNotEmpty())
     }
 
-    override suspend fun search(query: String): List<SearchResponse> {
-        val url = "$mainUrl/search?q=$query"
-        val doc = app.get(url, headers = mapOf("User-Agent" to UA)).document
-        return doc.select("div.video-box").mapNotNull { el ->
-            val linkEl = el.selectFirst("a.video-box__thumbnail__link") ?: return@mapNotNull null
-            val href = fixUrl(linkEl.attr("href"))
-            val title = linkEl.attr("title").ifBlank { el.selectFirst("h3.video-box__heading")?.text() }?.trim() ?: ""
-            val poster = el.selectFirst("img")?.attr("src")?.let { fixUrl(it) }
-            newMovieSearchResponse(title, href, TvType.NSFW) { this.posterUrl = poster }
-        }.distinctBy { it.url }
-    }
-
     override suspend fun load(url: String): LoadResponse {
         val doc = app.get(url, headers = mapOf("User-Agent" to UA)).document
         val title = doc.selectFirst("h1")?.text()?.trim() ?: "HeoVL Video"
         val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
-        val desc = doc.selectFirst("meta[property=og:description]")?.attr("content")
+        
+        // Trả về LoadResponse dạng phim lẻ
         return newMovieLoadResponse(title, url, TvType.NSFW, url) {
             this.posterUrl = poster
-            this.plot = desc
         }
     }
 
-    // --- PHẦN XỬ LÝ VIDEO: LOCAL PROXY SERVER ---
-
-    data class CapturedData(val url: String, val headers: Map<String, String>)
-
-    // Server trung gian chạy trên 127.0.0.1
-    inner class ProxyServer(private val targetUrl: String, private val headers: Map<String, String>) {
-        private var serverSocket: ServerSocket? = null
-        val port: Int get() = serverSocket?.localPort ?: 0
-
-        fun start() {
-            serverSocket = ServerSocket(0)
-            Thread {
-                try {
-                    val ss = serverSocket ?: return@Thread
-                    while (!ss.isClosed) {
-                        val client = ss.accept()
-                        Thread { handleClient(client) }.start()
-                    }
-                } catch (e: Exception) {}
-            }.also { it.isDaemon = true }.start()
-        }
-
-        private fun handleClient(client: Socket) {
-            try {
-                val input = client.getInputStream().bufferedReader()
-                val requestLine = input.readLine() ?: return
-                val parts = requestLine.split(" ")
-                if (parts.size < 2) return
-
-                val path = parts[1]
-
-                if (path.contains("/playlist")) {
-                    // 1. Tải file M3U8 gốc
-                    val conn = URL(targetUrl).openConnection() as HttpsURLConnection
-                    headers.forEach { (k, v) -> conn.setRequestProperty(k, v) }
-                    
-                    val content = conn.inputStream.bufferedReader().use { it.readText() }
-                    val baseUrl = targetUrl.substringBeforeLast("/") + "/"
-                    
-                    // 2. Rewrite: Chuyển tất cả link .ts về Proxy
-                    val rewritten = content.lines().joinToString("\n") { line ->
-                        if (line.isNotBlank() && !line.startsWith("#")) {
-                            val absUrl = if (line.startsWith("http")) line else "$baseUrl$line"
-                            val encodedUrl = java.net.URLEncoder.encode(absUrl, "UTF-8")
-                            // Trỏ về endpoint /segment của Proxy
-                            "http://127.0.0.1:$port/segment?url=$encodedUrl"
-                        } else {
-                            line
-                        }
-                    }
-                    
-                    val body = rewritten.toByteArray()
-                    val response = "HTTP/1.1 200 OK\r\n" +
-                            "Content-Type: application/vnd.apple.mpegurl\r\n" +
-                            "Content-Length: ${body.size}\r\n" +
-                            "Connection: close\r\n\r\n"
-                    client.getOutputStream().write(response.toByteArray())
-                    client.getOutputStream().write(body)
-
-                } else if (path.contains("/segment")) {
-                    // 3. Tải file Segment (TS)
-                    val urlParam = path.substringAfter("url=")
-                    val segmentUrl = java.net.URLDecoder.decode(urlParam, "UTF-8")
-                    
-                    val conn = URL(segmentUrl).openConnection() as HttpsURLConnection
-                    // QUAN TRỌNG: Gắn lại toàn bộ Header xịn vào request tải segment
-                    headers.forEach { (k, v) -> conn.setRequestProperty(k, v) }
-                    
-                    val inputStream = conn.inputStream
-                    val responseHeaders = "HTTP/1.1 200 OK\r\n" +
-                            "Content-Type: video/mp2t\r\n" +
-                            "Connection: close\r\n\r\n"
-                    
-                    client.getOutputStream().write(responseHeaders.toByteArray())
-                    
-                    val buffer = ByteArray(8192)
-                    var bytesRead: Int
-                    while (inputStream.read(buffer).also { bytesRead = it } != -1) {
-                        client.getOutputStream().write(buffer, 0, bytesRead)
-                    }
-                }
-                client.close()
-            } catch (e: Exception) {
-                try { client.close() } catch (e: Exception) {}
+    override suspend fun loadLinks(
+        data: String,
+        isCasting: Boolean,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        // PHƯƠNG PHÁP CUỐI CÙNG: Nhúng trực tiếp trang web vào trình phát
+        // Cloudstream sẽ mở trang web này trong WebView tích hợp
+        callback(
+            newExtractorLink(
+                source = "HeoVL",
+                name = "Xem trực tiếp (WebView)",
+                url = data, // Truyền thẳng URL phim
+                type = ExtractorLinkType.VIDEO
+            ) {
+                this.quality = Qualities.P1080.value
+                // Cloudstream sẽ tự động nhận diện đây là URL web và mở WebView
             }
-        }
-
-        fun stop() { try { serverSocket?.close() } catch (e: Exception) {} }
-    }
-
-    // Biến static để giữ server sống
-    companion object {
-        var currentServer: Any? = null
-    }
-
-    @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun sniffHeaders(iframeUrl: String): CapturedData? {
-        return withContext(Dispatchers.Main) {
-            val latch = CountDownLatch(1)
-            var result: CapturedData? = null
-            val ctx = try { AcraApplication.context } catch (e: Exception) { null } ?: return@withContext null
-
-            val wv = WebView(ctx)
-            wv.settings.apply {
-                javaScriptEnabled = true
-                domStorageEnabled = true
-                userAgentString = UA
-                mediaPlaybackRequiresUserGesture = false
-                mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-            }
-            
-            val cookieManager = CookieManager.getInstance()
-            cookieManager.setAcceptCookie(true)
-            cookieManager.setAcceptThirdPartyCookies(wv, true)
-
-            wv.webViewClient = object : WebViewClient() {
-                override fun onReceivedSslError(view: WebView?, handler: SslErrorHandler?, error: SslError?) {
-                    handler?.proceed()
-                }
-
-                override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
-                    val url = request.url.toString()
-                    
-                    // Bắt link elifros
-                    if (url.contains("elifros.top") && (url.contains(".m3u8") || url.contains("master"))) {
-                        if (result == null) {
-                            val headers = request.requestHeaders?.toMutableMap() ?: mutableMapOf()
-                            
-                            // Lấy Cookie
-                            val cookies = cookieManager.getCookie(url)
-                            if (cookies != null) headers["Cookie"] = cookies
-                            
-                            // Gắn Header chuẩn
-                            headers["Referer"] = iframeUrl
-                            headers["Origin"] = "https://${java.net.URI(iframeUrl).host}"
-                            headers["User-Agent"] = UA
-                            
-                            result = CapturedData(url, headers)
-                            latch.countDown()
-                        }
-                        return WebResourceResponse("text/plain", "utf-8", null)
-                    }
-                    return super.shouldInterceptRequest(view, request)
-                }
-
-                override fun onPageFinished(view: WebView?, url: String?) {
-                    // Auto Clicker
-                    view?.evaluateJavascript("""
-                        setInterval(function() {
-                            var b = document.querySelector('.jw-display-icon-display') || document.querySelector('video');
-                            if(b) b.click();
-                            if(b && b.play) b.play();
-                            var s = document.querySelector('.jw-skip');
-                            if(s) s.click();
-                        }, 1000);
-                    """.trimIndent(), null)
-                }
-            }
-
-            wv.loadUrl(iframeUrl, mapOf("Referer" to "$mainUrl/"))
-
-            withContext(Dispatchers.IO) {
-                try { latch.await(30, TimeUnit.SECONDS) } catch (e: Exception) {}
-            }
-
-            wv.stopLoading()
-            wv.destroy()
-            result
-        }
-    }
-
-    override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
-        val html = app.get(data, headers = mapOf("User-Agent" to UA)).text
-        val doc = org.jsoup.Jsoup.parse(html)
-
-        val sources = doc.select("button.set-player-source").map { 
-            it.attr("data-source") to it.attr("data-cdn-name") 
-        }.filter { it.first.isNotBlank() }
-        
-        val targets = if (sources.isNotEmpty()) sources else {
-            val iframe = doc.select("iframe").attr("src")
-            if (iframe.isNotBlank()) listOf(iframe to "Default Server") else emptyList()
-        }
-
-        targets.forEach { (sourceUrl, serverName) ->
-            val fixedUrl = fixUrl(sourceUrl)
-            val captured = sniffHeaders(fixedUrl)
-
-            if (captured != null) {
-                // Dừng server cũ
-                (currentServer as? ProxyServer)?.stop()
-                
-                // Khởi động Proxy mới
-                val server = ProxyServer(captured.url, captured.headers)
-                server.start()
-                currentServer = server
-
-                // Link localhost -> Cloudstream tải từ đây -> Proxy tải từ Elifros -> OK
-                val proxyUrl = "http://127.0.0.1:${server.port}/playlist"
-                val label = "$serverName (Proxy VIP)"
-
-                callback(newExtractorLink("HeoVL VIP", label, proxyUrl, ExtractorLinkType.M3U8) {
-                    this.quality = Qualities.P1080.value
-                })
-            }
-        }
+        )
         return true
     }
 }

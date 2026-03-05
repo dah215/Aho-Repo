@@ -9,6 +9,7 @@ import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.*
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.ConcurrentHashMap
 
 @CloudstreamPlugin
 class HeoVLPlugin : Plugin() {
@@ -24,7 +25,7 @@ class HeoVLProvider : MainAPI() {
     override val hasMainPage = true
     override val supportedTypes = setOf(TvType.NSFW)
 
-    // User-Agent mới nhất của Chrome Android để tránh bị phát hiện là Bot cũ
+    // Giả lập Chrome Android mới nhất
     private val UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
     override val mainPage = mainPageOf(
@@ -97,92 +98,96 @@ class HeoVLProvider : MainAPI() {
         }
     }
 
-    // --- PHẦN XỬ LÝ VIDEO: HEADER HIJACKING ---
+    // --- PHẦN XỬ LÝ VIDEO: OMNI-SNIFFER ---
 
-    data class HijackedData(val url: String, val headers: Map<String, String>)
-
-    // Script bấm Play cực mạnh, chạy liên tục
-    private val autoClickScript = """
+    // Script tự động tương tác cực mạnh
+    private val aggressiveScript = """
         (function() {
-            var interval = setInterval(function() {
-                // Bấm nút Play của JW Player, VideoJS, Plyr...
-                var btns = document.querySelectorAll('.jw-display-icon-display, .vjs-big-play-button, button[aria-label="Play"], .plyr__control--overlaid, #play-button');
-                for (var i = 0; i < btns.length; i++) {
-                    btns[i].click();
-                }
-                
-                // Bấm trực tiếp vào thẻ video
-                var vids = document.querySelectorAll('video');
-                for (var i = 0; i < vids.length; i++) {
-                    if (vids[i].paused) vids[i].play();
-                }
-            }, 500); // Lặp lại mỗi 0.5s
+            console.log("Omni-Sniffer: Active");
             
-            // Dừng sau 15s để tiết kiệm tài nguyên
-            setTimeout(function() { clearInterval(interval); }, 15000);
+            // 1. Xóa quảng cáo che màn hình
+            setInterval(function() {
+                var overlays = document.querySelectorAll('div[style*="z-index: 2147483647"], .overlay-ad, iframe[src*="chat"]');
+                overlays.forEach(el => el.remove());
+            }, 500);
+
+            // 2. Bấm Play liên tục
+            setInterval(function() {
+                var playBtns = document.querySelectorAll('.jw-display-icon-display, .vjs-big-play-button, button[aria-label="Play"], .plyr__control--overlaid');
+                playBtns.forEach(btn => btn.click());
+                
+                var video = document.querySelector('video');
+                if (video && video.paused) {
+                    video.muted = true; // Tắt tiếng để trình duyệt cho phép tự phát
+                    video.play();
+                }
+            }, 1000);
         })();
     """.trimIndent()
 
+    // Lưu trữ link bắt được (Thread-safe)
+    private val capturedLinks = ConcurrentHashMap<String, String>()
+
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun hijackLink(iframeUrl: String): List<HijackedData> {
+    private suspend fun omniSniff(iframeUrl: String): List<String> {
         return withContext(Dispatchers.Main) {
             val latch = CountDownLatch(1)
-            val results = mutableListOf<HijackedData>()
+            capturedLinks.clear()
+            
             val ctx = try { AcraApplication.context } catch (e: Exception) { null } ?: return@withContext emptyList()
-
             val wv = WebView(ctx)
+
             wv.settings.apply {
                 javaScriptEnabled = true
                 domStorageEnabled = true
                 userAgentString = UA
-                mediaPlaybackRequiresUserGesture = false
+                mediaPlaybackRequiresUserGesture = false // Cho phép video tự chạy
                 mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                blockNetworkImage = true // Chặn ảnh để load nhanh hơn
             }
             
-            CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
+            // Bật Cookie Manager
+            val cookieManager = CookieManager.getInstance()
+            cookieManager.setAcceptCookie(true)
+            cookieManager.setAcceptThirdPartyCookies(wv, true)
 
             wv.webViewClient = object : WebViewClient() {
-                override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
-                    val url = request.url.toString()
-                    
-                    // Bắt TẤT CẢ các link .m3u8 (Không lọc tên miền nữa để tránh sót)
-                    // Loại bỏ các link quảng cáo Google/Doubleclick
-                    if (url.contains(".m3u8") && !url.contains("google") && !url.contains("doubleclick")) {
-                        
-                        val headers = request.requestHeaders?.toMutableMap() ?: mutableMapOf()
-                        
-                        // Bổ sung Header nếu thiếu (Quan trọng!)
-                        if (!headers.containsKey("Referer")) headers["Referer"] = iframeUrl
-                        if (!headers.containsKey("Origin")) headers["Origin"] = "https://${java.net.URI(iframeUrl).host}"
-                        if (!headers.containsKey("User-Agent")) headers["User-Agent"] = UA
-                        
-                        results.add(HijackedData(url, headers))
-                        
-                        // Nếu bắt được link có vẻ là link thật (không phải master.m3u8 ngắn ngủn), thì dừng sớm
-                        if (url.contains("elifros") || url.length > 100) {
-                            latch.countDown()
+                // Bắt link ở tầng tài nguyên (Resource Level) - Không thể bị ẩn bởi JS
+                override fun onLoadResource(view: WebView?, url: String?) {
+                    if (url != null) {
+                        // Bắt link elifros hoặc m3u8
+                        if (url.contains("elifros.top") || (url.contains(".m3u8") && !url.contains("master"))) {
+                            capturedLinks[url] = url
+                            // Nếu bắt được elifros thì có thể dừng sớm
+                            if (url.contains("elifros.top")) {
+                                // Đợi thêm 2s để bắt nốt các link phụ rồi dừng
+                                view?.postDelayed({ latch.countDown() }, 2000)
+                            }
                         }
                     }
-                    return super.shouldInterceptRequest(view, request)
+                    super.onLoadResource(view, url)
                 }
 
                 override fun onPageFinished(view: WebView?, url: String?) {
-                    view?.evaluateJavascript(autoClickScript, null)
+                    view?.evaluateJavascript(aggressiveScript, null)
                 }
             }
 
             wv.loadUrl(iframeUrl, mapOf("Referer" to "$mainUrl/"))
 
-            // Đợi tối đa 20s
+            // Đợi tối đa 30s (Quảng cáo có thể dài)
             withContext(Dispatchers.IO) {
-                try { latch.await(20, TimeUnit.SECONDS) } catch (e: Exception) {}
+                try { latch.await(30, TimeUnit.SECONDS) } catch (e: Exception) {}
             }
 
+            // Lấy Cookie cuối cùng
+            val cookies = cookieManager.getCookie(iframeUrl)
+            
             wv.stopLoading()
             wv.destroy()
             
-            // Trả về danh sách link duy nhất
-            results.distinctBy { it.url }
+            // Trả về danh sách link kèm cookie (nếu cần xử lý sau này)
+            capturedLinks.keys.toList()
         }
     }
 
@@ -203,19 +208,34 @@ class HeoVLProvider : MainAPI() {
         targets.forEach { (sourceUrl, serverName) ->
             val fixedUrl = fixUrl(sourceUrl)
             
-            // Chạy Hijacker
-            val hijackedList = hijackLink(fixedUrl)
+            // Chạy Omni-Sniffer
+            val links = omniSniff(fixedUrl)
 
-            hijackedList.forEachIndexed { index, data ->
-                // Đặt tên server
-                val isElifros = data.url.contains("elifros")
-                val label = if (isElifros) "$serverName (Video Chính)" else "$serverName (Link $index)"
-                
-                // Trả về link trực tiếp kèm Header xịn
-                callback(newExtractorLink("HeoVL VIP", label, data.url, ExtractorLinkType.M3U8) {
-                    this.headers = data.headers
-                    this.quality = Qualities.P1080.value
-                })
+            links.forEachIndexed { index, link ->
+                // Lọc link rác
+                if (!link.contains("google") && !link.contains("facebook") && !link.contains("analytics")) {
+                    val isElifros = link.contains("elifros.top")
+                    val label = if (isElifros) "$serverName (Video Chính)" else "$serverName (Link $index)"
+                    
+                    // Tạo Header chuẩn để replay
+                    val videoHeaders = mapOf(
+                        "User-Agent" to UA,
+                        "Referer" to fixedUrl, // Referer là link Iframe
+                        "Origin" to "https://${java.net.URI(fixedUrl).host}"
+                    )
+
+                    callback(
+                        newExtractorLink(
+                            source = "HeoVL VIP",
+                            name = label,
+                            url = link,
+                            type = ExtractorLinkType.M3U8
+                        ) {
+                            this.headers = videoHeaders
+                            this.quality = Qualities.P1080.value
+                        }
+                    )
+                }
             }
         }
         

@@ -25,8 +25,8 @@ class HeoVLProvider : MainAPI() {
     override val hasMainPage = true
     override val supportedTypes = setOf(TvType.NSFW)
 
-    // Giả lập Pixel 7 Pro để tăng độ uy tín
-    private val UA = "Mozilla/5.0 (Linux; Android 13; Pixel 7 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36"
+    // User-Agent cố định để đồng bộ giữa WebView và Cloudstream
+    private val UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
     override val mainPage = mainPageOf(
         "/" to "Mới Cập Nhật",
@@ -98,12 +98,12 @@ class HeoVLProvider : MainAPI() {
         }
     }
 
-    // --- PHẦN XỬ LÝ VIDEO: REAL BROWSER SIMULATION ---
+    // --- PHẦN XỬ LÝ VIDEO: COOKIE SYNC ---
 
     data class CapturedLink(val url: String, val headers: Map<String, String>)
 
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun sniffLink(iframeUrl: String): CapturedLink? {
+    private suspend fun sniffLinkWithCookie(iframeUrl: String): CapturedLink? {
         return withContext(Dispatchers.Main) {
             val latch = CountDownLatch(1)
             var result: CapturedLink? = null
@@ -111,24 +111,19 @@ class HeoVLProvider : MainAPI() {
 
             val wv = WebView(ctx)
             
-            // Cấu hình WebView tối đa để giống thật nhất
             wv.settings.apply {
                 javaScriptEnabled = true
                 domStorageEnabled = true
-                databaseEnabled = true
-                useWideViewPort = true
-                loadWithOverviewMode = true
                 userAgentString = UA
                 mediaPlaybackRequiresUserGesture = false
                 mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                // Cho phép popup để script chạy mượt hơn
-                javaScriptCanOpenWindowsAutomatically = true
             }
             
-            CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
+            val cookieManager = CookieManager.getInstance()
+            cookieManager.setAcceptCookie(true)
+            cookieManager.setAcceptThirdPartyCookies(wv, true)
 
             wv.webViewClient = object : WebViewClient() {
-                // Bỏ qua lỗi SSL (Quan trọng với các web lậu)
                 override fun onReceivedSslError(view: WebView?, handler: SslErrorHandler?, error: SslError?) {
                     handler?.proceed()
                 }
@@ -137,16 +132,23 @@ class HeoVLProvider : MainAPI() {
                     val url = request.url.toString()
                     
                     // Bắt link elifros hoặc m3u8
-                    // Thêm điều kiện loại trừ favicon, css, font để tối ưu
                     if ((url.contains("elifros.top") || url.contains(".m3u8")) && !url.contains("favicon")) {
-                        // Bỏ qua link master.m3u8 nếu nó quá ngắn (thường là quảng cáo)
-                        // Nhưng với elifros thì bắt luôn
+                        // Bỏ qua link master nếu nó không phải elifros (để tránh quảng cáo)
                         if (url.contains("elifros") || !url.contains("master")) {
                             if (result == null) {
                                 val headers = request.requestHeaders?.toMutableMap() ?: mutableMapOf()
-                                headers["User-Agent"] = UA
+                                
+                                // 1. LẤY COOKIE TỪ COOKIEMANAGER (QUAN TRỌNG NHẤT)
+                                val cookies = cookieManager.getCookie(url)
+                                if (cookies != null) {
+                                    headers["Cookie"] = cookies
+                                }
+
+                                // 2. THIẾT LẬP REFERER & ORIGIN CHUẨN
+                                // Server video thường check Referer phải là trang Iframe
                                 headers["Referer"] = iframeUrl
                                 headers["Origin"] = "https://${java.net.URI(iframeUrl).host}"
+                                headers["User-Agent"] = UA
                                 
                                 result = CapturedLink(url, headers)
                                 latch.countDown()
@@ -157,19 +159,12 @@ class HeoVLProvider : MainAPI() {
                 }
 
                 override fun onPageFinished(view: WebView?, url: String?) {
-                    // Script bấm Play và Skip Ads liên tục
+                    // Auto Clicker
                     view?.evaluateJavascript("""
                         (function() {
                             setInterval(function() {
-                                // Bấm Play
-                                var playBtns = document.querySelectorAll('.jw-display-icon-display, .vjs-big-play-button, button[aria-label="Play"], .plyr__control--overlaid');
-                                playBtns.forEach(b => b.click());
-                                
-                                // Bấm Skip Ads
-                                var skipBtns = document.querySelectorAll('.jw-skip, .videoAdUiSkipButton, .skip-ad');
-                                skipBtns.forEach(b => b.click());
-                                
-                                // Bấm vào Video
+                                var btns = document.querySelectorAll('.jw-display-icon-display, .vjs-big-play-button, button[aria-label="Play"]');
+                                btns.forEach(b => b.click());
                                 var vid = document.querySelector('video');
                                 if(vid && vid.paused) vid.play();
                             }, 800);
@@ -180,9 +175,8 @@ class HeoVLProvider : MainAPI() {
 
             wv.loadUrl(iframeUrl, mapOf("Referer" to "$mainUrl/"))
 
-            // Tăng thời gian chờ lên 40s (Mạng chậm hoặc quảng cáo dài)
             withContext(Dispatchers.IO) {
-                try { latch.await(40, TimeUnit.SECONDS) } catch (e: Exception) {}
+                try { latch.await(30, TimeUnit.SECONDS) } catch (e: Exception) {}
             }
 
             wv.stopLoading()
@@ -195,7 +189,6 @@ class HeoVLProvider : MainAPI() {
         val html = app.get(data, headers = mapOf("User-Agent" to UA)).text
         val doc = org.jsoup.Jsoup.parse(html)
 
-        // Lấy danh sách Server
         val sources = doc.select("button.set-player-source").map { 
             it.attr("data-source") to it.attr("data-cdn-name") 
         }.filter { it.first.isNotBlank() }
@@ -208,8 +201,8 @@ class HeoVLProvider : MainAPI() {
         targets.forEach { (sourceUrl, serverName) ->
             val fixedUrl = fixUrl(sourceUrl)
             
-            // Chạy Sniffer
-            val captured = sniffLink(fixedUrl)
+            // Chạy Sniffer có lấy Cookie
+            val captured = sniffLinkWithCookie(fixedUrl)
 
             if (captured != null) {
                 val name = "$serverName (Video Chính)"

@@ -63,47 +63,50 @@ private val COOKIES = "__cf_bm=igDu3NVyWHJxG_DYAkYAQvx0F8gInb3ErDiI7hQK9Ps-17727
         return newHomePageResponse(request.name, items, items.isNotEmpty())
     }
 
+    // ... (Giữ nguyên các phần đầu như V32)
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val html = app.get(data, headers = baseHeaders).text
-        val doc = Jsoup.parse(html)
+        val html = app.get(data, headers = mapOf("User-Agent" to UA)).text
+        val doc = org.jsoup.Jsoup.parse(html)
 
-        // Lấy danh sách các nút Server
+        // Lấy danh sách Server
         val sources = doc.select("button.set-player-source").map { 
             it.attr("data-source") to it.attr("data-cdn-name") 
         }.filter { it.first.isNotBlank() }
+        
+        val targets = if (sources.isNotEmpty()) sources else {
+            val iframe = doc.select("iframe").attr("src")
+            if (iframe.isNotBlank()) listOf(iframe to "Default Server") else emptyList()
+        }
 
-        sources.forEach { (sourceUrl, serverName) ->
+        targets.forEach { (sourceUrl, serverName) ->
             val fixedUrl = fixUrl(sourceUrl)
             
-            // Truy cập vào trang Iframe để lấy link thật
-            val iframeRes = app.get(fixedUrl, headers = baseHeaders)
-            val iframeHtml = iframeRes.text
-            
-            // Quét link video (elifros hoặc m3u8)
-            val regex = """(https?://[^"'\s]+\.(?:m3u8|mp4)[^"'\s]*|https?://elifros\.top/s/[^"'\s]+)""".toRegex()
-            regex.findAll(iframeHtml).forEach { match ->
-                val link = match.value.replace("\\/", "/")
-                
-                // Loại bỏ link quảng cáo
-                if (!link.contains("ads") && !link.contains("vast")) {
-                    callback(newExtractorLink("HeoVL VIP", serverName, link, ExtractorLinkType.M3U8) {
-                        // GẮN COOKIE VÀO ĐÂY ĐỂ VƯỢT LỖI 2004/403
-                        this.headers = mapOf(
-                            "User-Agent" to UA,
-                            "Referer" to fixedUrl,
-                            "Origin" to "https://${java.net.URI(fixedUrl).host}",
-                            "Cookie" to COOKIES
-                        )
+            // Dùng WebView để bắt link thật (như bản V32)
+            val captured = sniffLinkWithCookie(fixedUrl)
+
+            if (captured != null) {
+                // THAY ĐỔI QUAN TRỌNG: Dùng ExtractorLinkType.VIDEO thay vì M3U8
+                // Điều này ép Cloudstream không cố gắng parse manifest mà phát thẳng link
+                callback(
+                    newExtractorLink(
+                        source = "HeoVL VIP",
+                        name = "$serverName (Direct Play)",
+                        url = captured.url,
+                        type = ExtractorLinkType.VIDEO 
+                    ) {
+                        this.headers = captured.headers
                         this.quality = Qualities.P1080.value
-                    })
-                }
+                    }
+                )
             }
         }
+        
         return true
     }
 }

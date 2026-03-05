@@ -1,11 +1,10 @@
 package com.heovl
 
-import android.annotation.SuppressLint
-import android.webkit.*
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
+import org.jsoup.Jsoup
 
 @CloudstreamPlugin
 class HeoVLPlugin : Plugin() {
@@ -22,6 +21,15 @@ class HeoVLProvider : MainAPI() {
     override val supportedTypes = setOf(TvType.NSFW)
 
     private val UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+
+    // Cookie bạn cung cấp, được định dạng lại để gửi kèm request
+    private val COOKIES = "__cf_bm=igDu3NVyWHJxG_DYAkYAQvx0F8gInb3ErDiI7hQK9Ps-1772718773-1.0.1.1-XCwFoJsn1rDY2702X9pAzccgo8ElE_ZBMFGtWsIfbU.6sSNIDC3rQnM_bschhLaee95RhN_0EQNf0SuxHQ3YxSb6OSSLDcGPCbLq0PNd9Fo; _ga=GA1.1.1737587921.1772718764; _ga_GR0GKQ8JBK=GS2.1.s1772718763$o1$g1$t1772718829$j60$l0$h0"
+
+    private val baseHeaders = mapOf(
+        "User-Agent" to UA,
+        "Referer" to "$mainUrl/",
+        "Cookie" to COOKIES
+    )
 
     override val mainPage = mainPageOf(
         "/" to "Mới Cập Nhật",
@@ -44,7 +52,7 @@ class HeoVLProvider : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page == 1) "$mainUrl${request.data}" else if (request.data == "/") "$mainUrl/?page=$page" else "$mainUrl${request.data}?page=$page"
-        val doc = app.get(url, headers = mapOf("User-Agent" to UA)).document
+        val doc = app.get(url, headers = baseHeaders).document
         val items = doc.select("div.video-box").mapNotNull { el ->
             val linkEl = el.selectFirst("a.video-box__thumbnail__link") ?: return@mapNotNull null
             val href = fixUrl(linkEl.attr("href"))
@@ -55,36 +63,47 @@ class HeoVLProvider : MainAPI() {
         return newHomePageResponse(request.name, items, items.isNotEmpty())
     }
 
-    override suspend fun load(url: String): LoadResponse {
-        val doc = app.get(url, headers = mapOf("User-Agent" to UA)).document
-        val title = doc.selectFirst("h1")?.text()?.trim() ?: "HeoVL Video"
-        val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
-        
-        // Trả về LoadResponse dạng phim lẻ
-        return newMovieLoadResponse(title, url, TvType.NSFW, url) {
-            this.posterUrl = poster
-        }
-    }
-
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // PHƯƠNG PHÁP CUỐI CÙNG: Nhúng trực tiếp trang web vào trình phát
-        // Cloudstream sẽ mở trang web này trong WebView tích hợp
-        callback(
-            newExtractorLink(
-                source = "HeoVL",
-                name = "Xem trực tiếp (WebView)",
-                url = data, // Truyền thẳng URL phim
-                type = ExtractorLinkType.VIDEO
-            ) {
-                this.quality = Qualities.P1080.value
-                // Cloudstream sẽ tự động nhận diện đây là URL web và mở WebView
+        val html = app.get(data, headers = baseHeaders).text
+        val doc = Jsoup.parse(html)
+
+        // Lấy danh sách các nút Server
+        val sources = doc.select("button.set-player-source").map { 
+            it.attr("data-source") to it.attr("data-cdn-name") 
+        }.filter { it.first.isNotBlank() }
+
+        sources.forEach { (sourceUrl, serverName) ->
+            val fixedUrl = fixUrl(sourceUrl)
+            
+            // Truy cập vào trang Iframe để lấy link thật
+            val iframeRes = app.get(fixedUrl, headers = baseHeaders)
+            val iframeHtml = iframeRes.text
+            
+            // Quét link video (elifros hoặc m3u8)
+            val regex = """(https?://[^"'\s]+\.(?:m3u8|mp4)[^"'\s]*|https?://elifros\.top/s/[^"'\s]+)""".toRegex()
+            regex.findAll(iframeHtml).forEach { match ->
+                val link = match.value.replace("\\/", "/")
+                
+                // Loại bỏ link quảng cáo
+                if (!link.contains("ads") && !link.contains("vast")) {
+                    callback(newExtractorLink("HeoVL VIP", serverName, link, ExtractorLinkType.M3U8) {
+                        // GẮN COOKIE VÀO ĐÂY ĐỂ VƯỢT LỖI 2004/403
+                        this.headers = mapOf(
+                            "User-Agent" to UA,
+                            "Referer" to fixedUrl,
+                            "Origin" to "https://${java.net.URI(fixedUrl).host}",
+                            "Cookie" to COOKIES
+                        )
+                        this.quality = Qualities.P1080.value
+                    })
+                }
             }
-        )
+        }
         return true
     }
 }

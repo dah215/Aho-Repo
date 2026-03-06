@@ -11,9 +11,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 @CloudstreamPlugin
-class HeoVLPlugin : Plugin() {
-    override fun load() { registerMainAPI(HeoVLProvider()) }
-}
+class HeoVLPlugin : Plugin() { override fun load() { registerMainAPI(HeoVLProvider()) } }
 
 class HeoVLProvider : MainAPI() {
     override var mainUrl = "https://heovl.moe"
@@ -71,7 +69,7 @@ class HeoVLProvider : MainAPI() {
 
             wv.addJavascriptInterface(object {
                 @JavascriptInterface fun onM3U8(url: String) {
-                    if (videoUrl == null) { videoUrl = url; latch.countDown() }
+                    if (videoUrl == null && url.contains(".m3u8")) { videoUrl = url; latch.countDown() }
                 }
             }, "Android")
 
@@ -89,18 +87,16 @@ class HeoVLProvider : MainAPI() {
 
             wv.evaluateJavascript("""
                 (function(){
-                    const h = (u) => { if(u.includes('.m3u8')) Android.onM3U8(u); };
-                    window.fetch = new Proxy(window.fetch, { apply: (t,a,args) => { if(args[0]&&typeof args[0]==='string') h(args[0]); return t.apply(this,args); } });
-                    const xo = XMLHttpRequest.prototype.open; XMLHttpRequest.prototype.open = function(m,u) { h(u); return xo.apply(this,arguments); };
-                    setTimeout(() => {
-                        document.querySelectorAll('video, source').forEach(v => { if(v.src) h(v.src); v.play(); });
-                        const mo = new MutationObserver(m => m.forEach(r => r.addedNodes.forEach(n => { if(n.src) h(n.src); }))); 
-                        mo.observe(document.body, { childList:true, subtree:true });
-                    }, 3000);
+                    const h = (u) => { if(u && typeof u==='string' && u.includes('.m3u8')) Android.onM3U8(u); };
+                    window.fetch = new Proxy(window.fetch, {apply:(t,a,args)=>{h(args[0]);return t.apply(this,args)}});
+                    const xo = XMLHttpRequest.prototype.open; XMLHttpRequest.prototype.open=function(m,u){h(u);return xo.apply(this,arguments)};
+                    Object.defineProperty(HTMLVideoElement.prototype,'src',{set(v){h(v);return v}});
+                    setTimeout(()=>{document.querySelectorAll('video,source').forEach(v=>{if(v.src)h(v.src);v.play();});},2000);
+                    new MutationObserver(m=>m.forEach(r=>r.addedNodes.forEach(n=>{if(n.src)h(n.src)}))).observe(document.body,{childList:true,subtree:true});
                 })();
             """.trimIndent(), null)
 
-            withContext(Dispatchers.IO) { try { latch.await(40, TimeUnit.SECONDS) } catch (e: Exception) {} }
+            withContext(Dispatchers.IO) { try { latch.await(45, TimeUnit.SECONDS) } catch (e: Exception) {} }
             wv.post { wv.destroy() }
             videoUrl
         }
@@ -114,7 +110,7 @@ class HeoVLProvider : MainAPI() {
         if (!iframeUrl.isNullOrBlank()) {
             val link = sniffVideoOnly(fixUrl(iframeUrl))
             if (link != null) {
-                callback(newExtractorLink("HeoVL VIP", "Server VIP (Ultra v2)", link, ExtractorLinkType.M3U8) {
+                callback(newExtractorLink("HeoVL VIP", "Server VIP (Hacker Mode)", link, ExtractorLinkType.M3U8) {
                     this.referer = fixUrl(iframeUrl)
                     this.quality = Qualities.P1080.value
                 })

@@ -22,6 +22,12 @@ class HeoVLProvider : MainAPI() {
     override val hasMainPage = true
     override val supportedTypes = setOf(TvType.NSFW)
 
+    override val mainPage = mainPageOf(
+        "/" to "Trang Chủ", "/categories/moi/" to "Mới",
+        "/categories/viet-nam/" to "Việt Nam", "/categories/han-quoc/" to "Hàn Quốc",
+        "/categories/nhat-ban/" to "Nhật Bản", "/categories/trung-quoc/" to "Trung Quốc"
+    )
+
     private val UA = "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Mobile Safari/537.36"
 
     private fun fixUrl(url: String): String {
@@ -61,19 +67,11 @@ class HeoVLProvider : MainAPI() {
             val ctx = try { AcraApplication.context } catch (e: Exception) { null } ?: return@withContext null
 
             val wv = WebView(ctx)
-            wv.settings.apply {
-                javaScriptEnabled = true
-                domStorageEnabled = true
-                userAgentString = UA
-            }
+            wv.settings.apply { javaScriptEnabled = true; domStorageEnabled = true; userAgentString = UA }
 
             wv.addJavascriptInterface(object {
-                @JavascriptInterface
-                fun onM3U8(url: String) {
-                    if (videoUrl == null) {
-                        videoUrl = url
-                        latch.countDown()
-                    }
+                @JavascriptInterface fun onM3U8(url: String) {
+                    if (videoUrl == null) { videoUrl = url; latch.countDown() }
                 }
             }, "Android")
 
@@ -81,10 +79,7 @@ class HeoVLProvider : MainAPI() {
                 override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                     val url = request.url.toString()
                     if (url.contains(".m3u8") && !url.contains("vast") && !url.contains("ads")) {
-                        if (videoUrl == null) {
-                            videoUrl = url
-                            latch.countDown()
-                        }
+                        if (videoUrl == null) { videoUrl = url; latch.countDown() }
                     }
                     return super.shouldInterceptRequest(view, request)
                 }
@@ -92,27 +87,20 @@ class HeoVLProvider : MainAPI() {
 
             wv.loadUrl(iframeUrl, mapOf("Referer" to "$mainUrl/"))
 
-            // JS hook siêu mạnh
             wv.evaluateJavascript("""
                 (function(){
-                    const origFetch = window.fetch;
-                    window.fetch = async function(...a){ 
-                        if(typeof a[0]==='string' && a[0].includes('.m3u8')) Android.onM3U8(a[0]);
-                        return origFetch(...a);
-                    };
-                    const origOpen = XMLHttpRequest.prototype.open;
-                    XMLHttpRequest.prototype.open = function(m,u){ 
-                        if(typeof u==='string' && u.includes('.m3u8')) Android.onM3U8(u);
-                        return origOpen.apply(this,arguments);
-                    };
-                    setTimeout(()=>{ 
-                        const v=document.querySelector('video'); 
-                        if(v&&v.src&&v.src.includes('.m3u8')) Android.onM3U8(v.src); 
-                    },5000);
+                    const h = (u) => { if(u.includes('.m3u8')) Android.onM3U8(u); };
+                    window.fetch = new Proxy(window.fetch, { apply: (t,a,args) => { if(args[0]&&typeof args[0]==='string') h(args[0]); return t.apply(this,args); } });
+                    const xo = XMLHttpRequest.prototype.open; XMLHttpRequest.prototype.open = function(m,u) { h(u); return xo.apply(this,arguments); };
+                    setTimeout(() => {
+                        document.querySelectorAll('video, source').forEach(v => { if(v.src) h(v.src); v.play(); });
+                        const mo = new MutationObserver(m => m.forEach(r => r.addedNodes.forEach(n => { if(n.src) h(n.src); }))); 
+                        mo.observe(document.body, { childList:true, subtree:true });
+                    }, 3000);
                 })();
             """.trimIndent(), null)
 
-            withContext(Dispatchers.IO) { try { latch.await(30, TimeUnit.SECONDS) } catch (e: Exception) {} }
+            withContext(Dispatchers.IO) { try { latch.await(40, TimeUnit.SECONDS) } catch (e: Exception) {} }
             wv.post { wv.destroy() }
             videoUrl
         }
@@ -120,13 +108,13 @@ class HeoVLProvider : MainAPI() {
 
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         val html = app.get(data, headers = mapOf("User-Agent" to UA)).text
-        val iframeUrl = Regex("""src=["'](https?://[^"']*(?:streamqq|trivonix|spexliu)[^"']*)["']""", RegexOption.IGNORE_CASE).find(html)?.groupValues?.get(1)
+        val iframeUrl = Regex("""src=["'](https?://[^"']*(?:streamqq|trivonix|spexliu|p1\.spexliu)[^"']*)["']""", RegexOption.IGNORE_CASE).find(html)?.groupValues?.get(1)
             ?: org.jsoup.Jsoup.parse(html).selectFirst("iframe")?.attr("src")
 
         if (!iframeUrl.isNullOrBlank()) {
             val link = sniffVideoOnly(fixUrl(iframeUrl))
             if (link != null) {
-                callback(newExtractorLink("HeoVL VIP", "Server VIP (Ultra)", link, ExtractorLinkType.M3U8) {
+                callback(newExtractorLink("HeoVL VIP", "Server VIP (Ultra v2)", link, ExtractorLinkType.M3U8) {
                     this.referer = fixUrl(iframeUrl)
                     this.quality = Qualities.P1080.value
                 })

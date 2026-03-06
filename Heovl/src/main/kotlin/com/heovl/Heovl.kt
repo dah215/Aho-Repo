@@ -67,16 +67,14 @@ class HeoVLProvider : MainAPI() {
             val wv = WebView(ctx)
             wv.settings.apply {
                 javaScriptEnabled = true
-                userAgentString = UA
                 domStorageEnabled = true
+                userAgentString = UA
             }
 
             wv.webViewClient = object : WebViewClient() {
                 override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                     val url = request.url.toString()
-                    if (url.contains(".m3u8") &&
-                        !url.contains(Regex("\\.(jpg|png|gif|jpeg|webp)$")) &&
-                        !url.contains("ads") && !url.contains("vast") && !url.contains("analytics")) {
+                    if (url.contains(".m3u8") && !url.contains("vast") && !url.contains("ads")) {
                         if (videoUrl == null) {
                             videoUrl = url
                             latch.countDown()
@@ -86,7 +84,7 @@ class HeoVLProvider : MainAPI() {
                 }
             }
             wv.loadUrl(iframeUrl, mapOf("Referer" to "$mainUrl/"))
-            withContext(Dispatchers.IO) { try { latch.await(15, TimeUnit.SECONDS) } catch (e: Exception) {} }
+            withContext(Dispatchers.IO) { try { latch.await(25, TimeUnit.SECONDS) } catch (e: Exception) {} }
             wv.post { wv.destroy() }
             videoUrl
         }
@@ -94,7 +92,7 @@ class HeoVLProvider : MainAPI() {
 
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         val html = app.get(data, headers = mapOf("User-Agent" to UA)).text
-        val iframeUrl = Regex("""src=["'](https?://[^"']*(?:streamqq|spexliu|flimora|embed|player|vid|dood|tape)[^"']*)["']""").find(html)?.groupValues?.get(1)
+        val iframeUrl = Regex("""src=["'](https?://[^"']*(?:streamqq|trivonix|spexliu)[^"']*)["']""", RegexOption.IGNORE_CASE).find(html)?.groupValues?.get(1)
             ?: org.jsoup.Jsoup.parse(html).selectFirst("iframe")?.attr("src")
 
         if (!iframeUrl.isNullOrBlank()) {

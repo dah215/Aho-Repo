@@ -9,7 +9,6 @@ import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.*
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.ConcurrentHashMap
 
 @CloudstreamPlugin
 class HeoVLPlugin : Plugin() {
@@ -25,9 +24,17 @@ class HeoVLProvider : MainAPI() {
     override val hasMainPage = true
     override val supportedTypes = setOf(TvType.NSFW)
 
-    private val UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+    private val UA = "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Mobile Safari/537.36"
 
-    // --- PHẦN GIAO DIỆN (GIỮ NGUYÊN) ---
+    private fun fixUrl(url: String): String {
+        if (url.isBlank()) return ""
+        var cleanUrl = url.trim().replace("\\/", "/")
+        if (cleanUrl.startsWith("http")) return cleanUrl
+        if (cleanUrl.startsWith("//")) return "https:$cleanUrl"
+        val base = mainUrl.removeSuffix("/")
+        return if (cleanUrl.startsWith("/")) "$base$cleanUrl" else "$base/$cleanUrl"
+    }
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page == 1) "$mainUrl${request.data}" else if (request.data == "/") "$mainUrl/?page=$page" else "$mainUrl${request.data}?page=$page"
         val doc = app.get(url, headers = mapOf("User-Agent" to UA)).document
@@ -50,8 +57,6 @@ class HeoVLProvider : MainAPI() {
         }
     }
 
-    // --- PHẦN XỬ LÝ VIDEO: FILTERED SNIFFER ---
-
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun sniffVideoOnly(iframeUrl: String): String? {
         return withContext(Dispatchers.Main) {
@@ -63,20 +68,15 @@ class HeoVLProvider : MainAPI() {
             wv.settings.apply {
                 javaScriptEnabled = true
                 userAgentString = UA
+                domStorageEnabled = true
             }
 
             wv.webViewClient = object : WebViewClient() {
                 override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                     val url = request.url.toString()
-                    
-                    // BỘ LỌC DỨT KHOÁT:
-                    // 1. Phải chứa elifros hoặc m3u8
-                    // 2. KHÔNG ĐƯỢC chứa .jpg, .png, .gif (Loại bỏ ảnh)
-                    // 3. KHÔNG ĐƯỢC chứa 'ads', 'vast' (Loại bỏ quảng cáo)
-                    if ((url.contains("elifros") || url.contains(".m3u8")) && 
-                        !url.contains(Regex("\\.(jpg|png|gif|jpeg)$")) && 
-                        !url.contains("ads") && !url.contains("vast")) {
-                        
+                    if (url.contains(".m3u8") &&
+                        !url.contains(Regex("\\.(jpg|png|gif|jpeg|webp)$")) &&
+                        !url.contains("ads") && !url.contains("vast") && !url.contains("analytics")) {
                         if (videoUrl == null) {
                             videoUrl = url
                             latch.countDown()
@@ -86,7 +86,7 @@ class HeoVLProvider : MainAPI() {
                 }
             }
             wv.loadUrl(iframeUrl, mapOf("Referer" to "$mainUrl/"))
-            withContext(Dispatchers.IO) { try { latch.await(20, TimeUnit.SECONDS) } catch (e: Exception) {} }
+            withContext(Dispatchers.IO) { try { latch.await(15, TimeUnit.SECONDS) } catch (e: Exception) {} }
             wv.post { wv.destroy() }
             videoUrl
         }
@@ -94,8 +94,8 @@ class HeoVLProvider : MainAPI() {
 
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         val html = app.get(data, headers = mapOf("User-Agent" to UA)).text
-        val iframeUrl = Regex("""src=["'](https?://[^"']*(?:streamqq|spexliu|flimora)[^"']*)["']""").find(html)?.groupValues?.get(1)
-            ?: org.jsoup.Jsoup.parse(html).select("iframe").attr("src")
+        val iframeUrl = Regex("""src=["'](https?://[^"']*(?:streamqq|spexliu|flimora|embed|player|vid|dood|tape)[^"']*)["']""").find(html)?.groupValues?.get(1)
+            ?: org.jsoup.Jsoup.parse(html).selectFirst("iframe")?.attr("src")
 
         if (!iframeUrl.isNullOrBlank()) {
             val link = sniffVideoOnly(fixUrl(iframeUrl))
@@ -107,14 +107,5 @@ class HeoVLProvider : MainAPI() {
             }
         }
         return true
-    }
-    
-    private fun fixUrl(url: String): String {
-        if (url.isBlank()) return ""
-        var cleanUrl = url.trim().replace("\\/", "/")
-        if (cleanUrl.startsWith("http")) return cleanUrl
-        if (cleanUrl.startsWith("//")) return "https:$cleanUrl"
-        val base = mainUrl.removeSuffix("/")
-        return if (cleanUrl.startsWith("/")) "$base$cleanUrl" else "$base/$cleanUrl"
     }
 }

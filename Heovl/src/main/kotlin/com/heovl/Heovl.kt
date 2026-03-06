@@ -12,9 +12,7 @@ import java.util.concurrent.TimeUnit
 
 @CloudstreamPlugin
 class HeoVLPlugin : Plugin() {
-    override fun load() {
-        registerMainAPI(HeoVLProvider())
-    }
+    override fun load() { registerMainAPI(HeoVLProvider()) }
 }
 
 class HeoVLProvider : MainAPI() {
@@ -52,9 +50,7 @@ class HeoVLProvider : MainAPI() {
         val doc = app.get(url, headers = mapOf("User-Agent" to UA)).document
         val title = doc.selectFirst("h1")?.text()?.trim() ?: "HeoVL Video"
         val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
-        return newMovieLoadResponse(title, url, TvType.NSFW, url) {
-            this.posterUrl = poster
-        }
+        return newMovieLoadResponse(title, url, TvType.NSFW, url) { this.posterUrl = poster }
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -71,6 +67,16 @@ class HeoVLProvider : MainAPI() {
                 userAgentString = UA
             }
 
+            wv.addJavascriptInterface(object {
+                @JavascriptInterface
+                fun onM3U8(url: String) {
+                    if (videoUrl == null) {
+                        videoUrl = url
+                        latch.countDown()
+                    }
+                }
+            }, "Android")
+
             wv.webViewClient = object : WebViewClient() {
                 override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                     val url = request.url.toString()
@@ -83,8 +89,30 @@ class HeoVLProvider : MainAPI() {
                     return super.shouldInterceptRequest(view, request)
                 }
             }
+
             wv.loadUrl(iframeUrl, mapOf("Referer" to "$mainUrl/"))
-            withContext(Dispatchers.IO) { try { latch.await(25, TimeUnit.SECONDS) } catch (e: Exception) {} }
+
+            // JS hook siêu mạnh
+            wv.evaluateJavascript("""
+                (function(){
+                    const origFetch = window.fetch;
+                    window.fetch = async function(...a){ 
+                        if(typeof a[0]==='string' && a[0].includes('.m3u8')) Android.onM3U8(a[0]);
+                        return origFetch(...a);
+                    };
+                    const origOpen = XMLHttpRequest.prototype.open;
+                    XMLHttpRequest.prototype.open = function(m,u){ 
+                        if(typeof u==='string' && u.includes('.m3u8')) Android.onM3U8(u);
+                        return origOpen.apply(this,arguments);
+                    };
+                    setTimeout(()=>{ 
+                        const v=document.querySelector('video'); 
+                        if(v&&v.src&&v.src.includes('.m3u8')) Android.onM3U8(v.src); 
+                    },5000);
+                })();
+            """.trimIndent(), null)
+
+            withContext(Dispatchers.IO) { try { latch.await(30, TimeUnit.SECONDS) } catch (e: Exception) {} }
             wv.post { wv.destroy() }
             videoUrl
         }
@@ -98,7 +126,7 @@ class HeoVLProvider : MainAPI() {
         if (!iframeUrl.isNullOrBlank()) {
             val link = sniffVideoOnly(fixUrl(iframeUrl))
             if (link != null) {
-                callback(newExtractorLink("HeoVL VIP", "Server VIP (Clean)", link, ExtractorLinkType.M3U8) {
+                callback(newExtractorLink("HeoVL VIP", "Server VIP (Ultra)", link, ExtractorLinkType.M3U8) {
                     this.referer = fixUrl(iframeUrl)
                     this.quality = Qualities.P1080.value
                 })

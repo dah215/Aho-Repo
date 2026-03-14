@@ -1,18 +1,9 @@
-// HeoVL Plugin - Copy file này vào thư mục src/main/java/com/heovl/ trong project CloudStream-Plugins
-
 package com.heovl
 
-import android.annotation.SuppressLint
-import android.webkit.*
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.AcraApplication
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
-import kotlinx.coroutines.*
-import org.jsoup.Jsoup
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
 
 @CloudstreamPlugin
 class HeoVLPlugin : Plugin() {
@@ -28,7 +19,10 @@ class HeoVLProvider : MainAPI() {
     override val hasMainPage = true
     override val supportedTypes = setOf(TvType.NSFW)
 
-    private val UA = "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Mobile Safari/537.36"
+    private val headers = mapOf(
+        "User-Agent" to "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Mobile Safari/537.36",
+        "Referer" to "$mainUrl/"
+    )
 
     override val mainPage = mainPageOf(
         "/" to "Trang Chủ",
@@ -36,65 +30,51 @@ class HeoVLProvider : MainAPI() {
         "/categories/viet-nam/" to "Việt Nam",
         "/categories/han-quoc/" to "Hàn Quốc",
         "/categories/nhat-ban/" to "Nhật Bản",
-        "/categories/trung-quoc/" to "Trung Quốc",
-        "/categories/au-my/" to "Âu Mỹ",
-        "/categories/jav/" to "JAV"
+        "/categories/trung-quoc/" to "Trung Quốc"
     )
 
-    private fun fixUrl(url: String, base: String = mainUrl): String {
+    private fun fixUrl(url: String): String {
         if (url.isBlank()) return ""
         var cleanUrl = url.trim().replace("\\/", "/")
         if (cleanUrl.startsWith("http")) return cleanUrl
         if (cleanUrl.startsWith("//")) return "https:$cleanUrl"
-        val baseUrl = base.removeSuffix("/")
-        return if (cleanUrl.startsWith("/")) "$baseUrl$cleanUrl" else "$baseUrl/$cleanUrl"
-    }
-
-    private fun buildHeaders(referer: String? = null): Map<String, String> {
-        val headers = mutableMapOf("User-Agent" to UA, "Accept" to "*/*")
-        referer?.let { headers["Referer"] = it }
-        return headers
+        val base = mainUrl.removeSuffix("/")
+        return if (cleanUrl.startsWith("/")) "$base$cleanUrl" else "$base/$cleanUrl"
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        return try {
-            val url = if (page == 1) "$mainUrl${request.data}" 
-                      else "$mainUrl${request.data}?page=$page".replace("//?", "/?")
-            val doc = app.get(url, headers = buildHeaders()).document
-
-            val items = doc.select("div.video-box").mapNotNull { el ->
-                val linkEl = el.selectFirst("a.video-box__thumbnail__link") ?: return@mapNotNull null
-                val href = fixUrl(linkEl.attr("href"))
-                val title = linkEl.attr("title").ifBlank { el.selectFirst("h3")?.text() }?.trim() ?: return@mapNotNull null
-                val poster = el.selectFirst("img")?.attr("abs:src").ifBlank { el.selectFirst("img")?.attr("data-src") }
-                newMovieSearchResponse(title, href, TvType.NSFW) { this.posterUrl = poster }
+        val url = "$mainUrl${request.data}${if (page > 1) "?page=$page" else ""}"
+        val doc = app.get(url, headers = headers).document
+        val items = doc.select("div.video-box").mapNotNull { el ->
+            val linkEl = el.selectFirst("a.video-box__thumbnail__link") ?: return@mapNotNull null
+            val href = fixUrl(linkEl.attr("href"))
+            val title = linkEl.attr("title").ifBlank { el.selectFirst("h3")?.text() ?: "" }
+            newMovieSearchResponse(title.trim(), href, TvType.NSFW) {
+                this.posterUrl = el.selectFirst("img")?.attr("abs:src")
             }
-            val hasNext = items.isNotEmpty() && doc.select("a.pagination__link--next, a.next, li.next a").isNotEmpty()
-            newHomePageResponse(request.name, items, hasNext)
-        } catch (e: Exception) {
-            newHomePageResponse(request.name, emptyList(), false)
         }
+        return newHomePageResponse(request.name, items, true)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        return try {
-            val url = "$mainUrl/search/${java.net.URLEncoder.encode(query, "UTF-8")}/"
-            val doc = app.get(url, headers = buildHeaders()).document
-            doc.select("div.video-box").mapNotNull { el ->
-                val linkEl = el.selectFirst("a.video-box__thumbnail__link") ?: return@mapNotNull null
-                val href = fixUrl(linkEl.attr("href"))
-                val title = linkEl.attr("title").ifBlank { el.selectFirst("h3")?.text() }?.trim() ?: return@mapNotNull null
-                val poster = el.selectFirst("img")?.attr("abs:src")
-                newMovieSearchResponse(title, href, TvType.NSFW) { this.posterUrl = poster }
+        val url = "$mainUrl/search/${java.net.URLEncoder.encode(query, "UTF-8")}/"
+        val doc = app.get(url, headers = headers).document
+        return doc.select("div.video-box").mapNotNull { el ->
+            val linkEl = el.selectFirst("a.video-box__thumbnail__link") ?: return@mapNotNull null
+            newMovieSearchResponse(linkEl.attr("title"), fixUrl(linkEl.attr("href")), TvType.NSFW) {
+                this.posterUrl = el.selectFirst("img")?.attr("abs:src")
             }
-        } catch (e: Exception) { emptyList() }
+        }
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val doc = app.get(url, headers = buildHeaders()).document
-        val title = doc.selectFirst("h1")?.text()?.trim() ?: "HeoVL Video"
+        val doc = app.get(url, headers = headers).document
+        val title = doc.selectFirst("h1")?.text()?.trim() ?: "Untitled"
         val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
-        return newMovieLoadResponse(title, url, TvType.NSFW, url) { this.posterUrl = poster }
+
+        return newMovieLoadResponse(title, url, TvType.NSFW, url) {
+            this.posterUrl = poster
+        }
     }
 
     override suspend fun loadLinks(
@@ -103,135 +83,84 @@ class HeoVLProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        return try {
-            val html = app.get(data, headers = buildHeaders()).text
-            var foundLinks = false
+        val res = app.get(data, headers = headers)
+        val doc = res.document
+        val html = res.text
 
-            // Extract iframe URLs
-            val iframeUrls = mutableListOf<String>()
-            val patterns = listOf(
-                """src=["'](https?://p1\.spexliu\.top[^"']*)["']""",
-                """src=["'](https?://[^"']*(?:spexliu|streamqq|trivonix)[^"']*)["']""",
-                """<iframe[^>]+src=["']([^"']+)["']"""
-            )
-            for (pattern in patterns) {
-                Regex(pattern, RegexOption.IGNORE_CASE).findAll(html).forEach {
-                    val url = it.groupValues[1].replace("\\/", "/")
-                    if (url.isNotBlank() && !iframeUrls.contains(url)) iframeUrls.add(url)
-                }
-            }
-            if (iframeUrls.isEmpty()) {
-                Jsoup.parse(html).select("iframe").forEach {
-                    val src = it.attr("src").ifBlank { it.attr("data-src") }
-                    if (src.isNotBlank() && !iframeUrls.contains(src)) iframeUrls.add(src)
-                }
-            }
+        val potentialUrls = mutableSetOf<String>()
 
-            for (iframeUrl in iframeUrls) {
-                val fullIframe = fixUrl(iframeUrl)
-                val iframeHtml = app.get(fullIframe, headers = buildHeaders(data)).text
-
-                // M3U8 patterns
-                val m3u8Patterns = listOf(
-                    """(https?://p1\.spexliu\.top/videos/[a-zA-Z0-9]+/master\.m3u8\?[^"'\s]*)""",
-                    """(https?://p1\.spexliu\.top/videos/[a-zA-Z0-9]+/master\.m3u8)""",
-                    """["'](/videos/[a-zA-Z0-9]+/master\.m3u8\?[^"']*)["']""",
-                    """["'](/videos/[a-zA-Z0-9]+/master\.m3u8)["']""",
-                    """(https?://[^"'\s]+?/videos/[a-zA-Z0-9]+/master\.m3u8[^"'\s]*)""",
-                    """(https?://[^"'\s]+?\.m3u8[^"'\s]*)"""
-                )
-
-                for (pattern in m3u8Patterns) {
-                    val match = Regex(pattern, RegexOption.IGNORE_CASE).find(iframeHtml)
-                    if (match != null) {
-                        var m3u8Url = match.groupValues[1].replace("\\/", "/")
-                        if (m3u8Url.startsWith("/videos/")) {
-                            m3u8Url = "https://p1.spexliu.top$m3u8Url"
-                        }
-                        callback(
-                            newExtractorLink("HeoVL", "Server VIP", m3u8Url, ExtractorLinkType.M3U8) {
-                                referer = "https://p1.spexliu.top/"
-                                quality = Qualities.P1080.value
-                            }
-                        )
-                        foundLinks = true
-                        break
-                    }
-                }
-                if (foundLinks) break
-            }
-
-            // Fallback: WebView sniffing
-            if (!foundLinks && iframeUrls.isNotEmpty()) {
-                val sniffed = sniffVideoUrl(fixUrl(iframeUrls.first()), data)
-                if (sniffed != null) {
-                    callback(
-                        newExtractorLink("HeoVL", "Server WebView", sniffed, ExtractorLinkType.M3U8) {
-                            referer = "https://p1.spexliu.top/"
-                            quality = Qualities.P1080.value
-                        }
-                    )
-                    foundLinks = true
-                }
-            }
-
-            foundLinks
-        } catch (e: Exception) { false }
-    }
-
-    @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun sniffVideoUrl(iframeUrl: String, referer: String): String? {
-        return withContext(Dispatchers.Main) {
-            val latch = CountDownLatch(1)
-            var videoUrl: String? = null
-            val ctx = AcraApplication.context ?: return@withContext null
-
-            val wv = WebView(ctx)
-            try {
-                wv.settings.apply {
-                    javaScriptEnabled = true
-                    domStorageEnabled = true
-                    userAgentString = UA
-                    mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                }
-
-                wv.addJavascriptInterface(object {
-                    @JavascriptInterface
-                    fun send(url: String) {
-                        if (videoUrl == null && url.contains("master.m3u8") && !url.contains("vast")) {
-                            videoUrl = url
-                            latch.countDown()
-                        }
-                    }
-                }, "Android")
-
-                wv.webViewClient = object : WebViewClient() {
-                    override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
-                        request?.url?.toString()?.let { url ->
-                            if (url.contains("master.m3u8") && !url.contains("vast") && videoUrl == null) {
-                                videoUrl = url
-                                latch.countDown()
-                            }
-                        }
-                        return super.shouldInterceptRequest(view, request)
-                    }
-                    override fun onPageFinished(view: WebView?, url: String?) {
-                        wv.evaluateJavascript("""
-                            (function(){
-                                const h=u=>{if(u&&u.includes('master.m3u8'))Android.send(u)};
-                                if(window.fetch){const _f=window.fetch;window.fetch=function(){if(arguments[0])h(arguments[0]);return _f.apply(this,arguments)}}
-                                const _o=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){h(u);return _o.apply(this,arguments)};
-                                setTimeout(()=>{document.querySelectorAll('video').forEach(v=>{if(v.src)h(v.src);try{v.play()}catch(e){}})},2000);
-                            })();
-                        """.trimIndent(), null)
-                    }
-                }
-
-                wv.loadUrl(iframeUrl, mapOf("Referer" to referer))
-                withContext(Dispatchers.IO) { latch.await(45, TimeUnit.SECONDS) }
-                videoUrl
-            } catch (e: Exception) { null }
-            finally { wv.post { wv.destroy() } }
+        // Find all iframe sources
+        doc.select("iframe").forEach { iframe ->
+            val src = iframe.attr("src").ifBlank { iframe.attr("data-src") }
+            if (src.isNotBlank()) potentialUrls.add(src)
         }
+
+        // Find URLs in attributes
+        doc.allElements.forEach { el ->
+            el.attributes().forEach { attr ->
+                val value = attr.value
+                if (value.contains("spexliu") || value.contains(".m3u8") || value.contains("iframe")) {
+                    potentialUrls.add(value)
+                }
+            }
+        }
+
+        // Find URLs in HTML via regex
+        Regex("""https?://[^\s"'<>]+""").findAll(html).forEach { 
+            potentialUrls.add(it.value) 
+        }
+
+        potentialUrls.filter { it.isNotBlank() }.distinct().forEach { rawUrl ->
+            val fullUrl = fixUrl(rawUrl)
+
+            // Direct m3u8 link
+            if (fullUrl.contains("master.m3u8")) {
+                callback(
+                    newExtractorLink(name, "Server VIP", fullUrl, type = ExtractorLinkType.M3U8) {
+                        this.referer = "https://p1.spexliu.top/"
+                        this.quality = Qualities.P1080.value
+                    }
+                )
+            }
+
+            // Iframe - fetch and extract m3u8
+            else if (fullUrl.contains("spexliu") || fullUrl.contains("streamqq") || fullUrl.contains("trivonix")) {
+                try {
+                    val iframeRes = app.get(fullUrl, headers = mapOf(
+                        "User-Agent" to "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36",
+                        "Referer" to data
+                    ))
+                    val iframeHtml = iframeRes.text
+
+                    // Find m3u8 in iframe HTML
+                    val m3u8Patterns = listOf(
+                        """(https://p1\.spexliu\.top/videos/[a-zA-Z0-9]+/master\.m3u8[^"'\s]*)""",
+                        """(/videos/[a-zA-Z0-9]+/master\.m3u8[^"'\s]*)""",
+                        """(https://[^\s"']+master\.m3u8[^\s"']*)"""
+                    )
+
+                    for (pattern in m3u8Patterns) {
+                        val match = Regex(pattern).find(iframeHtml)
+                        if (match != null) {
+                            var m3u8Url = match.groupValues[1].replace("\\/", "/")
+                            if (m3u8Url.startsWith("/videos/")) {
+                                m3u8Url = "https://p1.spexliu.top$m3u8Url"
+                            }
+                            callback(
+                                newExtractorLink(name, "Server VIP", m3u8Url, type = ExtractorLinkType.M3U8) {
+                                    this.referer = "https://p1.spexliu.top/"
+                                    this.quality = Qualities.P1080.value
+                                }
+                            )
+                            break
+                        }
+                    }
+                } catch (e: Exception) {
+                    // Skip failed iframe
+                }
+            }
+        }
+
+        return true
     }
 }

@@ -13,7 +13,7 @@ buildscript {
 
     dependencies {
         classpath("com.android.tools.build:gradle:8.13.2")
-        classpath("com.github.recloudstream:gradle:68db7215ec")
+        classpath("com.github.recloudstream:gradle:68db7215ecbb4c2bdd0ea3d4378cbb7771c0a076")
         classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.3.0")
     }
 }
@@ -23,6 +23,9 @@ allprojects {
         google()
         mavenCentral()
         maven("https://jitpack.io")
+    }
+    configurations.all {
+        resolutionStrategy.cacheChangingModulesFor(0, java.util.concurrent.TimeUnit.SECONDS)
     }
 }
 
@@ -47,14 +50,12 @@ subprojects {
             minSdk = 21
             compileSdkVersion(35)
             targetSdk = 35
-
         }
 
         compileOptions {
             sourceCompatibility = JavaVersion.VERSION_1_8
             targetCompatibility = JavaVersion.VERSION_1_8
         }
-
 
         tasks.withType<KotlinJvmCompile> {
             compilerOptions {
@@ -73,7 +74,6 @@ subprojects {
         val cloudstream by configurations
         cloudstream("com.lagradost:cloudstream3:pre-release")
 
-        // Other dependencies
         implementation(kotlin("stdlib"))
         implementation("com.github.Blatzar:NiceHttp:0.4.16")
         implementation("org.jsoup:jsoup:1.22.1")

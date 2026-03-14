@@ -28,14 +28,13 @@ class HeoVLProvider : MainAPI() {
 
     override val mainPage = mainPageOf(
         "/" to "Trang Chủ",
-        "/categories/moi/" to "Mới Cập Nhật",
         "/categories/vietsub/" to "VietSub",
         "/categories/hoat-hinh-hentai/" to "Hentai",
-        "/actresses/minami-aizawa/" to "Minami-Aizawa",
-        "/actresses/tsumugi-akari/" to "Tsumugi-Akari",
-        "actresses/riri-nanatsumori/" to "Riri-Nanatsumori",
-        "actresses/miu-shiromine/" to "Miu-Shiromine",
-        "actresses/kanako-ioka/" to "Kanako-Ioka"
+        "/actresses/minami-aizawa/" to "Minami Aizawa",
+        "/actresses/tsumugi-akari/" to "Tsumugi Akari",
+        "/actresses/riri-nanatsumori/" to "Riri Nanatsumori",
+        "/actresses/miu-shiromine/" to "Miu Shiromine",
+        "/actresses/kanako-ioka/" to "Kanako Ioka"
     )
 
     private fun fixUrl(url: String): String {

@@ -100,8 +100,7 @@ class HeoVLProvider : MainAPI() {
             """src=["'](https?://e\.streamqq\.com[^"']*)["']""",
             """src=["'](https?://[^"']*streamqq[^"']*)["']""",
             """src=["'](https?://p1\.spexliu\.top[^"']*)["']""",
-            """src=["'](https?://[^"']*spexliu[^"']*)["']""",
-            """src=["'](https?://[^"']*trivonix[^"']*)["']"""
+            """src=["'](https?://[^"']*spexliu[^"']*)["']"""
         )
 
         for (pattern in iframePatterns) {
@@ -116,8 +115,12 @@ class HeoVLProvider : MainAPI() {
 
         if (iframeUrl == null) return false
 
-        // WebView sniffing với auto skip ads
-        val sniffedM3u8 = sniffM3u8WithSkipAds(iframeUrl, data)
+        // Extract video ID
+        val videoIdMatch = Regex("""/videos/([a-zA-Z0-9]+)/play""").find(iframeUrl)
+        val videoId = videoIdMatch?.groupValues?.get(1)
+
+        // WebView sniffing với selector chính xác
+        val sniffedM3u8 = sniffM3u8(iframeUrl, data)
         if (sniffedM3u8 != null) {
             callback(
                 newExtractorLink(name, "Server VIP", sniffedM3u8, type = ExtractorLinkType.M3U8) {
@@ -132,11 +135,11 @@ class HeoVLProvider : MainAPI() {
     }
 
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun sniffM3u8WithSkipAds(iframeUrl: String, referer: String): String? {
+    private suspend fun sniffM3u8(iframeUrl: String, referer: String): String? {
         return withContext(Dispatchers.Main) {
             val latch = CountDownLatch(1)
             var videoUrl: String? = null
-            var isAdPlaying = false
+            var adVideoUrl: String? = null  // Lưu URL quảng cáo để loại bỏ
 
             val ctx = AcraApplication.context ?: return@withContext null
 
@@ -148,43 +151,39 @@ class HeoVLProvider : MainAPI() {
                     mediaPlaybackRequiresUserGesture = false
                     userAgentString = UA
                     mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                    blockNetworkImage = true
                 }
 
                 wv.addJavascriptInterface(object {
                     @JavascriptInterface
-                    fun send(url: String) {
-                        // Chỉ lấy m3u8 KHÔNG phải quảng cáo
-                        if (videoUrl == null && url.contains("master.m3u8")) {
-                            val lower = url.lowercase()
-                            // Bỏ qua quảng cáo
-                            if (!lower.contains("vast") && 
-                                !lower.contains("/ad/") && 
-                                !lower.contains("adtag") &&
-                                !lower.contains("adservice") &&
-                                !lower.contains("advertisement")) {
+                    fun send(url: String, isAd: Boolean) {
+                        if (isAd) {
+                            // Đây là quảng cáo, lưu lại để bỏ qua
+                            if (adVideoUrl == null) adVideoUrl = url
+                        } else if (videoUrl == null && url.contains("master.m3u8")) {
+                            // Lấy URL video chính (khác với quảng cáo)
+                            if (adVideoUrl == null || url != adVideoUrl) {
                                 videoUrl = url
                                 latch.countDown()
                             }
                         }
-                    }
-                    
-                    @JavascriptInterface
-                    fun log(msg: String) {
-                        android.util.Log.d("HeoVL", msg)
                     }
                 }, "Android")
 
                 wv.webViewClient = object : WebViewClient() {
                     override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                         request?.url?.toString()?.let { url ->
-                            if (url.contains("master.m3u8")) {
-                                val lower = url.lowercase()
-                                if (!lower.contains("vast") && 
-                                    !lower.contains("/ad/") && 
-                                    !lower.contains("adtag") &&
-                                    !lower.contains("adservice") &&
-                                    videoUrl == null) {
+                            // Bỏ qua vast/ad
+                            if (url.contains("vast") || url.contains("adtag")) {
+                                return super.shouldInterceptRequest(view, request)
+                            }
+                            
+                            // Capture m3u8
+                            if (url.contains("master.m3u8") && videoUrl == null) {
+                                if (adVideoUrl == null) {
+                                    // Đây có thể là quảng cáo (m3u8 đầu tiên)
+                                    adVideoUrl = url
+                                } else if (url != adVideoUrl) {
+                                    // Đây là video chính
                                     videoUrl = url
                                     latch.countDown()
                                 }
@@ -194,120 +193,104 @@ class HeoVLProvider : MainAPI() {
                     }
 
                     override fun onPageFinished(view: WebView?, url: String?) {
-                        // JavaScript: Click Play → Đợi 5s → Click Skip → Lấy m3u8
                         wv.evaluateJavascript("""
                             (function() {
-                                var h = function(u) {
+                                var capturedUrls = [];
+                                var adCaptured = false;
+                                
+                                var h = function(u, isAd) {
                                     if(u && u.includes('master.m3u8')) {
-                                        Android.send(u);
+                                        Android.send(u, isAd || false);
                                     }
                                 };
                                 
-                                // Intercept requests
+                                // Intercept fetch
                                 if(window.fetch) {
                                     var _f = window.fetch;
                                     window.fetch = function() {
-                                        if(arguments[0]) h(arguments[0]);
+                                        var url = arguments[0];
+                                        if(url && url.includes('master.m3u8')) {
+                                            h(url, !adCaptured);
+                                            if(!adCaptured) adCaptured = true;
+                                        }
                                         return _f.apply(this, arguments);
                                     };
                                 }
                                 
+                                // Intercept XHR
                                 var _o = XMLHttpRequest.prototype.open;
                                 XMLHttpRequest.prototype.open = function(m, u) {
-                                    h(u);
+                                    if(u && u.includes('master.m3u8')) {
+                                        h(u, !adCaptured);
+                                        if(!adCaptured) adCaptured = true;
+                                    }
                                     return _o.apply(this, arguments);
                                 };
                                 
-                                // Bước 1: Click Play
+                                // Click Play button
                                 function clickPlay() {
-                                    Android.log('Clicking play...');
+                                    var playBtn = document.querySelector('#play-btn, .play-button');
+                                    if(playBtn) {
+                                        playBtn.click();
+                                    }
                                     
-                                    // Click vào body/video
-                                    document.body.click();
-                                    
-                                    // Click tất cả các nút có thể là play
-                                    var playSelectors = [
-                                        'button',
-                                        '[class*="play"]',
-                                        '[class*="Play"]', 
-                                        '[onclick*="play"]',
-                                        '.jw-icon-playback',
-                                        '.vjs-big-play-button',
-                                        'video'
-                                    ];
-                                    
-                                    playSelectors.forEach(function(sel) {
-                                        var els = document.querySelectorAll(sel);
-                                        els.forEach(function(el) {
-                                            try {
-                                                el.click();
-                                            } catch(e) {}
-                                        });
-                                    });
-                                    
-                                    // Play video trực tiếp
-                                    document.querySelectorAll('video').forEach(function(v) {
+                                    // Also click video element
+                                    var videos = document.querySelectorAll('.jw-video, video');
+                                    videos.forEach(function(v) {
                                         try {
                                             v.muted = true;
-                                            v.play();
-                                        } catch(e) {}
-                                    });
-                                }
-                                
-                                // Bước 2: Click Skip Ads (sau 5-6 giây)
-                                function clickSkip() {
-                                    Android.log('Clicking skip...');
-                                    
-                                    var skipSelectors = [
-                                        '[class*="skip"]',
-                                        '[class*="Skip"]',
-                                        '[onclick*="skip"]',
-                                        '.jw-skip',
-                                        '.skip-ad',
-                                        '.skipBtn',
-                                        '.ads_skip',
-                                        'button[class*="close"]',
-                                        '[aria-label*="skip"]',
-                                        '[title*="skip"]'
-                                    ];
-                                    
-                                    skipSelectors.forEach(function(sel) {
-                                        var els = document.querySelectorAll(sel);
-                                        els.forEach(function(el) {
-                                            try {
-                                                el.click();
-                                                Android.log('Clicked: ' + sel);
-                                            } catch(e) {}
-                                        });
-                                    });
-                                    
-                                    // Click vào video để đảm bảo play
-                                    document.querySelectorAll('video').forEach(function(v) {
-                                        try {
                                             v.click();
                                             v.play();
-                                            if(v.src) h(v.src);
-                                            if(v.currentSrc) h(v.currentSrc);
                                         } catch(e) {}
                                     });
                                 }
                                 
-                                // Thực hiện: Click Play ngay
-                                setTimeout(clickPlay, 500);
-                                setTimeout(clickPlay, 1000);
-                                
-                                // Click Skip sau 5s (khi ads chạy xong)
-                                setTimeout(clickSkip, 5500);
-                                setTimeout(clickSkip, 6500);
-                                setTimeout(clickSkip, 8000);
-                                
-                                // Check video src định kỳ
-                                setInterval(function() {
-                                    document.querySelectorAll('video').forEach(function(v) {
-                                        if(v.src) h(v.src);
-                                        if(v.currentSrc) h(v.currentSrc);
+                                // Skip ads
+                                function skipAds() {
+                                    // Click vào JW skip button
+                                    var skipBtns = document.querySelectorAll('.jw-skiptext, .jw-icon-inline.jw-skip, [class*="skip"]');
+                                    skipBtns.forEach(function(btn) {
+                                        try { 
+                                            btn.click();
+                                            // Click parent too
+                                            if(btn.parentElement) btn.parentElement.click();
+                                        } catch(e) {}
                                     });
-                                }, 500);
+                                    
+                                    // Click any close buttons
+                                    var closeBtns = document.querySelectorAll('[class*="close"], [aria-label*="close"], [title*="close"]');
+                                    closeBtns.forEach(function(btn) {
+                                        try { btn.click(); } catch(e) {}
+                                    });
+                                    
+                                    // Play main video after skip
+                                    var videos = document.querySelectorAll('.jw-video, video');
+                                    videos.forEach(function(v) {
+                                        try {
+                                            v.muted = true;
+                                            v.click();
+                                            v.play();
+                                        } catch(e) {}
+                                    });
+                                }
+                                
+                                // Execute sequence
+                                setTimeout(clickPlay, 500);      // Click play
+                                setTimeout(clickPlay, 1500);
+                                setTimeout(skipAds, 5500);       // Skip after 5s
+                                setTimeout(skipAds, 6500);
+                                setTimeout(skipAds, 8000);
+                                setTimeout(clickPlay, 8500);     // Play main video
+                                
+                                // Monitor video src
+                                setInterval(function() {
+                                    var videos = document.querySelectorAll('.jw-video, video');
+                                    videos.forEach(function(v) {
+                                        if(v.src && v.src.includes('blob:')) {
+                                            // Blob URL - cần sniff qua network
+                                        }
+                                    });
+                                }, 1000);
                             })();
                         """.trimIndent(), null)
                     }
@@ -315,7 +298,6 @@ class HeoVLProvider : MainAPI() {
 
                 wv.loadUrl(iframeUrl, mapOf("Referer" to referer))
 
-                // Đợi lâu hơn để kịp skip ads và lấy video
                 withContext(Dispatchers.IO) {
                     latch.await(90, TimeUnit.SECONDS)
                 }

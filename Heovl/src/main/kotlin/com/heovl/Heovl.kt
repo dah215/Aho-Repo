@@ -1,9 +1,15 @@
 package com.heovl
 
+import android.annotation.SuppressLint
+import android.webkit.*
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.AcraApplication
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
+import kotlinx.coroutines.*
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 @CloudstreamPlugin
 class HeoVLPlugin : Plugin() {
@@ -19,8 +25,10 @@ class HeoVLProvider : MainAPI() {
     override val hasMainPage = true
     override val supportedTypes = setOf(TvType.NSFW)
 
+    private val UA = "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Mobile Safari/537.36"
+
     private val headers = mapOf(
-        "User-Agent" to "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Mobile Safari/537.36",
+        "User-Agent" to UA,
         "Referer" to "$mainUrl/"
     )
 
@@ -84,83 +92,240 @@ class HeoVLProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val res = app.get(data, headers = headers)
-        val doc = res.document
         val html = res.text
 
-        val potentialUrls = mutableSetOf<String>()
+        // Tìm iframe URL
+        var iframeUrl: String? = null
+        val iframePatterns = listOf(
+            """src=["'](https?://e\.streamqq\.com[^"']*)["']""",
+            """src=["'](https?://[^"']*streamqq[^"']*)["']""",
+            """src=["'](https?://p1\.spexliu\.top[^"']*)["']""",
+            """src=["'](https?://[^"']*spexliu[^"']*)["']""",
+            """src=["'](https?://[^"']*trivonix[^"']*)["']"""
+        )
 
-        // Find all iframe sources
-        doc.select("iframe").forEach { iframe ->
-            val src = iframe.attr("src").ifBlank { iframe.attr("data-src") }
-            if (src.isNotBlank()) potentialUrls.add(src)
+        for (pattern in iframePatterns) {
+            val match = Regex(pattern, RegexOption.IGNORE_CASE).find(html)
+            if (match != null) {
+                iframeUrl = match.groupValues[1]
+                    .replace("\\/", "/")
+                    .replace("&amp;", "&")
+                break
+            }
         }
 
-        // Find URLs in attributes
-        doc.allElements.forEach { el ->
-            el.attributes().forEach { attr ->
-                val value = attr.value
-                if (value.contains("spexliu") || value.contains(".m3u8") || value.contains("iframe")) {
-                    potentialUrls.add(value)
+        if (iframeUrl == null) return false
+
+        // WebView sniffing với auto skip ads
+        val sniffedM3u8 = sniffM3u8WithSkipAds(iframeUrl, data)
+        if (sniffedM3u8 != null) {
+            callback(
+                newExtractorLink(name, "Server VIP", sniffedM3u8, type = ExtractorLinkType.M3U8) {
+                    this.referer = "https://p1.spexliu.top/"
+                    this.quality = Qualities.P1080.value
                 }
-            }
+            )
+            return true
         }
 
-        // Find URLs in HTML via regex
-        Regex("""https?://[^\s"'<>]+""").findAll(html).forEach { 
-            potentialUrls.add(it.value) 
-        }
+        return false
+    }
 
-        potentialUrls.filter { it.isNotBlank() }.distinct().forEach { rawUrl ->
-            val fullUrl = fixUrl(rawUrl)
+    @SuppressLint("SetJavaScriptEnabled")
+    private suspend fun sniffM3u8WithSkipAds(iframeUrl: String, referer: String): String? {
+        return withContext(Dispatchers.Main) {
+            val latch = CountDownLatch(1)
+            var videoUrl: String? = null
+            var isAdPlaying = false
 
-            // Direct m3u8 link
-            if (fullUrl.contains("master.m3u8")) {
-                callback(
-                    newExtractorLink(name, "Server VIP", fullUrl, type = ExtractorLinkType.M3U8) {
-                        this.referer = "https://p1.spexliu.top/"
-                        this.quality = Qualities.P1080.value
-                    }
-                )
-            }
+            val ctx = AcraApplication.context ?: return@withContext null
 
-            // Iframe - fetch and extract m3u8
-            else if (fullUrl.contains("spexliu") || fullUrl.contains("streamqq") || fullUrl.contains("trivonix")) {
-                try {
-                    val iframeRes = app.get(fullUrl, headers = mapOf(
-                        "User-Agent" to "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36",
-                        "Referer" to data
-                    ))
-                    val iframeHtml = iframeRes.text
+            val wv = WebView(ctx)
+            try {
+                wv.settings.apply {
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    mediaPlaybackRequiresUserGesture = false
+                    userAgentString = UA
+                    mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                    blockNetworkImage = true
+                }
 
-                    // Find m3u8 in iframe HTML
-                    val m3u8Patterns = listOf(
-                        """(https://p1\.spexliu\.top/videos/[a-zA-Z0-9]+/master\.m3u8[^"'\s]*)""",
-                        """(/videos/[a-zA-Z0-9]+/master\.m3u8[^"'\s]*)""",
-                        """(https://[^\s"']+master\.m3u8[^\s"']*)"""
-                    )
-
-                    for (pattern in m3u8Patterns) {
-                        val match = Regex(pattern).find(iframeHtml)
-                        if (match != null) {
-                            var m3u8Url = match.groupValues[1].replace("\\/", "/")
-                            if (m3u8Url.startsWith("/videos/")) {
-                                m3u8Url = "https://p1.spexliu.top$m3u8Url"
+                wv.addJavascriptInterface(object {
+                    @JavascriptInterface
+                    fun send(url: String) {
+                        // Chỉ lấy m3u8 KHÔNG phải quảng cáo
+                        if (videoUrl == null && url.contains("master.m3u8")) {
+                            val lower = url.lowercase()
+                            // Bỏ qua quảng cáo
+                            if (!lower.contains("vast") && 
+                                !lower.contains("/ad/") && 
+                                !lower.contains("adtag") &&
+                                !lower.contains("adservice") &&
+                                !lower.contains("advertisement")) {
+                                videoUrl = url
+                                latch.countDown()
                             }
-                            callback(
-                                newExtractorLink(name, "Server VIP", m3u8Url, type = ExtractorLinkType.M3U8) {
-                                    this.referer = "https://p1.spexliu.top/"
-                                    this.quality = Qualities.P1080.value
-                                }
-                            )
-                            break
                         }
                     }
-                } catch (e: Exception) {
-                    // Skip failed iframe
+                    
+                    @JavascriptInterface
+                    fun log(msg: String) {
+                        android.util.Log.d("HeoVL", msg)
+                    }
+                }, "Android")
+
+                wv.webViewClient = object : WebViewClient() {
+                    override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                        request?.url?.toString()?.let { url ->
+                            if (url.contains("master.m3u8")) {
+                                val lower = url.lowercase()
+                                if (!lower.contains("vast") && 
+                                    !lower.contains("/ad/") && 
+                                    !lower.contains("adtag") &&
+                                    !lower.contains("adservice") &&
+                                    videoUrl == null) {
+                                    videoUrl = url
+                                    latch.countDown()
+                                }
+                            }
+                        }
+                        return super.shouldInterceptRequest(view, request)
+                    }
+
+                    override fun onPageFinished(view: WebView?, url: String?) {
+                        // JavaScript: Click Play → Đợi 5s → Click Skip → Lấy m3u8
+                        wv.evaluateJavascript("""
+                            (function() {
+                                var h = function(u) {
+                                    if(u && u.includes('master.m3u8')) {
+                                        Android.send(u);
+                                    }
+                                };
+                                
+                                // Intercept requests
+                                if(window.fetch) {
+                                    var _f = window.fetch;
+                                    window.fetch = function() {
+                                        if(arguments[0]) h(arguments[0]);
+                                        return _f.apply(this, arguments);
+                                    };
+                                }
+                                
+                                var _o = XMLHttpRequest.prototype.open;
+                                XMLHttpRequest.prototype.open = function(m, u) {
+                                    h(u);
+                                    return _o.apply(this, arguments);
+                                };
+                                
+                                // Bước 1: Click Play
+                                function clickPlay() {
+                                    Android.log('Clicking play...');
+                                    
+                                    // Click vào body/video
+                                    document.body.click();
+                                    
+                                    // Click tất cả các nút có thể là play
+                                    var playSelectors = [
+                                        'button',
+                                        '[class*="play"]',
+                                        '[class*="Play"]', 
+                                        '[onclick*="play"]',
+                                        '.jw-icon-playback',
+                                        '.vjs-big-play-button',
+                                        'video'
+                                    ];
+                                    
+                                    playSelectors.forEach(function(sel) {
+                                        var els = document.querySelectorAll(sel);
+                                        els.forEach(function(el) {
+                                            try {
+                                                el.click();
+                                            } catch(e) {}
+                                        });
+                                    });
+                                    
+                                    // Play video trực tiếp
+                                    document.querySelectorAll('video').forEach(function(v) {
+                                        try {
+                                            v.muted = true;
+                                            v.play();
+                                        } catch(e) {}
+                                    });
+                                }
+                                
+                                // Bước 2: Click Skip Ads (sau 5-6 giây)
+                                function clickSkip() {
+                                    Android.log('Clicking skip...');
+                                    
+                                    var skipSelectors = [
+                                        '[class*="skip"]',
+                                        '[class*="Skip"]',
+                                        '[onclick*="skip"]',
+                                        '.jw-skip',
+                                        '.skip-ad',
+                                        '.skipBtn',
+                                        '.ads_skip',
+                                        'button[class*="close"]',
+                                        '[aria-label*="skip"]',
+                                        '[title*="skip"]'
+                                    ];
+                                    
+                                    skipSelectors.forEach(function(sel) {
+                                        var els = document.querySelectorAll(sel);
+                                        els.forEach(function(el) {
+                                            try {
+                                                el.click();
+                                                Android.log('Clicked: ' + sel);
+                                            } catch(e) {}
+                                        });
+                                    });
+                                    
+                                    // Click vào video để đảm bảo play
+                                    document.querySelectorAll('video').forEach(function(v) {
+                                        try {
+                                            v.click();
+                                            v.play();
+                                            if(v.src) h(v.src);
+                                            if(v.currentSrc) h(v.currentSrc);
+                                        } catch(e) {}
+                                    });
+                                }
+                                
+                                // Thực hiện: Click Play ngay
+                                setTimeout(clickPlay, 500);
+                                setTimeout(clickPlay, 1000);
+                                
+                                // Click Skip sau 5s (khi ads chạy xong)
+                                setTimeout(clickSkip, 5500);
+                                setTimeout(clickSkip, 6500);
+                                setTimeout(clickSkip, 8000);
+                                
+                                // Check video src định kỳ
+                                setInterval(function() {
+                                    document.querySelectorAll('video').forEach(function(v) {
+                                        if(v.src) h(v.src);
+                                        if(v.currentSrc) h(v.currentSrc);
+                                    });
+                                }, 500);
+                            })();
+                        """.trimIndent(), null)
+                    }
                 }
+
+                wv.loadUrl(iframeUrl, mapOf("Referer" to referer))
+
+                // Đợi lâu hơn để kịp skip ads và lấy video
+                withContext(Dispatchers.IO) {
+                    latch.await(90, TimeUnit.SECONDS)
+                }
+
+                videoUrl
+            } catch (e: Exception) {
+                null
+            } finally {
+                wv.post { wv.destroy() }
             }
         }
-
-        return true
     }
 }

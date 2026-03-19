@@ -4,6 +4,7 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
+import org.jsoup.nodes.Document
 
 @CloudstreamPlugin
 class HentaizPlugin : Plugin() {
@@ -19,38 +20,62 @@ class HentaizProvider : MainAPI() {
     override val hasMainPage = true
     override val supportedTypes = setOf(TvType.NSFW)
 
-    private val UA = "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Mobile Safari/537.36"
+    private val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
 
-    private val headers = mapOf(
-        "User-Agent" to UA,
-        "Referer" to "$mainUrl/"
-    )
+    override suspend fun loadLinks(
+        data: String,
+        isCasting: Boolean,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        // 1. Lấy trang chi tiết
+        val res = app.get(data, headers = mapOf("User-Agent" to UA))
+        val doc = res.document
+        
+        // 2. Tìm tất cả các script trong trang, vì link video thường nằm trong các biến JS
+        val scripts = doc.select("script").map { it.html() }
+        
+        // 3. Tìm link master.m3u8 trong toàn bộ nội dung trang (bao gồm cả script)
+        // Chúng ta tìm link có chứa 'master.m3u8' và tham số 'e=' (phim thật)
+        val masterM3u8Regex = Regex("""https?://[^\s"']+/master\.m3u8\?[^\s"']+""")
+        
+        // Gom tất cả nội dung trang lại để quét
+        val fullContent = res.text + scripts.joinToString("\n")
+        val allLinks = masterM3u8Regex.findAll(fullContent).map { it.value }.toList()
 
-    override val mainPage = mainPageOf(
-        "/" to "Trang Chủ",
-        "/the-loai/vietsub" to "Vietsub",
-        "/the-loai/3d" to "Hentai 3D",
-        "/the-loai/khong-che" to "Không Che"
-    )
+        // 4. Lọc link thật (có chứa 'e=')
+        val realLink = allLinks.find { it.contains("e=") } ?: allLinks.firstOrNull()
 
-    private fun fixUrl(url: String): String {
-        if (url.isBlank()) return ""
-        if (url.startsWith("http")) return url
-        return "$mainUrl${if (url.startsWith("/")) "" else "/"}$url"
+        if (realLink != null) {
+            callback(
+                newExtractorLink(
+                    name,
+                    "Server HD (Direct)",
+                    realLink,
+                    type = ExtractorLinkType.M3U8
+                ) {
+                    this.referer = data
+                    this.headers = mapOf(
+                        "User-Agent" to UA,
+                        "Referer" to data,
+                        "Origin" to "https://hentaivietsub.com"
+                    )
+                }
+            )
+            return true
+        }
+        
+        return false
     }
 
+    // ... (Giữ nguyên các hàm getMainPage, search, load như cũ)
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page == 1) fixUrl(request.data) else "${fixUrl(request.data)}?page=$page"
-        val doc = app.get(url, headers = headers).document
-        
+        val doc = app.get(url, headers = mapOf("User-Agent" to UA)).document
         val items = doc.select("div.item-box").mapNotNull { el ->
             val linkEl = el.selectFirst("a") ?: return@mapNotNull null
-            val href = fixUrl(linkEl.attr("href"))
-            val title = linkEl.attr("title")
-            val poster = el.selectFirst("img")?.attr("src")
-            
-            newMovieSearchResponse(title, href, TvType.NSFW) {
-                this.posterUrl = poster
+            newMovieSearchResponse(linkEl.attr("title"), fixUrl(linkEl.attr("href")), TvType.NSFW) {
+                this.posterUrl = el.selectFirst("img")?.attr("src")
             }
         }
         return newHomePageResponse(request.name, items, true)
@@ -58,7 +83,7 @@ class HentaizProvider : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/tim-kiem?k=${java.net.URLEncoder.encode(query, "UTF-8")}"
-        val doc = app.get(url, headers = headers).document
+        val doc = app.get(url, headers = mapOf("User-Agent" to UA)).document
         return doc.select("div.item-box").mapNotNull { el ->
             val linkEl = el.selectFirst("a") ?: return@mapNotNull null
             newMovieSearchResponse(linkEl.attr("title"), fixUrl(linkEl.attr("href")), TvType.NSFW) {
@@ -68,57 +93,15 @@ class HentaizProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val doc = app.get(url, headers = headers).document
+        val doc = app.get(url, headers = mapOf("User-Agent" to UA)).document
         val title = doc.selectFirst("h1")?.text()?.trim() ?: "Untitled"
         val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
-
-        return newMovieLoadResponse(title, url, TvType.NSFW, url) {
-            this.posterUrl = poster
-        }
+        return newMovieLoadResponse(title, url, TvType.NSFW, url) { this.posterUrl = poster }
     }
 
-    override suspend fun loadLinks(
-        data: String,
-        isCasting: Boolean,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        val res = app.get(data, headers = headers)
-        val buttons = res.document.select("button.set-player-source")
-        
-        for (button in buttons) {
-            val sourceUrl = button.attr("data-source")
-            if (sourceUrl.isBlank()) continue
-
-            // Truy cập vào trang trung gian (iframe)
-            val serverRes = app.get(sourceUrl, headers = mapOf("User-Agent" to UA, "Referer" to data))
-            val serverHtml = serverRes.text
-
-            // Tìm tất cả các link master.m3u8
-            val masterM3u8Regex = Regex("""https?://[^\s"']+/master\.m3u8\?[^\s"']+""")
-            val allLinks = masterM3u8Regex.findAll(serverHtml).map { it.value }.toList()
-
-            // LỌC: Chỉ lấy link có chứa tham số 'e=' (đây là link phim thật)
-            val realLink = allLinks.find { it.contains("e=") }
-
-            if (realLink != null) {
-                callback(
-                    newExtractorLink(
-                        name,
-                        button.attr("data-cdn-name").ifBlank { "Server HD" },
-                        realLink,
-                        type = ExtractorLinkType.M3U8
-                    ) {
-                        this.referer = sourceUrl
-                        this.headers = mapOf(
-                            "User-Agent" to UA,
-                            "Referer" to sourceUrl
-                        )
-                    }
-                )
-                return true
-            }
-        }
-        return false
+    private fun fixUrl(url: String): String {
+        if (url.isBlank()) return ""
+        if (url.startsWith("http")) return url
+        return "$mainUrl${if (url.startsWith("/")) "" else "/"}$url"
     }
 }

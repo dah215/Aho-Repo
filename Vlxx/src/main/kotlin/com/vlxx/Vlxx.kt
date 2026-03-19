@@ -1,4 +1,4 @@
-package com.heovl
+package com.vlxx
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
@@ -6,15 +6,15 @@ import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
 
 @CloudstreamPlugin
-class HeoVLPlugin : Plugin() {
+class VLXXPlugin : Plugin() {
     override fun load() {
-        registerMainAPI(HeoVLProvider())
+        registerMainAPI(VLXXProvider())
     }
 }
 
-class HeoVLProvider : MainAPI() {
-    override var mainUrl = "https://heovl.moe"
-    override var name = "HeoVL"
+class VLXXProvider : MainAPI() {
+    override var mainUrl = "https://vlxx.bz"
+    override var name = "VLXX"
     override var lang = "vi"
     override val hasMainPage = true
     override val supportedTypes = setOf(TvType.NSFW)
@@ -28,18 +28,18 @@ class HeoVLProvider : MainAPI() {
 
     override val mainPage = mainPageOf(
         "/" to "Trang Chủ",
-        "/categories/vietsub/" to "VietSub",
-        "/categories/hoat-hinh-hentai/" to "Hentai",
-        "/actresses/minami-aizawa/" to "Minami Aizawa",
-        "/actresses/tsumugi-akari/" to "Tsumugi Akari",
-        "/actresses/riri-nanatsumori/" to "Riri Nanatsumori",
-        "/actresses/miu-shiromine/" to "Miu Shiromine",
-        "/actresses/kanako-ioka/" to "Kanako Ioka"
+        "/jav/" to "JAV",
+        "/phim-sex-hay/" to "Phim Sex Hay",
+        "/vietsub/" to "Vietsub",
+        "/khong-che/" to "Không Che",
+        "/hoc-sinh/" to "Học Sinh",
+        "/vung-trom/" to "Vụng Trộm",
+        "/chau-au/" to "Châu Âu"
     )
 
     private fun fixUrl(url: String): String {
         if (url.isBlank()) return ""
-        var cleanUrl = url.trim().replace("\\/", "/")
+        val cleanUrl = url.trim().replace("\\/", "/")
         if (cleanUrl.startsWith("http")) return cleanUrl
         if (cleanUrl.startsWith("//")) return "https:$cleanUrl"
         val base = mainUrl.removeSuffix("/")
@@ -47,36 +47,55 @@ class HeoVLProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = "$mainUrl${request.data}${if (page > 1) "?page=$page" else ""}"
+        val url = if (page == 1) {
+            "$mainUrl${request.data}"
+        } else {
+            "$mainUrl/new/$page/"
+        }
+
         val doc = app.get(url, headers = headers).document
-        val items = doc.select("div.video-box").mapNotNull { el ->
-            val linkEl = el.selectFirst("a.video-box__thumbnail__link") ?: return@mapNotNull null
+        val items = doc.select("div.video-item").mapNotNull { el ->
+            val linkEl = el.selectFirst("a") ?: return@mapNotNull null
             val href = fixUrl(linkEl.attr("href"))
-            val title = linkEl.attr("title").ifBlank { el.selectFirst("h3")?.text() ?: "" }
-            newMovieSearchResponse(title.trim(), href, TvType.NSFW) {
-                this.posterUrl = el.selectFirst("img")?.attr("abs:src")
+            val title = linkEl.attr("title").ifBlank { el.selectFirst(".video-name a")?.text() }?.trim() ?: return@mapNotNull null
+            val poster = el.selectFirst("img")?.let { img ->
+                img.attr("data-original").ifBlank { img.attr("src") }
+            }
+
+            newMovieSearchResponse(title, href, TvType.NSFW) {
+                this.posterUrl = poster
             }
         }
-        return newHomePageResponse(request.name, items, true)
+
+        val hasNext = items.isNotEmpty() && doc.select("a:contains(→), .pagenavi a:last-child").isNotEmpty()
+        return newHomePageResponse(request.name, items, hasNext)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/search/${java.net.URLEncoder.encode(query, "UTF-8")}/"
         val doc = app.get(url, headers = headers).document
-        return doc.select("div.video-box").mapNotNull { el ->
-            val linkEl = el.selectFirst("a.video-box__thumbnail__link") ?: return@mapNotNull null
-            newMovieSearchResponse(linkEl.attr("title"), fixUrl(linkEl.attr("href")), TvType.NSFW) {
-                this.posterUrl = el.selectFirst("img")?.attr("abs:src")
+
+        return doc.select("div.video-item").mapNotNull { el ->
+            val linkEl = el.selectFirst("a") ?: return@mapNotNull null
+            val href = fixUrl(linkEl.attr("href"))
+            val title = linkEl.attr("title").ifBlank { el.selectFirst(".video-name a")?.text() }?.trim() ?: return@mapNotNull null
+            val poster = el.selectFirst("img")?.attr("data-original").ifBlank { el.selectFirst("img")?.attr("src") }
+
+            newMovieSearchResponse(title, href, TvType.NSFW) {
+                this.posterUrl = poster
             }
         }
     }
 
     override suspend fun load(url: String): LoadResponse {
         val doc = app.get(url, headers = headers).document
-        val title = doc.selectFirst("h1")?.text()?.trim() ?: "Untitled"
+        val title = doc.selectFirst("h1, .video-name, title")?.text()?.trim() ?: "VLXX Video"
         val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
+            ?: doc.selectFirst("img.video-image")?.attr("src")
 
-        return newMovieLoadResponse(title, url, TvType.NSFW, url) {
+        val videoId = Regex("""/(\d+)/?$""").find(url)?.groupValues?.get(1)
+
+        return newMovieLoadResponse(title, url, TvType.NSFW, videoId ?: url) {
             this.posterUrl = poster
         }
     }
@@ -87,61 +106,95 @@ class HeoVLProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val res = app.get(data, headers = headers)
-        val html = res.text
-
-        // Tìm tất cả iframe URLs và video IDs
-        val videoIds = mutableSetOf<String>()
-        
-        // Pattern để tìm video ID từ các server
-        val patterns = listOf(
-            """trivonix\.top/videos/([a-zA-Z0-9]+)""",
-            """streamqq\.com/videos/([a-zA-Z0-9]+)""",
-            """spexliu\.top/videos/([a-zA-Z0-9]+)""",
-            """/videos/([a-zA-Z0-9]+)/play""",
-            """/videos/([a-zA-Z0-9]+)/master\.m3u8"""
-        )
-
-        for (pattern in patterns) {
-            Regex(pattern, RegexOption.IGNORE_CASE).findAll(html).forEach { match ->
-                videoIds.add(match.groupValues[1])
-            }
+        val videoId = if (data.startsWith("http")) {
+            Regex("""/(\d+)/?$""").find(data)?.groupValues?.get(1)
+        } else {
+            data
         }
 
-        if (videoIds.isEmpty()) return false
+        if (videoId == null) return false
 
-        // Ưu tiên server trivonix.top (không cần token)
-        val servers = listOf(
-            "trivonix.top" to "Trivonix",
-            "p1.spexliu.top" to "Spexliu",
-            "e.streamqq.com" to "StreamQQ"
+        val formattedId = videoId.padStart(5, '0')
+        val m3u8Url = "https://rr3---sn-8pxuuxa-i5ozr.qooglevideo.com/manifest-s1/$formattedId.vl"
+
+        val m3u8Headers = mapOf(
+            "User-Agent" to UA,
+            "Referer" to "https://play.vlstream.net/",
+            "Origin" to "https://play.vlstream.net"
         )
 
-        for ((domain, serverName) in servers) {
-            for (videoId in videoIds) {
-                val m3u8Url = "https://$domain/videos/$videoId/master.m3u8"
-                
-                try {
-                    val checkHeaders = mapOf(
-                        "User-Agent" to UA,
-                        "Referer" to "https://$domain/"
-                    )
-                    val checkRes = app.get(m3u8Url, headers = checkHeaders)
-                    
-                    if (checkRes.code == 200 && checkRes.text.contains("#EXTM3U")) {
-                        callback(
-                            newExtractorLink(name, "Server $serverName", m3u8Url, type = ExtractorLinkType.M3U8) {
-                                this.referer = "https://$domain/"
-                                this.headers = checkHeaders
-                                this.quality = Qualities.P1080.value
-                            }
-                        )
-                        return true
+        try {
+            val checkRes = app.get(m3u8Url, headers = m3u8Headers)
+            
+            if (checkRes.code == 200 && checkRes.text.contains("#EXTM3U")) {
+                callback(
+                    newExtractorLink(name, "Server VIP", m3u8Url, type = ExtractorLinkType.M3U8) {
+                        this.referer = "https://play.vlstream.net/"
+                        this.headers = m3u8Headers
+                        this.quality = Qualities.P1080.value
                     }
-                } catch (e: Exception) {
-                    // Try next server
+                )
+                return true
+            }
+        } catch (e: Exception) {
+            // Try alternative method
+        }
+
+        return loadLinksFromAjax(videoId, callback)
+    }
+
+    private suspend fun loadLinksFromAjax(
+        videoId: String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val ajaxUrl = "$mainUrl/ajax.php"
+        val ajaxData = "vlxx_server=1&id=$videoId&server=1"
+        
+        val ajaxHeaders = mapOf(
+            "User-Agent" to UA,
+            "Referer" to "$mainUrl/",
+            "X-Requested-With" to "XMLHttpRequest",
+            "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
+            "Accept" to "*/*"
+        )
+
+        try {
+            val response = app.post(ajaxUrl, requestBody = ajaxData, headers = ajaxHeaders).text
+            val embedMatch = Regex("""/embed/([a-zA-Z0-9]+)""").find(response)
+            
+            if (embedMatch != null) {
+                val embedId = embedMatch.groupValues[1]
+                
+                val servers = listOf(
+                    "https://stream.vlstream.net/videos/$embedId/master.m3u8",
+                    "https://play.vlstream.net/videos/$embedId/master.m3u8"
+                )
+
+                for (m3u8Url in servers) {
+                    try {
+                        val checkHeaders = mapOf(
+                            "User-Agent" to UA,
+                            "Referer" to "https://play.vlstream.net/"
+                        )
+                        val checkRes = app.get(m3u8Url, headers = checkHeaders)
+                        
+                        if (checkRes.code == 200 && checkRes.text.contains("#EXTM3U")) {
+                            callback(
+                                newExtractorLink(name, "Server VIP", m3u8Url, type = ExtractorLinkType.M3U8) {
+                                    this.referer = "https://play.vlstream.net/"
+                                    this.headers = checkHeaders
+                                    this.quality = Qualities.P1080.value
+                                }
+                            )
+                            return true
+                        }
+                    } catch (e: Exception) {
+                        // Try next
+                    }
                 }
             }
+        } catch (e: Exception) {
+            // Failed
         }
 
         return false

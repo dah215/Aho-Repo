@@ -86,26 +86,25 @@ class HentaizProvider : MainAPI() {
         val res = app.get(data, headers = headers)
         val html = res.text
 
-        // Tìm ID video từ trang web
-        val videoId = Regex("""streamqq\.com/videos/([a-zA-Z0-9]+)""").find(html)?.groupValues?.get(1)
-            ?: Regex("""/videos/([a-zA-Z0-9]+)""").find(html)?.groupValues?.get(1)
-            ?: return false
-
-        // URL luồng video trực tiếp (bỏ qua quảng cáo)
-        val m3u8Url = "https://e.streamqq.com/videos/$videoId/master.m3u8"
-
-        val checkRes = app.get(m3u8Url, headers = mapOf("Referer" to "https://e.streamqq.com/"))
+        // Regex này tìm link master.m3u8 bao gồm cả các tham số ?e=...&s=...
+        // Nó sẽ bắt được link p1.spexliu.top/.../master.m3u8?e=...&s=...
+        val masterM3u8Regex = Regex("""https?://[^\s"']+/master\.m3u8\?[^\s"']+""")
         
-        if (checkRes.code == 200) {
+        val allLinks = masterM3u8Regex.findAll(html).map { it.value }.toList()
+
+        // Lọc lấy link chứa domain p1.spexliu.top (link thật)
+        val realLink = allLinks.find { it.contains("p1.spexliu.top") }
+
+        if (realLink != null) {
             callback(
                 newExtractorLink(
-                    name, 
-                    "StreamQQ HD (No Ads)", 
-                    m3u8Url, 
+                    name,
+                    "Server HD (Real)",
+                    realLink,
                     type = ExtractorLinkType.M3U8
                 ) {
-                    this.referer = "https://e.streamqq.com/"
-                    this.headers = mapOf("Referer" to "https://e.streamqq.com/")
+                    this.referer = "https://p1.spexliu.top/"
+                    this.headers = mapOf("Referer" to "https://p1.spexliu.top/")
                 }
             )
             return true

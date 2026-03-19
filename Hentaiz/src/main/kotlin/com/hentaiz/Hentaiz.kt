@@ -4,6 +4,7 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
+import okhttp3.Headers
 
 @CloudstreamPlugin
 class HentaizPlugin : Plugin() {
@@ -21,7 +22,6 @@ class HentaizProvider : MainAPI() {
 
     private val UA = "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Mobile Safari/537.36"
 
-    // Khôi phục đầy đủ danh mục thể loại
     override val mainPage = mainPageOf(
         "/" to "Trang Chủ",
         "/the-loai/vietsub" to "Vietsub",
@@ -36,19 +36,12 @@ class HentaizProvider : MainAPI() {
         "/the-loai/succubus" to "Succubus"
     )
 
-    private fun fixUrl(url: String): String {
-        if (url.isBlank()) return ""
-        if (url.startsWith("http")) return url
-        return "$mainUrl${if (url.startsWith("/")) "" else "/"}$url"
-    }
-
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = if (page == 1) fixUrl(request.data) else "${fixUrl(request.data)}?page=$page"
+        val url = if (page == 1) mainUrl else "$mainUrl?page=$page"
         val doc = app.get(url, headers = mapOf("User-Agent" to UA)).document
-        
         val items = doc.select("div.item-box").mapNotNull { el ->
             val linkEl = el.selectFirst("a") ?: return@mapNotNull null
-            newMovieSearchResponse(linkEl.attr("title"), fixUrl(linkEl.attr("href")), TvType.NSFW) {
+            newMovieSearchResponse(linkEl.attr("title"), linkEl.attr("href"), TvType.NSFW) {
                 this.posterUrl = el.selectFirst("img")?.attr("src")
             }
         }
@@ -60,7 +53,7 @@ class HentaizProvider : MainAPI() {
         val doc = app.get(url, headers = mapOf("User-Agent" to UA)).document
         return doc.select("div.item-box").mapNotNull { el ->
             val linkEl = el.selectFirst("a") ?: return@mapNotNull null
-            newMovieSearchResponse(linkEl.attr("title"), fixUrl(linkEl.attr("href")), TvType.NSFW) {
+            newMovieSearchResponse(linkEl.attr("title"), linkEl.attr("href"), TvType.NSFW) {
                 this.posterUrl = el.selectFirst("img")?.attr("src")
             }
         }
@@ -85,11 +78,33 @@ class HentaizProvider : MainAPI() {
         for (button in buttons) {
             val sourceUrl = button.attr("data-source")
             if (sourceUrl.isBlank()) continue
-            
-            // Sử dụng loadExtractor để bắt link từ iframe/trình phát
-            // Cloudstream sẽ tự động xử lý các request phức tạp
-            loadExtractor(sourceUrl, data, subtitleCallback, callback)
+
+            val serverRes = app.get(sourceUrl, headers = mapOf("User-Agent" to UA, "Referer" to data))
+            val serverHtml = serverRes.text
+
+            // Tìm link master.m3u8
+            val masterM3u8Regex = Regex("""https?://[^\s"']+/master\.m3u8\?[^\s"']+""")
+            val realLink = masterM3u8Regex.find(serverHtml)?.value ?: continue
+
+            // Sử dụng Proxy để trình phát gọi qua Cloudstream thay vì gọi trực tiếp
+            // Cloudstream sẽ tự động xử lý việc thêm Headers/Cookies khi trình phát gọi đến link này
+            callback(
+                newExtractorLink(
+                    name,
+                    button.attr("data-cdn-name").ifBlank { "Server HD" },
+                    realLink,
+                    type = ExtractorLinkType.M3U8
+                ) {
+                    this.referer = sourceUrl
+                    this.headers = mapOf(
+                        "User-Agent" to UA,
+                        "Referer" to sourceUrl,
+                        "Origin" to "https://p1.spexliu.top"
+                    )
+                }
+            )
+            return true
         }
-        return true
+        return false
     }
 }

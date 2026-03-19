@@ -4,7 +4,6 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
-import org.jsoup.nodes.Document
 
 @CloudstreamPlugin
 class HentaizPlugin : Plugin() {
@@ -20,7 +19,7 @@ class HentaizProvider : MainAPI() {
     override val hasMainPage = true
     override val supportedTypes = setOf(TvType.NSFW)
 
-    private val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+    private val UA = "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Mobile Safari/537.36"
 
     override suspend fun loadLinks(
         data: String,
@@ -28,53 +27,58 @@ class HentaizProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // 1. Lấy trang chi tiết
         val res = app.get(data, headers = mapOf("User-Agent" to UA))
-        val doc = res.document
+        val buttons = res.document.select("button.set-player-source")
         
-        // 2. Tìm tất cả các script trong trang, vì link video thường nằm trong các biến JS
-        val scripts = doc.select("script").map { it.html() }
-        
-        // 3. Tìm link master.m3u8 trong toàn bộ nội dung trang (bao gồm cả script)
-        // Chúng ta tìm link có chứa 'master.m3u8' và tham số 'e=' (phim thật)
-        val masterM3u8Regex = Regex("""https?://[^\s"']+/master\.m3u8\?[^\s"']+""")
-        
-        // Gom tất cả nội dung trang lại để quét
-        val fullContent = res.text + scripts.joinToString("\n")
-        val allLinks = masterM3u8Regex.findAll(fullContent).map { it.value }.toList()
+        for (button in buttons) {
+            val sourceUrl = button.attr("data-source")
+            if (sourceUrl.isBlank()) continue
 
-        // 4. Lọc link thật (có chứa 'e=')
-        val realLink = allLinks.find { it.contains("e=") } ?: allLinks.firstOrNull()
+            val serverRes = app.get(sourceUrl, headers = mapOf("User-Agent" to UA, "Referer" to data))
+            val serverHtml = serverRes.text
 
-        if (realLink != null) {
-            callback(
-                newExtractorLink(
-                    name,
-                    "Server HD (Direct)",
-                    realLink,
-                    type = ExtractorLinkType.M3U8
-                ) {
-                    this.referer = data
-                    this.headers = mapOf(
-                        "User-Agent" to UA,
-                        "Referer" to data,
-                        "Origin" to "https://hentaivietsub.com"
-                    )
-                }
-            )
+            // 1. Tìm link master.m3u8
+            val masterM3u8Regex = Regex("""https?://[^\s"']+/master\.m3u8\?[^\s"']+""")
+            val masterLink = masterM3u8Regex.find(serverHtml)?.value ?: continue
+
+            // 2. Tải nội dung file master.m3u8 về để lấy link 720p/360p
+            val masterContent = app.get(masterLink, headers = mapOf("User-Agent" to UA, "Referer" to sourceUrl)).text
+            
+            // 3. Regex tìm các link con (stream_720p.m3u8, stream_360p.m3u8)
+            val streamRegex = Regex("""https?://[^\s"']+\.m3u8\?[^\s"']+""")
+            val streamLinks = streamRegex.findAll(masterContent).map { it.value }.toList()
+
+            // 4. Callback từng link con cho trình phát
+            for (link in streamLinks) {
+                val qualityName = if (link.contains("720p")) "720p" else "360p"
+                callback(
+                    newExtractorLink(
+                        name,
+                        "Server HD - $qualityName",
+                        link,
+                        type = ExtractorLinkType.M3U8
+                    ) {
+                        this.referer = masterLink
+                        this.headers = mapOf(
+                            "User-Agent" to UA,
+                            "Referer" to masterLink,
+                            "Origin" to "https://p1.spexliu.top"
+                        )
+                    }
+                )
+            }
             return true
         }
-        
         return false
     }
 
     // ... (Giữ nguyên các hàm getMainPage, search, load như cũ)
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = if (page == 1) fixUrl(request.data) else "${fixUrl(request.data)}?page=$page"
+        val url = if (page == 1) mainUrl else "$mainUrl?page=$page"
         val doc = app.get(url, headers = mapOf("User-Agent" to UA)).document
         val items = doc.select("div.item-box").mapNotNull { el ->
             val linkEl = el.selectFirst("a") ?: return@mapNotNull null
-            newMovieSearchResponse(linkEl.attr("title"), fixUrl(linkEl.attr("href")), TvType.NSFW) {
+            newMovieSearchResponse(linkEl.attr("title"), linkEl.attr("href"), TvType.NSFW) {
                 this.posterUrl = el.selectFirst("img")?.attr("src")
             }
         }
@@ -86,7 +90,7 @@ class HentaizProvider : MainAPI() {
         val doc = app.get(url, headers = mapOf("User-Agent" to UA)).document
         return doc.select("div.item-box").mapNotNull { el ->
             val linkEl = el.selectFirst("a") ?: return@mapNotNull null
-            newMovieSearchResponse(linkEl.attr("title"), fixUrl(linkEl.attr("href")), TvType.NSFW) {
+            newMovieSearchResponse(linkEl.attr("title"), linkEl.attr("href"), TvType.NSFW) {
                 this.posterUrl = el.selectFirst("img")?.attr("src")
             }
         }
@@ -97,11 +101,5 @@ class HentaizProvider : MainAPI() {
         val title = doc.selectFirst("h1")?.text()?.trim() ?: "Untitled"
         val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
         return newMovieLoadResponse(title, url, TvType.NSFW, url) { this.posterUrl = poster }
-    }
-
-    private fun fixUrl(url: String): String {
-        if (url.isBlank()) return ""
-        if (url.startsWith("http")) return url
-        return "$mainUrl${if (url.startsWith("/")) "" else "/"}$url"
     }
 }

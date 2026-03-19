@@ -21,16 +21,19 @@ class HentaizProvider : MainAPI() {
 
     private val UA = "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Mobile Safari/537.36"
 
-    private val headers = mapOf(
-        "User-Agent" to UA,
-        "Referer" to "$mainUrl/"
-    )
-
+    // Khôi phục đầy đủ danh mục thể loại
     override val mainPage = mainPageOf(
         "/" to "Trang Chủ",
         "/the-loai/vietsub" to "Vietsub",
         "/the-loai/3d" to "Hentai 3D",
-        "/the-loai/khong-che" to "Không Che"
+        "/the-loai/khong-che" to "Không Che",
+        "/the-loai/big-boobs" to "Mông To",
+        "/the-loai/school-girl" to "Học Sinh",
+        "/the-loai/rape" to "Hiếp Dâm",
+        "/the-loai/thu-dam" to "Tự Sướng",
+        "/the-loai/threesome" to "Tập Thể",
+        "/the-loai/teacher" to "Cô Giáo",
+        "/the-loai/succubus" to "Succubus"
     )
 
     private fun fixUrl(url: String): String {
@@ -41,16 +44,12 @@ class HentaizProvider : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page == 1) fixUrl(request.data) else "${fixUrl(request.data)}?page=$page"
-        val doc = app.get(url, headers = headers).document
+        val doc = app.get(url, headers = mapOf("User-Agent" to UA)).document
         
         val items = doc.select("div.item-box").mapNotNull { el ->
             val linkEl = el.selectFirst("a") ?: return@mapNotNull null
-            val href = fixUrl(linkEl.attr("href"))
-            val title = linkEl.attr("title")
-            val poster = el.selectFirst("img")?.attr("src")
-            
-            newMovieSearchResponse(title, href, TvType.NSFW) {
-                this.posterUrl = poster
+            newMovieSearchResponse(linkEl.attr("title"), fixUrl(linkEl.attr("href")), TvType.NSFW) {
+                this.posterUrl = el.selectFirst("img")?.attr("src")
             }
         }
         return newHomePageResponse(request.name, items, true)
@@ -58,7 +57,7 @@ class HentaizProvider : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/tim-kiem?k=${java.net.URLEncoder.encode(query, "UTF-8")}"
-        val doc = app.get(url, headers = headers).document
+        val doc = app.get(url, headers = mapOf("User-Agent" to UA)).document
         return doc.select("div.item-box").mapNotNull { el ->
             val linkEl = el.selectFirst("a") ?: return@mapNotNull null
             newMovieSearchResponse(linkEl.attr("title"), fixUrl(linkEl.attr("href")), TvType.NSFW) {
@@ -68,13 +67,10 @@ class HentaizProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val doc = app.get(url, headers = headers).document
+        val doc = app.get(url, headers = mapOf("User-Agent" to UA)).document
         val title = doc.selectFirst("h1")?.text()?.trim() ?: "Untitled"
         val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
-
-        return newMovieLoadResponse(title, url, TvType.NSFW, url) {
-            this.posterUrl = poster
-        }
+        return newMovieLoadResponse(title, url, TvType.NSFW, url) { this.posterUrl = poster }
     }
 
     override suspend fun loadLinks(
@@ -83,48 +79,17 @@ class HentaizProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val res = app.get(data, headers = headers)
+        val res = app.get(data, headers = mapOf("User-Agent" to UA))
         val buttons = res.document.select("button.set-player-source")
         
         for (button in buttons) {
             val sourceUrl = button.attr("data-source")
             if (sourceUrl.isBlank()) continue
-
-            val serverRes = app.get(sourceUrl, headers = mapOf("User-Agent" to UA, "Referer" to data))
-            val serverHtml = serverRes.text
-
-            // 1. Tìm link master.m3u8
-            val masterM3u8Regex = Regex("""https?://[^\s"']+/master\.m3u8\?[^\s"']+""")
-            val masterLink = masterM3u8Regex.find(serverHtml)?.value ?: continue
-
-            // 2. Tải nội dung file master.m3u8 để lấy link con (720p/360p)
-            val masterContent = app.get(masterLink, headers = mapOf("User-Agent" to UA, "Referer" to sourceUrl)).text
             
-            // 3. Tìm các link con (stream_720p.m3u8, stream_360p.m3u8)
-            val streamRegex = Regex("""https?://[^\s"']+\.m3u8\?[^\s"']+""")
-            val streamLinks = streamRegex.findAll(masterContent).map { it.value }.toList()
-
-            // 4. Callback từng link con
-            for (link in streamLinks) {
-                val qualityName = if (link.contains("720p")) "720p" else "360p"
-                callback(
-                    newExtractorLink(
-                        name,
-                        "Server HD - $qualityName",
-                        link,
-                        type = ExtractorLinkType.M3U8
-                    ) {
-                        this.referer = masterLink
-                        this.headers = mapOf(
-                            "User-Agent" to UA,
-                            "Referer" to masterLink,
-                            "Origin" to "https://p1.spexliu.top"
-                        )
-                    }
-                )
-            }
-            return true
+            // Sử dụng loadExtractor để bắt link từ iframe/trình phát
+            // Cloudstream sẽ tự động xử lý các request phức tạp
+            loadExtractor(sourceUrl, data, subtitleCallback, callback)
         }
-        return false
+        return true
     }
 }

@@ -1,4 +1,4 @@
-package com.hentaivietsub
+package com.hentaiz
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
@@ -6,13 +6,13 @@ import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
 
 @CloudstreamPlugin
-class HentaiVietsubPlugin : Plugin() {
+class HentaizPlugin : Plugin() {
     override fun load() {
-        registerMainAPI(HentaiVietsubProvider())
+        registerMainAPI(HentaizProvider())
     }
 }
 
-class HentaiVietsubProvider : MainAPI() {
+class HentaizProvider : MainAPI() {
     override var mainUrl = "https://hentaivietsub.com"
     override var name = "HentaiVietsub"
     override var lang = "vi"
@@ -26,35 +26,31 @@ class HentaiVietsubProvider : MainAPI() {
         "Referer" to "$mainUrl/"
     )
 
-    // Cập nhật các danh mục theo menu của hentaivietsub.com
     override val mainPage = mainPageOf(
         "/" to "Trang Chủ",
         "/the-loai/vietsub" to "Vietsub",
         "/the-loai/3d" to "Hentai 3D",
-        "/the-loai/khong-che" to "Không Che",
-        "/the-loai/big-boobs" to "Mông To"
+        "/the-loai/khong-che" to "Không Che"
     )
 
     private fun fixUrl(url: String): String {
         if (url.isBlank()) return ""
-        var cleanUrl = url.trim().replace("\\/", "/")
-        if (cleanUrl.startsWith("http")) return cleanUrl
-        if (cleanUrl.startsWith("//")) return "https:$cleanUrl"
-        val base = mainUrl.removeSuffix("/")
-        return if (cleanUrl.startsWith("/")) "$base$cleanUrl" else "$base/$cleanUrl"
+        if (url.startsWith("http")) return url
+        return "$mainUrl${if (url.startsWith("/")) "" else "/"}$url"
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page == 1) fixUrl(request.data) else "${fixUrl(request.data)}?page=$page"
         val doc = app.get(url, headers = headers).document
         
-        // Cập nhật selector từ video-box (cũ) sang item-box (mới)
         val items = doc.select("div.item-box").mapNotNull { el ->
             val linkEl = el.selectFirst("a") ?: return@mapNotNull null
             val href = fixUrl(linkEl.attr("href"))
-            val title = linkEl.attr("title").ifBlank { el.selectFirst("h3")?.text() ?: "" }
-            newMovieSearchResponse(title.trim(), href, TvType.NSFW) {
-                this.posterUrl = el.selectFirst("img")?.attr("abs:src")
+            val title = linkEl.attr("title")
+            val poster = el.selectFirst("img")?.attr("src")
+            
+            newMovieSearchResponse(title, href, TvType.NSFW) {
+                this.posterUrl = poster
             }
         }
         return newHomePageResponse(request.name, items, true)
@@ -66,7 +62,7 @@ class HentaiVietsubProvider : MainAPI() {
         return doc.select("div.item-box").mapNotNull { el ->
             val linkEl = el.selectFirst("a") ?: return@mapNotNull null
             newMovieSearchResponse(linkEl.attr("title"), fixUrl(linkEl.attr("href")), TvType.NSFW) {
-                this.posterUrl = el.selectFirst("img")?.attr("abs:src")
+                this.posterUrl = el.selectFirst("img")?.attr("src")
             }
         }
     }
@@ -81,7 +77,6 @@ class HentaiVietsubProvider : MainAPI() {
         }
     }
 
-    // Giữ nguyên logic lấy link từ plugin HeoVL cũ
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -91,11 +86,12 @@ class HentaiVietsubProvider : MainAPI() {
         val res = app.get(data, headers = headers)
         val html = res.text
 
-        // Tìm ID video
+        // Tìm ID video từ trang web
         val videoId = Regex("""streamqq\.com/videos/([a-zA-Z0-9]+)""").find(html)?.groupValues?.get(1)
             ?: Regex("""/videos/([a-zA-Z0-9]+)""").find(html)?.groupValues?.get(1)
             ?: return false
 
+        // URL luồng video trực tiếp (bỏ qua quảng cáo)
         val m3u8Url = "https://e.streamqq.com/videos/$videoId/master.m3u8"
 
         val checkRes = app.get(m3u8Url, headers = mapOf("Referer" to "https://e.streamqq.com/"))
@@ -117,3 +113,4 @@ class HentaiVietsubProvider : MainAPI() {
 
         return false
     }
+}

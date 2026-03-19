@@ -1,36 +1,38 @@
-package com.nangcuc
+package com.hentaivietsub
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
-import org.jsoup.nodes.Element
 
 @CloudstreamPlugin
-class NangCucPlugin : Plugin() {
+class HentaiVietsubPlugin : Plugin() {
     override fun load() {
-        registerMainAPI(NangCucProvider())
+        registerMainAPI(HentaiVietsubProvider())
     }
 }
 
-class NangCucProvider : MainAPI() {
-    override var mainUrl = "https://nangcuc.cv"
-    override var name = "Nắng Cực"
+class HentaiVietsubProvider : MainAPI() {
+    override var mainUrl = "https://hentaivietsub.com"
+    override var name = "HentaiVietsub"
     override var lang = "vi"
     override val hasMainPage = true
     override val supportedTypes = setOf(TvType.NSFW)
 
+    private val UA = "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Mobile Safari/537.36"
+
     private val headers = mapOf(
-        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+        "User-Agent" to UA,
         "Referer" to "$mainUrl/"
     )
 
+    // Cập nhật các danh mục theo menu của hentaivietsub.com
     override val mainPage = mainPageOf(
-        "/" to "Mới Cập Nhật",
-        "the-loai/han-quoc-18/" to "Hàn Quốc 18+",
-        "the-loai/nhat-ban/" to "Nhật Bản",
-        "the-loai/loan-luan/" to "Loạn Luân",
-        "the-loai/trung-quoc/" to "Trung Quốc"
+        "/" to "Trang Chủ",
+        "/the-loai/vietsub" to "Vietsub",
+        "/the-loai/3d" to "Hentai 3D",
+        "/the-loai/khong-che" to "Không Che",
+        "/the-loai/big-boobs" to "Mông To"
     )
 
     private fun fixUrl(url: String): String {
@@ -43,12 +45,14 @@ class NangCucProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = "$mainUrl/${request.data}${if (page > 1) "page/$page/" else ""}"
+        val url = if (page == 1) fixUrl(request.data) else "${fixUrl(request.data)}?page=$page"
         val doc = app.get(url, headers = headers).document
+        
+        // Cập nhật selector từ video-box (cũ) sang item-box (mới)
         val items = doc.select("div.item-box").mapNotNull { el ->
-            val linkEl = el.selectFirst("a.item-box__image") ?: return@mapNotNull null
+            val linkEl = el.selectFirst("a") ?: return@mapNotNull null
             val href = fixUrl(linkEl.attr("href"))
-            val title = linkEl.attr("title").ifBlank { el.selectFirst("p.item-box__title")?.text() ?: "" }
+            val title = linkEl.attr("title").ifBlank { el.selectFirst("h3")?.text() ?: "" }
             newMovieSearchResponse(title.trim(), href, TvType.NSFW) {
                 this.posterUrl = el.selectFirst("img")?.attr("abs:src")
             }
@@ -57,10 +61,10 @@ class NangCucProvider : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val url = "$mainUrl/?s=$query&post_type=movie"
+        val url = "$mainUrl/tim-kiem?k=${java.net.URLEncoder.encode(query, "UTF-8")}"
         val doc = app.get(url, headers = headers).document
         return doc.select("div.item-box").mapNotNull { el ->
-            val linkEl = el.selectFirst("a.item-box__image") ?: return@mapNotNull null
+            val linkEl = el.selectFirst("a") ?: return@mapNotNull null
             newMovieSearchResponse(linkEl.attr("title"), fixUrl(linkEl.attr("href")), TvType.NSFW) {
                 this.posterUrl = el.selectFirst("img")?.attr("abs:src")
             }
@@ -71,15 +75,13 @@ class NangCucProvider : MainAPI() {
         val doc = app.get(url, headers = headers).document
         val title = doc.selectFirst("h1")?.text()?.trim() ?: "Untitled"
         val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
-        val desc = doc.selectFirst("article p, .entry-content p")?.text()?.trim()
 
         return newMovieLoadResponse(title, url, TvType.NSFW, url) {
             this.posterUrl = poster
-            this.plot = desc
-            this.tags = doc.select(".categories a, .tags a").map { it.text() }
         }
     }
 
+    // Giữ nguyên logic lấy link từ plugin HeoVL cũ
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -87,54 +89,58 @@ class NangCucProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val res = app.get(data, headers = headers)
-        val doc = res.document
         val html = res.text
 
-        val potentialUrls = mutableSetOf<String>()
+        val videoIds = mutableSetOf<String>()
         
-        doc.allElements.forEach { el ->
-            el.attributes().forEach { attr ->
-                val value = attr.value
-                if (value.contains("dfplayer") || value.contains(".m3u8") || value.contains("bf.html")) {
-                    potentialUrls.add(value)
-                }
+        val patterns = listOf(
+            """trivonix\.top/videos/([a-zA-Z0-9]+)""",
+            """streamqq\.com/videos/([a-zA-Z0-9]+)""",
+            """spexliu\.top/videos/([a-zA-Z0-9]+)""",
+            """/videos/([a-zA-Z0-9]+)/play""",
+            """/videos/([a-zA-Z0-9]+)/master\.m3u8"""
+        )
+
+        for (pattern in patterns) {
+            Regex(pattern, RegexOption.IGNORE_CASE).findAll(html).forEach { match ->
+                videoIds.add(match.groupValues[1])
             }
         }
-        
-        Regex("""https?[:\\]+[/\\/]+[^\s"'<>]+""").findAll(html).forEach { potentialUrls.add(it.value) }
 
-        potentialUrls.filter { it.isNotBlank() }.distinct().forEach { rawUrl ->
-            val fullUrl = fixUrl(rawUrl)
-            
-            if (fullUrl.contains("dfplayer")) {
-                val id = Regex("""(?:did|id|v|s)[=/](\d+)""").find(fullUrl)?.groupValues?.get(1)
-                val host = Regex("""https?://([^/]+)""").find(fullUrl)?.groupValues?.get(1)
+        if (videoIds.isEmpty()) return false
+
+        val servers = listOf(
+            "trivonix.top" to "Trivonix",
+            "p1.spexliu.top" to "Spexliu",
+            "e.streamqq.com" to "StreamQQ"
+        )
+
+        for ((domain, serverName) in servers) {
+            for (videoId in videoIds) {
+                val m3u8Url = "https://$domain/videos/$videoId/master.m3u8"
                 
-                if (id != null && host != null) {
-                    val m3u8Link = "https://$host/v2/s/$id.m3u8"
-                    callback(
-                        newExtractorLink("DFPlayer", "DFPlayer", m3u8Link, type = ExtractorLinkType.M3U8) {
-                            this.referer = "https://$host/"
-                            this.quality = Qualities.P1080.value
-                        }
+                try {
+                    val checkHeaders = mapOf(
+                        "User-Agent" to UA,
+                        "Referer" to "https://$domain/"
                     )
-                }
-            } 
-        
-            else if (fullUrl.contains(".m3u8")) {
-                callback(
-                    newExtractorLink(name, "Server VIP", fullUrl, type = ExtractorLinkType.M3U8) {
-                        this.referer = data
-                        this.quality = Qualities.Unknown.value
+                    val checkRes = app.get(m3u8Url, headers = checkHeaders)
+                    
+                    if (checkRes.code == 200 && checkRes.text.contains("#EXTM3U")) {
+                        callback(
+                            newExtractorLink(name, "Server $serverName", m3u8Url, type = ExtractorLinkType.M3U8) {
+                                this.referer = "https://$domain/"
+                                this.headers = checkHeaders
+                                this.quality = Qualities.P1080.value
+                            }
+                        )
+                        return true
                     }
-                )
-            }
-
-            else if (fullUrl.contains("dood") || fullUrl.contains("tape") || fullUrl.contains("voe")) {
-                loadExtractor(fullUrl, data, subtitleCallback, callback)
+                } catch (e: Exception) {
+                    // Bỏ qua server lỗi
+                }
             }
         }
-
-        return true
+        return false
     }
 }

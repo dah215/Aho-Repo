@@ -84,42 +84,43 @@ class HentaizProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val res = app.get(data, headers = headers)
-        val doc = res.document
-        val serverButtons = doc.select("button.set-player-source")
+        val buttons = res.document.select("button.set-player-source")
         
-        for (button in serverButtons) {
+        for (button in buttons) {
             val sourceUrl = button.attr("data-source")
             if (sourceUrl.isBlank()) continue
 
-            // Lấy nội dung trang trung gian (iframe)
+            // 1. Giả lập hành động "Skip" quảng cáo
+            // Lấy adTag từ URL data-source và gọi nó trước
+            val adTag = Regex("""adTag=([^&]+)""").find(sourceUrl)?.groupValues?.get(1)?.let { 
+                java.net.URLDecoder.decode(it, "UTF-8") 
+            }
+            if (!adTag.isNullOrBlank()) {
+                app.get(adTag, headers = mapOf("User-Agent" to UA, "Referer" to sourceUrl))
+            }
+
+            // 2. Lấy trang trung gian sau khi đã "skip"
             val serverRes = app.get(sourceUrl, headers = mapOf("User-Agent" to UA, "Referer" to data))
             val serverHtml = serverRes.text
 
-            // Tìm tất cả các link master.m3u8
+            // 3. Tìm link master.m3u8 thật (ưu tiên link có tham số 'e=')
             val masterM3u8Regex = Regex("""https?://[^\s"']+/master\.m3u8\?[^\s"']+""")
             val allLinks = masterM3u8Regex.findAll(serverHtml).map { it.value }.toList()
+            val realLink = allLinks.find { it.contains("e=") } ?: allLinks.firstOrNull()
 
-            for (link in allLinks) {
-                // Kiểm tra nội dung file m3u8 trước khi gửi cho trình phát
-                val m3u8Content = app.get(link, headers = mapOf("Referer" to sourceUrl, "User-Agent" to UA)).text
-                
-                // Điều kiện: Phải là playlist hợp lệ và chứa các đoạn video (.ts)
-                // Quảng cáo thường không có các đoạn .ts hoặc rất ít
-                if (m3u8Content.contains("#EXTM3U") && m3u8Content.contains(".ts")) {
-                    callback(
-                        newExtractorLink(
-                            name,
-                            button.attr("data-cdn-name").ifBlank { "Server HD" },
-                            link,
-                            type = ExtractorLinkType.M3U8
-                        ) {
-                            this.referer = sourceUrl
-                            this.headers = mapOf("User-Agent" to UA, "Referer" to sourceUrl)
-                        }
-                    )
-                    // Nếu tìm thấy link hợp lệ, trả về true ngay
-                    return true
-                }
+            if (realLink != null) {
+                callback(
+                    newExtractorLink(
+                        name,
+                        button.attr("data-cdn-name").ifBlank { "Server HD" },
+                        realLink,
+                        type = ExtractorLinkType.M3U8
+                    ) {
+                        this.referer = sourceUrl
+                        this.headers = mapOf("User-Agent" to UA, "Referer" to sourceUrl)
+                    }
+                )
+                return true
             }
         }
         return false

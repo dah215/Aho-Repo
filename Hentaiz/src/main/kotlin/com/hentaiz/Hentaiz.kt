@@ -83,64 +83,39 @@ class HentaiVietsubProvider : MainAPI() {
 
     // Giữ nguyên logic lấy link từ plugin HeoVL cũ
     override suspend fun loadLinks(
-        data: String,
-        isCasting: Boolean,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        val res = app.get(data, headers = headers)
-        val html = res.text
+    data: String,
+    isCasting: Boolean,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit
+): Boolean {
+    val res = app.get(data, headers = headers)
+    val html = res.text
 
-        val videoIds = mutableSetOf<String>()
-        
-        val patterns = listOf(
-            """trivonix\.top/videos/([a-zA-Z0-9]+)""",
-            """streamqq\.com/videos/([a-zA-Z0-9]+)""",
-            """spexliu\.top/videos/([a-zA-Z0-9]+)""",
-            """/videos/([a-zA-Z0-9]+)/play""",
-            """/videos/([a-zA-Z0-9]+)/master\.m3u8"""
+    // Tìm ID video từ trang web
+    // Thường các trang này có dạng: streamqq.com/videos/ID
+    val videoId = Regex("""streamqq\.com/videos/([a-zA-Z0-9]+)""").find(html)?.groupValues?.get(1)
+        ?: Regex("""/videos/([a-zA-Z0-9]+)""").find(html)?.groupValues?.get(1)
+        ?: return false
+
+    // URL gốc của luồng video (thường không có quảng cáo nếu gọi trực tiếp)
+    // Cấu trúc của streamqq thường là: https://e.streamqq.com/videos/ID/master.m3u8
+    val m3u8Url = "https://e.streamqq.com/videos/$videoId/master.m3u8"
+
+    // Kiểm tra xem link có hoạt động không
+    val checkRes = app.get(m3u8Url, headers = mapOf("Referer" to "https://e.streamqq.com/"))
+    
+    if (checkRes.code == 200) {
+        callback(
+            newExtractorLink(
+                name, 
+                "StreamQQ HD (No Ads)", 
+                m3u8Url, 
+                referer = "https://e.streamqq.com/", 
+                type = ExtractorLinkType.M3U8
+            )
         )
-
-        for (pattern in patterns) {
-            Regex(pattern, RegexOption.IGNORE_CASE).findAll(html).forEach { match ->
-                videoIds.add(match.groupValues[1])
-            }
-        }
-
-        if (videoIds.isEmpty()) return false
-
-        val servers = listOf(
-            "trivonix.top" to "Trivonix",
-            "p1.spexliu.top" to "Spexliu",
-            "e.streamqq.com" to "StreamQQ"
-        )
-
-        for ((domain, serverName) in servers) {
-            for (videoId in videoIds) {
-                val m3u8Url = "https://$domain/videos/$videoId/master.m3u8"
-                
-                try {
-                    val checkHeaders = mapOf(
-                        "User-Agent" to UA,
-                        "Referer" to "https://$domain/"
-                    )
-                    val checkRes = app.get(m3u8Url, headers = checkHeaders)
-                    
-                    if (checkRes.code == 200 && checkRes.text.contains("#EXTM3U")) {
-                        callback(
-                            newExtractorLink(name, "Server $serverName", m3u8Url, type = ExtractorLinkType.M3U8) {
-                                this.referer = "https://$domain/"
-                                this.headers = checkHeaders
-                                this.quality = Qualities.P1080.value
-                            }
-                        )
-                        return true
-                    }
-                } catch (e: Exception) {
-                    // Bỏ qua server lỗi
-                }
-            }
-        }
-        return false
+        return true
     }
+
+    return false
 }

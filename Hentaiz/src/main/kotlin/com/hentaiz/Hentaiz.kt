@@ -21,13 +21,69 @@ class HentaizProvider : MainAPI() {
 
     private val UA = "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Mobile Safari/537.36"
 
+    private val headers = mapOf(
+        "User-Agent" to UA,
+        "Referer" to "$mainUrl/"
+    )
+
+    override val mainPage = mainPageOf(
+        "/" to "Trang Chủ",
+        "/the-loai/vietsub" to "Vietsub",
+        "/the-loai/3d" to "Hentai 3D",
+        "/the-loai/khong-che" to "Không Che"
+    )
+
+    private fun fixUrl(url: String): String {
+        if (url.isBlank()) return ""
+        if (url.startsWith("http")) return url
+        return "$mainUrl${if (url.startsWith("/")) "" else "/"}$url"
+    }
+
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        val url = if (page == 1) fixUrl(request.data) else "${fixUrl(request.data)}?page=$page"
+        val doc = app.get(url, headers = headers).document
+        
+        val items = doc.select("div.item-box").mapNotNull { el ->
+            val linkEl = el.selectFirst("a") ?: return@mapNotNull null
+            val href = fixUrl(linkEl.attr("href"))
+            val title = linkEl.attr("title")
+            val poster = el.selectFirst("img")?.attr("src")
+            
+            newMovieSearchResponse(title, href, TvType.NSFW) {
+                this.posterUrl = poster
+            }
+        }
+        return newHomePageResponse(request.name, items, true)
+    }
+
+    override suspend fun search(query: String): List<SearchResponse> {
+        val url = "$mainUrl/tim-kiem?k=${java.net.URLEncoder.encode(query, "UTF-8")}"
+        val doc = app.get(url, headers = headers).document
+        return doc.select("div.item-box").mapNotNull { el ->
+            val linkEl = el.selectFirst("a") ?: return@mapNotNull null
+            newMovieSearchResponse(linkEl.attr("title"), fixUrl(linkEl.attr("href")), TvType.NSFW) {
+                this.posterUrl = el.selectFirst("img")?.attr("src")
+            }
+        }
+    }
+
+    override suspend fun load(url: String): LoadResponse {
+        val doc = app.get(url, headers = headers).document
+        val title = doc.selectFirst("h1")?.text()?.trim() ?: "Untitled"
+        val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
+
+        return newMovieLoadResponse(title, url, TvType.NSFW, url) {
+            this.posterUrl = poster
+        }
+    }
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val res = app.get(data, headers = mapOf("User-Agent" to UA))
+        val res = app.get(data, headers = headers)
         val buttons = res.document.select("button.set-player-source")
         
         for (button in buttons) {
@@ -41,14 +97,14 @@ class HentaizProvider : MainAPI() {
             val masterM3u8Regex = Regex("""https?://[^\s"']+/master\.m3u8\?[^\s"']+""")
             val masterLink = masterM3u8Regex.find(serverHtml)?.value ?: continue
 
-            // 2. Tải nội dung file master.m3u8 về để lấy link 720p/360p
+            // 2. Tải nội dung file master.m3u8 để lấy link con (720p/360p)
             val masterContent = app.get(masterLink, headers = mapOf("User-Agent" to UA, "Referer" to sourceUrl)).text
             
-            // 3. Regex tìm các link con (stream_720p.m3u8, stream_360p.m3u8)
+            // 3. Tìm các link con (stream_720p.m3u8, stream_360p.m3u8)
             val streamRegex = Regex("""https?://[^\s"']+\.m3u8\?[^\s"']+""")
             val streamLinks = streamRegex.findAll(masterContent).map { it.value }.toList()
 
-            // 4. Callback từng link con cho trình phát
+            // 4. Callback từng link con
             for (link in streamLinks) {
                 val qualityName = if (link.contains("720p")) "720p" else "360p"
                 callback(
@@ -70,36 +126,5 @@ class HentaizProvider : MainAPI() {
             return true
         }
         return false
-    }
-
-    // ... (Giữ nguyên các hàm getMainPage, search, load như cũ)
-    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = if (page == 1) mainUrl else "$mainUrl?page=$page"
-        val doc = app.get(url, headers = mapOf("User-Agent" to UA)).document
-        val items = doc.select("div.item-box").mapNotNull { el ->
-            val linkEl = el.selectFirst("a") ?: return@mapNotNull null
-            newMovieSearchResponse(linkEl.attr("title"), linkEl.attr("href"), TvType.NSFW) {
-                this.posterUrl = el.selectFirst("img")?.attr("src")
-            }
-        }
-        return newHomePageResponse(request.name, items, true)
-    }
-
-    override suspend fun search(query: String): List<SearchResponse> {
-        val url = "$mainUrl/tim-kiem?k=${java.net.URLEncoder.encode(query, "UTF-8")}"
-        val doc = app.get(url, headers = mapOf("User-Agent" to UA)).document
-        return doc.select("div.item-box").mapNotNull { el ->
-            val linkEl = el.selectFirst("a") ?: return@mapNotNull null
-            newMovieSearchResponse(linkEl.attr("title"), linkEl.attr("href"), TvType.NSFW) {
-                this.posterUrl = el.selectFirst("img")?.attr("src")
-            }
-        }
-    }
-
-    override suspend fun load(url: String): LoadResponse {
-        val doc = app.get(url, headers = mapOf("User-Agent" to UA)).document
-        val title = doc.selectFirst("h1")?.text()?.trim() ?: "Untitled"
-        val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
-        return newMovieLoadResponse(title, url, TvType.NSFW, url) { this.posterUrl = poster }
     }
 }

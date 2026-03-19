@@ -86,19 +86,18 @@ class HentaizProvider : MainAPI() {
         val res = app.get(data, headers = headers)
         val doc = res.document
 
-        // 1. Lấy tất cả các nút chọn server
+        // Lấy tất cả các nút chọn server có chứa link trung gian
         val serverButtons = doc.select("button.set-player-source")
         
         for (button in serverButtons) {
             val sourceUrl = button.attr("data-source")
             if (sourceUrl.isBlank()) continue
 
-            // 2. Truy cập vào URL của server (thường là iframe hoặc trang trung gian)
-            val serverRes = app.get(sourceUrl, headers = mapOf("Referer" to data))
+            // Truy cập vào trang trung gian (nơi chứa iframe hoặc script load video)
+            val serverRes = app.get(sourceUrl, headers = mapOf("Referer" to data, "User-Agent" to UA))
             val serverHtml = serverRes.text
 
-            // 3. Tìm link master.m3u8 thật bên trong trang trung gian đó
-            // Regex này bắt link có chứa master.m3u8 và các tham số e=...&s=...
+            // Tìm link master.m3u8 thật (bao gồm cả tham số bảo mật e=...&s=...)
             val masterM3u8Regex = Regex("""https?://[^\s"']+/master\.m3u8\?[^\s"']+""")
             val realLink = masterM3u8Regex.find(serverHtml)?.value
 
@@ -114,10 +113,10 @@ class HentaizProvider : MainAPI() {
                         this.headers = mapOf("Referer" to sourceUrl)
                     }
                 )
-                // Nếu bạn muốn lấy tất cả server thì bỏ "return true" ở đây
-                // Nếu chỉ cần 1 server là đủ thì để return true
-                return true 
+                // Nếu tìm thấy link thật, trả về true ngay lập tức
+                return true
             }
         }
         return false
     }
+}

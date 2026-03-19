@@ -79,7 +79,8 @@ class VLXXProvider : MainAPI() {
             val linkEl = el.selectFirst("a") ?: return@mapNotNull null
             val href = fixUrl(linkEl.attr("href"))
             val title = linkEl.attr("title").ifBlank { el.selectFirst(".video-name a")?.text() }?.trim() ?: return@mapNotNull null
-            val poster = el.selectFirst("img")?.attr("data-original").ifBlank { el.selectFirst("img")?.attr("src") }
+            val imgEl = el.selectFirst("img")
+            val poster = imgEl?.attr("data-original")?.ifBlank { imgEl.attr("src") }
 
             newMovieSearchResponse(title, href, TvType.NSFW) {
                 this.posterUrl = poster
@@ -93,6 +94,7 @@ class VLXXProvider : MainAPI() {
         val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
             ?: doc.selectFirst("img.video-image")?.attr("src")
 
+        // Extract video ID from URL: /video/xxx/3099/
         val videoId = Regex("""/(\d+)/?$""").find(url)?.groupValues?.get(1)
 
         return newMovieLoadResponse(title, url, TvType.NSFW, videoId ?: url) {
@@ -106,6 +108,7 @@ class VLXXProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        // Data là video ID
         val videoId = if (data.startsWith("http")) {
             Regex("""/(\d+)/?$""").find(data)?.groupValues?.get(1)
         } else {
@@ -114,7 +117,10 @@ class VLXXProvider : MainAPI() {
 
         if (videoId == null) return false
 
+        // Format video ID thành 5 chữ số (3099 → 03099)
         val formattedId = videoId.padStart(5, '0')
+
+        // URL m3u8 trực tiếp
         val m3u8Url = "https://rr3---sn-8pxuuxa-i5ozr.qooglevideo.com/manifest-s1/$formattedId.vl"
 
         val m3u8Headers = mapOf(
@@ -140,6 +146,7 @@ class VLXXProvider : MainAPI() {
             // Try alternative method
         }
 
+        // Fallback: Gọi AJAX để lấy iframe
         return loadLinksFromAjax(videoId, callback)
     }
 
@@ -148,7 +155,6 @@ class VLXXProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val ajaxUrl = "$mainUrl/ajax.php"
-        val ajaxData = "vlxx_server=1&id=$videoId&server=1"
         
         val ajaxHeaders = mapOf(
             "User-Agent" to UA,
@@ -159,12 +165,22 @@ class VLXXProvider : MainAPI() {
         )
 
         try {
-            val response = app.post(ajaxUrl, requestBody = ajaxData, headers = ajaxHeaders).text
+            // Sử dụng data map thay vì requestBody string
+            val postData = mapOf(
+                "vlxx_server" to "1",
+                "id" to videoId,
+                "server" to "1"
+            )
+            
+            val response = app.post(ajaxUrl, data = postData, headers = ajaxHeaders).text
+            
+            // Tìm embed ID từ iframe URL
             val embedMatch = Regex("""/embed/([a-zA-Z0-9]+)""").find(response)
             
             if (embedMatch != null) {
                 val embedId = embedMatch.groupValues[1]
                 
+                // Thử các server khác
                 val servers = listOf(
                     "https://stream.vlstream.net/videos/$embedId/master.m3u8",
                     "https://play.vlstream.net/videos/$embedId/master.m3u8"

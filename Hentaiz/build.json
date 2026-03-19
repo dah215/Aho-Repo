@@ -1,13 +1,13 @@
 {
-  "name": "PhimMoiChill",
-  "pluginClassName": "com.nangcuc.NangCuc",
+  "name": "Hentaiz",
+  "pluginClassName": "com.hentaiz.Hentaiz",
   "version": 1,
   "requiresResources": false,
   "description": "Vietnamese anime streaming site",
-  "authors": ["NangCuc"],
+  "authors": ["Hentaiz"],
   "repositoryUrl": "https://github.com/dah215/Aho-Repo",
   "status": 1,
   "tvTypes": ["NSFW"],
   "language": "vi",
-  "iconUrl": "https://nangcuc.cv/favicon.ico"
+  "iconUrl": "https://hentaivietsub.com/favicon.ico"
 }

@@ -4,6 +4,7 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 
 @CloudstreamPlugin
 class HentaizPlugin : Plugin() {
@@ -71,40 +72,18 @@ class HentaizProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        // Sử dụng loadExtractor với WebView Interceptor
+        // Cloudstream sẽ mở một trình duyệt ẩn, thực thi JS, và bắt link m3u8
         val res = app.get(data, headers = mapOf("User-Agent" to UA))
         val buttons = res.document.select("button.set-player-source")
         
         for (button in buttons) {
             val sourceUrl = button.attr("data-source")
             if (sourceUrl.isBlank()) continue
-
-            // Truy cập vào iframe trung gian
-            val iframeRes = app.get(sourceUrl, headers = mapOf("User-Agent" to UA, "Referer" to data))
-            val iframeHtml = iframeRes.text
-
-            // Tìm link master.m3u8 bằng Regex mạnh hơn
-            val masterM3u8Regex = Regex("""https?://[^\s"']+/master\.m3u8\?[^\s"']+""")
-            val realLink = masterM3u8Regex.find(iframeHtml)?.value
-
-            if (realLink != null) {
-                callback(
-                    newExtractorLink(
-                        name,
-                        button.attr("data-cdn-name").ifBlank { "Server HD" },
-                        realLink,
-                        type = ExtractorLinkType.M3U8
-                    ) {
-                        this.referer = sourceUrl
-                        this.headers = mapOf(
-                            "User-Agent" to UA,
-                            "Referer" to sourceUrl,
-                            "Origin" to "https://p1.spexliu.top"
-                        )
-                    }
-                )
-                return true
-            }
+            
+            // loadExtractor sẽ tự động bắt các request m3u8 từ WebView
+            loadExtractor(sourceUrl, data, subtitleCallback, callback)
         }
-        return false
+        return true
     }
 }

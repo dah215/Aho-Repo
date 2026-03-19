@@ -86,15 +86,21 @@ class HentaizProvider : MainAPI() {
         val res = app.get(data, headers = headers)
         val doc = res.document
 
-        // Lấy tất cả các nút chọn server có chứa link trung gian
+        // Lấy tất cả các nút chọn server
         val serverButtons = doc.select("button.set-player-source")
         
         for (button in serverButtons) {
             val sourceUrl = button.attr("data-source")
             if (sourceUrl.isBlank()) continue
 
-            // Truy cập vào trang trung gian (nơi chứa iframe hoặc script load video)
-            val serverRes = app.get(sourceUrl, headers = mapOf("Referer" to data, "User-Agent" to UA))
+            // Truy cập vào trang trung gian với đầy đủ User-Agent và Referer
+            val serverRes = app.get(
+                sourceUrl, 
+                headers = mapOf(
+                    "User-Agent" to UA,
+                    "Referer" to data
+                )
+            )
             val serverHtml = serverRes.text
 
             // Tìm link master.m3u8 thật (bao gồm cả tham số bảo mật e=...&s=...)
@@ -110,10 +116,12 @@ class HentaizProvider : MainAPI() {
                         type = ExtractorLinkType.M3U8
                     ) {
                         this.referer = sourceUrl
-                        this.headers = mapOf("Referer" to sourceUrl)
+                        this.headers = mapOf(
+                            "User-Agent" to UA,
+                            "Referer" to sourceUrl
+                        )
                     }
                 )
-                // Nếu tìm thấy link thật, trả về true ngay lập tức
                 return true
             }
         }

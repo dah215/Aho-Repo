@@ -84,32 +84,40 @@ class HentaizProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val res = app.get(data, headers = headers)
-        val html = res.text
+        val doc = res.document
 
-        // Regex này tìm link master.m3u8 bao gồm cả các tham số ?e=...&s=...
-        // Nó sẽ bắt được link p1.spexliu.top/.../master.m3u8?e=...&s=...
-        val masterM3u8Regex = Regex("""https?://[^\s"']+/master\.m3u8\?[^\s"']+""")
+        // 1. Lấy tất cả các nút chọn server
+        val serverButtons = doc.select("button.set-player-source")
         
-        val allLinks = masterM3u8Regex.findAll(html).map { it.value }.toList()
+        for (button in serverButtons) {
+            val sourceUrl = button.attr("data-source")
+            if (sourceUrl.isBlank()) continue
 
-        // Lọc lấy link chứa domain p1.spexliu.top (link thật)
-        val realLink = allLinks.find { it.contains("p1.spexliu.top") }
+            // 2. Truy cập vào URL của server (thường là iframe hoặc trang trung gian)
+            val serverRes = app.get(sourceUrl, headers = mapOf("Referer" to data))
+            val serverHtml = serverRes.text
 
-        if (realLink != null) {
-            callback(
-                newExtractorLink(
-                    name,
-                    "Server HD (Real)",
-                    realLink,
-                    type = ExtractorLinkType.M3U8
-                ) {
-                    this.referer = "https://p1.spexliu.top/"
-                    this.headers = mapOf("Referer" to "https://p1.spexliu.top/")
-                }
-            )
-            return true
+            // 3. Tìm link master.m3u8 thật bên trong trang trung gian đó
+            // Regex này bắt link có chứa master.m3u8 và các tham số e=...&s=...
+            val masterM3u8Regex = Regex("""https?://[^\s"']+/master\.m3u8\?[^\s"']+""")
+            val realLink = masterM3u8Regex.find(serverHtml)?.value
+
+            if (realLink != null) {
+                callback(
+                    newExtractorLink(
+                        name,
+                        button.attr("data-cdn-name").ifBlank { "Server HD" },
+                        realLink,
+                        type = ExtractorLinkType.M3U8
+                    ) {
+                        this.referer = sourceUrl
+                        this.headers = mapOf("Referer" to sourceUrl)
+                    }
+                )
+                // Nếu bạn muốn lấy tất cả server thì bỏ "return true" ở đây
+                // Nếu chỉ cần 1 server là đủ thì để return true
+                return true 
+            }
         }
-
         return false
     }
-}

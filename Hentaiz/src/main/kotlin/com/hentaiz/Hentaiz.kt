@@ -4,7 +4,6 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
-import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 
 @CloudstreamPlugin
 class HentaizPlugin : Plugin() {
@@ -20,22 +19,60 @@ class HentaizProvider : MainAPI() {
     override val hasMainPage = true
     override val supportedTypes = setOf(TvType.NSFW)
 
-    private val UA = "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Mobile Safari/537.36"
+    private val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
 
-    override val mainPage = mainPageOf(
-        "/" to "Trang Chủ",
-        "/the-loai/vietsub" to "Vietsub",
-        "/the-loai/3d" to "Hentai 3D",
-        "/the-loai/khong-che" to "Không Che",
-        "/the-loai/big-boobs" to "Mông To",
-        "/the-loai/school-girl" to "Học Sinh",
-        "/the-loai/rape" to "Hiếp Dâm",
-        "/the-loai/thu-dam" to "Tự Sướng",
-        "/the-loai/threesome" to "Tập Thể",
-        "/the-loai/teacher" to "Cô Giáo",
-        "/the-loai/succubus" to "Succubus"
-    )
+    override suspend fun loadLinks(
+        data: String,
+        isCasting: Boolean,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        // 1. Lấy trang phim để lấy danh sách server
+        val res = app.get(data, headers = mapOf("User-Agent" to UA))
+        val buttons = res.document.select("button.set-player-source")
+        
+        for (button in buttons) {
+            val sourceUrl = button.attr("data-source")
+            if (sourceUrl.isBlank()) continue
 
+            // 2. Gọi trực tiếp vào URL của server video (bỏ qua iframe)
+            // Chúng ta giả lập request như một trình duyệt thật
+            val serverRes = app.get(sourceUrl, headers = mapOf(
+                "User-Agent" to UA,
+                "Referer" to data,
+                "Accept" to "*/*"
+            ))
+            
+            // 3. Tìm link master.m3u8 trong nội dung trả về
+            val masterM3u8Regex = Regex("""https?://[^\s"']+/master\.m3u8\?[^\s"']+""")
+            val allLinks = masterM3u8Regex.findAll(serverRes.text).map { it.value }.toList()
+
+            // 4. Lọc link thật (có tham số 'e=' là link phim, không có là quảng cáo)
+            val realLink = allLinks.find { it.contains("e=") }
+            
+            if (realLink != null) {
+                callback(
+                    newExtractorLink(
+                        name,
+                        "Server HD",
+                        realLink,
+                        type = ExtractorLinkType.M3U8
+                    ) {
+                        this.referer = sourceUrl
+                        this.headers = mapOf(
+                            "User-Agent" to UA,
+                            "Referer" to sourceUrl,
+                            "Origin" to "https://p1.spexliu.top"
+                        )
+                    }
+                )
+                return true
+            }
+        }
+        return false
+    }
+
+    // ... (Giữ nguyên các hàm getMainPage, search, load như cũ)
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page == 1) mainUrl else "$mainUrl?page=$page"
         val doc = app.get(url, headers = mapOf("User-Agent" to UA)).document
@@ -64,26 +101,5 @@ class HentaizProvider : MainAPI() {
         val title = doc.selectFirst("h1")?.text()?.trim() ?: "Untitled"
         val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
         return newMovieLoadResponse(title, url, TvType.NSFW, url) { this.posterUrl = poster }
-    }
-
-    override suspend fun loadLinks(
-        data: String,
-        isCasting: Boolean,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        // Sử dụng loadExtractor với WebView Interceptor
-        // Cloudstream sẽ mở một trình duyệt ẩn, thực thi JS, và bắt link m3u8
-        val res = app.get(data, headers = mapOf("User-Agent" to UA))
-        val buttons = res.document.select("button.set-player-source")
-        
-        for (button in buttons) {
-            val sourceUrl = button.attr("data-source")
-            if (sourceUrl.isBlank()) continue
-            
-            // loadExtractor sẽ tự động bắt các request m3u8 từ WebView
-            loadExtractor(sourceUrl, data, subtitleCallback, callback)
-        }
-        return true
     }
 }

@@ -19,9 +19,12 @@ class HentaizProvider : MainAPI() {
     override val hasMainPage = true
     override val supportedTypes = setOf(TvType.NSFW)
 
-    private val UA = "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Mobile Safari/537.36"
+    private val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
 
-    private val headers = mapOf("User-Agent" to UA, "Referer" to "$mainUrl/")
+    private val headers = mapOf(
+        "User-Agent" to UA,
+        "Referer" to "$mainUrl/"
+    )
 
     override val mainPage = mainPageOf(
         "/" to "Trang Chủ",
@@ -73,39 +76,26 @@ class HentaizProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val res = app.get(data, headers = headers)
-        val serverButtons = res.document.select("button.set-player-source")
+        val buttons = res.document.select("button.set-player-source")
         
-        for (button in serverButtons) {
+        for (button in buttons) {
             val sourceUrl = button.attr("data-source")
             if (sourceUrl.isBlank()) continue
 
-            val serverHtml = app.get(sourceUrl, headers = mapOf("User-Agent" to UA, "Referer" to data)).text
-            val masterM3u8Regex = Regex("""https?://[^\s"']+/master\.m3u8\?[^\s"']+""")
-            val allLinks = masterM3u8Regex.findAll(serverHtml).map { it.value }.toList()
-
-            for (link in allLinks) {
-                val m3u8Content = app.get(link, headers = mapOf("Referer" to sourceUrl, "User-Agent" to UA)).text
-                
-                // Tính tổng thời lượng các đoạn video (#EXTINF:...)
-                val durationRegex = Regex("""#EXTINF:([\d\.]+),""")
-                val totalDuration = durationRegex.findAll(m3u8Content).sumOf { it.groupValues[1].toDoubleOrNull() ?: 0.0 }
-
-                // Chỉ chấp nhận playlist dài hơn 60 giây (phim thật)
-                if (totalDuration > 60.0) {
-                    callback(
-                        newExtractorLink(
-                            name,
-                            button.attr("data-cdn-name").ifBlank { "Server HD" },
-                            link,
-                            type = ExtractorLinkType.M3U8
-                        ) {
-                            this.referer = sourceUrl
-                            this.headers = mapOf("User-Agent" to UA, "Referer" to sourceUrl)
-                        }
-                    )
-                    return true
+            // Thay vì tìm Regex, chúng ta lấy trực tiếp URL từ data-source
+            // URL này thường là một iframe chứa trình phát video thật
+            callback(
+                newExtractorLink(
+                    name,
+                    button.attr("data-cdn-name").ifBlank { "Server HD" },
+                    sourceUrl, // Truyền trực tiếp URL iframe
+                    type = ExtractorLinkType.M3U8 // Cloudstream sẽ tự xử lý iframe nếu cần
+                ) {
+                    this.referer = data
+                    this.headers = mapOf("User-Agent" to UA, "Referer" to data)
                 }
-            }
+            )
+            return true // Trả về link đầu tiên tìm thấy
         }
         return false
     }

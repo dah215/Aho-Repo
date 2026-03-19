@@ -4,7 +4,6 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
-import okhttp3.Headers
 
 @CloudstreamPlugin
 class HentaizPlugin : Plugin() {
@@ -79,31 +78,32 @@ class HentaizProvider : MainAPI() {
             val sourceUrl = button.attr("data-source")
             if (sourceUrl.isBlank()) continue
 
-            val serverRes = app.get(sourceUrl, headers = mapOf("User-Agent" to UA, "Referer" to data))
-            val serverHtml = serverRes.text
+            // Truy cập vào iframe trung gian
+            val iframeRes = app.get(sourceUrl, headers = mapOf("User-Agent" to UA, "Referer" to data))
+            val iframeHtml = iframeRes.text
 
-            // Tìm link master.m3u8
+            // Tìm link master.m3u8 bằng Regex mạnh hơn
             val masterM3u8Regex = Regex("""https?://[^\s"']+/master\.m3u8\?[^\s"']+""")
-            val realLink = masterM3u8Regex.find(serverHtml)?.value ?: continue
+            val realLink = masterM3u8Regex.find(iframeHtml)?.value
 
-            // Sử dụng Proxy để trình phát gọi qua Cloudstream thay vì gọi trực tiếp
-            // Cloudstream sẽ tự động xử lý việc thêm Headers/Cookies khi trình phát gọi đến link này
-            callback(
-                newExtractorLink(
-                    name,
-                    button.attr("data-cdn-name").ifBlank { "Server HD" },
-                    realLink,
-                    type = ExtractorLinkType.M3U8
-                ) {
-                    this.referer = sourceUrl
-                    this.headers = mapOf(
-                        "User-Agent" to UA,
-                        "Referer" to sourceUrl,
-                        "Origin" to "https://p1.spexliu.top"
-                    )
-                }
-            )
-            return true
+            if (realLink != null) {
+                callback(
+                    newExtractorLink(
+                        name,
+                        button.attr("data-cdn-name").ifBlank { "Server HD" },
+                        realLink,
+                        type = ExtractorLinkType.M3U8
+                    ) {
+                        this.referer = sourceUrl
+                        this.headers = mapOf(
+                            "User-Agent" to UA,
+                            "Referer" to sourceUrl,
+                            "Origin" to "https://p1.spexliu.top"
+                        )
+                    }
+                )
+                return true
+            }
         }
         return false
     }

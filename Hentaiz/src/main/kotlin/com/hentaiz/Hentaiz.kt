@@ -90,23 +90,16 @@ class HentaizProvider : MainAPI() {
             val sourceUrl = button.attr("data-source")
             if (sourceUrl.isBlank()) continue
 
-            // 1. Giả lập hành động "Skip" quảng cáo
-            // Lấy adTag từ URL data-source và gọi nó trước
-            val adTag = Regex("""adTag=([^&]+)""").find(sourceUrl)?.groupValues?.get(1)?.let { 
-                java.net.URLDecoder.decode(it, "UTF-8") 
-            }
-            if (!adTag.isNullOrBlank()) {
-                app.get(adTag, headers = mapOf("User-Agent" to UA, "Referer" to sourceUrl))
-            }
-
-            // 2. Lấy trang trung gian sau khi đã "skip"
+            // Truy cập vào trang trung gian (iframe)
             val serverRes = app.get(sourceUrl, headers = mapOf("User-Agent" to UA, "Referer" to data))
             val serverHtml = serverRes.text
 
-            // 3. Tìm link master.m3u8 thật (ưu tiên link có tham số 'e=')
+            // Tìm tất cả các link master.m3u8
             val masterM3u8Regex = Regex("""https?://[^\s"']+/master\.m3u8\?[^\s"']+""")
             val allLinks = masterM3u8Regex.findAll(serverHtml).map { it.value }.toList()
-            val realLink = allLinks.find { it.contains("e=") } ?: allLinks.firstOrNull()
+
+            // LỌC: Chỉ lấy link có chứa tham số 'e=' (đây là link phim thật)
+            val realLink = allLinks.find { it.contains("e=") }
 
             if (realLink != null) {
                 callback(
@@ -117,7 +110,10 @@ class HentaizProvider : MainAPI() {
                         type = ExtractorLinkType.M3U8
                     ) {
                         this.referer = sourceUrl
-                        this.headers = mapOf("User-Agent" to UA, "Referer" to sourceUrl)
+                        this.headers = mapOf(
+                            "User-Agent" to UA,
+                            "Referer" to sourceUrl
+                        )
                     }
                 )
                 return true

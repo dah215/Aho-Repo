@@ -105,17 +105,18 @@ class HentaiVietsubProvider : MainAPI() {
     val checkRes = app.get(m3u8Url, headers = mapOf("Referer" to "https://e.streamqq.com/"))
     
     if (checkRes.code == 200) {
-        callback(
-            newExtractorLink(
-                name, 
-                "StreamQQ HD (No Ads)", 
-                m3u8Url, 
-                referer = "https://e.streamqq.com/", 
-                type = ExtractorLinkType.M3U8
-            )
-        )
-        return true
-    }
-
+    callback(
+        newExtractorLink(
+            name, 
+            "StreamQQ HD (No Ads)", 
+            m3u8Url, 
+            type = ExtractorLinkType.M3U8
+        ) {
+            this.referer = "https://e.streamqq.com/"
+            this.headers = mapOf("Referer" to "https://e.streamqq.com/")
+        }
+    )
+    return true
+}
     return false
 }

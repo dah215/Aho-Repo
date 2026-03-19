@@ -21,10 +21,7 @@ class HentaizProvider : MainAPI() {
 
     private val UA = "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Mobile Safari/537.36"
 
-    private val headers = mapOf(
-        "User-Agent" to UA,
-        "Referer" to "$mainUrl/"
-    )
+    private val headers = mapOf("User-Agent" to UA, "Referer" to "$mainUrl/")
 
     override val mainPage = mainPageOf(
         "/" to "Trang Chủ",
@@ -42,15 +39,10 @@ class HentaizProvider : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page == 1) fixUrl(request.data) else "${fixUrl(request.data)}?page=$page"
         val doc = app.get(url, headers = headers).document
-        
         val items = doc.select("div.item-box").mapNotNull { el ->
             val linkEl = el.selectFirst("a") ?: return@mapNotNull null
-            val href = fixUrl(linkEl.attr("href"))
-            val title = linkEl.attr("title")
-            val poster = el.selectFirst("img")?.attr("src")
-            
-            newMovieSearchResponse(title, href, TvType.NSFW) {
-                this.posterUrl = poster
+            newMovieSearchResponse(linkEl.attr("title"), fixUrl(linkEl.attr("href")), TvType.NSFW) {
+                this.posterUrl = el.selectFirst("img")?.attr("src")
             }
         }
         return newHomePageResponse(request.name, items, true)
@@ -71,10 +63,7 @@ class HentaizProvider : MainAPI() {
         val doc = app.get(url, headers = headers).document
         val title = doc.selectFirst("h1")?.text()?.trim() ?: "Untitled"
         val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
-
-        return newMovieLoadResponse(title, url, TvType.NSFW, url) {
-            this.posterUrl = poster
-        }
+        return newMovieLoadResponse(title, url, TvType.NSFW, url) { this.posterUrl = poster }
     }
 
     override suspend fun loadLinks(
@@ -84,39 +73,38 @@ class HentaizProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val res = app.get(data, headers = headers)
-        val doc = res.document
-        val serverButtons = doc.select("button.set-player-source")
+        val serverButtons = res.document.select("button.set-player-source")
         
         for (button in serverButtons) {
             val sourceUrl = button.attr("data-source")
             if (sourceUrl.isBlank()) continue
 
-            val serverRes = app.get(sourceUrl, headers = mapOf("User-Agent" to UA, "Referer" to data))
-            val serverHtml = serverRes.text
-
-            // Tìm tất cả các link master.m3u8
+            val serverHtml = app.get(sourceUrl, headers = mapOf("User-Agent" to UA, "Referer" to data)).text
             val masterM3u8Regex = Regex("""https?://[^\s"']+/master\.m3u8\?[^\s"']+""")
             val allLinks = masterM3u8Regex.findAll(serverHtml).map { it.value }.toList()
 
-            // LỌC THÔNG MINH: Chỉ lấy link có chứa tham số "e=" (phim thật)
-            val realLink = allLinks.find { it.contains("e=") }
+            for (link in allLinks) {
+                val m3u8Content = app.get(link, headers = mapOf("Referer" to sourceUrl, "User-Agent" to UA)).text
+                
+                // Tính tổng thời lượng các đoạn video (#EXTINF:...)
+                val durationRegex = Regex("""#EXTINF:([\d\.]+),""")
+                val totalDuration = durationRegex.findAll(m3u8Content).sumOf { it.groupValues[1].toDoubleOrNull() ?: 0.0 }
 
-            if (realLink != null) {
-                callback(
-                    newExtractorLink(
-                        name,
-                        button.attr("data-cdn-name").ifBlank { "Server HD" },
-                        realLink,
-                        type = ExtractorLinkType.M3U8
-                    ) {
-                        this.referer = sourceUrl
-                        this.headers = mapOf(
-                            "User-Agent" to UA,
-                            "Referer" to sourceUrl
-                        )
-                    }
-                )
-                return true
+                // Chỉ chấp nhận playlist dài hơn 60 giây (phim thật)
+                if (totalDuration > 60.0) {
+                    callback(
+                        newExtractorLink(
+                            name,
+                            button.attr("data-cdn-name").ifBlank { "Server HD" },
+                            link,
+                            type = ExtractorLinkType.M3U8
+                        ) {
+                            this.referer = sourceUrl
+                            this.headers = mapOf("User-Agent" to UA, "Referer" to sourceUrl)
+                        }
+                    )
+                    return true
+                }
             }
         }
         return false

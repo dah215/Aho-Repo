@@ -27,14 +27,8 @@ class VLXXProvider : MainAPI() {
     )
 
     override val mainPage = mainPageOf(
-        "/" to "Trang Chủ",
-        "/jav/" to "JAV",
-        "/phim-sex-hay/" to "Phim Sex Hay",
-        "/vietsub/" to "Vietsub",
-        "/khong-che/" to "Không Che",
-        "/hoc-sinh/" to "Học Sinh",
-        "/vung-trom/" to "Vụng Trộm",
-        "/chau-au/" to "Châu Âu"
+        "/" to "Mới",
+        "/xxx/#day/" to "Hay Hàng Ngày"
     )
 
     private fun fixUrl(url: String): String {

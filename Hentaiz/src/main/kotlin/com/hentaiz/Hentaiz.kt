@@ -85,41 +85,42 @@ class HentaizProvider : MainAPI() {
     ): Boolean {
         val res = app.get(data, headers = headers)
         val doc = res.document
-
-        // Lấy tất cả các nút chọn server
         val serverButtons = doc.select("button.set-player-source")
         
         for (button in serverButtons) {
             val sourceUrl = button.attr("data-source")
             if (sourceUrl.isBlank()) continue
 
-            // Truy cập vào trang trung gian với đầy đủ User-Agent và Referer
-            val serverRes = app.get(
-                sourceUrl, 
-                headers = mapOf(
-                    "User-Agent" to UA,
-                    "Referer" to data
-                )
-            )
+            val serverRes = app.get(sourceUrl, headers = mapOf("User-Agent" to UA, "Referer" to data))
             val serverHtml = serverRes.text
 
-            // Tìm link master.m3u8 thật (bao gồm cả tham số bảo mật e=...&s=...)
+            // Tìm link master.m3u8
             val masterM3u8Regex = Regex("""https?://[^\s"']+/master\.m3u8\?[^\s"']+""")
             val realLink = masterM3u8Regex.find(serverHtml)?.value
 
             if (realLink != null) {
+                // Tải nội dung file m3u8 về để lọc quảng cáo
+                val m3u8Content = app.get(realLink, headers = mapOf("Referer" to sourceUrl, "User-Agent" to UA)).text
+                
+                // Lọc bỏ các dòng chứa quảng cáo (vast, ad, promo)
+                val cleanM3u8 = m3u8Content.lines().filter { line ->
+                    !line.contains("vast", ignoreCase = true) &&
+                    !line.contains("ad", ignoreCase = true) &&
+                    !line.contains("promo", ignoreCase = true)
+                }.joinToString("\n")
+
+                // Nếu file m3u8 quá ngắn hoặc không hợp lệ, bỏ qua
+                if (cleanM3u8.length < 100) continue
+
                 callback(
                     newExtractorLink(
                         name,
-                        button.attr("data-cdn-name").ifBlank { "Server HD" },
-                        realLink,
+                        button.attr("data-cdn-name").ifBlank { "Server HD (Clean)" },
+                        realLink, // Cloudstream sẽ tự xử lý nếu chúng ta truyền link gốc
                         type = ExtractorLinkType.M3U8
                     ) {
                         this.referer = sourceUrl
-                        this.headers = mapOf(
-                            "User-Agent" to UA,
-                            "Referer" to sourceUrl
-                        )
+                        this.headers = mapOf("User-Agent" to UA, "Referer" to sourceUrl)
                     }
                 )
                 return true

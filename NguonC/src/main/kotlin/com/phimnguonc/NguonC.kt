@@ -150,9 +150,9 @@ class PhimNguonCProvider : MainAPI() {
     }
 
     // ── Local proxy server ────────────────────────────────────────────────────
-    // M3U8: content-type=text/html → serve với application/vnd.apple.mpegurl
-    // Segment .png: content-type=image/png → proxy với video/mp2t
-    private var proxyServer: NguonCProxyServer? = null
+    // Dùng ThreadPool để handle nhiều segment requests song song
+    // Mỗi stream (Vietsub/TM) có server riêng
+    private val activeServers = mutableListOf<NguonCProxyServer>()
 
     inner class NguonCProxyServer(
         private val m3u8Content: String,
@@ -160,6 +160,7 @@ class PhimNguonCProvider : MainAPI() {
     ) {
         private var serverSocket: java.net.ServerSocket? = null
         val port: Int get() = serverSocket?.localPort ?: 0
+        private val threadPool = java.util.concurrent.Executors.newCachedThreadPool()
 
         fun start() {
             serverSocket = java.net.ServerSocket(0)
@@ -168,7 +169,7 @@ class PhimNguonCProvider : MainAPI() {
                 while (!ss.isClosed) {
                     try {
                         val client = ss.accept()
-                        Thread { handleClient(client) }.also { it.isDaemon = true }.start()
+                        threadPool.execute { handleClient(client) }
                     } catch (_: Exception) { break }
                 }
             }.also { it.isDaemon = true }.start()
@@ -178,46 +179,28 @@ class PhimNguonCProvider : MainAPI() {
             try {
                 val input  = client.getInputStream().bufferedReader()
                 val output = client.getOutputStream()
-
-                // Đọc request line
                 val requestLine = input.readLine() ?: return
-                // Đọc hết headers
                 while (true) { if ((input.readLine() ?: "").isBlank()) break }
-
                 val path = requestLine.split(" ").getOrNull(1) ?: "/"
                 val crlf = "\r\n"
-
                 when {
-                    // Serve M3U8
                     path == "/stream.m3u8" -> {
                         val body = m3u8Content.toByteArray(Charsets.UTF_8)
-                        val resp = "HTTP/1.1 200 OK${crlf}" +
-                            "Content-Type: application/vnd.apple.mpegurl${crlf}" +
-                            "Content-Length: ${body.size}${crlf}" +
-                            "Access-Control-Allow-Origin: *${crlf}" +
-                            crlf
-                        output.write(resp.toByteArray())
+                        output.write(("HTTP/1.1 200 OK${crlf}Content-Type: application/vnd.apple.mpegurl${crlf}Content-Length: ${body.size}${crlf}Access-Control-Allow-Origin: *${crlf}${crlf}").toByteArray())
                         output.write(body)
                     }
-                    // Proxy segment .png → video/mp2t
                     path.startsWith("/seg/") -> {
-                        val segUrl = java.net.URLDecoder.decode(
-                            path.removePrefix("/seg/"), "UTF-8"
-                        )
+                        val segUrl = java.net.URLDecoder.decode(path.removePrefix("/seg/"), "UTF-8")
                         try {
-                            val conn = java.net.URL(segUrl).openConnection()
-                                as java.net.HttpURLConnection
+                            val conn = java.net.URL(segUrl).openConnection() as java.net.HttpURLConnection
+                            conn.connectTimeout = 15000
+                            conn.readTimeout    = 30000
                             conn.setRequestProperty("User-Agent", USER_AGENT)
                             conn.setRequestProperty("Referer", segReferer)
                             conn.connect()
                             val bytes = conn.inputStream.readBytes()
                             conn.disconnect()
-                            val resp = "HTTP/1.1 200 OK${crlf}" +
-                                "Content-Type: video/mp2t${crlf}" +
-                                "Content-Length: ${bytes.size}${crlf}" +
-                                "Access-Control-Allow-Origin: *${crlf}" +
-                                crlf
-                            output.write(resp.toByteArray())
+                            output.write(("HTTP/1.1 200 OK${crlf}Content-Type: video/mp2t${crlf}Content-Length: ${bytes.size}${crlf}Access-Control-Allow-Origin: *${crlf}${crlf}").toByteArray())
                             output.write(bytes)
                         } catch (_: Exception) {
                             output.write("HTTP/1.1 502 Bad Gateway${crlf}${crlf}".toByteArray())
@@ -227,21 +210,20 @@ class PhimNguonCProvider : MainAPI() {
                 }
                 output.flush()
                 client.close()
-            } catch (_: Exception) {
-                try { client.close() } catch (_: Exception) {}
-            }
+            } catch (_: Exception) { try { client.close() } catch (_: Exception) {} }
         }
 
-        fun stop() { try { serverSocket?.close() } catch (_: Exception) {} }
+        fun stop() {
+            try { serverSocket?.close() } catch (_: Exception) {}
+            try { threadPool.shutdownNow() } catch (_: Exception) {}
+        }
     }
 
-    // Rewrite M3U8: thay segment URLs thành proxy URLs
     private fun rewriteM3U8(m3u8: String, proxyBase: String): String {
         return m3u8.lines().joinToString("\n") { line ->
             val trimmed = line.trim()
             if (trimmed.startsWith("http") && !trimmed.startsWith("#")) {
-                val encoded = java.net.URLEncoder.encode(trimmed, "UTF-8")
-                "$proxyBase/seg/$encoded"
+                "$proxyBase/seg/${java.net.URLEncoder.encode(trimmed, "UTF-8")}"
             } else line
         }
     }
@@ -289,33 +271,25 @@ class PhimNguonCProvider : MainAPI() {
             // Helper: fetch M3U8 → rewrite segments → serve qua proxy
             suspend fun serveStream(m3u8Url: String, serverName: String) {
                 try {
-                    // Fetch M3U8 qua OkHttp (server trả content-type sai nhưng content đúng)
                     val m3u8Raw = app.get(m3u8Url, headers = fetchHdr).text
                     if (!m3u8Raw.contains("#EXTM3U")) return
 
-                    proxyServer?.stop()
-                    val server = NguonCProxyServer(
-                        m3u8Content = "",   // placeholder, sẽ set sau
-                        segReferer  = embedUrl
-                    )
-                    server.start()
+                    // Mỗi stream dùng server riêng, không stop server cũ
+                    // Start server với port ngẫu nhiên trước để biết port
+                    val tempSocket = java.net.ServerSocket(0)
+                    val port = tempSocket.localPort
+                    tempSocket.close()
 
-                    val proxyBase    = "http://127.0.0.1:${server.port}"
+                    val proxyBase     = "http://127.0.0.1:$port"
                     val rewrittenM3U8 = rewriteM3U8(m3u8Raw, proxyBase)
-
-                    // Restart với M3U8 đúng
-                    server.stop()
-                    val finalServer = NguonCProxyServer(
-                        m3u8Content = rewrittenM3U8,
-                        segReferer  = embedUrl
-                    )
-                    finalServer.start()
-                    proxyServer = finalServer
+                    val server        = NguonCProxyServer(rewrittenM3U8, embedUrl)
+                    server.start()
+                    activeServers.add(server)
 
                     callback(newExtractorLink(
                         source = "NguonC",
                         name   = serverName,
-                        url    = "http://127.0.0.1:${finalServer.port}/stream.m3u8",
+                        url    = "http://127.0.0.1:${server.port}/stream.m3u8",
                         type   = ExtractorLinkType.M3U8
                     ) {
                         this.quality = Qualities.P1080.value

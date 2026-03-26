@@ -7,13 +7,10 @@ import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.network.WebViewResolver
 import org.jsoup.nodes.Element
-import java.net.URLEncoder
-import java.net.URLDecoder
+import java.net.*
+import java.io.*
 import android.util.Base64
 import java.util.EnumSet
-import java.net.ServerSocket
-import java.net.Socket
-import java.io.*
 import kotlinx.coroutines.*
 
 @CloudstreamPlugin
@@ -25,7 +22,7 @@ class PhimNguonCPlugin : Plugin() {
     override fun load() {
         registerMainAPI(PhimNguonCProvider())
         
-        // Khởi động Proxy Server tại đây
+        // Khởi động Proxy Server
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 val serverSocket = ServerSocket(0)
@@ -38,19 +35,22 @@ class PhimNguonCPlugin : Plugin() {
         }
     }
 
-    private suspend fun handleProxyRequest(client: Socket) {
-        withContext(Dispatchers.IO) {
+    private fun handleProxyRequest(client: Socket) {
+        CoroutineScope(Dispatchers.IO).launch {
             try {
                 val reader = BufferedReader(InputStreamReader(client.getInputStream()))
-                val requestLine = reader.readLine() ?: return@withContext
+                val requestLine = reader.readLine() ?: return@launch
                 val url = requestLine.split(" ")[1].removePrefix("/proxy?url=")
                 val targetUrl = URLDecoder.decode(url, "UTF-8")
 
-                val response = Requests().get(targetUrl, headers = mapOf("Referer" to "https://embed12.streamc.xyz/", "User-Agent" to "Mozilla/5.0"))
+                // Dùng HttpURLConnection thuần để không phụ thuộc vào 'app'
+                val connection = URL(targetUrl).openConnection() as HttpURLConnection
+                connection.setRequestProperty("Referer", "https://embed12.streamc.xyz/")
+                connection.setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
                 
                 val out = client.getOutputStream()
                 out.write("HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\n\r\n".toByteArray())
-                out.write(response.body.bytes())
+                connection.inputStream.copyTo(out)
                 out.flush()
                 client.close()
             } catch (e: Exception) { client.close() }
@@ -77,7 +77,6 @@ class PhimNguonCProvider : MainAPI() {
         "danh-sach/phim-bo" to "Phim Bộ"
     )
 
-    // --- CÁC HÀM PARSE ---
     private fun parseCard(el: Element): SearchResponse? {
         val a = el.selectFirst("a") ?: return null
         val href = a.attr("href")
@@ -144,7 +143,6 @@ class PhimNguonCProvider : MainAPI() {
         return false
     }
 
-    // Data Classes
     data class NguonCApiResponse(@JsonProperty("items") val items: List<NguonCApiItem>? = null)
     data class NguonCApiItem(@JsonProperty("name") val name: String? = null, @JsonProperty("slug") val slug: String? = null, @JsonProperty("poster_url") val poster_url: String? = null, @JsonProperty("thumb_url") val thumb_url: String? = null, @JsonProperty("current_episode") val current_episode: String? = null, @JsonProperty("language") val language: String? = null)
     data class NguonCDetailResponse(@JsonProperty("movie") val movie: NguonCMovie? = null)

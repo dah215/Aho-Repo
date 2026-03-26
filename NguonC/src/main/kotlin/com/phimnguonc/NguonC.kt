@@ -183,46 +183,40 @@ class PhimNguonCProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val embedUrl    = data
+        val embedUrl = data
         val embedDomain = Regex("""https?://[^/]+""").find(embedUrl)?.value ?: ""
 
         try {
             val embedRes = app.get(
                 embedUrl,
                 headers = mapOf(
-                    "Referer"    to "$mainUrl/",
+                    "Referer" to "$mainUrl/",
                     "User-Agent" to USER_AGENT
                 ),
                 interceptor = cfInterceptor
             )
-            val html    = embedRes.text
+            val html = embedRes.text
             val cookies = embedRes.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
 
             val obfMatch = Regex("""data-obf\s*=\s*["']([A-Za-z0-9+/=]+)["']""").find(html)
             if (obfMatch != null) {
-                val obfBase64  = obfMatch.groupValues[1]
-                val jsonData   = String(Base64.decode(obfBase64, Base64.DEFAULT))
+                val obfBase64 = obfMatch.groupValues[1]
+                val jsonData = String(Base64.decode(obfBase64, Base64.DEFAULT))
                 val streamData = AppUtils.parseJson<StreamData>(jsonData)
                 
+                // Header quan trọng để bypass lỗi 2004
                 val videoHeaders = mapOf(
-                    "User-Agent"      to USER_AGENT,
-                    "Referer"         to embedUrl,
-                    "Origin"          to embedDomain,
-                    "Cookie"          to cookies,
-                    "Accept"          to "*/*",
-                    "Accept-Language" to "vi-VN,vi;q=0.9",
-                    "Connection"      to "keep-alive"
+                    "User-Agent" to USER_AGENT,
+                    "Referer" to "$embedUrl", 
+                    "Origin" to embedDomain,
+                    "Cookie" to cookies
                 )
 
                 // Xử lý Vietsub
                 if (!streamData.sUb.isNullOrBlank()) {
+                    val url = if (streamData.sUb.startsWith("http")) streamData.sUb else "$embedDomain/${streamData.sUb}.m3u8"
                     callback(
-                        newExtractorLink(
-                            source = "NguonC",
-                            name   = "Vietsub",
-                            url    = "$embedDomain/${streamData.sUb}.m3u8",
-                            type   = ExtractorLinkType.M3U8
-                        ) {
+                        newExtractorLink("NguonC", "Vietsub", url, ExtractorLinkType.M3U8) {
                             this.quality = Qualities.P1080.value
                             this.headers = videoHeaders
                         }
@@ -231,13 +225,9 @@ class PhimNguonCProvider : MainAPI() {
 
                 // Xử lý Thuyết minh
                 if (!streamData.hD.isNullOrBlank()) {
+                    val url = if (streamData.hD.startsWith("http")) streamData.hD else "$embedDomain/${streamData.hD}.m3u8"
                     callback(
-                        newExtractorLink(
-                            source = "NguonC",
-                            name   = "Thuyết minh",
-                            url    = "$embedDomain/${streamData.hD}.m3u8",
-                            type   = ExtractorLinkType.M3U8
-                        ) {
+                        newExtractorLink("NguonC", "Thuyết minh", url, ExtractorLinkType.M3U8) {
                             this.quality = Qualities.P1080.value
                             this.headers = videoHeaders
                         }

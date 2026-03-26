@@ -204,7 +204,7 @@ class PhimNguonCProvider : MainAPI() {
                 val jsonData   = String(Base64.decode(obfBase64, Base64.DEFAULT))
                 val streamData = AppUtils.parseJson<StreamData>(jsonData)
                 
-                // SỬ DỤNG LẠI CHÍNH XÁC BỘ HEADER GỐC CỦA BẠN (Đã test chạy được Vietsub)
+                // BỘ HEADER AN TOÀN: Đã loại bỏ Sec-Fetch-* để tránh lỗi CORS trên server Thuyết minh
                 val videoHeaders = mapOf(
                     "User-Agent"      to USER_AGENT,
                     "Referer"         to embedUrl,
@@ -212,19 +212,17 @@ class PhimNguonCProvider : MainAPI() {
                     "Cookie"          to cookies,
                     "Accept"          to "*/*",
                     "Accept-Language" to "vi-VN,vi;q=0.9",
-                    "Connection"      to "keep-alive",
-                    "Sec-Fetch-Dest"  to "video",
-                    "Sec-Fetch-Mode"  to "cors",
-                    "Sec-Fetch-Site"  to "same-origin"
+                    "Connection"      to "keep-alive"
                 )
 
                 var linkFound = false
 
                 // 1. Xử lý Vietsub
                 val sUb = streamData.sUb
-                if (!sUb.isNullOrBlank()) {
-                    // Kiểm tra an toàn để không bị nối đuôi .m3u8 hai lần
-                    val finalUrl = if (sUb.startsWith("http")) sUb else if (sUb.endsWith(".m3u8")) "$embedDomain/$sUb" else "$embedDomain/$sUb.m3u8"
+                if (!sUb.isNullOrBlank() && sUb != "null") {
+                    // Dọn dẹp URL: Xóa dấu / ở đầu nếu có để tránh lỗi double slash (//)
+                    val cleanPath = sUb.trimStart('/')
+                    val finalUrl = if (cleanPath.startsWith("http")) cleanPath else "$embedDomain/$cleanPath" + (if (cleanPath.endsWith(".m3u8")) "" else ".m3u8")
                     
                     callback(
                         newExtractorLink(
@@ -242,9 +240,10 @@ class PhimNguonCProvider : MainAPI() {
 
                 // 2. Xử lý Thuyết minh
                 val hD = streamData.hD
-                if (!hD.isNullOrBlank()) {
-                    // Kiểm tra an toàn tương tự Vietsub
-                    val finalUrl = if (hD.startsWith("http")) hD else if (hD.endsWith(".m3u8")) "$embedDomain/$hD" else "$embedDomain/$hD.m3u8"
+                if (!hD.isNullOrBlank() && hD != "null") {
+                    // Dọn dẹp URL tương tự Vietsub
+                    val cleanPath = hD.trimStart('/')
+                    val finalUrl = if (cleanPath.startsWith("http")) cleanPath else "$embedDomain/$cleanPath" + (if (cleanPath.endsWith(".m3u8")) "" else ".m3u8")
                     
                     callback(
                         newExtractorLink(

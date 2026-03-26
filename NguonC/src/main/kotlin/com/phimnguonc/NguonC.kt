@@ -42,15 +42,16 @@ class PhimNguonCProvider : MainAPI() {
 
     private val API_PREFIX = "API::"
     
-    // --- LOCAL PROXY SERVER ---
     private var proxyPort = 0
-    
-    init {
-        CoroutineScope(Dispatchers.IO).launch {
+    private var serverJob: Job? = null
+
+    // Khởi tạo server trong load() thay vì init
+    override fun load() {
+        serverJob = CoroutineScope(Dispatchers.IO).launch {
             try {
                 val serverSocket = ServerSocket(0)
                 proxyPort = serverSocket.localPort
-                while (true) {
+                while (isActive) {
                     val client = serverSocket.accept()
                     handleProxyRequest(client)
                 }
@@ -58,19 +59,15 @@ class PhimNguonCProvider : MainAPI() {
         }
     }
 
-    private fun handleProxyRequest(client: Socket) {
-        CoroutineScope(Dispatchers.IO).launch {
+    private suspend fun handleProxyRequest(client: Socket) {
+        withContext(Dispatchers.IO) {
             try {
                 val reader = BufferedReader(InputStreamReader(client.getInputStream()))
-                val requestLine = reader.readLine() ?: return@launch
+                val requestLine = reader.readLine() ?: return@withContext
                 val url = requestLine.split(" ")[1].removePrefix("/proxy?url=")
                 val targetUrl = URLDecoder.decode(url, "UTF-8")
 
-                // Tải dữ liệu với Header chuẩn
-                val response = app.get(targetUrl, headers = mapOf(
-                    "Referer" to "https://embed12.streamc.xyz/", // Ép Referer cứng
-                    "User-Agent" to USER_AGENT
-                ))
+                val response = app.get(targetUrl, headers = mapOf("Referer" to "https://embed12.streamc.xyz/", "User-Agent" to USER_AGENT))
                 
                 val out = client.getOutputStream()
                 out.write("HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\n\r\n".toByteArray())
@@ -81,16 +78,12 @@ class PhimNguonCProvider : MainAPI() {
         }
     }
 
-    override val mainPage = mainPageOf(
-        "${API_PREFIX}api/films/phim-moi-cap-nhat" to "Phim Mới Cập Nhật",
-        "danh-sach/phim-le"                        to "Phim Lẻ",
-        "danh-sach/phim-bo"                        to "Phim Bộ",
-        "danh-sach/tv-shows"                       to "TV Shows"
-    )
+    // --- CÁC HÀM CŨ GIỮ NGUYÊN ---
+    override val mainPage = mainPageOf("${API_PREFIX}api/films/phim-moi-cap-nhat" to "Phim Mới Cập Nhật", "danh-sach/phim-le" to "Phim Lẻ", "danh-sach/phim-bo" to "Phim Bộ", "danh-sach/tv-shows" to "TV Shows")
     
     private fun parseCard(el: Element): SearchResponse? {
-        val a     = el.selectFirst("a") ?: return null
-        val href  = a.attr("href")
+        val a = el.selectFirst("a") ?: return null
+        val href = a.attr("href")
         val title = el.selectFirst("h3")?.text()?.trim() ?: a.attr("title")
         val poster = el.selectFirst("img")?.let { it.attr("data-src").ifBlank { it.attr("src") } }
         val statusText = el.selectFirst("span.bg-green-300")?.text()?.trim() ?: ""
@@ -100,23 +93,23 @@ class PhimNguonCProvider : MainAPI() {
         }
         return newAnimeSearchResponse(title, href, TvType.TvSeries) {
             this.posterUrl = poster
-            this.quality   = SearchQuality.HD
-            this.episodes  = mutableMapOf(DubStatus.Subbed to (episodeCount ?: 0))
+            this.quality = SearchQuality.HD
+            this.episodes = mutableMapOf(DubStatus.Subbed to (episodeCount ?: 0))
         }
     }
 
     private fun parseApiItem(item: NguonCApiItem): SearchResponse? {
-        val slug  = item.slug ?: return null
+        val slug = item.slug ?: return null
         val title = item.name ?: return null
-        val href  = "$mainUrl/phim/$slug"
+        val href = "$mainUrl/phim/$slug"
         val poster = item.poster_url ?: item.thumb_url
         val currentEp = item.current_episode ?: ""
         val episodeCount: Int? = when {
             currentEp.equals("FULL", ignoreCase = true) -> null
             else -> Regex("""[Tt]ập\s*(\d+)""").find(currentEp)?.groupValues?.get(1)?.toIntOrNull()
         }
-        val lang      = item.language ?: ""
-        val hasDub    = lang.contains("Thuyết Minh", ignoreCase = true)
+        val lang = item.language ?: ""
+        val hasDub = lang.contains("Thuyết Minh", ignoreCase = true)
         return newAnimeSearchResponse(title, href, TvType.TvSeries) {
             this.posterUrl = poster
             this.episodes = mutableMapOf(DubStatus.Subbed to (episodeCount ?: 0)).also { map ->
@@ -128,8 +121,8 @@ class PhimNguonCProvider : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         return if (request.data.startsWith(API_PREFIX)) {
             val path = request.data.removePrefix(API_PREFIX)
-            val url  = "$mainUrl/$path?page=$page"
-            val res  = app.get(url, headers = commonHeaders, interceptor = cfInterceptor).parsedSafe<NguonCApiResponse>()
+            val url = "$mainUrl/$path?page=$page"
+            val res = app.get(url, headers = commonHeaders, interceptor = cfInterceptor).parsedSafe<NguonCApiResponse>()
             val items = res?.items?.mapNotNull { parseApiItem(it) } ?: emptyList()
             newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
         } else {
@@ -147,9 +140,9 @@ class PhimNguonCProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val slug   = url.trim().trimEnd('/').substringAfterLast("/")
+        val slug = url.trim().trimEnd('/').substringAfterLast("/")
         val apiUrl = "$mainUrl/api/film/$slug"
-        val res   = app.get(apiUrl, headers = commonHeaders, interceptor = cfInterceptor).parsedSafe<NguonCDetailResponse>()
+        val res = app.get(apiUrl, headers = commonHeaders, interceptor = cfInterceptor).parsedSafe<NguonCDetailResponse>()
         val movie = res?.movie ?: throw ErrorLoadingException("Không thể tải dữ liệu phim")
         val episodes = mutableListOf<Episode>()
         movie.episodes?.forEach { server ->
@@ -157,7 +150,7 @@ class PhimNguonCProvider : MainAPI() {
                 val embed = ep.embed?.replace("\\/", "/") ?: ""
                 if (embed.isNotBlank()) {
                     episodes.add(newEpisode(embed) {
-                        this.name    = "Tập ${ep.name}"
+                        this.name = "Tập ${ep.name}"
                         this.episode = ep.name?.toIntOrNull()
                     })
                 }
@@ -165,7 +158,7 @@ class PhimNguonCProvider : MainAPI() {
         }
         return newTvSeriesLoadResponse(movie.name ?: "", url, TvType.TvSeries, episodes) {
             this.posterUrl = movie.poster_url ?: movie.thumb_url
-            this.plot      = movie.description
+            this.plot = movie.description
         }
     }
 
@@ -196,11 +189,10 @@ class PhimNguonCProvider : MainAPI() {
         return false
     }
 
-    // Data classes giữ nguyên...
     data class NguonCApiResponse(@JsonProperty("status") val status: String? = null, @JsonProperty("items") val items: List<NguonCApiItem>? = null)
     data class NguonCApiItem(@JsonProperty("name") val name: String? = null, @JsonProperty("slug") val slug: String? = null, @JsonProperty("poster_url") val poster_url: String? = null, @JsonProperty("thumb_url") val thumb_url: String? = null, @JsonProperty("current_episode") val current_episode: String? = null, @JsonProperty("quality") val quality: String? = null, @JsonProperty("language") val language: String? = null)
     data class NguonCDetailResponse(@JsonProperty("movie") val movie: NguonCMovie? = null)
-    data class NguonCMovie(@JsonProperty("name") val name: String? = null, @JsonProperty("description") val description: String? = null, @JsonProperty("poster_url") val poster_url: String? = null, @JsonProperty("thumb_url") val thumb_url: String? = null, @JsonProperty("episodes") val episodes: List<NguonCServer>? = null)
+    data class NguonCMovie(@JsonProperty("name") val name: String? = null, @JsonProperty("description") val description: String? = null, @JsonProperty("poster_url") val poster_url: String? = null, @JsonProperty("thumb_url") val thumb_url: String? = null, @JsonProperty("episodes") List<NguonCServer>? = null)
     data class NguonCServer(@JsonProperty("items") val items: List<NguonCEpisode>? = null, @JsonProperty("list") val list: List<NguonCEpisode>? = null)
     data class NguonCEpisode(@JsonProperty("name") val name: String? = null, @JsonProperty("embed") val embed: String? = null)
 }

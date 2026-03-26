@@ -27,7 +27,7 @@ class PhimNguonCProvider : MainAPI() {
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
 
     private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-    private val cfInterceptor = WebViewResolver(Regex("""phim\.nguonc\.com|.*streamc\.xyz|.*amass15\.top"""))
+    private val cfInterceptor = WebViewResolver(Regex("""phim\.nguonc\.com|.*streamc\.xyz|.*amass15\.top|.*hihihoho2\.top"""))
 
     private val commonHeaders = mapOf(
         "User-Agent" to USER_AGENT,
@@ -204,12 +204,13 @@ class PhimNguonCProvider : MainAPI() {
                 val jsonData = String(Base64.decode(obfBase64, Base64.DEFAULT))
                 val streamData = AppUtils.parseJson<StreamData>(jsonData)
                 
-                // Header quan trọng để bypass lỗi 2004
+                // Header "thần thánh" để bypass 2004
                 val videoHeaders = mapOf(
                     "User-Agent" to USER_AGENT,
                     "Referer" to "$embedUrl", 
                     "Origin" to embedDomain,
-                    "Cookie" to cookies
+                    "Cookie" to cookies,
+                    "X-Requested-With" to "XMLHttpRequest" // Thêm cái này vào
                 )
 
                 // Xử lý Vietsub

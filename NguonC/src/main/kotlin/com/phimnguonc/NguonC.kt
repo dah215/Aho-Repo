@@ -17,6 +17,7 @@ import kotlinx.coroutines.*
 class PhimNguonCPlugin : Plugin() {
     companion object {
         var proxyPort = 0
+        const val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
     }
 
     override fun load() {
@@ -43,10 +44,10 @@ class PhimNguonCPlugin : Plugin() {
                 val url = requestLine.split(" ")[1].removePrefix("/proxy?url=")
                 val targetUrl = URLDecoder.decode(url, "UTF-8")
 
-                // Dùng HttpURLConnection thuần để không phụ thuộc vào 'app'
+                // Dùng HttpURLConnection thuần (không cần 'app')
                 val connection = URL(targetUrl).openConnection() as HttpURLConnection
                 connection.setRequestProperty("Referer", "https://embed12.streamc.xyz/")
-                connection.setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+                connection.setRequestProperty("User-Agent", USER_AGENT)
                 
                 val out = client.getOutputStream()
                 out.write("HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\n\r\n".toByteArray())
@@ -66,9 +67,8 @@ class PhimNguonCProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
 
-    private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
     private val cfInterceptor = WebViewResolver(Regex("""phim\.nguonc\.com|.*streamc\.xyz|.*amass15\.top|.*hihihoho2\.top"""))
-    private val commonHeaders = mapOf("User-Agent" to USER_AGENT)
+    private val commonHeaders = mapOf("User-Agent" to PhimNguonCPlugin.USER_AGENT)
     private val API_PREFIX = "API::"
 
     override val mainPage = mainPageOf(
@@ -120,7 +120,7 @@ class PhimNguonCProvider : MainAPI() {
 
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         try {
-            val embedRes = app.get(data, headers = mapOf("Referer" to "$mainUrl/", "User-Agent" to USER_AGENT), interceptor = cfInterceptor)
+            val embedRes = app.get(data, headers = mapOf("Referer" to "$mainUrl/", "User-Agent" to PhimNguonCPlugin.USER_AGENT), interceptor = cfInterceptor)
             val obfMatch = Regex("""data-obf\s*=\s*["']([A-Za-z0-9+/=]+)["']""").find(embedRes.text)
             if (obfMatch != null) {
                 val jsonData = String(Base64.decode(obfMatch.groupValues[1], Base64.DEFAULT))

@@ -207,7 +207,7 @@ class PhimNguonCProvider : MainAPI() {
                 // Cấu hình Header cực kỳ quan trọng để bypass 2004
                 val videoHeaders = mapOf(
                     "User-Agent" to USER_AGENT,
-                    "Referer" to "$mainUrl", // Referer là trang embed
+                    "Referer" to "$embedUrl", // Referer là trang embed
                     "Origin" to embedDomain,
                     "Cookie" to cookies
                 )

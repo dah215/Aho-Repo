@@ -23,7 +23,7 @@ class PhimNguonCPlugin : Plugin() {
     override fun load() {
         registerMainAPI(PhimNguonCProvider())
         
-        // Khởi động Proxy Server ngầm 
+        // Khởi động Proxy Server ngầm
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 val serverSocket = ServerSocket(0)

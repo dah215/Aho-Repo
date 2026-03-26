@@ -27,7 +27,6 @@ class PhimNguonCProvider : MainAPI() {
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
 
     private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-
     private val cfInterceptor = WebViewResolver(Regex("""phim\.nguonc\.com|.*streamc\.xyz|.*amass15\.top"""))
 
     private val commonHeaders = mapOf(
@@ -122,7 +121,6 @@ class PhimNguonCProvider : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         return if (request.data.startsWith(API_PREFIX)) {
-            
             val path = request.data.removePrefix(API_PREFIX)
             val url  = "$mainUrl/$path?page=$page"
             val res  = app.get(url, headers = commonHeaders, interceptor = cfInterceptor)
@@ -130,7 +128,6 @@ class PhimNguonCProvider : MainAPI() {
             val items = res?.items?.mapNotNull { parseApiItem(it) } ?: emptyList()
             newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
         } else {
-            
             val url = if (page == 1) "$mainUrl/${request.data}"
                       else "$mainUrl/${request.data}?page=$page"
             val doc = app.get(url, headers = commonHeaders, interceptor = cfInterceptor).document
@@ -206,37 +203,49 @@ class PhimNguonCProvider : MainAPI() {
                 val obfBase64  = obfMatch.groupValues[1]
                 val jsonData   = String(Base64.decode(obfBase64, Base64.DEFAULT))
                 val streamData = AppUtils.parseJson<StreamData>(jsonData)
-                val sUb        = streamData.sUb
-                if (!sUb.isNullOrBlank()) {
-                    val finalM3u8Url = "$embedDomain/$sUb.m3u8"
-                    val videoHeaders = mapOf(
-                        "User-Agent"      to USER_AGENT,
-                        "Referer"         to embedUrl,
-                        "Origin"          to embedDomain,
-                        "Cookie"          to cookies,
-                        "Accept"          to "*/*",
-                        "Accept-Language" to "vi-VN,vi;q=0.9",
-                        "Connection"      to "keep-alive",
-                        "Sec-Fetch-Dest"  to "video",
-                        "Sec-Fetch-Mode"  to "cors",
-                        "Sec-Fetch-Site"  to "same-origin"
-                    )
+                
+                val videoHeaders = mapOf(
+                    "User-Agent"      to USER_AGENT,
+                    "Referer"         to embedUrl,
+                    "Origin"          to embedDomain,
+                    "Cookie"          to cookies,
+                    "Accept"          to "*/*",
+                    "Accept-Language" to "vi-VN,vi;q=0.9",
+                    "Connection"      to "keep-alive"
+                )
+
+                // Xử lý Vietsub
+                if (!streamData.sUb.isNullOrBlank()) {
                     callback(
                         newExtractorLink(
-                            source = "NguonC Server",
-                            name   = "HLS",
-                            url    = finalM3u8Url,
+                            source = "NguonC",
+                            name   = "Vietsub",
+                            url    = "$embedDomain/${streamData.sUb}.m3u8",
                             type   = ExtractorLinkType.M3U8
                         ) {
                             this.quality = Qualities.P1080.value
                             this.headers = videoHeaders
                         }
                     )
-                    return true
                 }
+
+                // Xử lý Thuyết minh
+                if (!streamData.hD.isNullOrBlank()) {
+                    callback(
+                        newExtractorLink(
+                            source = "NguonC",
+                            name   = "Thuyết minh",
+                            url    = "$embedDomain/${streamData.hD}.m3u8",
+                            type   = ExtractorLinkType.M3U8
+                        ) {
+                            this.quality = Qualities.P1080.value
+                            this.headers = videoHeaders
+                        }
+                    )
+                }
+                return true
             }
         } catch (e: Exception) {
-            println("Error in loadLinks: ${e.message}")
             e.printStackTrace()
         }
 

@@ -204,13 +204,12 @@ class PhimNguonCProvider : MainAPI() {
                 val jsonData = String(Base64.decode(obfBase64, Base64.DEFAULT))
                 val streamData = AppUtils.parseJson<StreamData>(jsonData)
                 
-                // Header "thần thánh" để bypass 2004
+                // Cấu hình Header cực kỳ quan trọng để bypass 2004
                 val videoHeaders = mapOf(
                     "User-Agent" to USER_AGENT,
-                    "Referer" to "$embedUrl", 
+                    "Referer" to "$embedUrl", // Referer là trang embed
                     "Origin" to embedDomain,
-                    "Cookie" to cookies,
-                    "X-Requested-With" to "XMLHttpRequest" // Thêm cái này vào
+                    "Cookie" to cookies
                 )
 
                 // Xử lý Vietsub

@@ -207,7 +207,7 @@ class PhimNguonCProvider : MainAPI() {
                 // Cấu hình Header: Referer phải là chính trang embedUrl
                 val videoHeaders = mapOf(
                     "User-Agent" to USER_AGENT,
-                    "Referer" to "$embedUrl", 
+                    "Referer" to "https://embed12.streamc.xyz/", 
                     "Origin" to embedDomain,
                     "Cookie" to cookies
                 )

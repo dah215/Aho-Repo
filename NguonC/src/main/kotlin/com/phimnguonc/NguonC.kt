@@ -151,13 +151,21 @@ class PhimNguonCProvider : MainAPI() {
         val movie = res?.movie ?: throw ErrorLoadingException("Không thể tải dữ liệu phim")
 
         val episodes = mutableListOf<Episode>()
+        
+        // ĐIỂM MẤU CHỐT: Phân loại rõ ràng Server Vietsub và Thuyết Minh từ API
         movie.episodes?.forEach { server ->
+            val serverName = server.server_name ?: "NguonC"
             val items = server.items ?: server.list
+            
             items?.forEach { ep ->
                 val embed = ep.embed?.replace("\\/", "/") ?: ""
                 if (embed.isNotBlank()) {
-                    episodes.add(newEpisode(embed) {
-                        this.name    = "Tập ${ep.name}"
+                    // Truyền cả embedUrl và serverName xuống cho loadLinks thông qua dấu |||
+                    val dataToPass = "$embed|||$serverName"
+                    
+                    episodes.add(newEpisode(dataToPass) {
+                        // Hiển thị rõ ràng trên UI: "Tập 1 (Vietsub #1)"
+                        this.name    = "Tập ${ep.name} ($serverName)"
                         this.episode = ep.name?.toIntOrNull()
                     })
                 }
@@ -173,8 +181,8 @@ class PhimNguonCProvider : MainAPI() {
     }
 
     data class StreamData(
-        @JsonProperty("sUb") val sUb: String? = null,
-        @JsonProperty("hD")  val hD: String?  = null
+        @JsonProperty("sUb") val sUb: String? = null
+        // Không cần hD nữa vì mỗi server đã có embedUrl riêng biệt!
     )
 
     override suspend fun loadLinks(
@@ -183,7 +191,10 @@ class PhimNguonCProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val embedUrl    = data
+        // Tách embedUrl và serverName đã được truyền từ hàm load()
+        val parts = data.split("|||")
+        val embedUrl = parts[0]
+        val serverName = if (parts.size > 1) parts[1] else "NguonC"
         val embedDomain = Regex("""https?://[^/]+""").find(embedUrl)?.value ?: ""
 
         try {
@@ -204,7 +215,7 @@ class PhimNguonCProvider : MainAPI() {
                 val jsonData   = String(Base64.decode(obfBase64, Base64.DEFAULT))
                 val streamData = AppUtils.parseJson<StreamData>(jsonData)
                 
-                // BỘ HEADER AN TOÀN: Đã loại bỏ Sec-Fetch-* để tránh lỗi CORS trên server Thuyết minh
+                // Bộ Header gốc an toàn tuyệt đối
                 val videoHeaders = mapOf(
                     "User-Agent"      to USER_AGENT,
                     "Referer"         to embedUrl,
@@ -215,19 +226,16 @@ class PhimNguonCProvider : MainAPI() {
                     "Connection"      to "keep-alive"
                 )
 
-                var linkFound = false
-
-                // 1. Xử lý Vietsub
+                // Vì embedUrl đã trỏ đúng đến Vietsub hoặc Thuyết Minh, ta chỉ cần lấy sUb là đủ!
                 val sUb = streamData.sUb
                 if (!sUb.isNullOrBlank() && sUb != "null") {
-                    // Dọn dẹp URL: Xóa dấu / ở đầu nếu có để tránh lỗi double slash (//)
                     val cleanPath = sUb.trimStart('/')
                     val finalUrl = if (cleanPath.startsWith("http")) cleanPath else "$embedDomain/$cleanPath" + (if (cleanPath.endsWith(".m3u8")) "" else ".m3u8")
                     
                     callback(
                         newExtractorLink(
                             source = "NguonC",
-                            name   = "Vietsub",
+                            name   = serverName, // Tên server sẽ hiển thị đúng là Vietsub hoặc Thuyết Minh
                             url    = finalUrl,
                             type   = ExtractorLinkType.M3U8
                         ) {
@@ -235,31 +243,8 @@ class PhimNguonCProvider : MainAPI() {
                             this.headers = videoHeaders
                         }
                     )
-                    linkFound = true
+                    return true
                 }
-
-                // 2. Xử lý Thuyết minh
-                val hD = streamData.hD
-                if (!hD.isNullOrBlank() && hD != "null") {
-                    // Dọn dẹp URL tương tự Vietsub
-                    val cleanPath = hD.trimStart('/')
-                    val finalUrl = if (cleanPath.startsWith("http")) cleanPath else "$embedDomain/$cleanPath" + (if (cleanPath.endsWith(".m3u8")) "" else ".m3u8")
-                    
-                    callback(
-                        newExtractorLink(
-                            source = "NguonC",
-                            name   = "Thuyết minh",
-                            url    = finalUrl,
-                            type   = ExtractorLinkType.M3U8
-                        ) {
-                            this.quality = Qualities.P1080.value
-                            this.headers = videoHeaders
-                        }
-                    )
-                    linkFound = true
-                }
-
-                if (linkFound) return true
             }
         } catch (e: Exception) {
             e.printStackTrace()
@@ -294,6 +279,7 @@ class PhimNguonCProvider : MainAPI() {
         @JsonProperty("episodes")    val episodes: List<NguonCServer>? = null
     )
     data class NguonCServer(
+        @JsonProperty("server_name") val server_name: String? = null, // Đã thêm trường này để lấy tên server
         @JsonProperty("items") val items: List<NguonCEpisode>? = null,
         @JsonProperty("list")  val list:  List<NguonCEpisode>? = null
     )

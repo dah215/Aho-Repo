@@ -23,7 +23,7 @@ class PhimNguonCPlugin : Plugin() {
     override fun load() {
         registerMainAPI(PhimNguonCProvider())
         
-        // Khởi động Proxy Server
+        // Khởi động Proxy Server ngầm
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 val serverSocket = ServerSocket(0)
@@ -41,16 +41,24 @@ class PhimNguonCPlugin : Plugin() {
             try {
                 val reader = BufferedReader(InputStreamReader(client.getInputStream()))
                 val requestLine = reader.readLine() ?: return@launch
-                val url = requestLine.split(" ")[1].removePrefix("/proxy?url=")
-                val targetUrl = URLDecoder.decode(url, "UTF-8")
+                
+                // Chỉ xử lý các request có chứa /proxy?url=
+                if (!requestLine.startsWith("GET /proxy?url=")) {
+                    client.close()
+                    return@launch
+                }
+                
+                val urlPart = requestLine.split(" ")[1].removePrefix("/proxy?url=")
+                val targetUrl = URLDecoder.decode(urlPart, "UTF-8")
 
-                // Dùng HttpURLConnection thuần (không cần 'app')
+                // Dùng HttpURLConnection thuần để tải file M3U8
                 val connection = URL(targetUrl).openConnection() as HttpURLConnection
                 connection.setRequestProperty("Referer", "https://embed12.streamc.xyz/")
                 connection.setRequestProperty("User-Agent", USER_AGENT)
                 
                 val out = client.getOutputStream()
-                out.write("HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\n\r\n".toByteArray())
+                // Trả về Header chuẩn của file M3U8
+                out.write("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nAccess-Control-Allow-Origin: *\r\n\r\n".toByteArray())
                 connection.inputStream.copyTo(out)
                 out.flush()
                 client.close()
@@ -127,14 +135,24 @@ class PhimNguonCProvider : MainAPI() {
                 val streamData = AppUtils.parseJson<StreamData>(jsonData)
                 val embedDomain = Regex("""https?://[^/]+""").find(data)?.value ?: ""
 
-                fun addProxyLink(name: String, path: String?) {
+                // ĐÃ SỬA LỖI: Thêm từ khóa 'suspend' vào hàm này
+                suspend fun addProxyLink(name: String, path: String?) {
                     if (path.isNullOrBlank()) return
                     val targetUrl = if (path.startsWith("http")) path else "$embedDomain/$path.m3u8"
+                    
+                    // Link đi qua Local Proxy
                     val localUrl = "http://127.0.0.1:${PhimNguonCPlugin.proxyPort}/proxy?url=${URLEncoder.encode(targetUrl, "UTF-8")}"
+                    
                     callback(newExtractorLink("NguonC", name, localUrl, ExtractorLinkType.M3U8) {
                         this.quality = Qualities.P1080.value
+                        // Truyền Header cho ExoPlayer để nó tải các file .png (TS segments) không bị lỗi 2004
+                        this.headers = mapOf(
+                            "Referer" to "https://embed12.streamc.xyz/",
+                            "User-Agent" to PhimNguonCPlugin.USER_AGENT
+                        )
                     })
                 }
+                
                 addProxyLink("Vietsub", streamData.sUb)
                 addProxyLink("Thuyết minh", streamData.hD)
                 return true

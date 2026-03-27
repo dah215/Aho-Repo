@@ -10,12 +10,7 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
-import kotlinx.coroutines.GlobalScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.*
 import org.jsoup.nodes.Element
 import java.io.ByteArrayInputStream
 import java.net.URLEncoder
@@ -27,79 +22,41 @@ class AnimeVietSubPlugin : Plugin() {
     override fun load() {
         val provider = AnimeVietSubProvider()
         registerMainAPI(provider)
-        kotlinx.coroutines.GlobalScope.launch {
-            provider.prefetchAvsJs()
-        }
+        GlobalScope.launch { provider.prefetchAvsJs() }
     }
 }
 
 class AnimeVietSubProvider : MainAPI() {
-    override var mainUrl     = "https://animevietsub.mx"
-    override var name        = "AnimeVietSub"
+    override var mainUrl = "https://animevietsub.mx"
+    override var name = "AnimeVietSub"
     override val hasMainPage = true
-    override var lang        = "vi"
+    override var lang = "vi"
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA)
 
-    private val UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 " +
-                     "(KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36"
-
-    private val baseHeaders = mapOf(
-        "User-Agent"      to UA,
-        "Accept-Language" to "vi-VN,vi;q=0.9",
-        "Referer"         to "$mainUrl/"
-    )
-
+    private val UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36"
+    private val baseHeaders = mapOf("User-Agent" to UA, "Referer" to "$mainUrl/")
     private var cachedAvsJs: String? = null
 
     override val mainPage = mainPageOf(
-        "$mainUrl/anime-moi/"                 to "Anime Mới Nhất",
-        "$mainUrl/anime-bo/"                  to "Anime Bộ",
-        "$mainUrl/anime-le/"                  to "Anime Lẻ",
-        "$mainUrl/hoat-hinh-trung-quoc/"      to "Hoạt Hình TQ",
-        "$mainUrl/danh-sach/list-dang-chieu/" to "Đang Chiếu",
-        "$mainUrl/danh-sach/list-tron-bo/"    to "Trọn Bộ"
+        "$mainUrl/anime-moi/" to "Anime Mới Nhất",
+        "$mainUrl/anime-bo/" to "Anime Bộ",
+        "$mainUrl/anime-le/" to "Anime Lẻ",
+        "$mainUrl/hoat-hinh-trung-quoc/" to "Hoạt Hình TQ"
     )
 
-    private fun parseCard(el: Element): SearchResponse? {
-        val article = el.selectFirst("article.TPost") ?: return null
-        val a       = article.selectFirst("a[href]") ?: return null
-        val href    = a.attr("href").let { if (it.startsWith("http")) it else "$mainUrl$it" }
-        val title   = article.selectFirst("h2.Title")?.text()?.trim() ?: return null
-        val poster  = article.selectFirst("div.Image img, figure img")?.attr("src")
-        val epiNum  = article.selectFirst("span.mli-eps i")?.text()?.trim()?.toIntOrNull()
-        return newAnimeSearchResponse(title, href, TvType.Anime) {
-            this.posterUrl = poster
-            this.quality   = SearchQuality.HD
-            this.dubStatus = EnumSet.of(DubStatus.Subbed)
-            if (epiNum != null) this.episodes = mutableMapOf(DubStatus.Subbed to epiNum)
-        }
-    }
-
-    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = if (page == 1) "${request.data.trimEnd('/')}/" else "${request.data.trimEnd('/')}/trang-$page.html"
-        val doc   = app.get(url, headers = baseHeaders).document
-        val items = doc.select("ul.MovieList li.TPostMv").mapNotNull { parseCard(it) }
-        return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
-    }
-
-    override suspend fun search(query: String): List<SearchResponse> {
-        val doc = app.get("$mainUrl/tim-kiem/${URLEncoder.encode(query, "UTF-8")}/", headers = baseHeaders).document
-        return doc.select("ul.MovieList li.TPostMv").mapNotNull { parseCard(it) }
-    }
-
     override suspend fun load(url: String): LoadResponse {
-        val base     = url.trimEnd('/')
+        val base = url.trimEnd('/')
         val watchDoc = app.get("$base/xem-phim.html", headers = baseHeaders).document
-        val title    = watchDoc.selectFirst("h1.Title")?.text()?.trim() ?: watchDoc.title()
-        val poster   = watchDoc.selectFirst("div.Image figure img")?.attr("src")
         
-        // --- PHẦN SỬA ĐỔI ĐỂ LÀM ĐẸP MÔ TẢ ---
+        val title = watchDoc.selectFirst("h1.Title")?.text()?.trim() ?: watchDoc.title()
+        val poster = watchDoc.selectFirst("div.Image figure img")?.attr("src")
         val rawPlot = watchDoc.selectFirst("div.Description")?.text()?.trim() ?: ""
+        
         val infoLists = watchDoc.select("ul.InfoList li")
         fun getInfo(label: String): String = infoLists.find { it.text().contains(label) }
             ?.text()?.replace(label, "")?.replace(":", "")?.trim() ?: "Đang cập nhật"
-        
+
         val castList = watchDoc.select("#MvTb-Cast .ListCast li figcaption").map { it.text() }
         val castString = if (castList.isNotEmpty()) "\n\n### 👥 Nhân vật\n" + castList.joinToString(", ") else ""
 
@@ -116,14 +73,12 @@ $rawPlot
 * **Rating:** ${getInfo("Rating")}
 $castString
         """.trimIndent()
-        // -------------------------------------
 
-        val tags     = watchDoc.select("p.Genre a").map { it.text().trim() }
         val episodes = watchDoc.select("#list-server .list-episode a.episode-link").mapNotNull { a ->
             val href = a.attr("href").let { if (it.startsWith("http")) it else "$mainUrl$it" }
-            val num  = Regex("""\d+""").find(a.text())?.value?.toIntOrNull()
+            val num = Regex("""\d+""").find(a.text())?.value?.toIntOrNull()
             newEpisode(href) {
-                this.name    = a.attr("title").ifBlank { "Tập ${a.text().trim()}" }
+                this.name = a.attr("title").ifBlank { "Tập ${a.text().trim()}" }
                 this.episode = num
             }
         }.sortedBy { it.episode ?: 0 }
@@ -131,7 +86,6 @@ $castString
         return newAnimeLoadResponse(title, url, TvType.Anime, true) {
             this.posterUrl = poster
             this.plot = formattedPlot
-            this.tags = tags
             addEpisodes(DubStatus.Subbed, episodes)
         }
     }
@@ -153,19 +107,12 @@ $castString
         } catch (_: Exception) {}
     }
 
-    private suspend fun fetchJs(url: String, cookie: String): String? {
-        return try {
-            val resp = app.get(url, headers = mapOf("User-Agent" to UA, "Referer" to "$mainUrl/", "Cookie" to cookie))
-            if (resp.text.length > 500) resp.text else null
-        } catch (_: Exception) { null }
-    }
-
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun getM3U8(epUrl: String, cookie: String, avsJs: String): String? {
         return withContext(Dispatchers.Main) {
             withTimeoutOrNull(30_000L) {
                 suspendCancellableCoroutine { cont ->
-                    val ctx = AcraApplication.context
+                    val ctx = AcraApplication.context ?: return@suspendCancellableCoroutine cont.resume(null)
                     val bridge = M3U8Bridge()
                     val wv = WebView(ctx)
                     wv.settings.apply { javaScriptEnabled = true; domStorageEnabled = true; userAgentString = UA }
@@ -227,14 +174,15 @@ $castString
         val epId = Regex("""-(\d+)\.html""").find(epUrl)?.groupValues?.get(1) ?: return true
         val playerResp = app.post("$mainUrl/ajax/player", headers = mapOf("X-Requested-With" to "XMLHttpRequest"), data = mapOf("episodeId" to epId, "backup" to "1"))
         val cookie = playerResp.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
-        val avsJs = cachedAvsJs ?: fetchJs("$mainUrl/statics/default/js/avs.watch.js?v=6.1.6", cookie) ?: return true
+        val avsJs = cachedAvsJs ?: return true
         val m3u8 = getM3U8(epUrl, cookie, avsJs) ?: return true
         
         localServer?.stop()
         val server = LocalM3U8Server(m3u8)
         server.start()
         localServer = server
-        callback(newExtractorLink(name, "$name - Stream", "http://127.0.0.1:${server.port}/stream.m3u8", "", ExtractorLinkType.M3U8, true))
+        
+        callback(newExtractorLink(name, "$name - Stream", "http://127.0.0.1:${server.port}/stream.m3u8", ExtractorLinkType.M3U8))
         return true
     }
 }

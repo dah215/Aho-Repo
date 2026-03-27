@@ -308,6 +308,8 @@ class PhimNguonCProvider : MainAPI() {
         @JsonProperty("hD")  val hD:  String? = null
     )
 
+    private val activeServers = mutableListOf<NguonCProxyServer>()
+
     override suspend fun loadLinks(
         data:             String,
         isCasting:        Boolean,

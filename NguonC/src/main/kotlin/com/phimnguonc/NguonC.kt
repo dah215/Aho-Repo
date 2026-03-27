@@ -128,20 +128,24 @@ class PhimNguonCProvider : MainAPI() {
                        .parsedSafe<NguonCDetailResponse>()
         val movie = res?.movie ?: throw ErrorLoadingException("Không thể tải dữ liệu phim")
 
-        val episodes = mutableListOf<Episode>()
+        val epMap = linkedMapOf<String, MutableList<String>>()
         movie.episodes?.forEach { server ->
             val items = server.items ?: server.list
             items?.forEach { ep ->
-                val embed = ep.embed?.replace("\\/", "/") ?: ""
+                val embed = ep.embed?.replace("\/", "/") ?: ""
                 if (embed.isNotBlank()) {
-                    episodes.add(newEpisode(embed) {
-                        this.name    = "Tập ${ep.name}"
-                        this.episode = ep.name?.toIntOrNull()
-                    })
+                    epMap.getOrPut(ep.name ?: "0") { mutableListOf() }.add(embed)
                 }
             }
         }
-        if (episodes.isEmpty()) throw ErrorLoadingException("Không tìm thấy tập phim")
+        if (epMap.isEmpty()) throw ErrorLoadingException("Không tìm thấy tập phim")
+
+        val episodes = epMap.map { (epName, embeds) ->
+            newEpisode(embeds.distinct().joinToString("|")) {
+                this.name    = "Tập $epName"
+                this.episode = epName.toIntOrNull()
+            }
+        }.sortedBy { it.episode ?: 0 }
 
         return newTvSeriesLoadResponse(movie.name ?: "", url, TvType.TvSeries, episodes) {
             this.posterUrl = movie.poster_url ?: movie.thumb_url
@@ -243,34 +247,35 @@ class PhimNguonCProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback:         (ExtractorLink) -> Unit
     ): Boolean {
-        val embedUrl    = data
-        val embedDomain = Regex("""https?://[^/]+""").find(embedUrl)?.value ?: ""
+        // data có thể chứa nhiều embed URLs cách nhau bằng "|"
+        val embedUrls = data.split("|").map { it.trim() }.filter { it.isNotBlank() }
+        var linkFound = false
 
-        try {
-            val embedRes = app.get(
-                embedUrl,
-                headers     = mapOf("Referer" to "$mainUrl/", "User-Agent" to USER_AGENT),
-                interceptor = cfInterceptor
-            )
-            val html    = embedRes.text
-            val cookies = embedRes.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+        for (embedUrl in embedUrls) {
+            val embedDomain = Regex("""https?://[^/]+""").find(embedUrl)?.value ?: continue
+            try {
+                val embedRes = app.get(
+                    embedUrl,
+                    headers     = mapOf("Referer" to "$mainUrl/", "User-Agent" to USER_AGENT),
+                    interceptor = cfInterceptor
+                )
+                val html    = embedRes.text
+                val cookies = embedRes.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
 
-            val obfMatch = Regex("""data-obf\s*=\s*["']([A-Za-z0-9+/=]+)["']""").find(html)
-                ?: return loadExtractor(embedUrl, "$mainUrl/", subtitleCallback, callback)
+                val obfMatch = Regex("""data-obf\s*=\s*["']([A-Za-z0-9+/=]+)["']""").find(html)
+                    ?: continue
 
-            val jsonData   = String(Base64.decode(obfMatch.groupValues[1], Base64.DEFAULT))
-            val streamData = AppUtils.parseJson<StreamData>(jsonData)
+                val jsonData   = String(Base64.decode(obfMatch.groupValues[1], Base64.DEFAULT))
+                val streamData = AppUtils.parseJson<StreamData>(jsonData)
 
-            val fetchHdr = mapOf(
-                "User-Agent"      to USER_AGENT,
-                "Referer"         to embedUrl,
-                "Origin"          to embedDomain,
-                "Cookie"          to cookies,
-                "Accept"          to "*/*",
-                "Accept-Language" to "vi-VN,vi;q=0.9"
-            )
-
-            var linkFound = false
+                val fetchHdr = mapOf(
+                    "User-Agent"      to USER_AGENT,
+                    "Referer"         to embedUrl,
+                    "Origin"          to embedDomain,
+                    "Cookie"          to cookies,
+                    "Accept"          to "*/*",
+                    "Accept-Language" to "vi-VN,vi;q=0.9"
+                )
 
             // Helper: fetch M3U8 → rewrite segments → serve qua proxy
             suspend fun serveStream(m3u8Url: String, serverName: String) {
@@ -300,20 +305,19 @@ class PhimNguonCProvider : MainAPI() {
                 } catch (_: Exception) {}
             }
 
-            if (!streamData.sUb.isNullOrBlank()) {
-                serveStream("$embedDomain/${streamData.sUb}.m3u8", "Vietsub")
-            }
-            if (!streamData.hD.isNullOrBlank()) {
-                serveStream("$embedDomain/${streamData.hD}.m3u8", "Thuyết minh")
-            }
+                if (!streamData.sUb.isNullOrBlank()) {
+                    serveStream("$embedDomain/${streamData.sUb}.m3u8", "Vietsub")
+                }
+                if (!streamData.hD.isNullOrBlank()) {
+                    serveStream("$embedDomain/${streamData.hD}.m3u8", "Thuyết minh")
+                }
 
-            if (linkFound) return true
-
-        } catch (e: Exception) {
-            e.printStackTrace()
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
         }
 
-        return loadExtractor(embedUrl, "$mainUrl/", subtitleCallback, callback)
+        return linkFound
     }
 
     // ── Data classes ──────────────────────────────────────────────────────────

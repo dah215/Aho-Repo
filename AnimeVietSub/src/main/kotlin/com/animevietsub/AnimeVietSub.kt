@@ -55,18 +55,9 @@ class AnimeVietSubProvider : MainAPI() {
     private var cachedAvsJs: String? = null
 
     override val mainPage = mainPageOf(
-        "$mainUrl/anime-moi/"                 to "Anime Mới Nhất",
-        "$mainUrl/anime-bo/"                  to "Anime Bộ",
+        "$mainUrl/anime-moi/"                 to "Anime Mới",
         "$mainUrl/anime-le/"                  to "Anime Lẻ",
-        "$mainUrl/hoat-hinh-trung-quoc/"      to "Hoạt Hình TQ",
-        "$mainUrl/danh-sach/list-dang-chieu/" to "Đang Chiếu",
-        "$mainUrl/danh-sach/list-tron-bo/"    to "Trọn Bộ",
-        "$mainUrl/the-loai/hanh-dong/"        to "Action",
-        "$mainUrl/the-loai/tinh-cam/"         to "Romance",
-        "$mainUrl/the-loai/phep-thuat/"       to "Fantasy",
-        "$mainUrl/the-loai/kinh-di/"          to "Horror",
-        "$mainUrl/the-loai/hai-huoc/"         to "Comedy",
-        "$mainUrl/the-loai/shounen/"          to "Shounen"
+        "$mainUrl/anime-bo/"                  to "Anime Bộ"
     )
 
     private fun pageUrl(base: String, page: Int) =
@@ -170,7 +161,7 @@ class AnimeVietSubProvider : MainAPI() {
                 this.plot = fullPlot
                 this.tags = tags
                 this.year = year
-                this.score = avgScore
+                this.score = avgScore?.let { Score(it) }
             }
         } else {
             newAnimeLoadResponse(title, url, TvType.Anime, true) {
@@ -179,7 +170,7 @@ class AnimeVietSubProvider : MainAPI() {
                 this.tags = tags
                 this.year = year
                 addEpisodes(DubStatus.Subbed, episodes)
-                this.score = avgScore
+                this.score = avgScore?.let { Score(it) }
             }
         }
     }

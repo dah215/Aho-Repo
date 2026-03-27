@@ -134,7 +134,7 @@ class PhimNguonCProvider : MainAPI() {
                 ?: if (idx == 0) "Vietsub" else "Thuyết minh"
             val items = server.items ?: server.list
             items?.forEach { ep ->
-                val embed = ep.embed?.replace("\/", "/") ?: ""
+                val embed = ep.embed?.replace("\\/", "/") ?: ""
                 if (embed.isNotBlank()) {
                     epMap.getOrPut(ep.name ?: "0") { mutableListOf() }
                         .add("$serverName::$embed")

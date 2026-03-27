@@ -10,12 +10,7 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
-import kotlinx.coroutines.GlobalScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.*
 import org.jsoup.nodes.Element
 import java.io.ByteArrayInputStream
 import java.net.URLEncoder
@@ -27,171 +22,93 @@ class AnimeVietSubPlugin : Plugin() {
     override fun load() {
         val provider = AnimeVietSubProvider()
         registerMainAPI(provider)
-        // Prefetch avs.watch.js ngay khi load plugin
-        kotlinx.coroutines.GlobalScope.launch {
-            provider.prefetchAvsJs()
-        }
+        GlobalScope.launch { provider.prefetchAvsJs() }
     }
 }
 
 class AnimeVietSubProvider : MainAPI() {
-    override var mainUrl     = "https://animevietsub.be"
-    override var name        = "AnimeVietSub"
+    override var mainUrl = "https://animevietsub.mx"
+    override var name = "AnimeVietSub"
     override val hasMainPage = true
-    override var lang        = "vi"
+    override var lang = "vi"
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA)
 
-    private val UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 " +
-                     "(KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36"
-
-    private val baseHeaders = mapOf(
-        "User-Agent"      to UA,
-        "Accept-Language" to "vi-VN,vi;q=0.9",
-        "Referer"         to "$mainUrl/"
-    )
-
-    // Cache avs.watch.js
+    private val UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36"
+    private val baseHeaders = mapOf("User-Agent" to UA, "Referer" to "$mainUrl/")
     private var cachedAvsJs: String? = null
 
     override val mainPage = mainPageOf(
-        "$mainUrl/anime-moi/"                 to "Anime Mới Nhất",
-        "$mainUrl/anime-bo/"                  to "Anime Bộ",
-        "$mainUrl/anime-le/"                  to "Anime Lẻ",
-        "$mainUrl/hoat-hinh-trung-quoc/"      to "Hoạt Hình TQ",
-        "$mainUrl/danh-sach/list-dang-chieu/" to "Đang Chiếu",
-        "$mainUrl/danh-sach/list-tron-bo/"    to "Trọn Bộ",
-        "$mainUrl/the-loai/hanh-dong/"        to "Action",
-        "$mainUrl/the-loai/tinh-cam/"         to "Romance",
-        "$mainUrl/the-loai/phep-thuat/"       to "Fantasy",
-        "$mainUrl/the-loai/kinh-di/"          to "Horror",
-        "$mainUrl/the-loai/hai-huoc/"         to "Comedy",
-        "$mainUrl/the-loai/shounen/"          to "Shounen"
+        "$mainUrl/anime-moi/" to "Anime Mới Nhất",
+        "$mainUrl/anime-bo/" to "Anime Bộ",
+        "$mainUrl/anime-le/" to "Anime Lẻ",
+        "$mainUrl/hoat-hinh-trung-quoc/" to "Hoạt Hình TQ"
     )
 
-    private fun pageUrl(base: String, page: Int) =
-        if (page == 1) "${base.trimEnd('/')}/"
-        else "${base.trimEnd('/')}/trang-$page.html"
-
-    private fun parseCard(el: Element): SearchResponse? {
-        val article = el.selectFirst("article.TPost") ?: return null
-        val a       = article.selectFirst("a[href]") ?: return null
-        val href    = a.attr("href").let { if (it.startsWith("http")) it else "$mainUrl$it" }
-        val title   = article.selectFirst("h2.Title")?.text()?.trim()
-                      ?.takeIf { it.isNotBlank() } ?: return null
-        val poster  = article.selectFirst("div.Image img, figure img")?.attr("src")
-                      ?.let { if (it.startsWith("http")) it else "$mainUrl$it" }
-        val epiNum  = article.selectFirst("span.mli-eps i")?.text()?.trim()?.toIntOrNull()
-        return newAnimeSearchResponse(title, href, TvType.Anime) {
-            this.posterUrl = poster
-            this.quality   = SearchQuality.HD
-            this.dubStatus = EnumSet.of(DubStatus.Subbed)
-            if (epiNum != null) this.episodes = mutableMapOf(DubStatus.Subbed to epiNum)
-        }
-    }
-
-    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val doc   = app.get(pageUrl(request.data, page), headers = baseHeaders).document
-        val items = doc.select("ul.MovieList li.TPostMv").mapNotNull { parseCard(it) }
-        return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
-    }
-
-    override suspend fun search(query: String): List<SearchResponse> {
-        val doc = app.get(
-            "$mainUrl/tim-kiem/${URLEncoder.encode(query, "UTF-8")}/",
-            headers = baseHeaders
-        ).document
-        return doc.select("ul.MovieList li.TPostMv").mapNotNull { parseCard(it) }
-    }
-
     override suspend fun load(url: String): LoadResponse {
-        val base     = url.trimEnd('/')
+        val base = url.trimEnd('/')
         val watchDoc = app.get("$base/xem-phim.html", headers = baseHeaders).document
-        val title    = watchDoc.selectFirst("h1.Title")?.text()?.trim() ?: watchDoc.title()
-        val poster   = watchDoc.selectFirst("div.Image figure img")?.attr("src")
-                       ?.let { if (it.startsWith("http")) it else "$mainUrl$it" }
-        val plot     = watchDoc.selectFirst("div.Description")?.text()?.trim()
-        val year     = watchDoc.selectFirst("p.Info .Date a, p.Info .Date")
-                       ?.text()?.filter { it.isDigit() }?.take(4)?.toIntOrNull()
-        val tags     = watchDoc.select("p.Genre a").map { it.text().trim() }.filter { it.isNotBlank() }
-        val seen     = mutableSetOf<String>()
-        val episodes = watchDoc.select("#list-server .list-episode a.episode-link")
-            .mapNotNull { a ->
-                val href = a.attr("href").let { if (it.startsWith("http")) it else "$mainUrl$it" }
-                if (href.isBlank() || !seen.add(href)) return@mapNotNull null
-                val num  = Regex("""\d+""").find(a.text())?.value?.toIntOrNull()
-                newEpisode(href) {
-                    this.name    = a.attr("title").ifBlank { "Tập ${a.text().trim()}" }
-                    this.episode = num
-                }
-            }.sortedBy { it.episode ?: 0 }
+        
+        val title = watchDoc.selectFirst("h1.Title")?.text()?.trim() ?: watchDoc.title()
+        val poster = watchDoc.selectFirst("div.Image figure img")?.attr("src")
+        val rawPlot = watchDoc.selectFirst("div.Description")?.text()?.trim() ?: ""
+        
+        // Trích xuất thông tin kỹ thuật từ InfoList
+        val infoLists = watchDoc.select("ul.InfoList li")
+        fun getInfo(label: String): String = infoLists.find { it.text().contains(label) }
+            ?.text()?.replace(label, "")?.replace(":", "")?.trim() ?: "Đang cập nhật"
 
-        return if (episodes.size <= 1) {
-            newMovieLoadResponse(
-                title, url, TvType.AnimeMovie,
-                episodes.firstOrNull()?.data ?: "$base/xem-phim.html"
-            ) { this.posterUrl = poster; this.plot = plot; this.tags = tags; this.year = year }
-        } else {
-            newAnimeLoadResponse(title, url, TvType.Anime, true) {
-                this.posterUrl = poster; this.plot = plot; this.tags = tags; this.year = year
-                addEpisodes(DubStatus.Subbed, episodes)
+        // Trích xuất danh sách nhân vật
+        val castList = watchDoc.select("#MvTb-Cast .ListCast li figcaption").map { it.text() }
+        val castString = if (castList.isNotEmpty()) "\n\n### 👥 Nhân vật\n" + castList.joinToString(", ") else ""
+
+        // Định dạng Markdown cho Plot
+        val formattedPlot = """
+$rawPlot
+
+---
+### 📋 Thông tin chi tiết
+* **Trạng thái:** ${getInfo("Trạng thái")}
+* **Thời lượng:** ${getInfo("Thời lượng")}
+* **Đạo diễn:** ${getInfo("Đạo diễn")}
+* **Studio:** ${getInfo("Studio")}
+* **Season:** ${getInfo("Season")}
+* **Rating:** ${getInfo("Rating")}
+$castString
+        """.trimIndent()
+
+        val episodes = watchDoc.select("#list-server .list-episode a.episode-link").mapNotNull { a ->
+            val href = a.attr("href").let { if (it.startsWith("http")) it else "$mainUrl$it" }
+            val num = Regex("""\d+""").find(a.text())?.value?.toIntOrNull()
+            newEpisode(href) {
+                this.name = a.attr("title").ifBlank { "Tập ${a.text().trim()}" }
+                this.episode = num
             }
+        }.sortedBy { it.episode ?: 0 }
+
+        return newAnimeLoadResponse(title, url, TvType.Anime, true) {
+            this.posterUrl = poster
+            this.plot = formattedPlot
+            addEpisodes(DubStatus.Subbed, episodes)
         }
     }
 
-    // Blob interceptor prefix - inject vào đầu avs.watch.js
-    private val blobInterceptor = """
-;(function(){
-var _oc=URL.createObjectURL;
-URL.createObjectURL=function(b){
-var u=_oc.apply(this,arguments);
-try{if(b&&b.type&&b.type.indexOf('mpegurl')!==-1){
-var r=new FileReader();
-r.onload=function(e){try{Android.onM3U8(e.target.result);}catch(x){}};
-r.readAsText(b);}}catch(x){}
-return u;};
-})();
-""".trimIndent()
-
-    // Fake adsbygoogle để qua ad detector
-    private val fakeAds = """
-window.adsbygoogle=window.adsbygoogle||[];
-window.adsbygoogle.loaded=true;
-window.adsbygoogle.push=function(){};
-""".trimIndent()
+    // --- Các hàm xử lý Link và M3U8 ---
+    private val blobInterceptor = ";(function(){var _oc=URL.createObjectURL;URL.createObjectURL=function(b){var u=_oc.apply(this,arguments);try{if(b&&b.type&&b.type.indexOf('mpegurl')!==-1){var r=new FileReader();r.onload=function(e){try{Android.onM3U8(e.target.result);}catch(x){}};r.readAsText(b);}}catch(x){}return u;};})();"
+    private val fakeAds = "window.adsbygoogle=window.adsbygoogle||[];window.adsbygoogle.loaded=true;window.adsbygoogle.push=function(){};"
 
     inner class M3U8Bridge {
         @Volatile var result: String? = null
         @JavascriptInterface
-        fun onM3U8(content: String) {
-            if (content.contains("#EXTM3U")) result = content
-        }
+        fun onM3U8(content: String) { if (content.contains("#EXTM3U")) result = content }
     }
 
-    // Prefetch avs.watch.js khi plugin load (không cần đợi loadLinks)
     suspend fun prefetchAvsJs() {
         if (cachedAvsJs != null) return
         try {
-            val js = app.get(
-                "$mainUrl/statics/default/js/avs.watch.js?v=6.1.6",
-                headers = mapOf("User-Agent" to UA, "Referer" to "$mainUrl/", "Accept" to "*/*")
-            ).text
+            val js = app.get("$mainUrl/statics/default/js/avs.watch.js?v=6.1.6", headers = baseHeaders).text
             if (js.length > 500) cachedAvsJs = js
         } catch (_: Exception) {}
-    }
-
-    // Fetch JS qua OkHttp (với cookie để bypass Cloudflare)
-    private suspend fun fetchJs(url: String, cookie: String): String? {
-        return try {
-            val resp = app.get(url, headers = mapOf(
-                "User-Agent"      to UA,
-                "Referer"         to "$mainUrl/",
-                "Accept"          to "*/*",
-                "Accept-Language" to "vi-VN,vi;q=0.9",
-                "Cookie"          to cookie
-            ))
-            if (resp.text.length > 500) resp.text else null
-        } catch (_: Exception) { null }
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -199,217 +116,43 @@ window.adsbygoogle.push=function(){};
         return withContext(Dispatchers.Main) {
             withTimeoutOrNull(30_000L) {
                 suspendCancellableCoroutine { cont ->
-                    val ctx = try { AcraApplication.context }
-                              catch (_: Exception) { null }
-                    if (ctx == null) { cont.resume(null); return@suspendCancellableCoroutine }
-
+                    val ctx = AcraApplication.context
                     val bridge = M3U8Bridge()
-
-                    // Sync cookie
-                    android.webkit.CookieManager.getInstance().apply {
-                        setAcceptCookie(true)
-                        cookie.split(";").forEach { kv ->
-                            val t = kv.trim()
-                            if (t.isNotBlank()) setCookie(mainUrl, t)
-                        }
-                        flush()
-                    }
-
                     val wv = WebView(ctx)
-                    wv.settings.apply {
-                        javaScriptEnabled                = true
-                        domStorageEnabled                = true
-                        mediaPlaybackRequiresUserGesture = false
-                        userAgentString                  = UA
-                        mixedContentMode                 = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                    }
-                    android.webkit.CookieManager.getInstance()
-                        .setAcceptThirdPartyCookies(wv, true)
+                    wv.settings.apply { javaScriptEnabled = true; domStorageEnabled = true; userAgentString = UA }
                     wv.addJavascriptInterface(bridge, "Android")
-
-                    // Interceptor có avs.watch.js đã được inject blob interceptor
+                    
                     val patchedAvsJs = blobInterceptor + "\n" + avsJs
-                    val avsJsBytes   = patchedAvsJs.toByteArray(Charsets.UTF_8)
-                    val fakeAdsBytes = fakeAds.toByteArray(Charsets.UTF_8)
-
                     wv.webViewClient = object : WebViewClient() {
-                        override fun shouldInterceptRequest(
-                            view: WebView,
-                            request: WebResourceRequest
-                        ): WebResourceResponse? {
+                        override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                             val url = request.url.toString()
-                            return when {
-                                // Serve patched avs.watch.js (blob interceptor đã inject)
-                                url.contains("avs.watch.js") -> WebResourceResponse(
-                                    "application/javascript", "utf-8",
-                                    ByteArrayInputStream(avsJsBytes)
-                                )
-                                // Fake adsbygoogle → bypass ad detector
-                                url.contains("adsbygoogle") ||
-                                url.contains("googlesyndication") -> WebResourceResponse(
-                                    "application/javascript", "utf-8",
-                                    ByteArrayInputStream(fakeAdsBytes)
-                                )
-                                // Block trackers + heavy resources không cần thiết
-                                url.contains("google-analytics") ||
-                                url.contains("doubleclick") ||
-                                url.contains("googletagmanager") ||
-                                url.contains("facebook.com") ||
-                                url.contains("hotjar") ||
-                                url.contains("disqus") -> WebResourceResponse(
-                                    "application/javascript", "utf-8",
-                                    ByteArrayInputStream("".toByteArray())
-                                )
-                                // Block fonts/CSS/images để page load nhanh hơn
-                                url.endsWith(".woff") || url.endsWith(".woff2") ||
-                                url.endsWith(".ttf") || url.endsWith(".eot") ||
-                                (url.endsWith(".css") && !url.contains(mainUrl)) -> WebResourceResponse(
-                                    "text/css", "utf-8",
-                                    ByteArrayInputStream("".toByteArray())
-                                )
-                                url.endsWith(".png") || url.endsWith(".jpg") ||
-                                url.endsWith(".jpeg") || url.endsWith(".gif") ||
-                                url.endsWith(".webp") || url.endsWith(".svg") -> WebResourceResponse(
-                                    "image/png", "utf-8",
-                                    ByteArrayInputStream("".toByteArray())
-                                )
-                                else -> null
-                            }
+                            return if (url.contains("avs.watch.js")) WebResourceResponse("application/javascript", "utf-8", ByteArrayInputStream(patchedAvsJs.toByteArray()))
+                            else null
                         }
                     }
-
-                    wv.loadUrl(epUrl, mapOf(
-                        "Accept-Language" to "vi-VN,vi;q=0.9",
-                        "Referer"         to "$mainUrl/"
-                    ))
-
+                    wv.loadUrl(epUrl)
                     val handler = android.os.Handler(android.os.Looper.getMainLooper())
-                    var elapsed = 0
                     val checker = object : Runnable {
                         override fun run() {
-                            val m = bridge.result
-                            when {
-                                m != null -> {
-                                    wv.stopLoading(); wv.destroy()
-                                    if (cont.isActive) cont.resume(m)
-                                }
-                                elapsed >= 25_000 -> {
-                                    wv.stopLoading(); wv.destroy()
-                                    if (cont.isActive) cont.resume(null)
-                                }
-                                else -> {
-                                    elapsed += 200
-                                    handler.postDelayed(this, 200)
-                                }
-                            }
+                            if (bridge.result != null) { wv.destroy(); if (cont.isActive) cont.resume(bridge.result) }
+                            else handler.postDelayed(this, 500)
                         }
                     }
-                    handler.postDelayed(checker, 800)
-                    cont.invokeOnCancellation {
-                        handler.removeCallbacks(checker)
-                        wv.stopLoading(); wv.destroy()
-                    }
+                    handler.postDelayed(checker, 1000)
                 }
             }
         }
     }
 
-    // ── Local HTTP server để serve M3U8 cho ExoPlayer ──────────────────────
-    // file:// không work Android 7+, dùng localhost thay thế
-    private var localServer: LocalM3U8Server? = null
-
-    inner class LocalM3U8Server(private val m3u8Content: String) {
-        private var serverSocket: java.net.ServerSocket? = null
-        val port: Int get() = serverSocket?.localPort ?: 0
-
-        fun start() {
-            serverSocket = java.net.ServerSocket(0) 
-            Thread {
-                try {
-                    val ss = serverSocket ?: return@Thread
-                    
-                    repeat(10) {
-                        try {
-                            val client = ss.accept()
-                            client.getInputStream().bufferedReader().readLine() // consume request
-                            val body = m3u8Content.toByteArray(Charsets.UTF_8)
-                            val crlf = "\r\n"
-                            val response = "HTTP/1.1 200 OK${crlf}" +
-                                "Content-Type: application/vnd.apple.mpegurl${crlf}" +
-                                "Content-Length: ${body.size}${crlf}" +
-                                "Access-Control-Allow-Origin: *${crlf}" +
-                                crlf
-                            client.getOutputStream().write(response.toByteArray())
-                            client.getOutputStream().write(body)
-                            client.getOutputStream().flush()
-                            client.close()
-                        } catch (_: Exception) {}
-                    }
-                } catch (_: Exception) {}
-            }.also { it.isDaemon = true }.start()
-        }
-
-        fun stop() {
-            try { serverSocket?.close() } catch (_: Exception) {}
-        }
-    }
-
-    private suspend fun serveM3U8AndCallback(m3u8: String, callback: (ExtractorLink) -> Unit) {
-        localServer?.stop()
-        val server = LocalM3U8Server(m3u8)
-        server.start()
-        localServer = server
-
-        callback(newExtractorLink(
-            source = name, name = "$name - DU",
-            url    = "http://127.0.0.1:${server.port}/stream.m3u8",
-            type   = ExtractorLinkType.M3U8
-        ) {
-            this.quality = Qualities.P1080.value
-            this.headers = mapOf(
-                "User-Agent" to UA,
-                "Referer"    to "$mainUrl/",
-                "Origin"     to mainUrl
-            )
-        })
-    }
-
-    override suspend fun loadLinks(
-        data:             String,
-        isCasting:        Boolean,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback:         (ExtractorLink) -> Unit
-    ): Boolean {
+    override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         val epUrl = data.substringBefore("|")
-
-        // Lấy cookie từ /ajax/player
         val epId = Regex("""-(\d+)\.html""").find(epUrl)?.groupValues?.get(1) ?: return true
-        val ajaxHdr = mapOf(
-            "User-Agent"       to UA,
-            "X-Requested-With" to "XMLHttpRequest",
-            "Content-Type"     to "application/x-www-form-urlencoded; charset=UTF-8",
-            "Referer"          to epUrl,
-            "Origin"           to mainUrl
-        )
-        val playerResp = app.post(
-            "$mainUrl/ajax/player",
-            headers = ajaxHdr,
-            data    = mapOf("episodeId" to epId, "backup" to "1")
-        )
-        val cookie = playerResp.cookies.entries
-            .joinToString("; ") { "${it.key}=${it.value}" }
-
-        // Fetch avs.watch.js (cache lại)
-        val avsJs = cachedAvsJs ?: fetchJs(
-            "$mainUrl/statics/default/js/avs.watch.js?v=6.1.6", cookie
-        )?.also { cachedAvsJs = it } ?: return true
-
-        // WebView load trang thật, serve patched avs.watch.js
+        val playerResp = app.post("$mainUrl/ajax/player", headers = mapOf("X-Requested-With" to "XMLHttpRequest"), data = mapOf("episodeId" to epId, "backup" to "1"))
+        val cookie = playerResp.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+        val avsJs = cachedAvsJs ?: return true
         val m3u8 = getM3U8(epUrl, cookie, avsJs) ?: return true
-
-        // Serve M3U8 qua local HTTP server (file:// không work trên Android 7+)
-        serveM3U8AndCallback(m3u8, callback)
-
+        
+        callback(newExtractorLink(name, "$name - Stream", m3u8, "", ExtractorLinkType.M3U8, true))
         return true
     }
 }

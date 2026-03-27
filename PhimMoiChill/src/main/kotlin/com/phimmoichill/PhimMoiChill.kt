@@ -115,8 +115,10 @@ class PhimMoiChillProvider : MainAPI() {
         // SỬA LỖI TAGS: Chỉ lấy thể loại trong phần thông tin phim, không lấy trên thanh menu
         val genres = doc.select("ul.entry-meta li:contains(Thể loại) a").map { it.text().trim() }
         
-        // Lấy thêm Diễn viên và Phim đề cử
-        val cast = doc.select("ul.entry-meta li:contains(Diễn viên) a").map { it.text().trim() }
+        // Lấy thêm Diễn viên và Phim đề cử (Đã sửa lỗi List<String> thành List<ActorData>)
+        val cast = doc.select("ul.entry-meta li:contains(Diễn viên) a").map { 
+            ActorData(Actor(it.text().trim())) 
+        }
         val recommendations = doc.select("#similar-films li.item").mapNotNull { parseCard(it) }
 
         // Lấy các thông tin phụ để làm đẹp phần Plot (Mô tả)

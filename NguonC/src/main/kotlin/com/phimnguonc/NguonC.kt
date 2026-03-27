@@ -276,7 +276,7 @@ class PhimNguonCProvider : MainAPI() {
                 val cookies = embedRes.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
 
                 val obfMatch = Regex("""data-obf\s*=\s*["']([A-Za-z0-9+/=]+)["']""").find(html)
-                    ?: continue
+                    ?: return@async
 
                 val jsonData   = String(Base64.decode(obfMatch.groupValues[1], Base64.DEFAULT))
                 val streamData = AppUtils.parseJson<StreamData>(jsonData)

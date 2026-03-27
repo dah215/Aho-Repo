@@ -110,34 +110,29 @@ class PhimMoiChillProvider : MainAPI() {
         val poster = imgUrl(doc.selectFirst(".film-poster img, img[itemprop=image]"))
         
         val year = doc.selectFirst("ul.entry-meta li:contains(Năm Phát Hành) a")?.text()?.let { Regex("""\b(20\d{2})\b""").find(it)?.value?.toIntOrNull() }
-        val genres = doc.select("ul.entry-meta li:contains(Thể loại) a").map { it.text().trim() }
         val recommendations = doc.select("#similar-films li.item").mapNotNull { parseCard(it) }
 
+        // Lấy các thông tin phụ
         val status = doc.selectFirst("ul.entry-meta li:contains(Đang phát) span")?.text()?.trim()
         val duration = doc.selectFirst("ul.entry-meta li:contains(Thời lượng)")?.text()?.substringAfter(":")?.trim()
-        val country = doc.select("ul.entry-meta li:contains(Quốc gia) a").map { it.text().trim() }.joinToString(", ")
+        val country = doc.select("ul.entry-meta li:contains(Quốc gia) a")?.text()?.trim()
         val imdb = doc.selectFirst("ul.entry-meta li:contains(IMDb) span.imdb")?.text()?.trim()
-        val castList = doc.select("ul.entry-meta li:contains(Diễn viên) a").map { it.text().trim() }
         val rawPlot = getPlot(doc)
 
-        val detailedPlot = buildString {
-            val infoList = mutableListOf<String>()
-            if (!status.isNullOrEmpty()) infoList.add("📺 $status")
-            if (!imdb.isNullOrEmpty()) infoList.add("⭐ $imdb")
-            if (!duration.isNullOrEmpty()) infoList.add("⏳ $duration")
-            if (country.isNotBlank()) infoList.add("🌎 $country")
-            
-            if (infoList.isNotEmpty()) {
-                append(infoList.joinToString(" • "))
-                append("\n\n")
-            }
-            
-            append(rawPlot ?: "Chưa có nội dung mô tả cho phim này.")
-            
-            if (castList.isNotEmpty()) {
-                append("\n\n🎭 Diễn viên: ")
-                append(castList.joinToString("| "))
-            }
+        // Đưa toàn bộ thông tin phụ vào danh sách Tags (Thể loại) để Cloudstream hiển thị thành các nút (chips)
+        val tagsList = mutableListOf<String>()
+        if (!status.isNullOrEmpty()) tagsList.add("📺 $status")
+        if (!imdb.isNullOrEmpty()) tagsList.add("⭐ $imdb")
+        if (!duration.isNullOrEmpty()) tagsList.add("⏳ $duration")
+        if (!country.isNullOrEmpty()) tagsList.add("🌎 $country")
+        
+        // Thêm các thể loại gốc của phim vào sau cùng
+        val genres = doc.select("ul.entry-meta li:contains(Thể loại) a").map { it.text().trim() }
+        tagsList.addAll(genres)
+
+        // Lấy danh sách diễn viên chuẩn của Cloudstream
+        val cast = doc.select("ul.entry-meta li:contains(Diễn viên) a").map { 
+            ActorData(Actor(it.text().trim())) 
         }
         
         val watchUrl = doc.selectFirst("a.btn-see[href*='/xem/']")?.attr("href")?.let { fixUrl(it) }
@@ -145,9 +140,10 @@ class PhimMoiChillProvider : MainAPI() {
 
         if (!hasEps && watchUrl == null) return newMovieLoadResponse(title, url, TvType.Movie, url) {
             this.posterUrl = poster
-            this.plot = detailedPlot
+            this.plot = rawPlot // Chỉ để lại nội dung phim thuần túy
             this.year = year
-            this.tags = genres
+            this.tags = tagsList // Gán danh sách Tags mới
+            this.actors = cast
             this.recommendations = recommendations
         }
 
@@ -177,9 +173,10 @@ class PhimMoiChillProvider : MainAPI() {
 
         return newTvSeriesLoadResponse(title, url, TvType.TvSeries, eps.ifEmpty { watchUrl?.let { listOf(newEpisode(it) { name = "Tập 1" }) } ?: emptyList() }) {
             this.posterUrl = poster
-            this.plot = detailedPlot
+            this.plot = rawPlot // Chỉ để lại nội dung phim thuần túy
             this.year = year
-            this.tags = genres
+            this.tags = tagsList // Gán danh sách Tags mới
+            this.actors = cast
             this.recommendations = recommendations
         }
     }

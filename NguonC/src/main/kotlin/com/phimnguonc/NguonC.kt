@@ -9,6 +9,9 @@ import com.lagradost.cloudstream3.network.WebViewResolver
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
 import android.util.Base64
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import java.util.EnumSet
 
 @CloudstreamPlugin
@@ -110,7 +113,7 @@ class PhimNguonCProvider : MainAPI() {
             newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
         } else {
             val url   = if (page == 1) "$mainUrl/${request.data}" else "$mainUrl/${request.data}?page=$page"
-            val doc   = app.get(url, headers = commonHeaders, interceptor = cfInterceptor).document
+            val doc   = app.get(url, headers = commonHeaders).document
             val items = doc.select("table tbody tr").mapNotNull { parseCard(it) }
             newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
         }
@@ -118,13 +121,13 @@ class PhimNguonCProvider : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/tim-kiem?keyword=${URLEncoder.encode(query, "utf-8")}"
-        val doc = app.get(url, headers = commonHeaders, interceptor = cfInterceptor).document
+        val doc = app.get(url, headers = commonHeaders).document
         return doc.select("table tbody tr").mapNotNull { parseCard(it) }
     }
 
     override suspend fun load(url: String): LoadResponse {
         val slug  = url.trim().trimEnd('/').substringAfterLast("/")
-        val res   = app.get("$mainUrl/api/film/$slug", headers = commonHeaders, interceptor = cfInterceptor)
+        val res   = app.get("$mainUrl/api/film/$slug", headers = commonHeaders)
                        .parsedSafe<NguonCDetailResponse>()
         val movie = res?.movie ?: throw ErrorLoadingException("Không thể tải dữ liệu phim")
 
@@ -259,13 +262,15 @@ class PhimNguonCProvider : MainAPI() {
         }
         var linkFound = false
 
-        for ((serverName, embedUrl) in embedEntries) {
-            val embedDomain = Regex("""https?://[^/]+""").find(embedUrl)?.value ?: continue
+        // Process embed URLs in parallel
+        coroutineScope {
+            embedEntries.map { (serverName, embedUrl) ->
+                async {
+            val embedDomain = Regex("""https?://[^/]+""").find(embedUrl)?.value ?: return@async
             try {
                 val embedRes = app.get(
                     embedUrl,
-                    headers     = mapOf("Referer" to "$mainUrl/", "User-Agent" to USER_AGENT),
-                    interceptor = cfInterceptor
+                    headers = mapOf("Referer" to "$mainUrl/", "User-Agent" to USER_AGENT)
                 )
                 val html    = embedRes.text
                 val cookies = embedRes.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
@@ -323,7 +328,9 @@ class PhimNguonCProvider : MainAPI() {
             } catch (e: Exception) {
                 e.printStackTrace()
             }
-        }
+                } // async
+            }.awaitAll()
+        } // coroutineScope
 
         return linkFound
     }

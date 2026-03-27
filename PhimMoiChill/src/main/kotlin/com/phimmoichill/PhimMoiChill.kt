@@ -89,7 +89,6 @@ class PhimMoiChillProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        
         val url = if (page <= 1) {
             "$mainUrl/${request.data}"
         } else {
@@ -110,19 +109,43 @@ class PhimMoiChillProvider : MainAPI() {
         val title = doc.selectFirst("h1")?.text()?.trim() ?: "Phim"
         val poster = imgUrl(doc.selectFirst(".film-poster img, img[itemprop=image]"))
         
+        // Lấy thông tin chi tiết từ block entry-meta
+        val year = doc.selectFirst("ul.entry-meta li:contains(Năm Phát Hành) a")?.text()?.let { Regex("""\b(20\d{2})\b""").find(it)?.value?.toIntOrNull() }
         
-        val plot = getPlot(doc)
+        // SỬA LỖI TAGS: Chỉ lấy thể loại trong phần thông tin phim, không lấy trên thanh menu
+        val genres = doc.select("ul.entry-meta li:contains(Thể loại) a").map { it.text().trim() }
         
+        // Lấy thêm Diễn viên và Phim đề cử
+        val cast = doc.select("ul.entry-meta li:contains(Diễn viên) a").map { it.text().trim() }
+        val recommendations = doc.select("#similar-films li.item").mapNotNull { parseCard(it) }
+
+        // Lấy các thông tin phụ để làm đẹp phần Plot (Mô tả)
+        val status = doc.selectFirst("ul.entry-meta li:contains(Đang phát) span")?.text()?.trim()
+        val duration = doc.selectFirst("ul.entry-meta li:contains(Thời lượng)")?.text()?.substringAfter(":")?.trim()
+        val country = doc.select("ul.entry-meta li:contains(Quốc gia) a").map { it.text().trim() }.joinToString(", ")
+        val imdb = doc.selectFirst("ul.entry-meta li:contains(IMDb) span.imdb")?.text()?.trim()
+        val rawPlot = getPlot(doc)
+
+        // Xây dựng lại phần mô tả trông đẹp và rõ ràng hơn
+        val detailedPlot = buildString {
+            if (!status.isNullOrEmpty()) append("📺 Trạng thái: $status\n")
+            if (!imdb.isNullOrEmpty()) append("⭐ Điểm IMDb: $imdb\n")
+            if (!duration.isNullOrEmpty()) append("⏳ Thời lượng: $duration\n")
+            if (country.isNotBlank()) append("🌎 Quốc gia: $country\n")
+            append("\n")
+            append(rawPlot ?: "Chưa có nội dung mô tả cho phim này.")
+        }
         
-        val year = doc.selectFirst("a[href*='phim-nam-']")?.text()?.let { Regex("""\b(20\d{2})\b""").find(it)?.value?.toIntOrNull() }
-        val genres = doc.select("a[href*='/genre/']").map { it.text().trim() }
         val watchUrl = doc.selectFirst("a.btn-see[href*='/xem/']")?.attr("href")?.let { fixUrl(it) }
-        
-    
         val hasEps = doc.select("div.latest-episode a[data-id], ul.episodes li a").isNotEmpty()
 
         if (!hasEps && watchUrl == null) return newMovieLoadResponse(title, url, TvType.Movie, url) {
-            this.posterUrl = poster; this.plot = plot; this.year = year; this.tags = genres
+            this.posterUrl = poster
+            this.plot = detailedPlot
+            this.year = year
+            this.tags = genres
+            this.actors = cast
+            this.recommendations = recommendations
         }
 
         val eps = (watchUrl?.let { wu ->
@@ -141,7 +164,6 @@ class PhimMoiChillProvider : MainAPI() {
                 }
             } catch (_: Exception) { emptyList() }
         } ?: emptyList()).ifEmpty {
-            
             doc.select("div.latest-episode a[data-id]").mapNotNull { a ->
                 newEpisode(fixUrl(a.attr("href"))) { 
                     this.name = a.text()
@@ -151,30 +173,32 @@ class PhimMoiChillProvider : MainAPI() {
         }
 
         return newTvSeriesLoadResponse(title, url, TvType.TvSeries, eps.ifEmpty { watchUrl?.let { listOf(newEpisode(it) { name = "Tập 1" }) } ?: emptyList() }) {
-            this.posterUrl = poster; this.plot = plot; this.year = year; this.tags = genres
+            this.posterUrl = poster
+            this.plot = detailedPlot
+            this.year = year
+            this.tags = genres
+            this.actors = cast
+            this.recommendations = recommendations
         }
     }
 
     private fun getPlot(doc: org.jsoup.nodes.Document): String? {
-
+        val filmContent = doc.selectFirst("#film-content")
+        if (filmContent != null) {
+            val clone = filmContent.clone()
+            // Xóa thẻ a chứa tên phim SEO ở đầu đoạn văn
+            clone.select("a").remove()
+            clone.select(".hidden").remove()
+            val text = clone.text().trim()
+            if (text.isNotEmpty()) return text
+        }
+        
         doc.selectFirst("meta[itemprop=description]")?.attr("content")?.trim()?.let { 
             if (it.isNotEmpty()) return it 
         }
         
         doc.selectFirst("meta[name=description]")?.attr("content")?.trim()?.let { 
             if (it.isNotEmpty()) return it 
-        }
-        
-        val filmContent = doc.selectFirst("#film-content")
-        if (filmContent != null) {
-            
-            val clone = filmContent.clone()
-            
-            clone.selectFirst("a")?.remove()
-            
-            clone.select(".hidden").remove()
-            val text = clone.text()?.trim()
-            if (!text.isNullOrEmpty()) return text
         }
         
         try {
@@ -200,7 +224,6 @@ class PhimMoiChillProvider : MainAPI() {
             val res = app.get(data, headers = headers)
             val html = res.text
             val cookies = res.cookies
-
 
             val epId = Regex("""[/-]pm(\d+)""").find(data)?.groupValues?.get(1)
                 ?: Regex("""data-id="(\d+)"""").find(html)?.groupValues?.get(1)
@@ -253,7 +276,6 @@ class PhimMoiChillProvider : MainAPI() {
                 } catch (e: Exception) { continue }
             }
 
-            
             if (!vietsubKey.isNullOrEmpty()) {
                 callback(
                     newExtractorLink(

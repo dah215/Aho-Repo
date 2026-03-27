@@ -247,11 +247,10 @@ class PhimNguonCProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback:         (ExtractorLink) -> Unit
     ): Boolean {
-        // data có thể chứa nhiều embed URLs cách nhau bằng "|"
         val embedUrls = data.split("|").map { it.trim() }.filter { it.isNotBlank() }
         var linkFound = false
 
-        for (embedUrl in embedUrls) {
+        for ((embedIdx, embedUrl) in embedUrls.withIndex()) {
             val embedDomain = Regex("""https?://[^/]+""").find(embedUrl)?.value ?: continue
             try {
                 val embedRes = app.get(
@@ -305,11 +304,12 @@ class PhimNguonCProvider : MainAPI() {
                 } catch (_: Exception) {}
             }
 
-                if (!streamData.sUb.isNullOrBlank()) {
-                    serveStream("$embedDomain/${streamData.sUb}.m3u8", "Vietsub")
-                }
-                if (!streamData.hD.isNullOrBlank()) {
-                    serveStream("$embedDomain/${streamData.hD}.m3u8", "Thuyết minh")
+                // Đặt tên theo thứ tự embed URL: URL[0]=Vietsub, URL[1+]=Thuyết Minh
+                val streamName = if (embedIdx == 0) "Vietsub" else "Thuyết minh"
+                // Ưu tiên sUb, fallback hD
+                val m3u8Path = streamData.sUb ?: streamData.hD
+                if (!m3u8Path.isNullOrBlank()) {
+                    serveStream("$embedDomain/$m3u8Path.m3u8", streamName)
                 }
 
             } catch (e: Exception) {

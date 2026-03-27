@@ -185,7 +185,7 @@ class PhimNguonCProvider : MainAPI() {
                 val crlf = "\r\n"
                 when {
                     path == "/stream.m3u8" -> {
-                        val body = m3u8Content.toByteArray(Charsets.UTF_8)
+                        val body = getM3U8().toByteArray(Charsets.UTF_8)
                         output.write(("HTTP/1.1 200 OK${crlf}Content-Type: application/vnd.apple.mpegurl${crlf}Content-Length: ${body.size}${crlf}Access-Control-Allow-Origin: *${crlf}${crlf}").toByteArray())
                         output.write(body)
                     }
@@ -212,6 +212,10 @@ class PhimNguonCProvider : MainAPI() {
                 client.close()
             } catch (_: Exception) { try { client.close() } catch (_: Exception) {} }
         }
+
+        @Volatile private var _m3u8: String = ""
+        fun setM3U8(content: String) { _m3u8 = content }
+        private fun getM3U8(): String = _m3u8
 
         fun stop() {
             try { serverSocket?.close() } catch (_: Exception) {}
@@ -274,22 +278,19 @@ class PhimNguonCProvider : MainAPI() {
                     val m3u8Raw = app.get(m3u8Url, headers = fetchHdr).text
                     if (!m3u8Raw.contains("#EXTM3U")) return
 
-                    // Mỗi stream dùng server riêng, không stop server cũ
-                    // Start server với port ngẫu nhiên trước để biết port
-                    val tempSocket = java.net.ServerSocket(0)
-                    val port = tempSocket.localPort
-                    tempSocket.close()
-
-                    val proxyBase     = "http://127.0.0.1:$port"
-                    val rewrittenM3U8 = rewriteM3U8(m3u8Raw, proxyBase)
-                    val server        = NguonCProxyServer(rewrittenM3U8, embedUrl)
+                    // Start server trước để lấy đúng port, rồi mới rewrite M3U8
+                    val server = NguonCProxyServer("", embedUrl)
                     server.start()
                     activeServers.add(server)
+
+                    val proxyBase     = "http://127.0.0.1:${server.port}"
+                    val rewrittenM3U8 = rewriteM3U8(m3u8Raw, proxyBase)
+                    server.setM3U8(rewrittenM3U8)
 
                     callback(newExtractorLink(
                         source = "NguonC",
                         name   = serverName,
-                        url    = "http://127.0.0.1:${server.port}/stream.m3u8",
+                        url    = "$proxyBase/stream.m3u8",
                         type   = ExtractorLinkType.M3U8
                     ) {
                         this.quality = Qualities.P1080.value

@@ -28,14 +28,14 @@ class AnimeVietSubPlugin : Plugin() {
         val provider = AnimeVietSubProvider()
         registerMainAPI(provider)
         // Prefetch avs.watch.js ngay khi load plugin
-        kotlinx.coroutines.GlobalScope.launch {
+        GlobalScope.launch {
             provider.prefetchAvsJs()
         }
     }
 }
 
 class AnimeVietSubProvider : MainAPI() {
-    override var mainUrl     = "https://animevietsub.mx"
+    override var mainUrl     = "https://animevietsub.be"
     override var name        = "AnimeVietSub"
     override val hasMainPage = true
     override var lang        = "vi"
@@ -55,9 +55,18 @@ class AnimeVietSubProvider : MainAPI() {
     private var cachedAvsJs: String? = null
 
     override val mainPage = mainPageOf(
-        "$mainUrl/anime-moi/"                 to "Anime Mới",
+        "$mainUrl/anime-moi/"                 to "Anime Mới Nhất",
+        "$mainUrl/anime-bo/"                  to "Anime Bộ",
         "$mainUrl/anime-le/"                  to "Anime Lẻ",
-        "$mainUrl/anime-bo/"                  to "Anime Bộ"
+        "$mainUrl/hoat-hinh-trung-quoc/"      to "Hoạt Hình TQ",
+        "$mainUrl/danh-sach/list-dang-chieu/" to "Đang Chiếu",
+        "$mainUrl/danh-sach/list-tron-bo/"    to "Trọn Bộ",
+        "$mainUrl/the-loai/hanh-dong/"        to "Action",
+        "$mainUrl/the-loai/tinh-cam/"         to "Romance",
+        "$mainUrl/the-loai/phep-thuat/"       to "Fantasy",
+        "$mainUrl/the-loai/kinh-di/"          to "Horror",
+        "$mainUrl/the-loai/hai-huoc/"         to "Comedy",
+        "$mainUrl/the-loai/shounen/"          to "Shounen"
     )
 
     private fun pageUrl(base: String, page: Int) =
@@ -106,33 +115,40 @@ class AnimeVietSubProvider : MainAPI() {
                        ?.text()?.filter { it.isDigit() }?.take(4)?.toIntOrNull()
         val tags     = watchDoc.select("p.Genre a").map { it.text().trim() }.filter { it.isNotBlank() }
 
-        // ---- BỔ SUNG: lấy thêm thông tin từ bảng "Thông tin phim" ----
+        // ---- Lấy thông tin từ bảng "Thông tin phim" ----
         val infoItems = watchDoc.select("div.MovieInfo .InfoList li")
         val infoMap = mutableMapOf<String, String>()
         for (item in infoItems) {
             val strong = item.selectFirst("strong") ?: continue
             val label = strong.text().trim().removeSuffix(":").trim()
-            // lấy nội dung sau strong (có thể chứa link)
             val value = item.text().replace(strong.text(), "").trim()
             infoMap[label] = value
         }
 
         val statusText   = infoMap["Trạng thái"]
         val directorText = infoMap["Đạo diễn"]?.takeIf { it.isNotBlank() && it != "null" }
-        val studioText   = infoMap["Studio"]   // có thể không có
+        val studioText   = infoMap["Studio"]
         val countryText  = infoMap["Quốc gia"]
         val seasonText   = infoMap["Season"]
-        val ratingText   = infoMap["Rating"]   // ví dụ "G - Mọi lứa tuổi"
-        val followersStr = infoMap["Số người theo dõi"]
+        val ratingText   = infoMap["Rating"]
 
-        // Rating sao và số lượng đánh giá
         val avgScore = watchDoc.selectFirst("#average_score")?.text()?.toFloatOrNull()
         val ratingCount = watchDoc.selectFirst(".num-rating")?.text()?.toIntOrNull()
 
-        // Lượt xem (có thể lấy cho vui, nhưng CloudStream không có field riêng)
-        // val views = watchDoc.selectFirst("p.Info .View")?.text()?.trim()
+        // Gom thông tin bổ sung vào plot
+        val additionalInfo = buildString {
+            if (!statusText.isNullOrBlank()) append("Trạng thái: $statusText\n")
+            if (!directorText.isNullOrBlank()) append("Đạo diễn: $directorText\n")
+            if (!studioText.isNullOrBlank()) append("Studio: $studioText\n")
+            if (!countryText.isNullOrBlank()) append("Quốc gia: $countryText\n")
+            if (!seasonText.isNullOrBlank()) append("Mùa: $seasonText\n")
+            if (!ratingText.isNullOrBlank()) append("Phân loại: $ratingText\n")
+            if (ratingCount != null) append("Đánh giá: $ratingCount người\n")
+            if (avgScore != null) append("Điểm: ${"%.1f".format(avgScore)}/10\n")
+        }
+        val fullPlot = if (additionalInfo.isNotBlank()) "$additionalInfo\n$plot" else plot
 
-        // ---- Xử lý danh sách tập (giữ nguyên code cũ) ----
+        // ---- Xử lý danh sách tập ----
         val seen     = mutableSetOf<String>()
         val episodes = watchDoc.select("#list-server .list-episode a.episode-link")
             .mapNotNull { a ->
@@ -151,35 +167,19 @@ class AnimeVietSubProvider : MainAPI() {
                 episodes.firstOrNull()?.data ?: "$base/xem-phim.html"
             ) {
                 this.posterUrl = poster
-                this.plot = plot
+                this.plot = fullPlot
                 this.tags = tags
                 this.year = year
-                // --- Thêm các trường cho Movie ---
-                this.rating = avgScore
-                this.reviews = ratingCount
-                this.status = statusText
-                this.director = directorText
-                this.studio = studioText
-                this.country = countryText
-                this.airDate = seasonText
-                this.imdbRating = ratingText  // hiển thị phân loại độ tuổi
+                this.score = avgScore
             }
         } else {
             newAnimeLoadResponse(title, url, TvType.Anime, true) {
                 this.posterUrl = poster
-                this.plot = plot
+                this.plot = fullPlot
                 this.tags = tags
                 this.year = year
                 addEpisodes(DubStatus.Subbed, episodes)
-                // --- Thêm các trường cho Anime ---
-                this.rating = avgScore
-                this.reviews = ratingCount
-                this.status = statusText
-                this.director = directorText
-                this.studio = studioText
-                this.country = countryText
-                this.airDate = seasonText
-                this.imdbRating = ratingText
+                this.score = avgScore
             }
         }
     }

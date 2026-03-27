@@ -109,33 +109,40 @@ class PhimMoiChillProvider : MainAPI() {
         val title = doc.selectFirst("h1")?.text()?.trim() ?: "Phim"
         val poster = imgUrl(doc.selectFirst(".film-poster img, img[itemprop=image]"))
         
-        // Lấy thông tin chi tiết từ block entry-meta
         val year = doc.selectFirst("ul.entry-meta li:contains(Năm Phát Hành) a")?.text()?.let { Regex("""\b(20\d{2})\b""").find(it)?.value?.toIntOrNull() }
-        
-        // SỬA LỖI TAGS: Chỉ lấy thể loại trong phần thông tin phim, không lấy trên thanh menu
         val genres = doc.select("ul.entry-meta li:contains(Thể loại) a").map { it.text().trim() }
-        
-        // Lấy thêm Diễn viên và Phim đề cử (Đã sửa lỗi List<String> thành List<ActorData>)
-        val cast = doc.select("ul.entry-meta li:contains(Diễn viên) a").map { 
-            ActorData(Actor(it.text().trim())) 
-        }
         val recommendations = doc.select("#similar-films li.item").mapNotNull { parseCard(it) }
 
-        // Lấy các thông tin phụ để làm đẹp phần Plot (Mô tả)
+        // Lấy các thông tin phụ
         val status = doc.selectFirst("ul.entry-meta li:contains(Đang phát) span")?.text()?.trim()
         val duration = doc.selectFirst("ul.entry-meta li:contains(Thời lượng)")?.text()?.substringAfter(":")?.trim()
         val country = doc.select("ul.entry-meta li:contains(Quốc gia) a").map { it.text().trim() }.joinToString(", ")
         val imdb = doc.selectFirst("ul.entry-meta li:contains(IMDb) span.imdb")?.text()?.trim()
+        val castList = doc.select("ul.entry-meta li:contains(Diễn viên) a").map { it.text().trim() }
         val rawPlot = getPlot(doc)
 
-        // Xây dựng lại phần mô tả trông đẹp và rõ ràng hơn
+        // Xây dựng lại phần mô tả (Dùng \n\n để ép Cloudstream tách đoạn)
         val detailedPlot = buildString {
-            if (!status.isNullOrEmpty()) append("📺 Trạng thái: $status\n")
-            if (!imdb.isNullOrEmpty()) append("⭐ Điểm IMDb: $imdb\n")
-            if (!duration.isNullOrEmpty()) append("⏳ Thời lượng: $duration\n")
-            if (country.isNotBlank()) append("🌎 Quốc gia: $country\n")
-            append("\n")
+            val infoList = mutableListOf<String>()
+            if (!status.isNullOrEmpty()) infoList.add("📺 $status")
+            if (!imdb.isNullOrEmpty()) infoList.add("⭐ $imdb")
+            if (!duration.isNullOrEmpty()) infoList.add("⏳ $duration")
+            if (country.isNotBlank()) infoList.add("🌎 $country")
+            
+            // Dòng 1: Các thông tin ngắn cách nhau bằng dấu chấm tròn
+            if (infoList.isNotEmpty()) {
+                append(infoList.joinToString(" • "))
+                append("\n\n")
+            }
+            
+            // Dòng 2: Nội dung phim
             append(rawPlot ?: "Chưa có nội dung mô tả cho phim này.")
+            
+            // Dòng 3: Danh sách diễn viên (Tự nối bằng dấu phẩy)
+            if (castList.isNotEmpty()) {
+                append("\n\n🎭 Diễn viên: ")
+                append(castList.joinToString("~ "))
+            }
         }
         
         val watchUrl = doc.selectFirst("a.btn-see[href*='/xem/']")?.attr("href")?.let { fixUrl(it) }
@@ -146,7 +153,6 @@ class PhimMoiChillProvider : MainAPI() {
             this.plot = detailedPlot
             this.year = year
             this.tags = genres
-            this.actors = cast
             this.recommendations = recommendations
         }
 
@@ -179,7 +185,6 @@ class PhimMoiChillProvider : MainAPI() {
             this.plot = detailedPlot
             this.year = year
             this.tags = genres
-            this.actors = cast
             this.recommendations = recommendations
         }
     }
@@ -188,7 +193,6 @@ class PhimMoiChillProvider : MainAPI() {
         val filmContent = doc.selectFirst("#film-content")
         if (filmContent != null) {
             val clone = filmContent.clone()
-            // Xóa thẻ a chứa tên phim SEO ở đầu đoạn văn
             clone.select("a").remove()
             clone.select(".hidden").remove()
             val text = clone.text().trim()

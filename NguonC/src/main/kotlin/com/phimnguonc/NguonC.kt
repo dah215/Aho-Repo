@@ -127,7 +127,7 @@ class PhimNguonCProvider : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse {
         val slug  = url.trim().trimEnd('/').substringAfterLast("/")
-        val res   = app.get("$mainUrl/api/film/$slug", headers = commonHeaders)
+        val res   = app.get("$mainUrl/api/film/$slug", headers = commonHeaders, interceptor = cfInterceptor)
                        .parsedSafe<NguonCDetailResponse>()
         val movie = res?.movie ?: throw ErrorLoadingException("Không thể tải dữ liệu phim")
 

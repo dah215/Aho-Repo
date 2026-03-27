@@ -129,12 +129,15 @@ class PhimNguonCProvider : MainAPI() {
         val movie = res?.movie ?: throw ErrorLoadingException("Không thể tải dữ liệu phim")
 
         val epMap = linkedMapOf<String, MutableList<String>>()
-        movie.episodes?.forEach { server ->
+        movie.episodes?.forEachIndexed { idx, server ->
+            val serverName = server.server_name ?: server.name
+                ?: if (idx == 0) "Vietsub" else "Thuyết minh"
             val items = server.items ?: server.list
             items?.forEach { ep ->
-                val embed = ep.embed?.replace("\\/", "/") ?: ""
+                val embed = ep.embed?.replace("\/", "/") ?: ""
                 if (embed.isNotBlank()) {
-                    epMap.getOrPut(ep.name ?: "0") { mutableListOf() }.add(embed)
+                    epMap.getOrPut(ep.name ?: "0") { mutableListOf() }
+                        .add("$serverName::$embed")
                 }
             }
         }
@@ -247,10 +250,16 @@ class PhimNguonCProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback:         (ExtractorLink) -> Unit
     ): Boolean {
-        val embedUrls = data.split("|").map { it.trim() }.filter { it.isNotBlank() }
+        // Parse "ServerName::embedUrl|ServerName2::embedUrl2"
+        val embedEntries = data.split("|").mapNotNull { entry ->
+            val parts = entry.trim().split("::", limit = 2)
+            if (parts.size == 2) Pair(parts[0], parts[1])
+            else if (parts.size == 1 && parts[0].startsWith("http")) Pair("Vietsub", parts[0])
+            else null
+        }
         var linkFound = false
 
-        for ((embedIdx, embedUrl) in embedUrls.withIndex()) {
+        for ((serverName, embedUrl) in embedEntries) {
             val embedDomain = Regex("""https?://[^/]+""").find(embedUrl)?.value ?: continue
             try {
                 val embedRes = app.get(
@@ -305,11 +314,10 @@ class PhimNguonCProvider : MainAPI() {
             }
 
                 // Đặt tên theo thứ tự embed URL: URL[0]=Vietsub, URL[1+]=Thuyết Minh
-                val streamName = if (embedIdx == 0) "Vietsub" else "Thuyết minh"
-                // Ưu tiên sUb, fallback hD
+                // Dùng tên server từ load(), fallback theo sUb/hD
                 val m3u8Path = streamData.sUb ?: streamData.hD
                 if (!m3u8Path.isNullOrBlank()) {
-                    serveStream("$embedDomain/$m3u8Path.m3u8", streamName)
+                    serveStream("$embedDomain/$m3u8Path.m3u8", serverName)
                 }
 
             } catch (e: Exception) {
@@ -345,8 +353,10 @@ class PhimNguonCProvider : MainAPI() {
         @JsonProperty("episodes")    val episodes:    List<NguonCServer>? = null
     )
     data class NguonCServer(
-        @JsonProperty("items") val items: List<NguonCEpisode>? = null,
-        @JsonProperty("list")  val list:  List<NguonCEpisode>? = null
+        @JsonProperty("server_name") val server_name: String?              = null,
+        @JsonProperty("name")        val name:         String?              = null,
+        @JsonProperty("items")       val items:        List<NguonCEpisode>? = null,
+        @JsonProperty("list")        val list:          List<NguonCEpisode>? = null
     )
     data class NguonCEpisode(
         @JsonProperty("name")  val name:  String? = null,

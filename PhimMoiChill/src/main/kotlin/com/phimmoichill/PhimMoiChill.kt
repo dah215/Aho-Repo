@@ -113,7 +113,6 @@ class PhimMoiChillProvider : MainAPI() {
         val genres = doc.select("ul.entry-meta li:contains(Thể loại) a").map { it.text().trim() }
         val recommendations = doc.select("#similar-films li.item").mapNotNull { parseCard(it) }
 
-        // Lấy các thông tin phụ
         val status = doc.selectFirst("ul.entry-meta li:contains(Đang phát) span")?.text()?.trim()
         val duration = doc.selectFirst("ul.entry-meta li:contains(Thời lượng)")?.text()?.substringAfter(":")?.trim()
         val country = doc.select("ul.entry-meta li:contains(Quốc gia) a").map { it.text().trim() }.joinToString(", ")
@@ -121,7 +120,6 @@ class PhimMoiChillProvider : MainAPI() {
         val castList = doc.select("ul.entry-meta li:contains(Diễn viên) a").map { it.text().trim() }
         val rawPlot = getPlot(doc)
 
-        // Xây dựng lại phần mô tả (Dùng \n\n để ép Cloudstream tách đoạn)
         val detailedPlot = buildString {
             val infoList = mutableListOf<String>()
             if (!status.isNullOrEmpty()) infoList.add("📺 $status")
@@ -129,19 +127,16 @@ class PhimMoiChillProvider : MainAPI() {
             if (!duration.isNullOrEmpty()) infoList.add("⏳ $duration")
             if (country.isNotBlank()) infoList.add("🌎 $country")
             
-            // Dòng 1: Các thông tin ngắn cách nhau bằng dấu chấm tròn
             if (infoList.isNotEmpty()) {
                 append(infoList.joinToString(" • "))
                 append("\n\n")
             }
             
-            // Dòng 2: Nội dung phim
             append(rawPlot ?: "Chưa có nội dung mô tả cho phim này.")
             
-            // Dòng 3: Danh sách diễn viên (Tự nối bằng dấu phẩy)
             if (castList.isNotEmpty()) {
                 append("\n\n🎭 Diễn viên: ")
-                append(castList.joinToString("~ "))
+                append(castList.joinToString("| "))
             }
         }
         

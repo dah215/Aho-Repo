@@ -120,6 +120,34 @@ class PhimNguonCProvider : MainAPI() {
         }
     }
 
+    // Hàm hỗ trợ bóc tách dữ liệu an toàn tránh lỗi JSON
+    private fun extractNames(obj: Any?): List<String> {
+        val names = mutableListOf<String>()
+        when (obj) {
+            is List<*> -> {
+                obj.forEach { item ->
+                    if (item is Map<*, *>) item["name"]?.toString()?.let { names.add(it) }
+                }
+            }
+            is Map<*, *> -> {
+                obj.values.forEach { item ->
+                    if (item is Map<*, *>) item["name"]?.toString()?.let { names.add(it) }
+                }
+            }
+        }
+        return names
+    }
+
+    private fun extractActors(obj: Any?): List<ActorData> {
+        val actors = mutableListOf<String>()
+        when (obj) {
+            is String -> actors.addAll(obj.split(",").map { it.trim() })
+            is List<*> -> actors.addAll(obj.mapNotNull { it?.toString()?.trim() })
+        }
+        return actors.filter { it.isNotBlank() && !it.contains("Đang cập nhật", true) }
+            .map { ActorData(Actor(it)) }
+    }
+
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/tim-kiem?keyword=${URLEncoder.encode(query, "utf-8")}"
         val doc = app.get(url, headers = commonHeaders).document
@@ -132,20 +160,18 @@ class PhimNguonCProvider : MainAPI() {
                        .parsedSafe<NguonCDetailResponse>()
         val movie = res?.movie ?: throw ErrorLoadingException("Không thể tải dữ liệu phim")
 
-        // Lấy thông tin cơ bản
         val title = movie.name ?: ""
         val poster = movie.poster_url ?: movie.thumb_url
-        val year = movie.year
+        val year = movie.year?.toString()?.toIntOrNull()
 
-        // Xử lý các thông tin phụ để đưa vào Tags (Chips)
         val epCurrent = movie.episode_current ?: ""
         val quality = movie.quality ?: ""
         val lang = movie.language ?: ""
         val status = listOf(epCurrent, quality, lang).filter { it.isNotBlank() }.joinToString(" ")
         
         val duration = movie.time ?: ""
-        val country = movie.country?.mapNotNull { it.name }?.joinToString(", ") ?: ""
-        val genres = movie.category?.mapNotNull { it.name } ?: emptyList()
+        val country = extractNames(movie.country).joinToString(", ")
+        val genres = extractNames(movie.category)
 
         val tagsList = mutableListOf<String>()
         if (status.isNotBlank()) tagsList.add("📺 $status")
@@ -153,17 +179,12 @@ class PhimNguonCProvider : MainAPI() {
         if (country.isNotBlank()) tagsList.add("🌎 $country")
         tagsList.addAll(genres)
 
-        // Xử lý danh sách diễn viên (Lọc bỏ chữ "Đang cập nhật")
-        val cast = movie.actor?.filter { it.isNotBlank() && !it.contains("Đang cập nhật", true) }?.map {
-            ActorData(Actor(it.trim()))
-        } ?: emptyList()
+        val cast = extractActors(movie.actor)
 
-        // Xử lý nội dung phim (Dùng Jsoup để xóa các thẻ HTML rác từ API trả về)
         val rawPlot = (movie.description ?: movie.content ?: "").let {
             Jsoup.parse(it).text()
         }
 
-        // Xử lý danh sách tập phim
         val epMap = linkedMapOf<String, MutableList<String>>()
         movie.episodes?.forEachIndexed { idx, server ->
             val serverName = server.server_name ?: server.name
@@ -322,35 +343,34 @@ class PhimNguonCProvider : MainAPI() {
                             "Accept-Language" to "vi-VN,vi;q=0.9"
                         )
 
-                        suspend fun serveStream(m3u8Url: String, serverName: String) {
-                            try {
-                                val m3u8Raw = app.get(m3u8Url, headers = fetchHdr).text
-                                if (!m3u8Raw.contains("#EXTM3U")) return
-
-                                val server = NguonCProxyServer("", embedUrl)
-                                server.start()
-                                activeServers.add(server)
-
-                                val proxyBase     = "http://127.0.0.1:${server.port}"
-                                val rewrittenM3U8 = rewriteM3U8(m3u8Raw, proxyBase)
-                                server.setM3U8(rewrittenM3U8)
-
-                                callback(newExtractorLink(
-                                    source = "NguonC",
-                                    name   = serverName,
-                                    url    = "$proxyBase/stream.m3u8",
-                                    type   = ExtractorLinkType.M3U8
-                                ) {
-                                    this.quality = Qualities.P1080.value
-                                    this.headers = mapOf("User-Agent" to USER_AGENT)
-                                })
-                                linkFound = true
-                            } catch (_: Exception) {}
-                        }
-
                         val m3u8Path = streamData.sUb ?: streamData.hD
                         if (!m3u8Path.isNullOrBlank()) {
-                            serveStream("$embedDomain/$m3u8Path.m3u8", serverName)
+                            val m3u8Url = "$embedDomain/$m3u8Path.m3u8"
+                            try {
+                                val m3u8Raw = app.get(m3u8Url, headers = fetchHdr).text
+                                if (m3u8Raw.contains("#EXTM3U")) {
+                                    val server = NguonCProxyServer("", embedUrl)
+                                    server.start()
+                                    activeServers.add(server)
+
+                                    val proxyBase     = "http://127.0.0.1:${server.port}"
+                                    val rewrittenM3U8 = rewriteM3U8(m3u8Raw, proxyBase)
+                                    server.setM3U8(rewrittenM3U8)
+
+                                    callback(newExtractorLink(
+                                        source = "NguonC",
+                                        name   = serverName,
+                                        url    = "$proxyBase/stream.m3u8",
+                                        type   = ExtractorLinkType.M3U8
+                                    ) {
+                                        this.quality = Qualities.P1080.value
+                                        this.headers = mapOf("User-Agent" to USER_AGENT)
+                                    })
+                                    linkFound = true
+                                }
+                            } catch (e: Exception) {
+                                e.printStackTrace()
+                            }
                         }
 
                     } catch (e: Exception) {
@@ -363,7 +383,7 @@ class PhimNguonCProvider : MainAPI() {
         return linkFound
     }
 
-    // ── Data classes mở rộng để lấy thêm thông tin ────────────────────────────
+    // ── Data classes mở rộng (Sử dụng Any? để chống lỗi JSON) ────────────────────────────
     data class NguonCApiResponse(
         @JsonProperty("status") val status: String?             = null,
         @JsonProperty("items")  val items:  List<NguonCApiItem>? = null
@@ -391,15 +411,11 @@ class PhimNguonCProvider : MainAPI() {
         @JsonProperty("episode_current") val episode_current: String?             = null,
         @JsonProperty("quality")         val quality:         String?             = null,
         @JsonProperty("language")        val language:        String?             = null,
-        @JsonProperty("year")            val year:            Int?                = null,
-        @JsonProperty("actor")           val actor:           List<String>?       = null,
-        @JsonProperty("category")        val category:        List<NguonCItem>?   = null,
-        @JsonProperty("country")         val country:         List<NguonCItem>?   = null,
+        @JsonProperty("year")            val year:            Any?                = null,
+        @JsonProperty("actor")           val actor:           Any?                = null,
+        @JsonProperty("category")        val category:        Any?                = null,
+        @JsonProperty("country")         val country:         Any?                = null,
         @JsonProperty("episodes")        val episodes:        List<NguonCServer>? = null
-    )
-    
-    data class NguonCItem(
-        @JsonProperty("name") val name: String? = null
     )
     
     data class NguonCServer(

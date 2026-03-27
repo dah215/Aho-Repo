@@ -6,7 +6,6 @@ import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.network.WebViewResolver
-import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
 import android.util.Base64
@@ -120,34 +119,6 @@ class PhimNguonCProvider : MainAPI() {
         }
     }
 
-    // Hàm hỗ trợ bóc tách dữ liệu an toàn tránh lỗi JSON
-    private fun extractNames(obj: Any?): List<String> {
-        val names = mutableListOf<String>()
-        when (obj) {
-            is List<*> -> {
-                obj.forEach { item ->
-                    if (item is Map<*, *>) item["name"]?.toString()?.let { names.add(it) }
-                }
-            }
-            is Map<*, *> -> {
-                obj.values.forEach { item ->
-                    if (item is Map<*, *>) item["name"]?.toString()?.let { names.add(it) }
-                }
-            }
-        }
-        return names
-    }
-
-    private fun extractActors(obj: Any?): List<ActorData> {
-        val actors = mutableListOf<String>()
-        when (obj) {
-            is String -> actors.addAll(obj.split(",").map { it.trim() })
-            is List<*> -> actors.addAll(obj.mapNotNull { it?.toString()?.trim() })
-        }
-        return actors.filter { it.isNotBlank() && !it.contains("Đang cập nhật", true) }
-            .map { ActorData(Actor(it)) }
-    }
-
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/tim-kiem?keyword=${URLEncoder.encode(query, "utf-8")}"
         val doc = app.get(url, headers = commonHeaders).document
@@ -160,31 +131,121 @@ class PhimNguonCProvider : MainAPI() {
                        .parsedSafe<NguonCDetailResponse>()
         val movie = res?.movie ?: throw ErrorLoadingException("Không thể tải dữ liệu phim")
 
+        // ===== TRÍCH XUẤT METADATA CHI TIẾT =====
         val title = movie.name ?: ""
+        val altTitle = movie.original_name ?: movie.english_name ?: ""
         val poster = movie.poster_url ?: movie.thumb_url
-        val year = movie.year?.toString()?.toIntOrNull()
-
-        val epCurrent = movie.episode_current ?: ""
-        val quality = movie.quality ?: ""
-        val lang = movie.language ?: ""
-        val status = listOf(epCurrent, quality, lang).filter { it.isNotBlank() }.joinToString(" ")
         
-        val duration = movie.time ?: ""
-        val country = extractNames(movie.country).joinToString(", ")
-        val genres = extractNames(movie.category)
+        // Trích xuất các trường metadata
+        val status = movie.status ?: movie.current_episode ?: ""
+        val episodeTotal = movie.total_episodes?.toString() ?: ""
+        val duration = movie.time ?: movie.duration ?: ""
+        val quality = movie.quality ?: "HD"
+        val language = movie.language ?: "Vietsub"
+        val director = movie.director ?: movie.directors ?: ""
+        val cast = movie.actor ?: movie.actors ?: movie.cast ?: ""
+        val categories = movie.category ?: movie.categories ?: ""
+        val genres = movie.genre ?: movie.genres ?: ""
+        val year = movie.year ?: movie.publish_year ?: ""
+        val country = movie.country ?: movie.countries ?: ""
+        val plotOriginal = movie.description ?: movie.content ?: ""
 
-        val tagsList = mutableListOf<String>()
-        if (status.isNotBlank()) tagsList.add("📺 $status")
-        if (duration.isNotBlank()) tagsList.add("⏳ $duration")
-        if (country.isNotBlank()) tagsList.add("🌎 $country")
-        tagsList.addAll(genres)
+        // ===== TẠO MÔ TẢ HTML ĐẸP =====
+        val description = buildString {
+            // Tên tiếng Anh (nếu có)
+            if (altTitle.isNotBlank() && altTitle != title) {
+                append("<font color='#AAAAAA'><i>$altTitle</i></font><br><br>")
+            }
 
-        val cast = extractActors(movie.actor)
+            // Thông tin chính dạng bảng giống screenshot
+            append("<table cellpadding='3'>")
+            
+            // Trạng thái
+            if (status.isNotBlank()) {
+                val statusColor = when {
+                    status.contains("tập", ignoreCase = true) -> "#4CAF50" // Xanh lá - đang chiếu
+                    status.contains("hoàn tất", ignoreCase = true) -> "#2196F3" // Xanh dương
+                    status.contains("full", ignoreCase = true) -> "#9C27B0" // Tím
+                    else -> "#FFFFFF"
+                }
+                append("<tr><td>📺</td><td><b>Trạng thái:</b> <font color='$statusColor'>$status</font></td></tr>")
+            }
+            
+            // Số tập
+            if (episodeTotal.isNotBlank() && episodeTotal != "0") {
+                append("<tr><td>🎞</td><td><b>Số tập:</b> $episodeTotal</td></tr>")
+            }
+            
+            // Thời lượng
+            if (duration.isNotBlank()) {
+                append("<tr><td>⏱</td><td><b>Thời lượng:</b> $duration</td></tr>")
+            }
+            
+            // Chất lượng
+            if (quality.isNotBlank()) {
+                append("<tr><td>🎬</td><td><b>Chất lượng:</b> <font color='#E91E63'>$quality</font></td></tr>")
+            }
+            
+            // Ngôn ngữ
+            if (language.isNotBlank()) {
+                val langColor = when {
+                    language.contains("vietsub", ignoreCase = true) -> "#00BCD4" // Cyan
+                    language.contains("thuyết minh", ignoreCase = true) -> "#FF5722" // Cam
+                    language.contains("lồng tiếng", ignoreCase = true) -> "#3F51B5" // Indigo
+                    else -> "#FFFFFF"
+                }
+                append("<tr><td>🔊</td><td><b>Ngôn ngữ:</b> <font color='$langColor'>$language</font></td></tr>")
+            }
+            
+            // Đạo diễn
+            if (director.isNotBlank()) {
+                append("<tr><td>🎥</td><td><b>Đạo diễn:</b> $director</td></tr>")
+            }
+            
+            // Diễn viên
+            if (cast.isNotBlank()) {
+                // Giới hạn độ dài nếu quá dài
+                val castDisplay = if (cast.length > 100) cast.substring(0, 100) + "..." else cast
+                append("<tr><td>⭐</td><td><b>Diễn viên:</b> $castDisplay</td></tr>")
+            }
+            
+            // Danh sách (Phim bộ/Phim lẻ/Đang chiếu)
+            if (categories.isNotBlank()) {
+                append("<tr><td>📂</td><td><b>Danh sách:</b> $categories</td></tr>")
+            }
+            
+            // Thể loại
+            if (genres.isNotBlank()) {
+                append("<tr><td>🏷</td><td><b>Thể loại:</b> $genres</td></tr>")
+            }
+            
+            // Năm phát hành
+            if (year.isNotBlank() && year != "0") {
+                append("<tr><td>📅</td><td><b>Năm phát hành:</b> $year</td></tr>")
+            }
+            
+            // Quốc gia
+            if (country.isNotBlank()) {
+                append("<tr><td>🌍</td><td><b>Quốc gia:</b> $country</td></tr>")
+            }
+            
+            append("</table>")
 
-        val rawPlot = (movie.description ?: movie.content ?: "").let {
-            Jsoup.parse(it).text()
+            // Nội dung phim
+            if (plotOriginal.isNotBlank()) {
+                append("<br><b><font color='#4CAF50'>✦ NỘI DUNG PHIM</font></b><br>")
+                append("<hr color='#333333' size='1'><br>")
+                append(plotOriginal)
+            }
+
+            // Footer
+            append("<br><br><br>")
+            append("<font color='#666666' size='2'><i>")
+            append("Nguồn: NguonC.com")
+            append("</i></font>")
         }
 
+        // ===== XỬ LÝ DANH SÁCH TẬP =====
         val epMap = linkedMapOf<String, MutableList<String>>()
         movie.episodes?.forEachIndexed { idx, server ->
             val serverName = server.server_name ?: server.name
@@ -207,12 +268,14 @@ class PhimNguonCProvider : MainAPI() {
             }
         }.sortedBy { it.episode ?: 0 }
 
+        val tags = genres.split(",").map { it.trim() }.filter { it.isNotBlank() }
+        val yearInt = year.toIntOrNull()
+
         return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
             this.posterUrl = poster
-            this.year = year
-            this.plot = rawPlot
-            this.tags = tagsList
-            this.actors = cast
+            this.plot      = description
+            this.tags      = tags
+            this.year      = yearInt
         }
     }
 
@@ -343,47 +406,48 @@ class PhimNguonCProvider : MainAPI() {
                             "Accept-Language" to "vi-VN,vi;q=0.9"
                         )
 
-                        val m3u8Path = streamData.sUb ?: streamData.hD
-                        if (!m3u8Path.isNullOrBlank()) {
-                            val m3u8Url = "$embedDomain/$m3u8Path.m3u8"
+                        suspend fun serveStream(m3u8Url: String, serverName: String) {
                             try {
                                 val m3u8Raw = app.get(m3u8Url, headers = fetchHdr).text
-                                if (m3u8Raw.contains("#EXTM3U")) {
-                                    val server = NguonCProxyServer("", embedUrl)
-                                    server.start()
-                                    activeServers.add(server)
+                                if (!m3u8Raw.contains("#EXTM3U")) return
 
-                                    val proxyBase     = "http://127.0.0.1:${server.port}"
-                                    val rewrittenM3U8 = rewriteM3U8(m3u8Raw, proxyBase)
-                                    server.setM3U8(rewrittenM3U8)
+                                val server = NguonCProxyServer("", embedUrl)
+                                server.start()
+                                activeServers.add(server)
 
-                                    callback(newExtractorLink(
-                                        source = "NguonC",
-                                        name   = serverName,
-                                        url    = "$proxyBase/stream.m3u8",
-                                        type   = ExtractorLinkType.M3U8
-                                    ) {
-                                        this.quality = Qualities.P1080.value
-                                        this.headers = mapOf("User-Agent" to USER_AGENT)
-                                    })
-                                    linkFound = true
-                                }
-                            } catch (e: Exception) {
-                                e.printStackTrace()
-                            }
+                                val proxyBase     = "http://127.0.0.1:${server.port}"
+                                val rewrittenM3U8 = rewriteM3U8(m3u8Raw, proxyBase)
+                                server.setM3U8(rewrittenM3U8)
+
+                                callback(newExtractorLink(
+                                    source = "NguonC",
+                                    name   = serverName,
+                                    url    = "$proxyBase/stream.m3u8",
+                                    type   = ExtractorLinkType.M3U8
+                                ) {
+                                    this.quality = Qualities.P1080.value
+                                    this.headers = mapOf("User-Agent" to USER_AGENT)
+                                })
+                                linkFound = true
+                            } catch (_: Exception) {}
+                        }
+
+                        val m3u8Path = streamData.sUb ?: streamData.hD
+                        if (!m3u8Path.isNullOrBlank()) {
+                            serveStream("$embedDomain/$m3u8Path.m3u8", serverName)
                         }
 
                     } catch (e: Exception) {
                         e.printStackTrace()
                     }
-                } 
+                }
             }.awaitAll()
-        } 
+        }
 
         return linkFound
     }
 
-    // ── Data classes mở rộng (Sử dụng Any? để chống lỗi JSON) ────────────────────────────
+    // ── Data classes ──────────────────────────────────────────────────────────
     data class NguonCApiResponse(
         @JsonProperty("status") val status: String?             = null,
         @JsonProperty("items")  val items:  List<NguonCApiItem>? = null
@@ -400,24 +464,36 @@ class PhimNguonCProvider : MainAPI() {
         @JsonProperty("language")        val language:        String? = null
     )
     data class NguonCDetailResponse(@JsonProperty("movie") val movie: NguonCMovie? = null)
-    
     data class NguonCMovie(
         @JsonProperty("name")            val name:            String?             = null,
+        @JsonProperty("original_name")   val original_name:   String?             = null,
+        @JsonProperty("english_name")     val english_name:     String?             = null,
         @JsonProperty("description")     val description:     String?             = null,
-        @JsonProperty("content")         val content:         String?             = null,
+        @JsonProperty("content")          val content:          String?             = null,
         @JsonProperty("thumb_url")       val thumb_url:       String?             = null,
         @JsonProperty("poster_url")      val poster_url:      String?             = null,
+        @JsonProperty("status")          val status:          String?             = null,
+        @JsonProperty("current_episode") val current_episode: String?             = null,
+        @JsonProperty("total_episodes")  val total_episodes:  Int?                = null,
         @JsonProperty("time")            val time:            String?             = null,
-        @JsonProperty("episode_current") val episode_current: String?             = null,
-        @JsonProperty("quality")         val quality:         String?             = null,
-        @JsonProperty("language")        val language:        String?             = null,
-        @JsonProperty("year")            val year:            Any?                = null,
-        @JsonProperty("actor")           val actor:           Any?                = null,
-        @JsonProperty("category")        val category:        Any?                = null,
-        @JsonProperty("country")         val country:         Any?                = null,
-        @JsonProperty("episodes")        val episodes:        List<NguonCServer>? = null
+        @JsonProperty("duration")          val duration:         String?             = null,
+        @JsonProperty("quality")          val quality:          String?             = null,
+        @JsonProperty("language")         val language:         String?             = null,
+        @JsonProperty("director")         val director:         String?             = null,
+        @JsonProperty("directors")        val directors:        String?             = null,
+        @JsonProperty("actor")            val actor:            String?             = null,
+        @JsonProperty("actors")            val actors:            String?             = null,
+        @JsonProperty("cast")             val cast:             String?             = null,
+        @JsonProperty("category")         val category:         String?             = null,
+        @JsonProperty("categories")       val categories:       String?             = null,
+        @JsonProperty("genre")            val genre:            String?             = null,
+        @JsonProperty("genres")            val genres:            String?             = null,
+        @JsonProperty("year")             val year:             String?             = null,
+        @JsonProperty("publish_year")     val publish_year:     String?             = null,
+        @JsonProperty("country")          val country:          String?             = null,
+        @JsonProperty("countries")         val countries:         String?             = null,
+        @JsonProperty("episodes")         val episodes:        List<NguonCServer>? = null
     )
-    
     data class NguonCServer(
         @JsonProperty("server_name") val server_name: String?              = null,
         @JsonProperty("name")        val name:         String?              = null,

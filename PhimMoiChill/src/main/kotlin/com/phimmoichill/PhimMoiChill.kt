@@ -79,11 +79,11 @@ class PhimMoiChillProvider : MainAPI() {
         val title = doc.selectFirst("h1[itemprop=name]")?.text()?.trim() ?: ""
         val poster = fixUrl(doc.selectFirst("div.image img")?.attr("src") ?: "")
         
-        // --- Lấy Metadata ---
+        // --- Lấy dữ liệu thô ---
         val originalName = doc.selectFirst("span.real-name")?.text()?.trim()
         val status = doc.selectFirst("span.status")?.text()?.trim()
         val quality = doc.selectFirst("span.quality")?.text()?.trim()
-        val year = doc.selectFirst("a[href*='/nam-phat-hanh/']")?.text()?.trim()
+        val yearText = doc.selectFirst("a[href*='/nam-phat-hanh/']")?.text()?.trim()
         val country = doc.selectFirst("a[href*='/quoc-gia/']")?.text()?.trim()
         val categories = doc.select("a[href*='/the-loai/']").map { it.text() }.joinToString(", ")
         
@@ -95,8 +95,11 @@ class PhimMoiChillProvider : MainAPI() {
             if (text.contains("Diễn viên", true)) casts = text.substringAfter(":").trim()
         }
 
-        // Lấy nội dung phim và làm sạch (bỏ khoảng trắng thừa)
-        val plotText = doc.selectFirst("div#film-content")?.text()?.replace(title, "")?.trim()
+        // Làm sạch Plot: Loại bỏ tiêu đề bị lặp lại trong nội dung
+        var plotText = doc.selectFirst("div#film-content")?.text() ?: ""
+        if (plotText.startsWith(title)) {
+            plotText = plotText.removePrefix(title).trim().removePrefix(":").trim()
+        }
 
         val episodes = doc.select("ul#list_episodes li a").map {
             val epHref = fixUrl(it.attr("href"))
@@ -110,9 +113,9 @@ class PhimMoiChillProvider : MainAPI() {
         return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
             this.posterUrl = poster
             this.plot = buildBeautifulDescription(
-                originalName, status, quality, year, country, categories, director, casts, plotText
+                originalName, status, quality, yearText, country, categories, director, casts, plotText
             )
-            this.year = year?.toIntOrNull()
+            this.year = yearText?.toIntOrNull()
             this.tags = categories.split(", ").filter { it.isNotBlank() }
         }
     }
@@ -129,7 +132,7 @@ class PhimMoiChillProvider : MainAPI() {
         plotText: String?
     ): String {
         return buildString {
-            // Tên gốc (chỉ thêm nếu khác tên chính)
+            // Tên gốc - In nghiêng mờ
             if (!originalName.isNullOrBlank()) {
                 append("<font color='#AAAAAA'><i>$originalName</i></font><br><br>")
             }
@@ -140,6 +143,7 @@ class PhimMoiChillProvider : MainAPI() {
                 }
             }
 
+            // Status Color (Xanh lá nếu Hoàn tất, Xanh dương nếu đang chiếu)
             val statusColor = if (status?.contains("Full", true) == true || status?.contains("Hoàn", true) == true) "#4CAF50" else "#2196F3"
 
             addInfo("📺", "Trạng thái", status, statusColor)
@@ -150,11 +154,11 @@ class PhimMoiChillProvider : MainAPI() {
             addInfo("🎭", "Diễn viên", casts)
             addInfo("🏷", "Thể loại", categories)
 
+            // Phần nội dung - Cách biệt hẳn ra bằng gạch ngang
             if (!plotText.isNullOrBlank()) {
-                append("<br><b><font color='#FFEB3B'>✦ NỘI DUNG PHIM</font></b><br>")
+                append("<br><br><b><font color='#FFEB3B'>✦ NỘI DUNG PHIM</font></b><br>")
                 append("<hr color='#333333' size='1'><br>")
-                // Giới hạn độ dài hoặc làm sạch nội dung để tránh trùng lặp
-                append(plotText.take(1000)) 
+                append(plotText.trim())
             }
         }
     }

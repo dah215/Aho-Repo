@@ -128,100 +128,142 @@ class PhimNguonCProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         val slug = url.trim().trimEnd('/').substringAfterLast("/")
 
-        // Try API first
+        // Strategy 1: Try JSON API (may be 403 blocked by Cloudflare)
         val movie = try {
-            app.get("$mainUrl/api/film/$slug", headers = commonHeaders, interceptor = cfInterceptor)
+            app.get("$mainUrl/api/film/$slug", headers = commonHeaders)
                .parsedSafe<NguonCDetailResponse>()?.movie
         } catch (_: Exception) { null }
 
         if (movie != null) {
-            val title    = movie.name ?: ""
-            val poster   = movie.poster_url ?: movie.thumb_url
-            val altTitle = (movie.original_name ?: movie.english_name ?: "").let {
-                if (it.isNotBlank() && it != title) it else ""
-            }
-            val status   = movie.status ?: movie.current_episode ?: ""
-            val quality  = movie.quality ?: "HD"
-            val language = movie.language ?: ""
-            val plotRaw  = movie.description ?: movie.content ?: ""
+            return buildResponseFromMovie(movie, url, slug)
+        }
 
-            val description = buildString {
-                if (altTitle.isNotBlank())
-                    append("<font color='#AAAAAA'><i>$altTitle</i></font><br><br>")
-                if (status.isNotBlank())
-                    append("<b>Trạng thái:</b> $status<br>")
-                if (quality.isNotBlank())
-                    append("<b>Chất lượng:</b> <font color='#E91E63'>$quality</font><br>")
-                if (language.isNotBlank())
-                    append("<b>Ngôn ngữ:</b> $language<br>")
-                if (plotRaw.isNotBlank())
-                    append("<br>$plotRaw")
-            }
+        // Strategy 2: Parse HTML page via WebView (cfInterceptor handles Cloudflare)
+        return try {
+            val doc = app.get(url, headers = commonHeaders, interceptor = cfInterceptor).document
 
+            val title  = doc.selectFirst("h1")?.text()?.trim()
+                         ?: doc.selectFirst("meta[property=og:title]")?.attr("content")
+                         ?: slug.replace("-", " ")
+            val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
+                         ?: doc.selectFirst("img.film-poster, .poster img")?.attr("src")
+            val plot   = doc.selectFirst("meta[property=og:description]")?.attr("content")
+                         ?: doc.selectFirst("meta[name=description]")?.attr("content")
+
+            // Parse episode total from page
+            val totalEp = doc.selectFirst(".total-episodes, .episode-number")
+                             ?.text()?.filter { it.isDigit() }?.toIntOrNull()
+                          ?: Regex("""\d+""").findAll(
+                                doc.selectFirst(".latest-episode, .episode-latest")?.text() ?: ""
+                             ).lastOrNull()?.value?.toIntOrNull()
+                          ?: 1
+
+            // Build episode list: construct URLs /phim/{slug}/tap-{n}
             val epMap = linkedMapOf<String, MutableList<String>>()
-            movie.episodes?.forEachIndexed { idx, server ->
-                val sName = server.server_name ?: server.name
-                    ?: if (idx == 0) "Vietsub" else "Thuyet minh"
-                val items = server.items ?: server.list
-                items?.forEach { ep ->
-                    val embed = ep.embed?.replace("\\/", "/") ?: ""
-                    if (embed.isNotBlank())
-                        epMap.getOrPut(ep.name ?: "0") { mutableListOf() }.add("$sName::$embed")
+
+            // Try to find episode links directly in HTML first
+            doc.select("a[href*='/tap-'], a[href*='-tap-']").forEach { a ->
+                val href = a.attr("href").let { if (it.startsWith("http")) it else "$mainUrl$it" }
+                val num  = Regex("""tap-(\d+)""").find(href)?.groupValues?.get(1) ?: return@forEach
+                epMap.getOrPut(num) { mutableListOf() }.add("Vietsub::$href")
+            }
+
+            // If no links found, construct from total count
+            if (epMap.isEmpty() && totalEp > 0) {
+                for (i in 1..minOf(totalEp, 200)) {
+                    val epUrl = "$mainUrl/phim/$slug/tap-$i"
+                    epMap["$i"] = mutableListOf("Vietsub::$epUrl")
                 }
             }
-            if (epMap.isEmpty()) throw ErrorLoadingException("Khong tim thay tap phim")
+
+            // Single episode / movie
+            if (epMap.isEmpty()) {
+                epMap["1"] = mutableListOf("Vietsub::$url")
+            }
 
             val episodes = epMap.map { (epName, embeds) ->
                 newEpisode(embeds.distinct().joinToString("|")) {
-                    this.name    = "Tap $epName"
+                    this.name    = "Tập $epName"
                     this.episode = epName.toIntOrNull()
                 }
             }.sortedBy { it.episode ?: 0 }
 
-            return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
+            newTvSeriesLoadResponse(title ?: slug, url, TvType.TvSeries, episodes) {
                 this.posterUrl = poster
-                this.plot      = description
+                this.plot      = plot
+            }
+        } catch (e: Exception) {
+            // Strategy 3: Construct minimal response from URL alone (last resort)
+            val episodes = (1..1).map { i ->
+                newEpisode("Vietsub::$url") {
+                    this.name    = "Tập $i"
+                    this.episode = i
+                }
+            }
+            newTvSeriesLoadResponse(slug.replace("-", " "), url, TvType.TvSeries, episodes) {
+                this.plot = null
+            }
+        }
+    }
+
+    private fun buildResponseFromMovie(movie: NguonCMovie, url: String, slug: String): LoadResponse {
+        val title    = movie.name ?: slug
+        val poster   = movie.poster_url ?: movie.thumb_url
+        val altTitle = (movie.original_name ?: movie.english_name ?: "").let {
+            if (it.isNotBlank() && it != title) it else ""
+        }
+        val status   = movie.status ?: movie.current_episode ?: ""
+        val quality  = movie.quality ?: "HD"
+        val language = movie.language ?: ""
+        val plotRaw  = movie.description ?: movie.content ?: ""
+
+        val description = buildString {
+            if (altTitle.isNotBlank())
+                append("<font color='#AAAAAA'><i>$altTitle</i></font><br><br>")
+            append("<table cellpadding='2'>")
+            if (status.isNotBlank()) {
+                val sc = when {
+                    status.contains("chiếu", ignoreCase = true) -> "#4CAF50"
+                    status.contains("hoàn", ignoreCase = true)  -> "#2196F3"
+                    else -> "#FFFFFF"
+                }
+                append("<tr><td>📺</td><td><b>Trạng thái:</b> <font color='$sc'>$status</font></td></tr>")
+            }
+            if (quality.isNotBlank())
+                append("<tr><td>🎬</td><td><b>Chất lượng:</b> <font color='#E91E63'>$quality</font></td></tr>")
+            if (language.isNotBlank())
+                append("<tr><td>🔊</td><td><b>Ngôn ngữ:</b> $language</td></tr>")
+            append("</table>")
+            if (plotRaw.isNotBlank()) {
+                append("<br><b><font color='#FFEB3B'>✦ NỘI DUNG PHIM</font></b><br>")
+                append("<hr color='#333333' size='1'><br>")
+                append(plotRaw)
             }
         }
 
-        // Fallback: parse HTML page
-        val doc    = app.get(url, headers = commonHeaders, interceptor = cfInterceptor).document
-        val title  = doc.selectFirst("h1")?.text()?.trim()
-                     ?: doc.selectFirst("meta[property=og:title]")?.attr("content") ?: "Phim"
-        val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
-                     ?: doc.selectFirst(".film-poster img")?.attr("src")
-        val plot   = doc.selectFirst("meta[property=og:description]")?.attr("content")
-                     ?: doc.selectFirst("meta[name=description]")?.attr("content")
-
-        val epMap2 = linkedMapOf<String, MutableList<String>>()
-        doc.select(".list-server, #list-server .server-item").forEachIndexed { sIdx, serverEl ->
-            val sName = serverEl.selectFirst(".server-name, h4")?.text()?.trim()
-                ?: if (sIdx == 0) "Vietsub" else "Thuyet minh"
-            serverEl.select("a[href]").forEach { a ->
-                val href   = a.attr("href").let { if (it.startsWith("http")) it else "$mainUrl$it" }
-                val epName = a.text().trim().filter { it.isDigit() }.ifBlank { "${sIdx+1}" }
-                if (href.contains(mainUrl))
-                    epMap2.getOrPut(epName) { mutableListOf() }.add("$sName::$href")
+        val epMap = linkedMapOf<String, MutableList<String>>()
+        movie.episodes?.forEachIndexed { idx, server ->
+            val sName = server.server_name ?: server.name
+                ?: if (idx == 0) "Vietsub" else "Thuyết minh"
+            val items = server.items ?: server.list
+            items?.forEach { ep ->
+                val embed = ep.embed?.replace("\\/", "/") ?: ""
+                if (embed.isNotBlank())
+                    epMap.getOrPut(ep.name ?: "0") { mutableListOf() }.add("$sName::$embed")
             }
         }
+        if (epMap.isEmpty()) throw ErrorLoadingException("Không tìm thấy tập phim")
 
-        val watchUrl = doc.selectFirst("a.btn-see[href*='/xem/']")?.attr("href")
-            ?.let { if (it.startsWith("http")) it else "$mainUrl$it" }
-        if (epMap2.isEmpty() && watchUrl != null)
-            epMap2["1"] = mutableListOf("Vietsub::$watchUrl")
-
-        if (epMap2.isEmpty()) throw ErrorLoadingException("Khong tim thay tap phim")
-
-        val episodes2 = epMap2.map { (epName, embeds) ->
+        val episodes = epMap.map { (epName, embeds) ->
             newEpisode(embeds.distinct().joinToString("|")) {
-                this.name    = "Tap $epName"
+                this.name    = "Tập $epName"
                 this.episode = epName.toIntOrNull()
             }
         }.sortedBy { it.episode ?: 0 }
 
-        return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes2) {
+        return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
             this.posterUrl = poster
-            this.plot      = plot
+            this.plot      = description
         }
     }
 

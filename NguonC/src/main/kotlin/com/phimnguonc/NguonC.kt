@@ -126,139 +126,22 @@ class PhimNguonCProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val slug = url.trim().trimEnd('/').substringAfterLast("/")
-
-        // Strategy 1: Try JSON API (may be 403 blocked by Cloudflare)
-        val movie = try {
-            app.get("$mainUrl/api/film/$slug", headers = commonHeaders)
-               .parsedSafe<NguonCDetailResponse>()?.movie
-        } catch (_: Exception) { null }
-
-        if (movie != null) {
-            return buildResponseFromMovie(movie, url, slug)
-        }
-
-        // Strategy 2: Parse HTML page via WebView (cfInterceptor handles Cloudflare)
-        val doc = try {
-            app.get(url, headers = commonHeaders, interceptor = cfInterceptor).document
-        } catch (_: Exception) { null }
-
-        if (doc != null) {
-            val title  = doc.selectFirst("h1")?.text()?.trim()
-                         ?: doc.selectFirst("meta[property=og:title]")?.attr("content")
-                         ?: slug.replace("-", " ")
-
-            // Poster: og:image is most reliable for nguonc
-            val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
-                         ?.takeIf { it.isNotBlank() && it.startsWith("http") }
-                         ?: doc.selectFirst("meta[name=thumbnail]")?.attr("content")
-                         ?: doc.selectFirst("img.poster-film, img[itemprop=image]")?.attr("src")
-                            ?.let { if (it.startsWith("http")) it else "$mainUrl$it" }
-                         ?: doc.select("img[src]").firstOrNull { el ->
-                                val src = el.attr("src")
-                                src.contains("poster") || src.contains("thumb") ||
-                                src.contains("cdn") || src.contains("upload")
-                            }?.attr("src")
-                            ?.let { if (it.startsWith("http")) it else "$mainUrl$it" }
-
-            val plot   = doc.selectFirst("meta[property=og:description]")?.attr("content")
-                         ?: doc.selectFirst("meta[name=description]")?.attr("content")
-
-            // Parse embed URLs from episode buttons - these contain the real embed links
-            val epMap = linkedMapOf<String, MutableList<String>>()
-
-            // Nguonc episode buttons: <a class="ep-item" data-id="X" href="...">
-            doc.select("a.ep-item, a[data-id][href*=xem], a.episode-item, #list-server a")
-               .forEach { a ->
-                   val href = a.attr("href").let { if (it.startsWith("http")) it else "$mainUrl$it" }
-                   val num  = a.attr("data-id").ifBlank {
-                       Regex("""(\d+)$""").find(a.text().trim())?.groupValues?.get(1)
-                       ?: Regex("""tap-(\d+)""").find(href)?.groupValues?.get(1)
-                   } ?: return@forEach
-                   if (href.isNotBlank())
-                       epMap.getOrPut(num) { mutableListOf() }.add("Vietsub::$href")
-               }
-
-            // Fallback: look for any episode-like links
-            if (epMap.isEmpty()) {
-                doc.select("a[href*='/xem/'], a[href*='/tap-']").forEach { a ->
-                    val href = a.attr("href").let { if (it.startsWith("http")) it else "$mainUrl$it" }
-                    val num  = Regex("""tap-(\d+)|/(\d+)$""").find(href)
-                                   ?.groupValues?.drop(1)?.firstOrNull { it.isNotBlank() }
-                               ?: Regex("""\d+""").find(a.text())?.value
-                               ?: return@forEach
-                    epMap.getOrPut(num) { mutableListOf() }.add("Vietsub::$href")
-                }
-            }
-
-            // Last resort: use the page URL itself as single episode
-            if (epMap.isEmpty()) {
-                epMap["1"] = mutableListOf("Vietsub::$url")
-            }
-
-            val episodes = epMap.map { (epName, embeds) ->
-                newEpisode(embeds.distinct().joinToString("|")) {
-                    this.name    = "Tập $epName"
-                    this.episode = epName.toIntOrNull()
-                }
-            }.sortedBy { it.episode ?: 0 }
-
-            return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
-                this.posterUrl = poster
-                this.plot      = plot
-            }
-        }
-
-        // Strategy 3: Minimal response
-        return newTvSeriesLoadResponse(slug.replace("-", " "), url, TvType.TvSeries,
-            listOf(newEpisode("Vietsub::$url") { this.name = "Tập 1"; this.episode = 1 })
-        ) { this.plot = null }
-    }
-
-    private suspend fun buildResponseFromMovie(movie: NguonCMovie, url: String, slug: String): LoadResponse {
-        val title    = movie.name ?: slug
-        val poster   = movie.poster_url ?: movie.thumb_url
-        val altTitle = (movie.original_name ?: movie.english_name ?: "").let {
-            if (it.isNotBlank() && it != title) it else ""
-        }
-        val status   = movie.status ?: movie.current_episode ?: ""
-        val quality  = movie.quality ?: "HD"
-        val language = movie.language ?: ""
-        val plotRaw  = movie.description ?: movie.content ?: ""
-
-        val description = buildString {
-            if (altTitle.isNotBlank())
-                append("<font color='#AAAAAA'><i>$altTitle</i></font><br><br>")
-            append("<table cellpadding='2'>")
-            if (status.isNotBlank()) {
-                val sc = when {
-                    status.contains("chiếu", ignoreCase = true) -> "#4CAF50"
-                    status.contains("hoàn", ignoreCase = true)  -> "#2196F3"
-                    else -> "#FFFFFF"
-                }
-                append("<tr><td>📺</td><td><b>Trạng thái:</b> <font color='$sc'>$status</font></td></tr>")
-            }
-            if (quality.isNotBlank())
-                append("<tr><td>🎬</td><td><b>Chất lượng:</b> <font color='#E91E63'>$quality</font></td></tr>")
-            if (language.isNotBlank())
-                append("<tr><td>🔊</td><td><b>Ngôn ngữ:</b> $language</td></tr>")
-            append("</table>")
-            if (plotRaw.isNotBlank()) {
-                append("<br><b><font color='#FFEB3B'>✦ NỘI DUNG PHIM</font></b><br>")
-                append("<hr color='#333333' size='1'><br>")
-                append(plotRaw)
-            }
-        }
+        val slug  = url.trim().trimEnd('/').substringAfterLast("/")
+        val res   = app.get("$mainUrl/api/film/$slug", headers = commonHeaders)
+                       .parsedSafe<NguonCDetailResponse>()
+        val movie = res?.movie ?: throw ErrorLoadingException("Không thể tải dữ liệu phim")
 
         val epMap = linkedMapOf<String, MutableList<String>>()
         movie.episodes?.forEachIndexed { idx, server ->
-            val sName = server.server_name ?: server.name
+            val serverName = server.server_name ?: server.name
                 ?: if (idx == 0) "Vietsub" else "Thuyết minh"
             val items = server.items ?: server.list
             items?.forEach { ep ->
                 val embed = ep.embed?.replace("\\/", "/") ?: ""
-                if (embed.isNotBlank())
-                    epMap.getOrPut(ep.name ?: "0") { mutableListOf() }.add("$sName::$embed")
+                if (embed.isNotBlank()) {
+                    epMap.getOrPut(ep.name ?: "0") { mutableListOf() }
+                        .add("$serverName::$embed")
+                }
             }
         }
         if (epMap.isEmpty()) throw ErrorLoadingException("Không tìm thấy tập phim")
@@ -270,11 +153,339 @@ class PhimNguonCProvider : MainAPI() {
             }
         }.sortedBy { it.episode ?: 0 }
 
-        return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
-            this.posterUrl = poster
-            this.plot      = description
+        // Extract metadata from categories
+        val categories = movie.category ?: emptyMap()
+        val dinhDang = categories.values.find { it.group?.name == "Định dạng" }?.list?.map { it.name }?.joinToString(", ") ?: ""
+        val theLoai = categories.values.find { it.group?.name == "Thể loại" }?.list?.map { it.name }?.joinToString(", ") ?: ""
+        val namPhatHanh = categories.values.find { it.group?.name == "Năm" }?.list?.map { it.name }?.joinToString(", ") ?: ""
+        val quocGia = categories.values.find { it.group?.name == "Quốc gia" }?.list?.map { it.name }?.joinToString(", ") ?: ""
+
+        // Build beautiful description HTML like Animevietsub
+        val beautifulPlot = buildBeautifulDescription(
+            movie = movie,
+            dinhDang = dinhDang,
+            theLoai = theLoai,
+            namPhatHanh = namPhatHanh,
+            quocGia = quocGia
+        )
+
+        return newTvSeriesLoadResponse(movie.name ?: "", url, TvType.TvSeries, episodes) {
+            this.posterUrl = movie.poster_url ?: movie.thumb_url
+            this.plot      = beautifulPlot
+            this.tags      = theLoai.split(", ").filter { it.isNotBlank() }
+            this.year      = namPhatHanh.toIntOrNull()
         }
     }
+
+    private fun buildBeautifulDescription(
+        movie: NguonCMovie,
+        dinhDang: String,
+        theLoai: String,
+        namPhatHanh: String,
+        quocGia: String
+    ): String {
+        val description = movie.description ?: ""
+        val director = movie.director ?: ""
+        val casts = movie.casts ?: ""
+        val time = movie.time ?: ""
+        val quality = movie.quality ?: ""
+        val language = movie.language ?: ""
+        val currentEpisode = movie.current_episode ?: ""
+        val totalEpisodes = movie.total_episodes?.toString() ?: ""
+        val originalName = movie.original_name ?: ""
+
+        return """
+        <html>
+        <head>
+        <style>
+            @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap');
+            
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            
+            body {
+                font-family: 'Roboto', sans-serif;
+                background: linear-gradient(180deg, #0d1117 0%, #161b22 100%);
+                color: #e6edf3;
+                line-height: 1.6;
+                padding: 16px;
+            }
+            
+            .movie-header {
+                background: linear-gradient(135deg, #1a1f2e 0%, #21262d 100%);
+                border-radius: 16px;
+                padding: 20px;
+                margin-bottom: 16px;
+                border: 1px solid #30363d;
+                box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+            }
+            
+            .movie-title {
+                font-size: 24px;
+                font-weight: 700;
+                color: #ffffff;
+                margin-bottom: 8px;
+                text-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+            }
+            
+            .original-title {
+                font-size: 14px;
+                color: #8b949e;
+                font-style: italic;
+                margin-bottom: 12px;
+            }
+            
+            .tags-container {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 8px;
+                margin-bottom: 16px;
+            }
+            
+            .tag {
+                background: linear-gradient(135deg, #238636 0%, #2ea043 100%);
+                color: white;
+                padding: 4px 12px;
+                border-radius: 20px;
+                font-size: 12px;
+                font-weight: 500;
+            }
+            
+            .tag.quality {
+                background: linear-gradient(135deg, #8957e5 0%, #a371f7 100%);
+            }
+            
+            .tag.year {
+                background: linear-gradient(135deg, #1f6feb 0%, #58a6ff 100%);
+            }
+            
+            .tag.language {
+                background: linear-gradient(135deg, #d29922 0%, #e3b341 100%);
+            }
+            
+            .rating-section {
+                display: flex;
+                align-items: center;
+                gap: 12px;
+                margin-bottom: 16px;
+                padding: 12px;
+                background: rgba(0, 0, 0, 0.2);
+                border-radius: 12px;
+            }
+            
+            .stars {
+                color: #fbbc04;
+                font-size: 18px;
+                letter-spacing: 2px;
+            }
+            
+            .rating-text {
+                font-size: 14px;
+                color: #8b949e;
+            }
+            
+            .rating-score {
+                color: #fbbc04;
+                font-weight: 700;
+                font-size: 16px;
+            }
+            
+            .info-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+                gap: 12px;
+                margin-bottom: 16px;
+            }
+            
+            .info-item {
+                background: rgba(48, 54, 61, 0.6);
+                padding: 12px;
+                border-radius: 10px;
+                border-left: 3px solid #58a6ff;
+            }
+            
+            .info-label {
+                font-size: 11px;
+                color: #8b949e;
+                text-transform: uppercase;
+                letter-spacing: 0.5px;
+                margin-bottom: 4px;
+            }
+            
+            .info-value {
+                font-size: 14px;
+                color: #e6edf3;
+                font-weight: 500;
+            }
+            
+            .section-title {
+                font-size: 16px;
+                font-weight: 700;
+                color: #f0883e;
+                margin: 20px 0 12px 0;
+                display: flex;
+                align-items: center;
+                gap: 8px;
+            }
+            
+            .section-title::before {
+                content: "◆";
+                color: #f0883e;
+            }
+            
+            .description-box {
+                background: linear-gradient(135deg, #1c2128 0%, #21262d 100%);
+                border-radius: 12px;
+                padding: 16px;
+                border: 1px solid #30363d;
+                position: relative;
+                overflow: hidden;
+            }
+            
+            .description-box::before {
+                content: "";
+                position: absolute;
+                top: 0;
+                left: 0;
+                right: 0;
+                height: 3px;
+                background: linear-gradient(90deg, #f0883e, #fb8500, #f0883e);
+            }
+            
+            .description-text {
+                font-size: 14px;
+                color: #c9d1d9;
+                line-height: 1.8;
+                text-align: justify;
+            }
+            
+            .meta-section {
+                margin-top: 16px;
+                padding: 16px;
+                background: rgba(48, 54, 61, 0.4);
+                border-radius: 12px;
+            }
+            
+            .meta-row {
+                display: flex;
+                margin-bottom: 10px;
+                align-items: flex-start;
+            }
+            
+            .meta-label {
+                min-width: 100px;
+                font-size: 13px;
+                color: #58a6ff;
+                font-weight: 500;
+            }
+            
+            .meta-value {
+                flex: 1;
+                font-size: 13px;
+                color: #e6edf3;
+            }
+            
+            .episode-badge {
+                display: inline-block;
+                background: linear-gradient(135deg, #da3633 0%, #f85149 100%);
+                color: white;
+                padding: 6px 16px;
+                border-radius: 20px;
+                font-size: 14px;
+                font-weight: 600;
+                margin-bottom: 12px;
+            }
+            
+            .divider {
+                height: 1px;
+                background: linear-gradient(90deg, transparent, #30363d, transparent);
+                margin: 16px 0;
+            }
+        </style>
+        </head>
+        <body>
+            <div class="movie-header">
+                ${if (originalName.isNotBlank()) "<div class=\"original-title\">$originalName</div>" else ""}
+                
+                <div class="tags-container">
+                    ${if (language.isNotBlank()) "<span class=\"tag language\">$language</span>" else ""}
+                    ${if (quality.isNotBlank()) "<span class=\"tag quality\">$quality</span>" else ""}
+                    ${if (namPhatHanh.isNotBlank()) "<span class=\"tag year\">$namPhatHanh</span>" else ""}
+                    ${if (dinhDang.isNotBlank()) "<span class=\"tag\">$dinhDang</span>" else ""}
+                </div>
+                
+                <div class="info-grid">
+                    ${if (currentEpisode.isNotBlank()) """
+                    <div class="info-item">
+                        <div class="info-label">📺 Trạng thái</div>
+                        <div class="info-value">$currentEpisode</div>
+                    </div>
+                    """ else ""}
+                    
+                    ${if (totalEpisodes.isNotBlank() && totalEpisodes != "0") """
+                    <div class="info-item">
+                        <div class="info-label">🎬 Số tập</div>
+                        <div class="info-value">$totalEpisodes</div>
+                    </div>
+                    """ else ""}
+                    
+                    ${if (time.isNotBlank()) """
+                    <div class="info-item">
+                        <div class="info-label">⏱️ Thờ lượng</div>
+                        <div class="info-value">$time</div>
+                    </div>
+                    """ else ""}
+                    
+                    ${if (quocGia.isNotBlank()) """
+                    <div class="info-item">
+                        <div class="info-label">🌍 Quốc gia</div>
+                        <div class="info-value">$quocGia</div>
+                    </div>
+                    """ else ""}
+                </div>
+                
+                ${if (director.isNotBlank() || casts.isNotBlank() || theLoai.isNotBlank()) """
+                <div class="meta-section">
+                    ${if (director.isNotBlank()) """
+                    <div class="meta-row">
+                        <span class="meta-label">🎬 Đạo diễn:</span>
+                        <span class="meta-value">$director</span>
+                    </div>
+                    """ else ""}
+                    
+                    ${if (casts.isNotBlank()) """
+                    <div class="meta-row">
+                        <span class="meta-label">🎭 Diễn viên:</span>
+                        <span class="meta-value">$casts</span>
+                    </div>
+                    """ else ""}
+                    
+                    ${if (theLoai.isNotBlank()) """
+                    <div class="meta-row">
+                        <span class="meta-label">🏷️ Thể loại:</span>
+                        <span class="meta-value">$theLoai</span>
+                    </div>
+                    """ else ""}
+                </div>
+                """ else ""}
+            </div>
+            
+            ${if (description.isNotBlank()) """
+            <div class="section-title">NỘI DUNG PHIM</div>
+            <div class="description-box">
+                <div class="description-text">$description</div>
+            </div>
+            """ else ""}
+        </body>
+        </html>
+        """.trimIndent()
+    }
+
+    // ── Local proxy server ────────────────────────────────────────────────────
+    private val activeServers = mutableListOf<NguonCProxyServer>()
 
     inner class NguonCProxyServer(
         private val m3u8Content: String,
@@ -345,8 +556,6 @@ class PhimNguonCProvider : MainAPI() {
         }
     }
 
-    private val activeServers = mutableListOf<NguonCProxyServer>()
-
     private fun rewriteM3U8(m3u8: String, proxyBase: String): String {
         return m3u8.lines().joinToString("\n") { line ->
             val trimmed = line.trim()
@@ -361,110 +570,81 @@ class PhimNguonCProvider : MainAPI() {
         @JsonProperty("hD")  val hD:  String? = null
     )
 
-    // Resolve watch page URL → find embed URL inside it
-    private suspend fun resolveEmbedUrl(watchUrl: String): String? {
-        return try {
-            val doc = app.get(watchUrl, headers = commonHeaders, interceptor = cfInterceptor).document
-            // Embed iframe src
-            doc.selectFirst("iframe[src*=streamc], iframe[src*=embed], iframe[src*=amass]")
-               ?.attr("src")
-               ?.let { if (it.startsWith("http")) it else "https:$it" }
-            // Or data-embed attribute
-            ?: doc.selectFirst("[data-embed], [data-src*=streamc]")
-                  ?.attr("data-embed")?.ifBlank { null }
-                  ?.let { if (it.startsWith("http")) it else "https:$it" }
-        } catch (_: Exception) { null }
-    }
-
     override suspend fun loadLinks(
         data:             String,
         isCasting:        Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback:         (ExtractorLink) -> Unit
     ): Boolean {
-        // Parse entries - each entry is "ServerName::URL"
-        // URL can be: embed URL (streamc.xyz) OR watch page URL (phim.nguonc.com)
-        val rawEntries = data.split("|").mapNotNull { entry ->
+        val embedEntries = data.split("|").mapNotNull { entry ->
             val parts = entry.trim().split("::", limit = 2)
             if (parts.size == 2) Pair(parts[0], parts[1])
             else if (parts.size == 1 && parts[0].startsWith("http")) Pair("Vietsub", parts[0])
             else null
         }
-
-        // Resolve watch page URLs to embed URLs if needed
-        val embedEntries = rawEntries.map { (serverName, url) ->
-            if (url.contains("streamc") || url.contains("embed") || url.contains("amass")) {
-                Pair(serverName, url) // already embed URL
-            } else {
-                // It's a watch page - need to extract embed URL
-                val embedUrl = resolveEmbedUrl(url)
-                Pair(serverName, embedUrl ?: url)
-            }
-        }.filter { it.second.isNotBlank() }
-
         var linkFound = false
 
         coroutineScope {
             embedEntries.map { (serverName, embedUrl) ->
                 async {
-                    val embedDomain = Regex("""https?://[^/]+""").find(embedUrl)?.value ?: return@async
-                    try {
-                        val embedRes = app.get(
-                            embedUrl,
-                            headers = mapOf("Referer" to "$mainUrl/", "User-Agent" to USER_AGENT)
-                        )
-                        val html    = embedRes.text
-                        val cookies = embedRes.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+            val embedDomain = Regex("""https?://[^/]+""").find(embedUrl)?.value ?: return@async
+            try {
+                val embedRes = app.get(
+                    embedUrl,
+                    headers = mapOf("Referer" to "$mainUrl/", "User-Agent" to USER_AGENT)
+                )
+                val html    = embedRes.text
+                val cookies = embedRes.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
 
-                        val obfMatch = Regex("""data-obf\s*=\s*["']([A-Za-z0-9+/=]+)["']""").find(html)
-                            ?: return@async
+                val obfMatch = Regex("""data-obf\s*=\s*["']([A-Za-z0-9+/=]+)["']""").find(html)
+                    ?: return@async
 
-                        val jsonData   = String(Base64.decode(obfMatch.groupValues[1], Base64.DEFAULT))
-                        val streamData = AppUtils.parseJson<StreamData>(jsonData)
+                val jsonData   = String(Base64.decode(obfMatch.groupValues[1], Base64.DEFAULT))
+                val streamData = AppUtils.parseJson<StreamData>(jsonData)
 
-                        val fetchHdr = mapOf(
-                            "User-Agent"      to USER_AGENT,
-                            "Referer"         to embedUrl,
-                            "Origin"          to embedDomain,
-                            "Cookie"          to cookies,
-                            "Accept"          to "*/*",
-                            "Accept-Language" to "vi-VN,vi;q=0.9"
-                        )
+                val fetchHdr = mapOf(
+                    "User-Agent"      to USER_AGENT,
+                    "Referer"         to embedUrl,
+                    "Origin"          to embedDomain,
+                    "Cookie"          to cookies,
+                    "Accept"          to "*/*",
+                    "Accept-Language" to "vi-VN,vi;q=0.9"
+                )
 
-                        suspend fun serveStream(m3u8Url: String, serverName: String) {
-                            try {
-                                val m3u8Raw = app.get(m3u8Url, headers = fetchHdr).text
-                                if (!m3u8Raw.contains("#EXTM3U")) return
+            suspend fun serveStream(m3u8Url: String, serverName: String) {
+                try {
+                    val m3u8Raw = app.get(m3u8Url, headers = fetchHdr).text
+                    if (!m3u8Raw.contains("#EXTM3U")) return
 
-                                val server = NguonCProxyServer("", embedUrl)
-                                server.start()
-                                activeServers.add(server)
+                    val server = NguonCProxyServer("", embedUrl)
+                    server.start()
+                    activeServers.add(server)
 
-                                val proxyBase     = "http://127.0.0.1:${server.port}"
-                                val rewrittenM3U8 = rewriteM3U8(m3u8Raw, proxyBase)
-                                server.setM3U8(rewrittenM3U8)
+                    val proxyBase     = "http://127.0.0.1:${server.port}"
+                    val rewrittenM3U8 = rewriteM3U8(m3u8Raw, proxyBase)
+                    server.setM3U8(rewrittenM3U8)
 
-                                callback(newExtractorLink(
-                                    source = "NguonC",
-                                    name   = serverName,
-                                    url    = "$proxyBase/stream.m3u8",
-                                    type   = ExtractorLinkType.M3U8
-                                ) {
-                                    this.quality = Qualities.P1080.value
-                                    this.headers = mapOf("User-Agent" to USER_AGENT)
-                                })
-                                linkFound = true
-                            } catch (_: Exception) {}
-                        }
+                    callback(newExtractorLink(
+                        source = "NguonC",
+                        name   = serverName,
+                        url    = "$proxyBase/stream.m3u8",
+                        type   = ExtractorLinkType.M3U8
+                    ) {
+                        this.quality = Qualities.P1080.value
+                        this.headers = mapOf("User-Agent" to USER_AGENT)
+                    })
+                    linkFound = true
+                } catch (_: Exception) {}
+            }
 
-                        val m3u8Path = streamData.sUb ?: streamData.hD
-                        if (!m3u8Path.isNullOrBlank()) {
-                            serveStream("$embedDomain/$m3u8Path.m3u8", serverName)
-                        }
+                val m3u8Path = streamData.sUb ?: streamData.hD
+                if (!m3u8Path.isNullOrBlank()) {
+                    serveStream("$embedDomain/$m3u8Path.m3u8", serverName)
+                }
 
-                    } catch (e: Exception) {
-                        e.printStackTrace()
-                    }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
                 }
             }.awaitAll()
         }
@@ -477,6 +657,7 @@ class PhimNguonCProvider : MainAPI() {
         @JsonProperty("status") val status: String?             = null,
         @JsonProperty("items")  val items:  List<NguonCApiItem>? = null
     )
+    
     data class NguonCApiItem(
         @JsonProperty("name")            val name:             String? = null,
         @JsonProperty("slug")            val slug:             String? = null,
@@ -488,45 +669,55 @@ class PhimNguonCProvider : MainAPI() {
         @JsonProperty("quality")         val quality:         String? = null,
         @JsonProperty("language")        val language:        String? = null
     )
-    data class NguonCDetailResponse(@JsonProperty("movie") val movie: NguonCMovie? = null)
-    data class NguonCMovie(
-        @JsonProperty("name")            val name:            String?             = null,
-        @JsonProperty("original_name")   val original_name:   String?             = null,
-        @JsonProperty("english_name")     val english_name:     String?             = null,
-        @JsonProperty("description")     val description:     String?             = null,
-        @JsonProperty("content")          val content:          String?             = null,
-        @JsonProperty("thumb_url")       val thumb_url:       String?             = null,
-        @JsonProperty("poster_url")      val poster_url:      String?             = null,
-        @JsonProperty("status")          val status:          String?             = null,
-        @JsonProperty("current_episode") val current_episode: String?             = null,
-        @JsonProperty("total_episodes")  val total_episodes:  Int?                = null,
-        @JsonProperty("time")            val time:            String?             = null,
-        @JsonProperty("duration")          val duration:         String?             = null,
-        @JsonProperty("quality")          val quality:          String?             = null,
-        @JsonProperty("language")         val language:         String?             = null,
-        @JsonProperty("director")         val director:         String?             = null,
-        @JsonProperty("directors")        val directors:        String?             = null,
-        @JsonProperty("actor")            val actor:            String?             = null,
-        @JsonProperty("actors")            val actors:            String?             = null,
-        @JsonProperty("cast")             val cast:             String?             = null,
-        @JsonProperty("category")         val category:         String?             = null,
-        @JsonProperty("categories")       val categories:       String?             = null,
-        @JsonProperty("genre")            val genre:            String?             = null,
-        @JsonProperty("genres")            val genres:            String?             = null,
-        @JsonProperty("year")             val year:             String?             = null,
-        @JsonProperty("publish_year")     val publish_year:     String?             = null,
-        @JsonProperty("country")          val country:          String?             = null,
-        @JsonProperty("countries")         val countries:         String?             = null,
-        @JsonProperty("episodes")         val episodes:        List<NguonCServer>? = null
+    
+    data class NguonCDetailResponse(
+        @JsonProperty("movie") val movie: NguonCMovie? = null
     )
+    
+    data class NguonCMovie(
+        @JsonProperty("id")               val id:               String?                      = null,
+        @JsonProperty("name")             val name:             String?                      = null,
+        @JsonProperty("slug")             val slug:             String?                      = null,
+        @JsonProperty("original_name")    val original_name:    String?                      = null,
+        @JsonProperty("description")      val description:      String?                      = null,
+        @JsonProperty("thumb_url")        val thumb_url:        String?                      = null,
+        @JsonProperty("poster_url")       val poster_url:       String?                      = null,
+        @JsonProperty("total_episodes")   val total_episodes:   Int?                         = null,
+        @JsonProperty("current_episode")  val current_episode:  String?                      = null,
+        @JsonProperty("time")             val time:             String?                      = null,
+        @JsonProperty("quality")          val quality:          String?                      = null,
+        @JsonProperty("language")         val language:         String?                      = null,
+        @JsonProperty("director")         val director:         String?                      = null,
+        @JsonProperty("casts")            val casts:            String?                      = null,
+        @JsonProperty("category")         val category:         Map<String, NguonCCategory>? = null,
+        @JsonProperty("episodes")         val episodes:         List<NguonCServer>?          = null
+    )
+    
+    data class NguonCCategory(
+        @JsonProperty("group") val group: NguonCGroup?       = null,
+        @JsonProperty("list")  val list:  List<NguonCGroupItem>? = null
+    )
+    
+    data class NguonCGroup(
+        @JsonProperty("id")   val id:   String? = null,
+        @JsonProperty("name") val name: String? = null
+    )
+    
+    data class NguonCGroupItem(
+        @JsonProperty("id")   val id:   String? = null,
+        @JsonProperty("name") val name: String? = null
+    )
+    
     data class NguonCServer(
         @JsonProperty("server_name") val server_name: String?              = null,
-        @JsonProperty("name")        val name:         String?              = null,
-        @JsonProperty("items")       val items:        List<NguonCEpisode>? = null,
-        @JsonProperty("list")        val list:          List<NguonCEpisode>? = null
+        @JsonProperty("name")        val name:        String?              = null,
+        @JsonProperty("items")       val items:       List<NguonCEpisode>? = null,
+        @JsonProperty("list")        val list:        List<NguonCEpisode>? = null
     )
+    
     data class NguonCEpisode(
         @JsonProperty("name")  val name:  String? = null,
+        @JsonProperty("slug")  val slug:  String? = null,
         @JsonProperty("embed") val embed: String? = null,
         @JsonProperty("m3u8")  val m3u8:  String? = null
     )

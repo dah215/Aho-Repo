@@ -50,7 +50,6 @@ class PhimMoiChillProvider : MainAPI() {
             val poster = fixUrl(it.selectFirst("img")?.attr("src") ?: "")
             val status = it.selectFirst("span.label")?.text() ?: ""
             
-            // Nhãn Dub/Sub
             val isDub = status.contains("Lồng Tiếng", true) || status.contains("Thuyết Minh", true)
             
             newAnimeSearchResponse(title, href, TvType.TvSeries) {
@@ -80,7 +79,7 @@ class PhimMoiChillProvider : MainAPI() {
         val title = doc.selectFirst("h1[itemprop=name]")?.text()?.trim() ?: ""
         val poster = fixUrl(doc.selectFirst("div.image img")?.attr("src") ?: "")
         
-        // Trích xuất metadata cho mô tả đẹp
+        // --- Lấy Metadata ---
         val originalName = doc.selectFirst("span.real-name")?.text()?.trim()
         val status = doc.selectFirst("span.status")?.text()?.trim()
         val quality = doc.selectFirst("span.quality")?.text()?.trim()
@@ -88,7 +87,6 @@ class PhimMoiChillProvider : MainAPI() {
         val country = doc.selectFirst("a[href*='/quoc-gia/']")?.text()?.trim()
         val categories = doc.select("a[href*='/the-loai/']").map { it.text() }.joinToString(", ")
         
-        // Tìm đạo diễn và diễn viên từ danh sách meta
         var director = ""
         var casts = ""
         doc.select("ul.entry-meta li").forEach { li ->
@@ -97,7 +95,8 @@ class PhimMoiChillProvider : MainAPI() {
             if (text.contains("Diễn viên", true)) casts = text.substringAfter(":").trim()
         }
 
-        val plotText = doc.selectFirst("div#film-content")?.text()?.trim() ?: ""
+        // Lấy nội dung phim và làm sạch (bỏ khoảng trắng thừa)
+        val plotText = doc.selectFirst("div#film-content")?.text()?.replace(title, "")?.trim()
 
         val episodes = doc.select("ul#list_episodes li a").map {
             val epHref = fixUrl(it.attr("href"))
@@ -130,13 +129,13 @@ class PhimMoiChillProvider : MainAPI() {
         plotText: String?
     ): String {
         return buildString {
-            // Tên gốc
+            // Tên gốc (chỉ thêm nếu khác tên chính)
             if (!originalName.isNullOrBlank()) {
                 append("<font color='#AAAAAA'><i>$originalName</i></font><br><br>")
             }
 
             fun addInfo(icon: String, label: String, value: String?, color: String = "#FFFFFF") {
-                if (!value.isNullOrBlank()) {
+                if (!value.isNullOrBlank() && value != "Đang cập nhật") {
                     append("$icon <b>$label:</b> <font color='$color'>$value</font><br>")
                 }
             }
@@ -154,7 +153,8 @@ class PhimMoiChillProvider : MainAPI() {
             if (!plotText.isNullOrBlank()) {
                 append("<br><b><font color='#FFEB3B'>✦ NỘI DUNG PHIM</font></b><br>")
                 append("<hr color='#333333' size='1'><br>")
-                append(plotText)
+                // Giới hạn độ dài hoặc làm sạch nội dung để tránh trùng lặp
+                append(plotText.take(1000)) 
             }
         }
     }
@@ -173,59 +173,20 @@ class PhimMoiChillProvider : MainAPI() {
             val tmKey = Regex("\"key_presub\":\\s*\"([^\"]+)\"").find(script)?.groupValues?.get(1)
 
             if (!vietsubKey.isNullOrEmpty()) {
-                callback(
-                    newExtractorLink(
-                        "Vietsub - PMHLS",
-                        "Vietsub - PMHLS",
-                        "https://sotrim.topphimmoi.org/mpeg/$vietsubKey/index.m3u8",
-                        ExtractorLinkType.M3U8
-                    ) {
-                        this.referer = "$mainUrl/"
-                        this.quality = Qualities.P1080.value
-                    }
-                )
-                callback(
-                    newExtractorLink(
-                        "Vietsub - PMPRO",
-                        "Vietsub - PMPRO",
-                        "https://dash.megacdn.xyz/mpeg/$vietsubKey/index.m3u8",
-                        ExtractorLinkType.M3U8
-                    ) {
-                        this.referer = "$mainUrl/"
-                        this.quality = Qualities.P1080.value
-                    }
-                )
+                callback(newExtractorLink("Vietsub - PMHLS", "Vietsub - PMHLS", "https://sotrim.topphimmoi.org/mpeg/$vietsubKey/index.m3u8", ExtractorLinkType.M3U8) {
+                    this.referer = "$mainUrl/"
+                    this.quality = Qualities.P1080.value
+                })
             }
 
             if (!tmKey.isNullOrEmpty() && tmKey != vietsubKey) {
-                callback(
-                    newExtractorLink(
-                        "Thuyết Minh - PMHLS",
-                        "Thuyết Minh - PMHLS",
-                        "https://sotrim.topphimmoi.org/mpeg/$tmKey/index.m3u8",
-                        ExtractorLinkType.M3U8
-                    ) {
-                        this.referer = "$mainUrl/"
-                        this.quality = Qualities.P1080.value
-                    }
-                )
-                callback(
-                    newExtractorLink(
-                        "Thuyết Minh - PMPRO",
-                        "Thuyết Minh - PMPRO",
-                        "https://dash.megacdn.xyz/mpeg/$tmKey/index.m3u8",
-                        ExtractorLinkType.M3U8
-                    ) {
-                        this.referer = "$mainUrl/"
-                        this.quality = Qualities.P1080.value
-                    }
-                )
+                callback(newExtractorLink("Thuyết Minh - PMHLS", "Thuyết Minh - PMHLS", "https://sotrim.topphimmoi.org/mpeg/$tmKey/index.m3u8", ExtractorLinkType.M3U8) {
+                    this.referer = "$mainUrl/"
+                    this.quality = Qualities.P1080.value
+                })
             }
 
             return !vietsubKey.isNullOrEmpty() || !tmKey.isNullOrEmpty()
-
-        } catch (e: Exception) {
-            return false
-        }
+        } catch (e: Exception) { return false }
     }
 }

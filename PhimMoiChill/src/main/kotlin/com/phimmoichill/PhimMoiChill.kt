@@ -30,8 +30,8 @@ class PhimMoiChillProvider : MainAPI() {
 
     override val mainPage = mainPageOf(
         "/" to "Phim Mới",
-        "list/phim-le" to "Phim Lẻ",
-        "list/phim-bo" to "Phim Bộ"
+        "/list/phim-le" to "Phim Lẻ",
+        "/list/phim-bo" to "Phim Bộ"
     )
 
     private fun fixUrl(url: String): String {

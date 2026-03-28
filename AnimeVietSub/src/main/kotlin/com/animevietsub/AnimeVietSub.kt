@@ -35,7 +35,7 @@ class AnimeVietSubPlugin : Plugin() {
 }
 
 class AnimeVietSubProvider : MainAPI() {
-    override var mainUrl = "https://animevietsub.be"
+    override var mainUrl = "https://animevietsub.mx"
     override var name = "AnimeVietSub"
     override val hasMainPage = true
     override var lang = "vi"

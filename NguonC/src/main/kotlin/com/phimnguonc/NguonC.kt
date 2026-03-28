@@ -206,7 +206,7 @@ class PhimNguonCProvider : MainAPI() {
         }
     }
 
-    private fun buildResponseFromMovie(movie: NguonCMovie, url: String, slug: String): LoadResponse {
+    private suspend fun buildResponseFromMovie(movie: NguonCMovie, url: String, slug: String): LoadResponse {
         val title    = movie.name ?: slug
         val poster   = movie.poster_url ?: movie.thumb_url
         val altTitle = (movie.original_name ?: movie.english_name ?: "").let {

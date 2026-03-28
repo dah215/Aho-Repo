@@ -158,9 +158,8 @@ class PhimMoiChillProvider : MainAPI() {
                           ?.text()?.trim()?.let {
                               if (it.contains("/") || it.any { c -> c.isDigit() }) it else null
                           }
-        val views    = doc.selectFirst("[class*=view], .view-count")?.text()?.trim()
-        val country  = doc.select("a[href*='/country/'], a[href*='/quoc-gia/']")
-                          .firstOrNull()?.text()?.trim() ?: infoRow("Quốc gia")
+        
+        
         val duration = infoRow("Thời lượng").ifBlank { infoRow("Duration") }
         val director = doc.select("a[href*='/director/']").joinToString(", ") { it.text() }
                           .ifBlank { infoRow("Đạo diễn") }
@@ -194,8 +193,7 @@ class PhimMoiChillProvider : MainAPI() {
             }
             if (quality.isNotBlank())
                 append("🎬 <b>Chất lượng:</b> <font color='#E91E63'>$quality</font><br>")
-            if (country.isNotBlank())
-                append("🌍 <b>Quốc gia:</b> $country<br>")
+            
             if (duration.isNotBlank())
                 append("⏱ <b>Thời lượng:</b> $duration<br>")
             if (director.isNotBlank())

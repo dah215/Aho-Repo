@@ -51,12 +51,17 @@ class PhimNguonCProvider : MainAPI() {
         val title  = el.selectFirst("h3")?.text()?.trim() ?: a.attr("title")
         val poster = el.selectFirst("img")?.let { it.attr("data-src").ifBlank { it.attr("src") } }
         val statusText = el.selectFirst("span.bg-green-300")?.text()?.trim() ?: ""
+        
         val epCount = Regex("""(\d+)""").find(statusText)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+        
+        // KHÔI PHỤC: Kiểm tra nhãn Lồng tiếng/Thuyết minh
+        val hasDub = statusText.contains("Lồng Tiếng", ignoreCase = true) || statusText.contains("Thuyết Minh", ignoreCase = true)
+        val dubStatus = if (hasDub) EnumSet.of(DubStatus.Subbed, DubStatus.Dubbed) else EnumSet.of(DubStatus.Subbed)
  
         return newAnimeSearchResponse(title, href, TvType.TvSeries) {
             this.posterUrl = poster
             this.quality   = SearchQuality.HD
-            this.dubStatus = EnumSet.of(DubStatus.Subbed)
+            this.dubStatus = dubStatus
             this.episodes  = mutableMapOf(DubStatus.Subbed to epCount)
         }
     }
@@ -69,10 +74,15 @@ class PhimNguonCProvider : MainAPI() {
         val currentEp = item.current_episode ?: ""
         val epCount = Regex("""(\d+)""").find(currentEp)?.groupValues?.get(1)?.toIntOrNull() ?: 0
         
+        // KHÔI PHỤC: Kiểm tra nhãn từ API language
+        val lang = item.language ?: ""
+        val hasDub = lang.contains("Lồng Tiếng", ignoreCase = true) || lang.contains("Thuyết Minh", ignoreCase = true)
+        val dubStatus = if (hasDub) EnumSet.of(DubStatus.Subbed, DubStatus.Dubbed) else EnumSet.of(DubStatus.Subbed)
+        
         return newAnimeSearchResponse(title, href, TvType.TvSeries) {
             this.posterUrl = poster
             this.quality   = SearchQuality.HD
-            this.dubStatus = EnumSet.of(DubStatus.Subbed)
+            this.dubStatus = dubStatus
             this.episodes  = mutableMapOf(DubStatus.Subbed to epCount)
         }
     }
@@ -151,12 +161,10 @@ class PhimNguonCProvider : MainAPI() {
         quocGia: String
     ): String {
         return buildString {
-            // Tên gốc
             movie.original_name?.takeIf { it.isNotBlank() && it != movie.name }?.let {
                 append("<font color='#AAAAAA'><i>$it</i></font><br><br>")
             }
 
-            // Hàm hỗ trợ tạo dòng thông tin sạch sẽ (Label: Value)
             fun addInfo(icon: String, label: String, value: String?, color: String = "#FFFFFF") {
                 if (!value.isNullOrBlank()) {
                     append("$icon <b>$label:</b> <font color='$color'>$value</font><br>")
@@ -177,7 +185,6 @@ class PhimNguonCProvider : MainAPI() {
             addInfo("🎭", "Diễn viên", movie.casts)
             addInfo("🏷", "Thể loại", theLoai)
 
-            // Phần nội dung (Cách biệt rõ ràng)
             movie.description?.takeIf { it.isNotBlank() }?.let {
                 append("<br><b><font color='#FFEB3B'>✦ NỘI DUNG PHIM</font></b><br>")
                 append("<hr color='#333333' size='1'><br>")
@@ -270,7 +277,6 @@ class PhimNguonCProvider : MainAPI() {
                         }
                         server.setM3U8(rewritten)
                         
-                        // SỬA LỖI TẠI ĐÂY: Chuyển các thuộc tính vào trong khối {}
                         callback(newExtractorLink(
                             source = "NguonC",
                             name   = serverName,

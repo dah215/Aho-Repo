@@ -28,7 +28,7 @@ class PhimMoiChillProvider : MainAPI() {
     )
 
     override val mainPage = mainPageOf(
-        "/" to "Phim Mới",
+        "list/phim-nam-2026" to "Phim Mới",
         "list/phim-le" to "Phim Lẻ",
         "list/phim-bo" to "Phim Bộ"
     )
@@ -117,7 +117,14 @@ class PhimMoiChillProvider : MainAPI() {
         // ===== METADATA =====
         val year = doc.selectFirst("a[href*='phim-nam-']")?.text()
                       ?.let { Regex("""(20\d{2})""").find(it)?.value?.toIntOrNull() }
-        val tags = doc.select("a[href*='/genre/']").map { it.text().trim() }.filter { it.isNotBlank() }
+        // Only get genres from the film info section, not from navigation/sidebar
+        val tags = (doc.selectFirst(".film-info, .info-film, #film-info, .film-detail, ul.list-info")
+                       ?: doc.selectFirst(".film-content, .content-film"))
+                   ?.select("a[href*='/genre/'], a[href*='/the-loai/']")
+                   ?.map { it.text().trim() }?.filter { it.isNotBlank() }
+                   ?: doc.select("a[href*='/genre/']")
+                        .filter { it.parents().any { p -> p.className().contains("info") || p.className().contains("detail") || p.className().contains("film") } }
+                        .map { it.text().trim() }.filter { it.isNotBlank() }
 
         // Rating / IMDb
         val imdbScore = doc.selectFirst("[class*=imdb], .imdb-score, [data-imdb]")
@@ -160,46 +167,41 @@ class PhimMoiChillProvider : MainAPI() {
             if (!altTitle.isNullOrBlank() && altTitle != title)
                 append("<font color='#AAAAAA'><i>$altTitle</i></font><br><br>")
 
-            // IMDb / Rotten Tomatoes
-            if (!imdbScore.isNullOrBlank() || !rtScore.isNullOrBlank()) {
-                if (!imdbScore.isNullOrBlank())
-                    append("<font color='#F5C518'>⭐ IMDb: <b>$imdbScore</b></font>")
-                if (!imdbScore.isNullOrBlank() && !rtScore.isNullOrBlank())
-                    append("  ")
-                if (!rtScore.isNullOrBlank())
-                    append("<font color='#FA320A'>🍅 RT: <b>$rtScore</b></font>")
+            // IMDb / RT
+            if (!imdbScore.isNullOrBlank())
+                append("<font color='#F5C518'>⭐ <b>IMDb: $imdbScore</b></font>  ")
+            if (!rtScore.isNullOrBlank())
+                append("<font color='#FA320A'>🍅 <b>RT: $rtScore</b></font>")
+            if (!imdbScore.isNullOrBlank() || !rtScore.isNullOrBlank())
                 append("<br><br>")
-            }
 
-            // Bảng thông tin
-            append("<table cellpadding='2'>")
+            // Thông tin - mỗi dòng cách nhau rõ ràng
             if (!views.isNullOrBlank())
-                append("<tr><td>👁</td><td><b>Lượt xem:</b> $views</td></tr>")
+                append("👁 <b>Lượt xem:</b> $views<br>")
             if (!status.isNullOrBlank()) {
-                val statusColor = when {
+                val sc = when {
                     status.contains("Tập", ignoreCase = true) -> "#4CAF50"
                     status.contains("Hoàn", ignoreCase = true) -> "#2196F3"
                     else -> "#FFFFFF"
                 }
-                append("<tr><td>📺</td><td><b>Trạng thái:</b> <font color='$statusColor'>$status</font></td></tr>")
+                append("📺 <b>Trạng thái:</b> <font color='$sc'>$status</font><br>")
             }
             if (quality.isNotBlank())
-                append("<tr><td>🎬</td><td><b>Chất lượng:</b> <font color='#E91E63'>$quality</font></td></tr>")
+                append("🎬 <b>Chất lượng:</b> <font color='#E91E63'>$quality</font><br>")
             if (country.isNotBlank())
-                append("<tr><td>🌍</td><td><b>Quốc gia:</b> $country</td></tr>")
+                append("🌍 <b>Quốc gia:</b> $country<br>")
             if (duration.isNotBlank())
-                append("<tr><td>⏱</td><td><b>Thời lượng:</b> $duration</td></tr>")
+                append("⏱ <b>Thời lượng:</b> $duration<br>")
             if (director.isNotBlank())
-                append("<tr><td>🎥</td><td><b>Đạo diễn:</b> $director</td></tr>")
+                append("🎥 <b>Đạo diễn:</b> $director<br>")
             if (cast.isNotBlank())
-                append("<tr><td>🎭</td><td><b>Diễn viên:</b> $cast</td></tr>")
+                append("🎭 <b>Diễn viên:</b> $cast<br>")
             if (tags.isNotEmpty())
-                append("<tr><td>🏷</td><td><b>Thể loại:</b> ${tags.take(5).joinToString(", ")}</td></tr>")
-            append("</table>")
+                append("🏷 <b>Thể loại:</b> ${tags.take(5).joinToString(" · ")}<br>")
 
             if (!plotOriginal.isNullOrBlank()) {
                 append("<br><b><font color='#FFEB3B'>✦ NỘI DUNG PHIM</font></b><br>")
-                append("<hr color='#333333' size='1'><br>")
+                append("<br>")
                 append(plotOriginal)
             }
 

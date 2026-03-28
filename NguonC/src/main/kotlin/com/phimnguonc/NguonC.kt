@@ -294,6 +294,8 @@ class PhimNguonCProvider : MainAPI() {
         }
     }
 
+    private val activeServers = mutableListOf<NguonCProxyServer>()
+
     private fun rewriteM3U8(m3u8: String, proxyBase: String): String {
         return m3u8.lines().joinToString("\n") { line ->
             val trimmed = line.trim()
@@ -307,8 +309,6 @@ class PhimNguonCProvider : MainAPI() {
         @JsonProperty("sUb") val sUb: String? = null,
         @JsonProperty("hD")  val hD:  String? = null
     )
-
-    private val activeServers = mutableListOf<NguonCProxyServer>()
 
     override suspend fun loadLinks(
         data:             String,

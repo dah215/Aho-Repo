@@ -154,10 +154,6 @@ class PhimMoiChillProvider : MainAPI() {
                              t == "CAM" || t == "FULL HD" || t == "SD"
                          }?.text()?.trim() ?: ""
 
-        // Year: extract separately from quality
-                              ?.let { Regex("""(20\d{2})""").find(it)?.value?.toIntOrNull() }
-                   ?: doc.selectFirst("meta[property=og:title]")?.attr("content")
-                         ?.let { Regex("""(20\d{2})""").find(it)?.value?.toIntOrNull() }
         val status   = doc.selectFirst(".current-episode, .episode-status, [class*=status]")
                           ?.text()?.trim()?.let {
                               if (it.contains("/") || it.any { c -> c.isDigit() }) it else null

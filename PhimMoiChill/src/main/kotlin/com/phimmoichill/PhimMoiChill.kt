@@ -158,7 +158,7 @@ class PhimMoiChillProvider : MainAPI() {
                           ?.text()?.trim()?.let {
                               if (it.contains("/") || it.any { c -> c.isDigit() }) it else null
                           }
-        
+        val views    = doc.selectFirst("[class*=view], .view-count")?.text()?.trim()
         
         val duration = infoRow("Thời lượng").ifBlank { infoRow("Duration") }
         val director = doc.select("a[href*='/director/']").joinToString(", ") { it.text() }

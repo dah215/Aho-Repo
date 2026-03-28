@@ -148,11 +148,18 @@ class PhimNguonCProvider : MainAPI() {
                          ?: doc.selectFirst("meta[property=og:title]")?.attr("content")
                          ?: slug.replace("-", " ")
 
-            // Poster: try multiple selectors
+            // Poster: og:image is most reliable for nguonc
             val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
-                         ?: doc.selectFirst("img[itemprop=image]")?.attr("src")
-                         ?: doc.selectFirst(".film-info img, .poster img, .thumb img")?.attr("src")
-                         ?: doc.selectFirst("img[src*=poster], img[src*=thumb]")?.attr("src")
+                         ?.takeIf { it.isNotBlank() && it.startsWith("http") }
+                         ?: doc.selectFirst("meta[name=thumbnail]")?.attr("content")
+                         ?: doc.selectFirst("img.poster-film, img[itemprop=image]")?.attr("src")
+                            ?.let { if (it.startsWith("http")) it else "$mainUrl$it" }
+                         ?: doc.select("img[src]").firstOrNull { el ->
+                                val src = el.attr("src")
+                                src.contains("poster") || src.contains("thumb") ||
+                                src.contains("cdn") || src.contains("upload")
+                            }?.attr("src")
+                            ?.let { if (it.startsWith("http")) it else "$mainUrl$it" }
 
             val plot   = doc.selectFirst("meta[property=og:description]")?.attr("content")
                          ?: doc.selectFirst("meta[name=description]")?.attr("content")
@@ -354,18 +361,47 @@ class PhimNguonCProvider : MainAPI() {
         @JsonProperty("hD")  val hD:  String? = null
     )
 
+    // Resolve watch page URL → find embed URL inside it
+    private suspend fun resolveEmbedUrl(watchUrl: String): String? {
+        return try {
+            val doc = app.get(watchUrl, headers = commonHeaders, interceptor = cfInterceptor).document
+            // Embed iframe src
+            doc.selectFirst("iframe[src*=streamc], iframe[src*=embed], iframe[src*=amass]")
+               ?.attr("src")
+               ?.let { if (it.startsWith("http")) it else "https:$it" }
+            // Or data-embed attribute
+            ?: doc.selectFirst("[data-embed], [data-src*=streamc]")
+                  ?.attr("data-embed")?.ifBlank { null }
+                  ?.let { if (it.startsWith("http")) it else "https:$it" }
+        } catch (_: Exception) { null }
+    }
+
     override suspend fun loadLinks(
         data:             String,
         isCasting:        Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback:         (ExtractorLink) -> Unit
     ): Boolean {
-        val embedEntries = data.split("|").mapNotNull { entry ->
+        // Parse entries - each entry is "ServerName::URL"
+        // URL can be: embed URL (streamc.xyz) OR watch page URL (phim.nguonc.com)
+        val rawEntries = data.split("|").mapNotNull { entry ->
             val parts = entry.trim().split("::", limit = 2)
             if (parts.size == 2) Pair(parts[0], parts[1])
             else if (parts.size == 1 && parts[0].startsWith("http")) Pair("Vietsub", parts[0])
             else null
         }
+
+        // Resolve watch page URLs to embed URLs if needed
+        val embedEntries = rawEntries.map { (serverName, url) ->
+            if (url.contains("streamc") || url.contains("embed") || url.contains("amass")) {
+                Pair(serverName, url) // already embed URL
+            } else {
+                // It's a watch page - need to extract embed URL
+                val embedUrl = resolveEmbedUrl(url)
+                Pair(serverName, embedUrl ?: url)
+            }
+        }.filter { it.second.isNotBlank() }
+
         var linkFound = false
 
         coroutineScope {

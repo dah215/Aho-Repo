@@ -146,8 +146,15 @@ class PhimMoiChillProvider : MainAPI() {
             return ""
         }
 
-        val quality  = doc.selectFirst(".quality, .film-status, span[class*=quality], .badge-hd, .badge-fhd")
-                          ?.text()?.trim() ?: ""
+        // Quality: specifically look for HD/FHD/4K badge, not status/year text
+        val quality = doc.select("span.quality, span[class*=quality], .badge-hd, .badge-fhd, .badge-4k, span.film-quality")
+                         .firstOrNull()?.text()?.trim()
+                      ?: doc.select("span, div")
+                            .firstOrNull { el ->
+                                val t = el.text().trim().uppercase()
+                                (t == "HD" || t == "FHD" || t == "4K" || t == "CAM" || t == "SD")
+                                && el.text().length <= 5
+                            }?.text()?.trim() ?: ""
         val status   = doc.selectFirst(".current-episode, .episode-status, [class*=status]")
                           ?.text()?.trim()?.let {
                               if (it.contains("/") || it.any { c -> c.isDigit() }) it else null

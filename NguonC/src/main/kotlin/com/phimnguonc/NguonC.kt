@@ -51,14 +51,13 @@ class PhimNguonCProvider : MainAPI() {
         val title  = el.selectFirst("h3")?.text()?.trim() ?: a.attr("title")
         val poster = el.selectFirst("img")?.let { it.attr("data-src").ifBlank { it.attr("src") } }
         val statusText = el.selectFirst("span.bg-green-300")?.text()?.trim() ?: ""
-        
-        val episodeCount = Regex("""(\d+)""").find(statusText)?.groupValues?.get(1)?.toIntOrNull()
+        val epCount = Regex("""(\d+)""").find(statusText)?.groupValues?.get(1)?.toIntOrNull() ?: 0
  
         return newAnimeSearchResponse(title, href, TvType.TvSeries) {
             this.posterUrl = poster
             this.quality   = SearchQuality.HD
             this.dubStatus = EnumSet.of(DubStatus.Subbed)
-            this.episodes  = mutableMapOf(DubStatus.Subbed to (episodeCount ?: 0))
+            this.episodes  = mutableMapOf(DubStatus.Subbed to epCount)
         }
     }
 
@@ -68,17 +67,13 @@ class PhimNguonCProvider : MainAPI() {
         val href   = "$mainUrl/phim/$slug"
         val poster = item.poster_url ?: item.thumb_url
         val currentEp = item.current_episode ?: ""
-        val episodeCount = Regex("""(\d+)""").find(currentEp)?.groupValues?.get(1)?.toIntOrNull()
-        
-        val lang      = item.language ?: ""
-        val hasDub    = lang.contains("Thuyết Minh", ignoreCase = true)
-        val dubStatus = if (hasDub) EnumSet.of(DubStatus.Subbed, DubStatus.Dubbed) else EnumSet.of(DubStatus.Subbed)
+        val epCount = Regex("""(\d+)""").find(currentEp)?.groupValues?.get(1)?.toIntOrNull() ?: 0
         
         return newAnimeSearchResponse(title, href, TvType.TvSeries) {
             this.posterUrl = poster
             this.quality   = SearchQuality.HD
-            this.dubStatus = dubStatus
-            this.episodes  = mutableMapOf(DubStatus.Subbed to (episodeCount ?: 0))
+            this.dubStatus = EnumSet.of(DubStatus.Subbed)
+            this.episodes  = mutableMapOf(DubStatus.Subbed to epCount)
         }
     }
 
@@ -161,28 +156,28 @@ class PhimNguonCProvider : MainAPI() {
                 append("<font color='#AAAAAA'><i>$it</i></font><br><br>")
             }
 
-            // Bảng thông tin (Label: Giá trị)
-            fun addRow(label: String, value: String?, color: String = "#FFFFFF") {
+            // Hàm hỗ trợ tạo dòng thông tin sạch sẽ (Label: Value)
+            fun addInfo(icon: String, label: String, value: String?, color: String = "#FFFFFF") {
                 if (!value.isNullOrBlank()) {
-                    append("<b>$label:</b> <font color='$color'>$value</font><br>")
+                    append("$icon <b>$label:</b> <font color='$color'>$value</font><br>")
                 }
             }
 
             val statusColor = if (movie.current_episode?.contains("hoàn tất", true) == true) "#4CAF50" else "#2196F3"
             
-            addRow("📺 Trạng thái", movie.current_episode, statusColor)
+            addInfo("📺", "Trạng thái", movie.current_episode, statusColor)
             if (movie.total_episodes != null && movie.total_episodes != 0) 
-                addRow("🎞 Số tập", "${movie.total_episodes} tập")
+                addInfo("🎞", "Số tập", "${movie.total_episodes} tập")
             
-            addRow("⏱ Thời lượng", movie.time)
-            addRow("🎬 Chất lượng", movie.quality, "#E91E63")
-            addRow("🌍 Quốc gia", quocGia)
-            addRow("📅 Năm", namPhatHanh)
-            addRow("🎥 Đạo diễn", movie.director)
-            addRow("🎭 Diễn viên", movie.casts)
-            addRow("🏷 Thể loại", theLoai)
+            addInfo("⏱", "Thời lượng", movie.time)
+            addInfo("🎬", "Chất lượng", movie.quality, "#E91E63")
+            addInfo("🌍", "Quốc gia", quocGia)
+            addInfo("📅", "Năm", namPhatHanh)
+            addInfo("🎥", "Đạo diễn", movie.director)
+            addInfo("🎭", "Diễn viên", movie.casts)
+            addInfo("🏷", "Thể loại", theLoai)
 
-            // Nội dung phim (Phân cách rõ ràng)
+            // Phần nội dung (Cách biệt rõ ràng)
             movie.description?.takeIf { it.isNotBlank() }?.let {
                 append("<br><b><font color='#FFEB3B'>✦ NỘI DUNG PHIM</font></b><br>")
                 append("<hr color='#333333' size='1'><br>")
@@ -275,14 +270,16 @@ class PhimNguonCProvider : MainAPI() {
                         }
                         server.setM3U8(rewritten)
                         
+                        // SỬA LỖI TẠI ĐÂY: Chuyển các thuộc tính vào trong khối {}
                         callback(newExtractorLink(
                             source = "NguonC",
                             name   = serverName,
                             url    = "http://127.0.0.1:${server.port}/stream.m3u8",
-                            referer = embedUrl,
-                            quality = Qualities.P1080.value,
-                            isM3u8  = true
-                        ))
+                            type   = ExtractorLinkType.M3U8
+                        ) {
+                            this.quality = Qualities.P1080.value
+                            this.referer = embedUrl
+                        })
                         linkFound = true
                     } catch (_: Exception) {}
                 }

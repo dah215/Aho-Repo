@@ -139,44 +139,52 @@ class PhimNguonCProvider : MainAPI() {
         }
 
         // Strategy 2: Parse HTML page via WebView (cfInterceptor handles Cloudflare)
-        return try {
-            val doc = app.get(url, headers = commonHeaders, interceptor = cfInterceptor).document
+        val doc = try {
+            app.get(url, headers = commonHeaders, interceptor = cfInterceptor).document
+        } catch (_: Exception) { null }
 
+        if (doc != null) {
             val title  = doc.selectFirst("h1")?.text()?.trim()
                          ?: doc.selectFirst("meta[property=og:title]")?.attr("content")
                          ?: slug.replace("-", " ")
+
+            // Poster: try multiple selectors
             val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
-                         ?: doc.selectFirst("img.film-poster, .poster img")?.attr("src")
+                         ?: doc.selectFirst("img[itemprop=image]")?.attr("src")
+                         ?: doc.selectFirst(".film-info img, .poster img, .thumb img")?.attr("src")
+                         ?: doc.selectFirst("img[src*=poster], img[src*=thumb]")?.attr("src")
+
             val plot   = doc.selectFirst("meta[property=og:description]")?.attr("content")
                          ?: doc.selectFirst("meta[name=description]")?.attr("content")
 
-            // Parse episode total from page
-            val totalEp = doc.selectFirst(".total-episodes, .episode-number")
-                             ?.text()?.filter { it.isDigit() }?.toIntOrNull()
-                          ?: Regex("""\d+""").findAll(
-                                doc.selectFirst(".latest-episode, .episode-latest")?.text() ?: ""
-                             ).lastOrNull()?.value?.toIntOrNull()
-                          ?: 1
-
-            // Build episode list: construct URLs /phim/{slug}/tap-{n}
+            // Parse embed URLs from episode buttons - these contain the real embed links
             val epMap = linkedMapOf<String, MutableList<String>>()
 
-            // Try to find episode links directly in HTML first
-            doc.select("a[href*='/tap-'], a[href*='-tap-']").forEach { a ->
-                val href = a.attr("href").let { if (it.startsWith("http")) it else "$mainUrl$it" }
-                val num  = Regex("""tap-(\d+)""").find(href)?.groupValues?.get(1) ?: return@forEach
-                epMap.getOrPut(num) { mutableListOf() }.add("Vietsub::$href")
-            }
+            // Nguonc episode buttons: <a class="ep-item" data-id="X" href="...">
+            doc.select("a.ep-item, a[data-id][href*=xem], a.episode-item, #list-server a")
+               .forEach { a ->
+                   val href = a.attr("href").let { if (it.startsWith("http")) it else "$mainUrl$it" }
+                   val num  = a.attr("data-id").ifBlank {
+                       Regex("""(\d+)$""").find(a.text().trim())?.groupValues?.get(1)
+                       ?: Regex("""tap-(\d+)""").find(href)?.groupValues?.get(1)
+                   } ?: return@forEach
+                   if (href.isNotBlank())
+                       epMap.getOrPut(num) { mutableListOf() }.add("Vietsub::$href")
+               }
 
-            // If no links found, construct from total count
-            if (epMap.isEmpty() && totalEp > 0) {
-                for (i in 1..minOf(totalEp, 200)) {
-                    val epUrl = "$mainUrl/phim/$slug/tap-$i"
-                    epMap["$i"] = mutableListOf("Vietsub::$epUrl")
+            // Fallback: look for any episode-like links
+            if (epMap.isEmpty()) {
+                doc.select("a[href*='/xem/'], a[href*='/tap-']").forEach { a ->
+                    val href = a.attr("href").let { if (it.startsWith("http")) it else "$mainUrl$it" }
+                    val num  = Regex("""tap-(\d+)|/(\d+)$""").find(href)
+                                   ?.groupValues?.drop(1)?.firstOrNull { it.isNotBlank() }
+                               ?: Regex("""\d+""").find(a.text())?.value
+                               ?: return@forEach
+                    epMap.getOrPut(num) { mutableListOf() }.add("Vietsub::$href")
                 }
             }
 
-            // Single episode / movie
+            // Last resort: use the page URL itself as single episode
             if (epMap.isEmpty()) {
                 epMap["1"] = mutableListOf("Vietsub::$url")
             }
@@ -188,22 +196,16 @@ class PhimNguonCProvider : MainAPI() {
                 }
             }.sortedBy { it.episode ?: 0 }
 
-            newTvSeriesLoadResponse(title ?: slug, url, TvType.TvSeries, episodes) {
+            return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
                 this.posterUrl = poster
                 this.plot      = plot
             }
-        } catch (e: Exception) {
-            // Strategy 3: Construct minimal response from URL alone (last resort)
-            val episodes = (1..1).map { i ->
-                newEpisode("Vietsub::$url") {
-                    this.name    = "Tập $i"
-                    this.episode = i
-                }
-            }
-            newTvSeriesLoadResponse(slug.replace("-", " "), url, TvType.TvSeries, episodes) {
-                this.plot = null
-            }
         }
+
+        // Strategy 3: Minimal response
+        return newTvSeriesLoadResponse(slug.replace("-", " "), url, TvType.TvSeries,
+            listOf(newEpisode("Vietsub::$url") { this.name = "Tập 1"; this.episode = 1 })
+        ) { this.plot = null }
     }
 
     private suspend fun buildResponseFromMovie(movie: NguonCMovie, url: String, slug: String): LoadResponse {

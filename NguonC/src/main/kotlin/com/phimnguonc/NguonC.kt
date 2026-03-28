@@ -58,6 +58,7 @@ class PhimNguonCProvider : MainAPI() {
                     ?: Regex("""(\d+)\s*/\s*\d+""").find(statusText)?.groupValues?.get(1)?.toIntOrNull()
                     ?: Regex("""^(\d+)$""").find(statusText)?.groupValues?.get(1)?.toIntOrNull()
         }
+ 
         return newAnimeSearchResponse(title, href, TvType.TvSeries) {
             this.posterUrl = poster
             this.quality   = SearchQuality.HD
@@ -166,7 +167,6 @@ class PhimNguonCProvider : MainAPI() {
         val namPhatHanh = categories.values.find { it.group?.name == "Năm" }?.list?.map { it.name }?.joinToString(", ") ?: ""
         val quocGia = categories.values.find { it.group?.name == "Quốc gia" }?.list?.map { it.name }?.joinToString(", ") ?: ""
 
-        // Build beautiful description HTML like Animevietsub
         val beautifulPlot = buildBeautifulDescription(
             movie = movie,
             dinhDang = dinhDang,
@@ -204,47 +204,44 @@ class PhimNguonCProvider : MainAPI() {
             if (originalName.isNotBlank() && originalName != (movie.name ?: ""))
                 append("<font color='#AAAAAA'><i>$originalName</i></font><br><br>")
 
-            append("<table cellpadding='2'>")
+            // Dòng 1: Trạng thái, Số tập, Thời lượng
+            val line1 = mutableListOf<String>()
             if (currentEp.isNotBlank()) {
                 val sc = when {
                     currentEp.contains("hoàn tất", ignoreCase = true) -> "#2196F3"
-                    currentEp.contains("tập",     ignoreCase = true) -> "#4CAF50"
-                    currentEp.equals("full",      ignoreCase = true) -> "#9C27B0"
+                    currentEp.contains("tập", ignoreCase = true) -> "#4CAF50"
+                    currentEp.equals("full", ignoreCase = true) -> "#9C27B0"
                     else -> "#FFFFFF"
                 }
-                append("<tr><td>📺</td><td><b>Trạng thái:</b> <font color='$sc'>$currentEp</font></td></tr>")
+                line1.add("📺 <b>Trạng thái:</b> <font color='$sc'>$currentEp</font>")
             }
-            if (totalEp.isNotBlank() && totalEp != "0")
-                append("<tr><td>🎞</td><td><b>Số tập:</b> $totalEp</td></tr>")
-            if (time.isNotBlank())
-                append("<tr><td>⏱</td><td><b>Thời lượng:</b> $time</td></tr>")
-            if (quality.isNotBlank())
-                append("<tr><td>🎬</td><td><b>Chất lượng:</b> <font color='#E91E63'>$quality</font></td></tr>")
-            if (language.isNotBlank())
-                append("<tr><td>🔊</td><td><b>Ngôn ngữ:</b> $language</td></tr>")
-            if (quocGia.isNotBlank())
-                append("<tr><td>🌍</td><td><b>Quốc gia:</b> $quocGia</td></tr>")
-            if (namPhatHanh.isNotBlank())
-                append("<tr><td>📅</td><td><b>Năm:</b> $namPhatHanh</td></tr>")
-            if (dinhDang.isNotBlank())
-                append("<tr><td>📽</td><td><b>Định dạng:</b> $dinhDang</td></tr>")
-            if (director.isNotBlank())
-                append("<tr><td>🎥</td><td><b>Đạo diễn:</b> $director</td></tr>")
-            if (casts.isNotBlank())
-                append("<tr><td>🎭</td><td><b>Diễn viên:</b> $casts</td></tr>")
-            if (theLoai.isNotBlank())
-                append("<tr><td>🏷</td><td><b>Thể loại:</b> $theLoai</td></tr>")
-            append("</table>")
+            if (totalEp.isNotBlank() && totalEp != "0") line1.add("🎞 <b>Số tập:</b> $totalEp")
+            if (time.isNotBlank()) line1.add("⏱ <b>Thời lượng:</b> $time")
+            if (line1.isNotEmpty()) append(line1.joinToString("  •  ")).append("<br>")
 
+            // Dòng 2: Chất lượng, Ngôn ngữ, Năm, Quốc gia
+            val line2 = mutableListOf<String>()
+            if (quality.isNotBlank()) line2.add("🎬 <b>Chất lượng:</b> <font color='#E91E63'>$quality</font>")
+            if (language.isNotBlank()) line2.add("🔊 <b>Ngôn ngữ:</b> $language")
+            if (namPhatHanh.isNotBlank()) line2.add("📅 <b>Năm:</b> $namPhatHanh")
+            if (quocGia.isNotBlank()) line2.add("🌍 <b>Quốc gia:</b> $quocGia")
+            if (line2.isNotEmpty()) append(line2.joinToString("  •  ")).append("<br>")
+
+            // Các thông tin dài hiển thị trên từng dòng riêng biệt
+            if (dinhDang.isNotBlank()) append("📽 <b>Định dạng:</b> $dinhDang<br>")
+            if (director.isNotBlank()) append("🎥 <b>Đạo diễn:</b> $director<br>")
+            if (casts.isNotBlank()) append("🎭 <b>Diễn viên:</b> $casts<br>")
+            if (theLoai.isNotBlank()) append("🏷 <b>Thể loại:</b> $theLoai<br>")
+
+            // Phần nội dung phim
             if (description.isNotBlank()) {
                 append("<br><b><font color='#FFEB3B'>✦ NỘI DUNG PHIM</font></b><br>")
-                append("<hr color='#333333' size='1'><br>")
                 append(description)
             }
         }
     }
 
-        private val activeServers = mutableListOf<NguonCProxyServer>()
+    private val activeServers = mutableListOf<NguonCProxyServer>()
 
     inner class NguonCProxyServer(
         private val m3u8Content: String,
@@ -353,7 +350,7 @@ class PhimNguonCProvider : MainAPI() {
                     headers = mapOf("Referer" to "$mainUrl/", "User-Agent" to USER_AGENT)
                 )
                 val html    = embedRes.text
-                val cookies = embedRes.cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+                val cookies = embedRes.cookies.entries.joinToString(";") { "${it.key}=${it.value}" }
 
                 val obfMatch = Regex("""data-obf\s*=\s*["']([A-Za-z0-9+/=]+)["']""").find(html)
                     ?: return@async
@@ -370,7 +367,7 @@ class PhimNguonCProvider : MainAPI() {
                     "Accept-Language" to "vi-VN,vi;q=0.9"
                 )
 
-            suspend fun serveStream(m3u8Url: String, serverName: String) {
+                suspend fun serveStream(m3u8Url: String, serverName: String) {
                 try {
                     val m3u8Raw = app.get(m3u8Url, headers = fetchHdr).text
                     if (!m3u8Raw.contains("#EXTM3U")) return
@@ -413,14 +410,14 @@ class PhimNguonCProvider : MainAPI() {
 
     // ── Data classes ──────────────────────────────────────────────────────────
     data class NguonCApiResponse(
-        @JsonProperty("status") val status: String?             = null,
+        @JsonProperty("status") val status: String? = null,
         @JsonProperty("items")  val items:  List<NguonCApiItem>? = null
     )
     
     data class NguonCApiItem(
         @JsonProperty("name")            val name:             String? = null,
         @JsonProperty("slug")            val slug:             String? = null,
-        @JsonProperty("original_name")   val original_name:   String? = null,
+        @JsonProperty("original_name")   val original_name:    String? = null,
         @JsonProperty("thumb_url")       val thumb_url:       String? = null,
         @JsonProperty("poster_url")      val poster_url:      String? = null,
         @JsonProperty("total_episodes")  val total_episodes:  Int?    = null,
@@ -434,22 +431,22 @@ class PhimNguonCProvider : MainAPI() {
     )
     
     data class NguonCMovie(
-        @JsonProperty("id")               val id:               String?                      = null,
-        @JsonProperty("name")             val name:             String?                      = null,
-        @JsonProperty("slug")             val slug:             String?                      = null,
-        @JsonProperty("original_name")    val original_name:    String?                      = null,
-        @JsonProperty("description")      val description:      String?                      = null,
-        @JsonProperty("thumb_url")        val thumb_url:        String?                      = null,
-        @JsonProperty("poster_url")       val poster_url:       String?                      = null,
-        @JsonProperty("total_episodes")   val total_episodes:   Int?                         = null,
-        @JsonProperty("current_episode")  val current_episode:  String?                      = null,
-        @JsonProperty("time")             val time:             String?                      = null,
-        @JsonProperty("quality")          val quality:          String?                      = null,
-        @JsonProperty("language")         val language:         String?                      = null,
-        @JsonProperty("director")         val director:         String?                      = null,
-        @JsonProperty("casts")            val casts:            String?                      = null,
+        @JsonProperty("id")               val id:               String? = null,
+        @JsonProperty("name")             val name:             String? = null,
+        @JsonProperty("slug")             val slug:             String? = null,
+        @JsonProperty("original_name")    val original_name:    String? = null,
+        @JsonProperty("description")      val description:      String? = null,
+        @JsonProperty("thumb_url")        val thumb_url:        String? = null,
+        @JsonProperty("poster_url")       val poster_url:       String? = null,
+        @JsonProperty("total_episodes")   val total_episodes:   Int? = null,
+        @JsonProperty("current_episode")  val current_episode:  String? = null,
+        @JsonProperty("time")             val time:             String? = null,
+        @JsonProperty("quality")          val quality:          String? = null,
+        @JsonProperty("language")         val language:         String? = null,
+        @JsonProperty("director")         val director:         String? = null,
+        @JsonProperty("casts")            val casts:            String? = null,
         @JsonProperty("category")         val category:         Map<String, NguonCCategory>? = null,
-        @JsonProperty("episodes")         val episodes:         List<NguonCServer>?          = null
+        @JsonProperty("episodes")         val episodes:         List<NguonCServer>? = null
     )
     
     data class NguonCCategory(
@@ -461,7 +458,7 @@ class PhimNguonCProvider : MainAPI() {
         @JsonProperty("id")   val id:   String? = null,
         @JsonProperty("name") val name: String? = null
     )
-    
+   
     data class NguonCGroupItem(
         @JsonProperty("id")   val id:   String? = null,
         @JsonProperty("name") val name: String? = null

@@ -116,7 +116,8 @@ class PhimMoiChillProvider : MainAPI() {
 
         // ===== METADATA =====
         val year = doc.selectFirst("a[href*='phim-nam-']")?.text()
-                      ?.let { Regex("""(20\d{2})""").find(it)?.value?.toIntOrNull() }
+                      ?.let { Regex("""\b(20\d{2})\b""").find(it)?.value?.toIntOrNull() }
+        
         // Only get genres from the film info section, not from navigation/sidebar
         val tags = (doc.selectFirst(".film-info, .info-film, #film-info, .film-detail, ul.list-info")
                        ?: doc.selectFirst(".film-content, .content-film"))
@@ -125,12 +126,6 @@ class PhimMoiChillProvider : MainAPI() {
                    ?: doc.select("a[href*='/genre/']")
                         .filter { it.parents().any { p -> p.className().contains("info") || p.className().contains("detail") || p.className().contains("film") } }
                         .map { it.text().trim() }.filter { it.isNotBlank() }
-
-        // Rating / IMDb
-        val imdbScore = doc.selectFirst("[class*=imdb], .imdb-score, [data-imdb]")
-                           ?.text()?.replace(Regex("[^0-9.]"), "")?.trim()
-        val rtScore   = doc.selectFirst("[class*=tomato], [class*=rotten], .rotten-score")
-                           ?.text()?.trim()
 
         // Thông tin từ bảng info
         fun infoRow(label: String): String {
@@ -158,7 +153,6 @@ class PhimMoiChillProvider : MainAPI() {
                           ?.text()?.trim()?.let {
                               if (it.contains("/") || it.any { c -> c.isDigit() }) it else null
                           }
-        val views    = doc.selectFirst("[class*=view], .view-count")?.text()?.trim()
         
         val duration = infoRow("Thời lượng").ifBlank { infoRow("Duration") }
         val director = doc.select("a[href*='/director/']").joinToString(", ") { it.text() }
@@ -166,53 +160,64 @@ class PhimMoiChillProvider : MainAPI() {
         val cast     = doc.select("a[href*='/actor/'], a[href*='/dien-vien/']")
                           .take(5).joinToString(", ") { it.text() }
                           .ifBlank { infoRow("Diễn viên") }
+        
+        // Lấy thêm thông tin Quốc gia và Số tập
+        val country  = doc.select("a[href*='/quoc-gia/'], a[href*='/country/']").joinToString(", ") { it.text() }
+                          .ifBlank { infoRow("Quốc gia") }
+        val epCount  = infoRow("Số tập")
 
-        // ===== TẠO MÔ TẢ HTML ĐẸP (y hệt AnimeVietSub style) =====
+        // ===== TẠO MÔ TẢ HTML ĐẸP (Style NguonC) =====
         val description = buildString {
-            if (!altTitle.isNullOrBlank() && altTitle != title)
-                append("<font color='#AAAAAA'><i>$altTitle</i></font><br><br>")
-
-            // IMDb / RT
-            if (!imdbScore.isNullOrBlank())
-                append("<font color='#F5C518'>⭐ <b>IMDb: $imdbScore</b></font>  ")
-            if (!rtScore.isNullOrBlank())
-                append("<font color='#FA320A'>🍅 <b>RT: $rtScore</b></font>")
-            if (!imdbScore.isNullOrBlank() || !rtScore.isNullOrBlank())
-                append("<br><br>")
-
-            // Thông tin - mỗi dòng cách nhau rõ ràng
-            if (!views.isNullOrBlank())
-                append("👁 <b>Lượt xem:</b> $views<br>")
+            // Trạng thái
             if (!status.isNullOrBlank()) {
-                val sc = when {
-                    status.contains("Tập", ignoreCase = true) -> "#4CAF50"
-                    status.contains("Hoàn", ignoreCase = true) -> "#2196F3"
-                    else -> "#FFFFFF"
-                }
-                append("📺 <b>Trạng thái:</b> <font color='$sc'>$status</font><br>")
+                append("📺 <b>Trạng thái:</b> <font color='#4CAF50'>$status</font><br>")
             }
-            if (quality.isNotBlank())
-                append("🎬 <b>Chất lượng:</b> <font color='#E91E63'>$quality</font><br>")
             
-            if (duration.isNotBlank())
-                append("⏱ <b>Thời lượng:</b> $duration<br>")
-            if (director.isNotBlank())
-                append("🎥 <b>Đạo diễn:</b> $director<br>")
-            if (cast.isNotBlank())
-                append("🎭 <b>Diễn viên:</b> $cast<br>")
-            if (tags.isNotEmpty())
-                append("🏷 <b>Thể loại:</b> ${tags.take(5).joinToString(" · ")}<br>")
+            // Số tập
+            if (epCount.isNotBlank()) {
+                append("🎞️ <b>Số tập:</b> $epCount<br>")
+            }
 
+            // Thời lượng
+            if (duration.isNotBlank()) {
+                append("⏱ <b>Thời lượng:</b> $duration<br>")
+            }
+
+            // Chất lượng
+            if (quality.isNotBlank()) {
+                append("🎬 <b>Chất lượng:</b> <font color='#E91E63'>$quality</font><br>")
+            }
+
+            // Quốc gia
+            if (country.isNotBlank()) {
+                append("🌍 <b>Quốc gia:</b> $country<br>")
+            }
+
+            // Năm phát hành
+            if (year != null) {
+                append("📅 <b>Năm:</b> $year<br>")
+            }
+
+            // Đạo diễn
+            if (director.isNotBlank()) {
+                append("🎥 <b>Đạo diễn:</b> $director<br>")
+            }
+
+            // Diễn viên
+            if (cast.isNotBlank()) {
+                append("🎭 <b>Diễn viên:</b> $cast<br>")
+            }
+
+            // Thể loại
+            if (tags.isNotEmpty()) {
+                append("🏷️ <b>Thể loại:</b> ${tags.joinToString(", ")}<br>")
+            }
+
+            // Nội dung phim
             if (!plotOriginal.isNullOrBlank()) {
-                append("<br><b><font color='#FFEB3B'>✦ NỘI DUNG PHIM</font></b><br>")
-                append("<br>")
+                append("<br><b><font color='#FFEB3B'>✦ NỘI DUNG PHIM</font></b><br><br>")
                 append(plotOriginal)
             }
-
-            append("<br><br>")
-            append("<font color='#666666' size='2'><i>Nguồn: PhimMoiChill")
-            if (year != null) append("<br>Năm phát hành: $year")
-            append("</i></font>")
         }
 
         val watchUrl = doc.selectFirst("a.btn-see[href*='/xem/']")?.attr("href")?.let { fixUrl(it) }

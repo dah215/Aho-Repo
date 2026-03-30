@@ -160,7 +160,7 @@ class PhimMoiChillProvider : MainAPI() {
                           }
 
         val country  = doc.selectFirst("a[href*='/quoc-gia/']")?.text()?.trim()
-                          .ifBlank { infoRow("Quốc gia") }
+                          ?.ifBlank { infoRow("Quốc gia") } ?: infoRow("Quốc gia")
 
         val duration = infoRow("Thời lượng").ifBlank { infoRow("Duration") }
         val director = doc.select("a[href*='/director/']").joinToString(", ") { it.text() }

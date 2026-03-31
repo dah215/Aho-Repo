@@ -117,7 +117,7 @@ class PhimMoiChillProvider : MainAPI() {
         // ===== METADATA =====
         val year = doc.selectFirst("a[href*='phim-nam-']")?.text()
                       ?.let { Regex("""(20\d{2})""").find(it)?.value?.toIntOrNull() }
-        // Only get genres from the film info section, not from navigation/sidebar
+
         val tags = (doc.selectFirst(".film-info, .info-film, #film-info, .film-detail, ul.list-info")
                        ?: doc.selectFirst(".film-content, .content-film"))
                    ?.select("a[href*='/genre/'], a[href*='/the-loai/']")
@@ -125,12 +125,6 @@ class PhimMoiChillProvider : MainAPI() {
                    ?: doc.select("a[href*='/genre/']")
                         .filter { it.parents().any { p -> p.className().contains("info") || p.className().contains("detail") || p.className().contains("film") } }
                         .map { it.text().trim() }.filter { it.isNotBlank() }
-
-        // Rating / IMDb
-        val imdbScore = doc.selectFirst("[class*=imdb], .imdb-score, [data-imdb]")
-                           ?.text()?.replace(Regex("[^0-9.]"), "")?.trim()
-        val rtScore   = doc.selectFirst("[class*=tomato], [class*=rotten], .rotten-score")
-                           ?.text()?.trim()
 
         // Thông tin từ bảng info
         fun infoRow(label: String): String {
@@ -146,7 +140,7 @@ class PhimMoiChillProvider : MainAPI() {
             return ""
         }
 
-        // Quality: only exact badge text, never pick year or long text
+        // ===== EXTRACT FIELDS (NguonC data model equivalent) =====
         val quality = doc.select("span, .badge, .label")
                          .firstOrNull { el ->
                              val t = el.text().trim().uppercase()
@@ -154,55 +148,35 @@ class PhimMoiChillProvider : MainAPI() {
                              t == "CAM" || t == "FULL HD" || t == "SD"
                          }?.text()?.trim() ?: ""
 
-        val status   = doc.selectFirst(".current-episode, .episode-status, [class*=status]")
-                          ?.text()?.trim()?.let {
-                              if (it.contains("/") || it.any { c -> c.isDigit() }) it else null
-                          }
+        val status = doc.selectFirst(".current-episode, .episode-status, [class*=status]")
+                         ?.text()?.trim()?.let {
+                             if (it.contains("/") || it.any { c -> c.isDigit() }) it else null
+                         }
 
-        val country  = doc.selectFirst("a[href*='/quoc-gia/']")?.text()?.trim()
-                          ?.ifBlank { infoRow("Quốc gia") } ?: infoRow("Quốc gia")
+        // Số tập: tìm pattern "X/Y" hoặc "X tập" trong status hoặc info
+        val totalEpisodes = Regex("""(\d+)\s*/\s*\d+""").find(status ?: "")?.groupValues?.get(1)?.toIntOrNull()
+            ?: Regex("""(\d+)\s*(tập|tap|episodes?)""", RegexOption.IGNORE_CASE)
+                .find(infoRow("Số tập") + " " + infoRow("Tập"))?.groupValues?.get(1)?.toIntOrNull()
+            ?: Regex("""(\d+)\s*(tập|tap)""", RegexOption.IGNORE_CASE)
+                .find(status ?: "")?.groupValues?.get(1)?.toIntOrNull()
 
         val duration = infoRow("Thời lượng").ifBlank { infoRow("Duration") }
+        val country  = doc.selectFirst("a[href*='/quoc-gia/']")?.text()?.trim()
+                          ?.ifBlank { infoRow("Quốc gia") } ?: infoRow("Quốc gia")
         val director = doc.select("a[href*='/director/']").joinToString(", ") { it.text() }
                           .ifBlank { infoRow("Đạo diễn") }
         val cast     = doc.select("a[href*='/actor/'], a[href*='/dien-vien/']")
                           .take(5).joinToString(", ") { it.text() }
                           .ifBlank { infoRow("Diễn viên") }
 
-        // ===== TẠO MÔ TẢ HTML ĐẸP (NguonC style) =====
-        val description = buildString {
-            if (!altTitle.isNullOrBlank() && altTitle != title)
-                append("<font color='#AAAAAA'><i>$altTitle</i></font><br><br>")
+        val theLoai    = tags.joinToString(", ")
+        val namPhatHanh = year?.toString() ?: ""
 
-            fun addInfo(icon: String, label: String, value: String?, color: String = "#FFFFFF") {
-                if (!value.isNullOrBlank()) {
-                    append("$icon <b>$label:</b> <font color='$color'>$value</font><br>")
-                }
-            }
-
-            val statusColor = when {
-                status?.contains("Hoàn", ignoreCase = true) == true -> "#4CAF50"
-                status?.contains("Tập", ignoreCase = true) == true -> "#2196F3"
-                else -> "#FFFFFF"
-            }
-
-            addInfo("📺", "Trạng thái", status, statusColor)
-            addInfo("⏱", "Thời lượng", duration)
-            addInfo("🎬", "Chất lượng", quality.ifBlank { null }, "#E91E63")
-            addInfo("🌍", "Quốc gia", country)
-            if (year != null)
-                addInfo("📅", "Năm", year.toString())
-            addInfo("🎥", "Đạo diễn", director)
-            addInfo("🎭", "Diễn viên", cast)
-            if (tags.isNotEmpty())
-                addInfo("🏷", "Thể loại", tags.take(5).joinToString(" · "))
-
-            if (!plotOriginal.isNullOrBlank()) {
-                append("<br><b><font color='#FFEB3B'>✦ NỘI DUNG PHIM</font></b><br>")
-                append("<hr color='#333333' size='1'><br>")
-                append(plotOriginal)
-            }
-        }
+        // ===== TẠO MÔ TẢ HTML (giống y NguonC) =====
+        val description = buildBeautifulDescription(
+            altTitle, status, totalEpisodes, duration, quality, country,
+            namPhatHanh, director, cast, theLoai, plotOriginal
+        )
 
         val watchUrl = doc.selectFirst("a.btn-see[href*='/xem/']")?.attr("href")?.let { fixUrl(it) }
         val hasEps   = doc.select("div.latest-episode a[data-id], ul.episodes li a").isNotEmpty()
@@ -236,6 +210,56 @@ class PhimMoiChillProvider : MainAPI() {
             eps.ifEmpty { watchUrl?.let { listOf(newEpisode(it) { name = "Tập 1" }) } ?: emptyList() }
         ) {
             this.posterUrl = poster; this.plot = description; this.year = year; this.tags = tags
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    //  TẠO MÔ TẢ HTML ĐẸP — Giống y hệt NguonC style
+    // ════════════════════════════════════════════════════════════════
+    private fun buildBeautifulDescription(
+        altTitle: String?,
+        currentEpisode: String?,
+        totalEpisodes: Int?,
+        time: String?,
+        quality: String?,
+        country: String?,
+        year: String?,
+        director: String?,
+        cast: String?,
+        genre: String?,
+        description: String?
+    ): String {
+        return buildString {
+            altTitle?.takeIf { it.isNotBlank() }?.let {
+                append("<font color='#AAAAAA'><i>$it</i></font><br><br>")
+            }
+
+            fun addInfo(icon: String, label: String, value: String?, color: String = "#FFFFFF") {
+                if (!value.isNullOrBlank()) {
+                    append("$icon <b>$label:</b> <font color='$color'>$value</font><br>")
+                }
+            }
+
+            val statusColor = if (currentEpisode?.contains("hoàn tất", true) == true ||
+                                 currentEpisode?.contains("Hoàn Tất", true) == true) "#4CAF50" else "#2196F3"
+
+            addInfo("📺", "Trạng thái", currentEpisode, statusColor)
+            if (totalEpisodes != null && totalEpisodes != 0)
+                addInfo("🎞", "Số tập", "$totalEpisodes tập")
+
+            addInfo("⏱", "Thời lượng", time)
+            addInfo("🎬", "Chất lượng", quality.ifBlank { null }, "#E91E63")
+            addInfo("🌍", "Quốc gia", country)
+            addInfo("📅", "Năm", year.ifBlank { null })
+            addInfo("🎥", "Đạo diễn", director)
+            addInfo("🎭", "Diễn viên", cast)
+            addInfo("🏷", "Thể loại", genre)
+
+            description?.takeIf { it.isNotBlank() }?.let {
+                append("<br><b><font color='#FFEB3B'>✦ NỘI DUNG PHIM</font></b><br>")
+                append("<hr color='#333333' size='1'><br>")
+                append(it.trim())
+            }
         }
     }
 

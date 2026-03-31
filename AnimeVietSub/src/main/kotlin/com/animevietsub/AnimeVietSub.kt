@@ -27,7 +27,6 @@ class AnimeVietSubPlugin : Plugin() {
     override fun load() {
         val provider = AnimeVietSubProvider()
         registerMainAPI(provider)
-        // Prefetch avs.watch.js ngay khi load plugin
         kotlinx.coroutines.GlobalScope.launch {
             provider.prefetchAvsJs()
         }
@@ -51,13 +50,12 @@ class AnimeVietSubProvider : MainAPI() {
         "Referer" to "$mainUrl/"
     )
 
-    // Cache avs.watch.js
     private var cachedAvsJs: String? = null
 
     override val mainPage = mainPageOf(
-        "$mainUrl/anime-moi/"                 to "Anime Mới",
-        "$mainUrl/anime-le/"                  to "Anime Lẻ",
-        "$mainUrl/anime-bo/"                  to "Anime Bộ"
+        "$mainUrl/anime-moi/" to "Anime Mới",
+        "$mainUrl/anime-le/" to "Anime Lẻ",
+        "$mainUrl/anime-bo/" to "Anime Bộ"
     )
 
     private fun pageUrl(base: String, page: Int) =
@@ -97,145 +95,80 @@ class AnimeVietSubProvider : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse {
         val base = url.trimEnd('/')
+
+        val infoDoc = try {
+            app.get("$base/", headers = baseHeaders).document
+        } catch (_: Exception) { null }
+
         val watchDoc = app.get("$base/xem-phim.html", headers = baseHeaders).document
 
-        // ===== TRÍCH XUẤT THÔNG TIN CƠ BẢN =====
         val title = watchDoc.selectFirst("h1.Title")?.text()?.trim()
+            ?: infoDoc?.selectFirst("h1.Title")?.text()?.trim()
             ?: watchDoc.title()
-        val altTitle = watchDoc.selectFirst("h2.SubTitle")?.text()?.trim() // Tên tiếng Anh
+        val altTitle = watchDoc.selectFirst("h2.SubTitle")?.text()?.trim()
+            ?: infoDoc?.selectFirst("h2.SubTitle")?.text()?.trim()
         val poster = watchDoc.selectFirst("div.Image figure img")?.attr("src")
+            ?: infoDoc?.selectFirst("div.Image figure img")?.attr("src")
             ?.let { if (it.startsWith("http")) it else "$mainUrl$it" }
         val plotOriginal = watchDoc.selectFirst("div.Description")?.text()?.trim()
+            ?: infoDoc?.selectFirst("div.Description")?.text()?.trim()
 
-        // ===== TRÍCH XUẤT METADATA CHI TIẾT =====
-        // Rating: 6.6/10 từ 24 thành viên
-        val ratingValue = watchDoc.selectFirst("#average_score")?.text()?.trim()
-            ?: watchDoc.selectFirst("[data-percent]")?.attr("data-percent")?.let {
-                (it.toIntOrNull()?.div(10))?.toString()
+        fun metaValue(doc: org.jsoup.nodes.Document?, label: String): String? {
+            if (doc == null) return null
+            for (li in doc.select("li")) {
+                val lbl = li.selectFirst("label")
+                if (lbl != null && lbl.text().contains(label, ignoreCase = true)) {
+                    return li.text().substringAfter(lbl.text()).trim().ifBlank { null }
+                }
             }
-        val ratingCount = watchDoc.selectFirst(".num-rating")?.text()?.trim()
-            ?: watchDoc.selectFirst("span[itemprop=ratingCount]")?.text()?.trim()
+            val found = doc.selectFirst("li:contains($label)")
+            if (found != null) {
+                return found.text().replace(label, "").trim().ifBlank { null }
+            }
+            return null
+        }
 
-        // Lượt xem: 215,391 Lượt Xem
         val views = watchDoc.selectFirst("span.View")?.text()?.trim()
             ?.replace("Lượt Xem", "lượt xem")
 
-        // Năm
-        val year = watchDoc.selectFirst("p.Info .Date a, p.Info .Date, span.Date a")
-            ?.text()?.filter { it.isDigit() }?.take(4)?.toIntOrNull()
-
-        // Thông tin chi tiết từ tab "Thông tin phim"
-        val status = watchDoc.selectFirst("li:contains(Trạng thái:)")?.text()
-            ?.replace("Trạng thái:", "")?.trim()
-            ?.replace("VietSub", "Vietsub")
-
         val quality = watchDoc.selectFirst("span.Qlty")?.text()?.trim() ?: "HD"
 
-        val duration = watchDoc.selectFirst("li:contains(Thời lượng:)")?.text()
-            ?.replace("Thời lượng:", "")?.trim()
+        val year = (watchDoc.selectFirst("p.Info .Date a, p.Info .Date, span.Date a")
+            ?.text()?.filter { it.isDigit() }?.take(4)?.toIntOrNull())
+            ?: (infoDoc?.selectFirst("p.Info .Date a, p.Info .Date, span.Date a")
+            ?.text()?.filter { it.isDigit() }?.take(4)?.toIntOrNull())
 
-        val country = watchDoc.selectFirst("li:contains(Quốc gia:) a")?.text()?.trim()
+        val status = (metaValue(infoDoc, "Trạng thái") ?: metaValue(watchDoc, "Trạng thái"))
+            ?.replace("VietSub", "Vietsub")
 
-        val studio = watchDoc.selectFirst("li:contains(Studio:) a, li:contains(Đạo diễn:)")?.text()
-            ?.replace("Studio:", "")?.replace("Đạo diễn:", "")?.trim()
+        val duration = metaValue(infoDoc, "Thời lượng") ?: metaValue(watchDoc, "Thời lượng")
 
-        val season = watchDoc.selectFirst("li:contains(Season:) a, li:contains(Season:)")?.text()
-            ?.replace("Season:", "")?.trim()
+        val country = infoDoc?.selectFirst("li:contains(Quốc gia:) a")?.text()?.trim()
+            ?: watchDoc.selectFirst("li:contains(Quốc gia:) a")?.text()?.trim()
 
-        val followers = watchDoc.selectFirst("li:contains(Số người theo dõi:)")?.text()
-            ?.replace("Số người theo dõi:", "")?.trim()
+        val studio = (metaValue(infoDoc, "Studio") ?: metaValue(infoDoc, "Đạo diễn"))
+            ?: (metaValue(watchDoc, "Studio") ?: metaValue(watchDoc, "Đạo diễn"))
 
-        // Thể loại
-        val tags = watchDoc.select("p.Genre a, li:contains(Thể loại:) a").map {
+        val followers = metaValue(infoDoc, "Theo dõi")
+            ?: metaValue(infoDoc, "Số người theo dõi")
+            ?: metaValue(watchDoc, "Theo dõi")
+            ?: metaValue(watchDoc, "Số người theo dõi")
+
+        val tags = (infoDoc?.select("p.Genre a, li:contains(Thể loại:) a")
+            ?: watchDoc.select("p.Genre a, li:contains(Thể loại:) a")).map {
             it.text().trim()
         }.filter { it.isNotBlank() }.distinct()
 
-        // Tập mới nhất
-        val latestEps = watchDoc.select("li.latest_eps a").map { it.text().trim() }
+        val latestEps = (infoDoc?.select("li.latest_eps a")
+            ?: watchDoc.select("li.latest_eps a")).map { it.text().trim() }
             .take(3).joinToString(", ")
 
-        // ===== TẠO MÔ TẢ HTML ĐẸP =====
-        val description = buildString {
-            // Tên tiếng Anh (nếu có)
-            if (!altTitle.isNullOrBlank() && altTitle != title) {
-                append("<font color='#AAAAAA'><i>$altTitle</i></font><br><br>")
-            }
+        val description = buildBeautifulDescription(
+            altTitle, status, duration, quality, country,
+            year?.toString(), studio, followers, views,
+            latestEps.ifBlank { null }, tags.joinToString(", "), plotOriginal
+        )
 
-            // Phần đánh giá sao giống website
-            if (ratingValue != null) {
-                val ratingFloat = ratingValue.toFloatOrNull() ?: 0f
-                val fullStars = ratingFloat.toInt()
-                val hasHalfStar = ratingFloat - fullStars >= 0.5
-                val emptyStars = 10 - fullStars - (if (hasHalfStar) 1 else 0)
-
-                val starBuilder = StringBuilder()
-                repeat(fullStars) { starBuilder.append("★") }
-                if (hasHalfStar) starBuilder.append("✬")
-                repeat(emptyStars) { starBuilder.append("☆") }
-
-                append("<font color='#FFD700' size='5'>$starBuilder</font><br>")
-                append("<b>Đánh giá:</b> <font color='#FF6B6B'>$ratingValue</font>/10")
-                if (!ratingCount.isNullOrBlank()) {
-                    append(" từ <b>$ratingCount</b> thành viên")
-                }
-                append("<br><br>")
-            }
-
-            // Thông tin chính dạng icon + text
-            append("<table cellpadding='2'>")
-
-            if (!views.isNullOrBlank()) {
-                append("<tr><td>👁</td><td><b>Lượt xem:</b> $views</td></tr>")
-            }
-            if (!status.isNullOrBlank()) {
-                val statusColor = when {
-                    status.contains("đang chiếu", ignoreCase = true) -> "#4CAF50"
-                    status.contains("hoàn thành", ignoreCase = true) -> "#2196F3"
-                    status.contains("sắp chiếu", ignoreCase = true) -> "#FF9800"
-                    else -> "#FFFFFF"
-                }
-                append("<tr><td>📺</td><td><b>Trạng thái:</b> <font color='$statusColor'>$status</font></td></tr>")
-            }
-            if (!duration.isNullOrBlank()) {
-                append("<tr><td>⏱</td><td><b>Thời lượng:</b> $duration</td></tr>")
-            }
-            if (!quality.isNullOrBlank()) {
-                append("<tr><td>🎬</td><td><b>Chất lượng:</b> <font color='#E91E63'>$quality</font></td></tr>")
-            }
-            if (!country.isNullOrBlank()) {
-                append("<tr><td>🌍</td><td><b>Quốc gia:</b> $country</td></tr>")
-            }
-            if (!season.isNullOrBlank()) {
-                append("<tr><td>📅</td><td><b>Season:</b> $season</td></tr>")
-            }
-            if (!studio.isNullOrBlank()) {
-                append("<tr><td>🎥</td><td><b>Studio:</b> $studio</td></tr>")
-            }
-            if (!followers.isNullOrBlank()) {
-                append("<tr><td>👥</td><td><b>Theo dõi:</b> $followers người</td></tr>")
-            }
-            if (latestEps.isNotBlank()) {
-                append("<tr><td>🎞</td><td><b>Tập mới:</b> $latestEps</td></tr>")
-            }
-
-            append("</table>")
-
-            // Nội dung phim
-            if (!plotOriginal.isNullOrBlank()) {
-                append("<br><b><font color='#FFEB3B'>✦ NỘI DUNG PHIM</font></b><br>")
-                append("<hr color='#333333' size='1'><br>")
-                append(plotOriginal)
-            }
-
-            // Footer nhắc nhở
-            append("<br><br><br>")
-            append("<font color='#666666' size='2'><i>")
-            append("Nguồn: AnimeVietSub<br>")
-            if (year != null) append("Năm phát hành: $year")
-            append("</i></font>")
-        }
-
-        // ===== TRÍCH XUẤT DANH SÁCH TẬP =====
         val seen = mutableSetOf<String>()
         val episodes = watchDoc.select("#list-server .list-episode a.episode-link, " +
                 ".listing.items a[href*=/tap-], " +
@@ -277,7 +210,57 @@ class AnimeVietSubProvider : MainAPI() {
         }
     }
 
-    // Blob interceptor prefix - inject vào đầu avs.watch.js
+    private fun buildBeautifulDescription(
+        altTitle: String?,
+        status: String?,
+        duration: String?,
+        quality: String?,
+        country: String?,
+        year: String?,
+        studio: String?,
+        followers: String?,
+        views: String?,
+        latestEps: String?,
+        genre: String?,
+        description: String?
+    ): String {
+        return buildString {
+            altTitle?.takeIf { it.isNotBlank() }?.let {
+                append("<font color='#AAAAAA'><i>$it</i></font><br><br>")
+            }
+
+            fun addInfo(icon: String, label: String, value: String?, color: String = "#FFFFFF") {
+                if (!value.isNullOrBlank()) {
+                    append("$icon <b>$label:</b> <font color='$color'>$value</font><br>")
+                }
+            }
+
+            val statusColor = when {
+                status?.contains("đang chiếu", ignoreCase = true) == true -> "#4CAF50"
+                status?.contains("hoàn thành", ignoreCase = true) == true -> "#2196F3"
+                status?.contains("sắp chiếu", ignoreCase = true) == true -> "#FF9800"
+                else -> "#2196F3"
+            }
+
+            addInfo("📺", "Trạng thái", status, statusColor)
+            addInfo("⏱", "Thời lượng", duration)
+            addInfo("🎬", "Chất lượng", quality?.ifBlank { null }, "#E91E63")
+            addInfo("🌍", "Quốc gia", country)
+            addInfo("📅", "Năm", year?.ifBlank { null })
+            addInfo("🎥", "Studio", studio)
+            addInfo("👥", "Theo dõi", followers?.ifBlank { null })
+            addInfo("👁", "Lượt xem", views)
+            addInfo("🎞", "Tập mới", latestEps)
+            addInfo("🏷", "Thể loại", genre?.ifBlank { null })
+
+            description?.takeIf { it.isNotBlank() }?.let {
+                append("<br><b><font color='#FFEB3B'>✦ NỘI DUNG PHIM</font></b><br>")
+                append("<hr color='#333333' size='1'><br>")
+                append(it.trim())
+            }
+        }
+    }
+
     private val blobInterceptor = """
 ;(function(){
 var _oc=URL.createObjectURL;
@@ -291,7 +274,6 @@ return u;};
 })();
 """.trimIndent()
 
-    // Fake adsbygoogle để qua ad detector
     private val fakeAds = """
 window.adsbygoogle=window.adsbygoogle||[];
 window.adsbygoogle.loaded=true;
@@ -306,7 +288,6 @@ window.adsbygoogle.push=function(){};
         }
     }
 
-    // Prefetch avs.watch.js khi plugin load (không cần đợi loadLinks)
     suspend fun prefetchAvsJs() {
         if (cachedAvsJs != null) return
         try {
@@ -318,7 +299,6 @@ window.adsbygoogle.push=function(){};
         } catch (_: Exception) {}
     }
 
-    // Fetch JS qua OkHttp (với cookie để bypass Cloudflare)
     private suspend fun fetchJs(url: String, cookie: String): String? {
         return try {
             val resp = app.get(url, headers = mapOf(
@@ -343,7 +323,6 @@ window.adsbygoogle.push=function(){};
 
                     val bridge = M3U8Bridge()
 
-                    // Sync cookie
                     android.webkit.CookieManager.getInstance().apply {
                         setAcceptCookie(true)
                         cookie.split(";").forEach { kv ->
@@ -365,7 +344,6 @@ window.adsbygoogle.push=function(){};
                         .setAcceptThirdPartyCookies(wv, true)
                     wv.addJavascriptInterface(bridge, "Android")
 
-                    // Interceptor có avs.watch.js đã được inject blob interceptor
                     val patchedAvsJs = blobInterceptor + "\n" + avsJs
                     val avsJsBytes = patchedAvsJs.toByteArray(Charsets.UTF_8)
                     val fakeAdsBytes = fakeAds.toByteArray(Charsets.UTF_8)
@@ -377,18 +355,15 @@ window.adsbygoogle.push=function(){};
                         ): WebResourceResponse? {
                             val url = request.url.toString()
                             return when {
-                                // Serve patched avs.watch.js (blob interceptor đã inject)
                                 url.contains("avs.watch.js") -> WebResourceResponse(
                                     "application/javascript", "utf-8",
                                     ByteArrayInputStream(avsJsBytes)
                                 )
-                                // Fake adsbygoogle → bypass ad detector
                                 url.contains("adsbygoogle") ||
                                         url.contains("googlesyndication") -> WebResourceResponse(
                                     "application/javascript", "utf-8",
                                     ByteArrayInputStream(fakeAdsBytes)
                                 )
-                                // Block trackers + heavy resources không cần thiết
                                 url.contains("google-analytics") ||
                                         url.contains("doubleclick") ||
                                         url.contains("googletagmanager") ||
@@ -398,7 +373,6 @@ window.adsbygoogle.push=function(){};
                                     "application/javascript", "utf-8",
                                     ByteArrayInputStream("".toByteArray())
                                 )
-                                // Block fonts/CSS/images để page load nhanh hơn
                                 url.endsWith(".woff") || url.endsWith(".woff2") ||
                                         url.endsWith(".ttf") || url.endsWith(".eot") ||
                                         (url.endsWith(".css") && !url.contains(mainUrl)) -> WebResourceResponse(
@@ -452,8 +426,6 @@ window.adsbygoogle.push=function(){};
         }
     }
 
-    // ── Local HTTP server để serve M3U8 cho ExoPlayer ──────────────────────
-    // file:// không work Android 7+, dùng localhost thay thế
     private var localServer: LocalM3U8Server? = null
 
     inner class LocalM3U8Server(private val m3u8Content: String) {
@@ -465,11 +437,10 @@ window.adsbygoogle.push=function(){};
             Thread {
                 try {
                     val ss = serverSocket ?: return@Thread
-
                     repeat(10) {
                         try {
                             val client = ss.accept()
-                            client.getInputStream().bufferedReader().readLine() // consume request
+                            client.getInputStream().bufferedReader().readLine()
                             val body = m3u8Content.toByteArray(Charsets.UTF_8)
                             val crlf = "\r\n"
                             val response = "HTTP/1.1 200 OK${crlf}" +
@@ -520,7 +491,6 @@ window.adsbygoogle.push=function(){};
     ): Boolean {
         val epUrl = data.substringBefore("|")
 
-        // Lấy cookie từ /ajax/player
         val epId = Regex("""-(\d+)\.html""").find(epUrl)?.groupValues?.get(1) ?: return true
         val ajaxHdr = mapOf(
             "User-Agent" to UA,
@@ -537,15 +507,12 @@ window.adsbygoogle.push=function(){};
         val cookie = playerResp.cookies.entries
             .joinToString("; ") { "${it.key}=${it.value}" }
 
-        // Fetch avs.watch.js (cache lại)
         val avsJs = cachedAvsJs ?: fetchJs(
             "$mainUrl/statics/default/js/avs.watch.js?v=6.1.6", cookie
         )?.also { cachedAvsJs = it } ?: return true
 
-        // WebView load trang thật, serve patched avs.watch.js
         val m3u8 = getM3U8(epUrl, cookie, avsJs) ?: return true
 
-        // Serve M3U8 qua local HTTP server (file:// không work trên Android 7+)
         serveM3U8AndCallback(m3u8, callback)
 
         return true

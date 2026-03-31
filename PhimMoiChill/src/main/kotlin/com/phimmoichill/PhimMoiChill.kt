@@ -248,9 +248,9 @@ class PhimMoiChillProvider : MainAPI() {
                 addInfo("🎞", "Số tập", "$totalEpisodes tập")
 
             addInfo("⏱", "Thời lượng", time)
-            addInfo("🎬", "Chất lượng", quality.ifBlank { null }, "#E91E63")
+            addInfo("🎬", "Chất lượng", quality?.ifBlank { null }, "#E91E63")
             addInfo("🌍", "Quốc gia", country)
-            addInfo("📅", "Năm", year.ifBlank { null })
+            addInfo("📅", "Năm", year?.ifBlank { null })
             addInfo("🎥", "Đạo diễn", director)
             addInfo("🎭", "Diễn viên", cast)
             addInfo("🏷", "Thể loại", genre)

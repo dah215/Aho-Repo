@@ -309,50 +309,26 @@ window.adsbygoogle.push=function(){};
     // Prefetch avs.watch.js khi plugin load (không cần đợi loadLinks)
     suspend fun prefetchAvsJs() {
         if (cachedAvsJs != null) return
-        // Try multiple versions in case site updated
-        val versions = listOf("6.1.6", "6.1.7", "6.2.0", "6.1.5", "6.0.0")
-        for (ver in versions) {
-            try {
-                val js = app.get(
-                    "$mainUrl/statics/default/js/avs.watch.js?v=$ver",
-                    headers = mapOf("User-Agent" to UA, "Referer" to "$mainUrl/", "Accept" to "*/*")
-                ).text
-                if (js.length > 500 && js.contains("AnimeVsub")) {
-                    cachedAvsJs = js
-                    return
-                }
-            } catch (_: Exception) {}
-        }
-        // Fallback: fetch page and extract JS URL from HTML
         try {
-            val html = app.get("$mainUrl/", headers = baseHeaders).text
-            val jsUrl = Regex("""avs\.watch\.js\?v=([0-9.]+)""").find(html)?.let {
-                "$mainUrl/statics/default/js/avs.watch.js?v=${it.groupValues[1]}"
-            } ?: return
-            val js = app.get(jsUrl, headers = mapOf("User-Agent" to UA, "Referer" to "$mainUrl/")).text
+            val js = app.get(
+                "$mainUrl/statics/default/js/avs.watch.js?v=6.1.6",
+                headers = mapOf("User-Agent" to UA, "Referer" to "$mainUrl/", "Accept" to "*/*")
+            ).text
             if (js.length > 500) cachedAvsJs = js
         } catch (_: Exception) {}
     }
 
     // Fetch JS qua OkHttp (với cookie để bypass Cloudflare)
     private suspend fun fetchJs(url: String, cookie: String): String? {
-        // Try given URL first
-        try {
-            val resp = app.get(url, headers = mapOf(
-                "User-Agent" to UA, "Referer" to "$mainUrl/",
-                "Accept" to "*/*", "Cookie" to cookie
-            ))
-            if (resp.text.length > 500 && resp.text.contains("AnimeVsub")) return resp.text
-        } catch (_: Exception) {}
-        // Auto-detect version from page HTML
         return try {
-            val html = app.get("$mainUrl/", headers = baseHeaders + mapOf("Cookie" to cookie)).text
-            val match = Regex("""avs\.watch\.js\?v=([0-9.]+)""").find(html) ?: return null
-            val detectedUrl = "$mainUrl/statics/default/js/avs.watch.js?v=${match.groupValues[1]}"
-            val js = app.get(detectedUrl, headers = mapOf(
-                "User-Agent" to UA, "Referer" to "$mainUrl/", "Cookie" to cookie
-            )).text
-            if (js.length > 500) js else null
+            val resp = app.get(url, headers = mapOf(
+                "User-Agent" to UA,
+                "Referer" to "$mainUrl/",
+                "Accept" to "*/*",
+                "Accept-Language" to "vi-VN,vi;q=0.9",
+                "Cookie" to cookie
+            ))
+            if (resp.text.length > 500) resp.text else null
         } catch (_: Exception) { null }
     }
 

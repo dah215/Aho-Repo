@@ -53,9 +53,9 @@ class AnimeVietSubProvider : MainAPI() {
     private var cachedAvsJs: String? = null
 
     override val mainPage = mainPageOf(
-        "$mainUrl/anime-moi/"                 to "Anime Mới",
-        "$mainUrl/anime-le/"                  to "Anime Lẻ",
-        "$mainUrl/anime-bo/"                  to "Anime Bộ"
+        "$mainUrl/anime-moi/" to "Anime Mới",
+        "$mainUrl/anime-le/" to "Anime Lẻ",
+        "$mainUrl/anime-bo/" to "Anime Bộ"
     )
 
     private fun pageUrl(base: String, page: Int) =
@@ -96,15 +96,12 @@ class AnimeVietSubProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         val base = url.trimEnd('/')
 
-        // Fetch trang chính để lấy metadata chi tiết
         val infoDoc = try {
             app.get("$base/", headers = baseHeaders).document
         } catch (_: Exception) { null }
 
-        // Fetch trang xem phim để lấy info cơ bản + episodes
         val watchDoc = app.get("$base/xem-phim.html", headers = baseHeaders).document
 
-        // ===== THÔNG TIN CƠ BẢN =====
         val title = watchDoc.selectFirst("h1.Title")?.text()?.trim()
             ?: infoDoc?.selectFirst("h1.Title")?.text()?.trim()
             ?: watchDoc.title()
@@ -116,7 +113,6 @@ class AnimeVietSubProvider : MainAPI() {
         val plotOriginal = watchDoc.selectFirst("div.Description")?.text()?.trim()
             ?: infoDoc?.selectFirst("div.Description")?.text()?.trim()
 
-        // ===== METADATA CHI TIẾT =====
         fun metaValue(doc: org.jsoup.nodes.Document?, label: String): String? {
             if (doc == null) return null
             for (li in doc.select("li")) {
@@ -153,8 +149,6 @@ class AnimeVietSubProvider : MainAPI() {
         val studio = (metaValue(infoDoc, "Studio") ?: metaValue(infoDoc, "Đạo diễn"))
             ?: (metaValue(watchDoc, "Studio") ?: metaValue(watchDoc, "Đạo diễn"))
 
-        val season = metaValue(infoDoc, "Season") ?: metaValue(watchDoc, "Season")
-
         val followers = metaValue(infoDoc, "Theo dõi")
             ?: metaValue(infoDoc, "Số người theo dõi")
             ?: metaValue(watchDoc, "Theo dõi")
@@ -169,14 +163,12 @@ class AnimeVietSubProvider : MainAPI() {
             ?: watchDoc.select("li.latest_eps a")).map { it.text().trim() }
             .take(3).joinToString(", ")
 
-        // ===== MÔ TẢ HTML ĐẸP (NguonC style) =====
         val description = buildBeautifulDescription(
             altTitle, status, duration, quality, country,
-            year?.toString(), studio, season, followers, views,
+            year?.toString(), studio, followers, views,
             latestEps.ifBlank { null }, tags.joinToString(", "), plotOriginal
         )
 
-        // ===== DANH SÁCH TẬP =====
         val seen = mutableSetOf<String>()
         val episodes = watchDoc.select("#list-server .list-episode a.episode-link, " +
                 ".listing.items a[href*=/tap-], " +
@@ -218,10 +210,7 @@ class AnimeVietSubProvider : MainAPI() {
         }
     }
 
-    // ════════════════════════════════════════════════════════════════
-    //  TẠO MÔ TẢ HTML ĐẸP — NguonC style
-    // ════════════════════════════════════════════════════════════════
-        private fun buildBeautifulDescription(
+    private fun buildBeautifulDescription(
         altTitle: String?,
         status: String?,
         duration: String?,
@@ -272,7 +261,6 @@ class AnimeVietSubProvider : MainAPI() {
         }
     }
 
-    // Blob interceptor prefix - inject vào đầu avs.watch.js
     private val blobInterceptor = """
 ;(function(){
 var _oc=URL.createObjectURL;
@@ -286,7 +274,6 @@ return u;};
 })();
 """.trimIndent()
 
-    // Fake adsbygoogle để qua ad detector
     private val fakeAds = """
 window.adsbygoogle=window.adsbygoogle||[];
 window.adsbygoogle.loaded=true;
@@ -301,7 +288,6 @@ window.adsbygoogle.push=function(){};
         }
     }
 
-    // Prefetch avs.watch.js khi plugin load
     suspend fun prefetchAvsJs() {
         if (cachedAvsJs != null) return
         try {
@@ -313,7 +299,6 @@ window.adsbygoogle.push=function(){};
         } catch (_: Exception) {}
     }
 
-    // Fetch JS qua OkHttp (với cookie để bypass Cloudflare)
     private suspend fun fetchJs(url: String, cookie: String): String? {
         return try {
             val resp = app.get(url, headers = mapOf(

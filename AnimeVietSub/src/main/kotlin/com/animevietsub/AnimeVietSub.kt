@@ -27,7 +27,6 @@ class AnimeVietSubPlugin : Plugin() {
     override fun load() {
         val provider = AnimeVietSubProvider()
         registerMainAPI(provider)
-        // Prefetch avs.watch.js ngay khi load plugin
         kotlinx.coroutines.GlobalScope.launch {
             provider.prefetchAvsJs()
         }
@@ -51,7 +50,6 @@ class AnimeVietSubProvider : MainAPI() {
         "Referer" to "$mainUrl/"
     )
 
-    // Cache avs.watch.js
     private var cachedAvsJs: String? = null
 
     override val mainPage = mainPageOf(
@@ -97,63 +95,88 @@ class AnimeVietSubProvider : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse {
         val base = url.trimEnd('/')
+
+        // Fetch trang chính để lấy metadata chi tiết
+        val infoDoc = try {
+            app.get("$base/", headers = baseHeaders).document
+        } catch (_: Exception) { null }
+
+        // Fetch trang xem phim để lấy info cơ bản + episodes
         val watchDoc = app.get("$base/xem-phim.html", headers = baseHeaders).document
 
-        // ===== TRÍCH XUẤT THÔNG TIN CƠ BẢN =====
+        // ===== THÔNG TIN CƠ BẢN =====
         val title = watchDoc.selectFirst("h1.Title")?.text()?.trim()
+            ?: infoDoc?.selectFirst("h1.Title")?.text()?.trim()
             ?: watchDoc.title()
-        val altTitle = watchDoc.selectFirst("h2.SubTitle")?.text()?.trim() // Tên tiếng Anh
+        val altTitle = watchDoc.selectFirst("h2.SubTitle")?.text()?.trim()
+            ?: infoDoc?.selectFirst("h2.SubTitle")?.text()?.trim()
         val poster = watchDoc.selectFirst("div.Image figure img")?.attr("src")
+            ?: infoDoc?.selectFirst("div.Image figure img")?.attr("src")
             ?.let { if (it.startsWith("http")) it else "$mainUrl$it" }
         val plotOriginal = watchDoc.selectFirst("div.Description")?.text()?.trim()
+            ?: infoDoc?.selectFirst("div.Description")?.text()?.trim()
 
-        // ===== TRÍCH XUẤT METADATA CHI TIẾT =====
-        // Lượt xem
+        // ===== METADATA CHI TIẾT =====
+        fun metaValue(doc: org.jsoup.nodes.Document?, label: String): String? {
+            if (doc == null) return null
+            for (li in doc.select("li")) {
+                val lbl = li.selectFirst("label")
+                if (lbl != null && lbl.text().contains(label, ignoreCase = true)) {
+                    return li.text().substringAfter(lbl.text()).trim().ifBlank { null }
+                }
+            }
+            val found = doc.selectFirst("li:contains($label)")
+            if (found != null) {
+                return found.text().replace(label, "").trim().ifBlank { null }
+            }
+            return null
+        }
+
         val views = watchDoc.selectFirst("span.View")?.text()?.trim()
             ?.replace("Lượt Xem", "lượt xem")
 
-        // Năm
-        val year = watchDoc.selectFirst("p.Info .Date a, p.Info .Date, span.Date a")
-            ?.text()?.filter { it.isDigit() }?.take(4)?.toIntOrNull()
-
-        // Thông tin chi tiết từ tab "Thông tin phim"
-        val status = watchDoc.selectFirst("li:contains(Trạng thái:)")?.text()
-            ?.replace("Trạng thái:", "")?.trim()
-            ?.replace("VietSub", "Vietsub")
-
         val quality = watchDoc.selectFirst("span.Qlty")?.text()?.trim() ?: "HD"
 
-        val duration = watchDoc.selectFirst("li:contains(Thời lượng:)")?.text()
-            ?.replace("Thời lượng:", "")?.trim()
+        val year = (watchDoc.selectFirst("p.Info .Date a, p.Info .Date, span.Date a")
+            ?.text()?.filter { it.isDigit() }?.take(4)?.toIntOrNull())
+            ?: (infoDoc?.selectFirst("p.Info .Date a, p.Info .Date, span.Date a")
+            ?.text()?.filter { it.isDigit() }?.take(4)?.toIntOrNull())
 
-        val country = watchDoc.selectFirst("li:contains(Quốc gia:) a")?.text()?.trim()
+        val status = (metaValue(infoDoc, "Trạng thái") ?: metaValue(watchDoc, "Trạng thái"))
+            ?.replace("VietSub", "Vietsub")
 
-        val studio = watchDoc.selectFirst("li:contains(Studio:) a, li:contains(Đạo diễn:)")?.text()
-            ?.replace("Studio:", "")?.replace("Đạo diễn:", "")?.trim()
+        val duration = metaValue(infoDoc, "Thời lượng") ?: metaValue(watchDoc, "Thời lượng")
 
-        val season = watchDoc.selectFirst("li:contains(Season:) a, li:contains(Season:)")?.text()
-            ?.replace("Season:", "")?.trim()
+        val country = infoDoc?.selectFirst("li:contains(Quốc gia:) a")?.text()?.trim()
+            ?: watchDoc.selectFirst("li:contains(Quốc gia:) a")?.text()?.trim()
 
-        val followers = watchDoc.selectFirst("li:contains(Số người theo dõi:)")?.text()
-            ?.replace("Số người theo dõi:", "")?.trim()
+        val studio = (metaValue(infoDoc, "Studio") ?: metaValue(infoDoc, "Đạo diễn"))
+            ?: (metaValue(watchDoc, "Studio") ?: metaValue(watchDoc, "Đạo diễn"))
 
-        // Thể loại
-        val tags = watchDoc.select("p.Genre a, li:contains(Thể loại:) a").map {
+        val season = metaValue(infoDoc, "Season") ?: metaValue(watchDoc, "Season")
+
+        val followers = metaValue(infoDoc, "Theo dõi")
+            ?: metaValue(infoDoc, "Số người theo dõi")
+            ?: metaValue(watchDoc, "Theo dõi")
+            ?: metaValue(watchDoc, "Số người theo dõi")
+
+        val tags = (infoDoc?.select("p.Genre a, li:contains(Thể loại:) a")
+            ?: watchDoc.select("p.Genre a, li:contains(Thể loại:) a")).map {
             it.text().trim()
         }.filter { it.isNotBlank() }.distinct()
 
-        // Tập mới nhất
-        val latestEps = watchDoc.select("li.latest_eps a").map { it.text().trim() }
+        val latestEps = (infoDoc?.select("li.latest_eps a")
+            ?: watchDoc.select("li.latest_eps a")).map { it.text().trim() }
             .take(3).joinToString(", ")
 
-        // ===== TẠO MÔ TẢ HTML ĐẸP (NguonC style) =====
+        // ===== MÔ TẢ HTML ĐẸP (NguonC style) =====
         val description = buildBeautifulDescription(
             altTitle, status, duration, quality, country,
             year?.toString(), studio, season, followers, views,
             latestEps.ifBlank { null }, tags.joinToString(", "), plotOriginal
         )
 
-        // ===== TRÍCH XUẤT DANH SÁCH TẬP =====
+        // ===== DANH SÁCH TẬP =====
         val seen = mutableSetOf<String>()
         val episodes = watchDoc.select("#list-server .list-episode a.episode-link, " +
                 ".listing.items a[href*=/tap-], " +
@@ -196,7 +219,7 @@ class AnimeVietSubProvider : MainAPI() {
     }
 
     // ════════════════════════════════════════════════════════════════
-    //  TẠO MÔ TẢ HTML ĐẸP — Giống y hệt NguonC style
+    //  TẠO MÔ TẢ HTML ĐẸP — NguonC style
     // ════════════════════════════════════════════════════════════════
     private fun buildBeautifulDescription(
         altTitle: String?,
@@ -280,7 +303,7 @@ window.adsbygoogle.push=function(){};
         }
     }
 
-    // Prefetch avs.watch.js khi plugin load (không cần đợi loadLinks)
+    // Prefetch avs.watch.js khi plugin load
     suspend fun prefetchAvsJs() {
         if (cachedAvsJs != null) return
         try {
@@ -317,7 +340,6 @@ window.adsbygoogle.push=function(){};
 
                     val bridge = M3U8Bridge()
 
-                    // Sync cookie
                     android.webkit.CookieManager.getInstance().apply {
                         setAcceptCookie(true)
                         cookie.split(";").forEach { kv ->
@@ -339,7 +361,6 @@ window.adsbygoogle.push=function(){};
                         .setAcceptThirdPartyCookies(wv, true)
                     wv.addJavascriptInterface(bridge, "Android")
 
-                    // Interceptor có avs.watch.js đã được inject blob interceptor
                     val patchedAvsJs = blobInterceptor + "\n" + avsJs
                     val avsJsBytes = patchedAvsJs.toByteArray(Charsets.UTF_8)
                     val fakeAdsBytes = fakeAds.toByteArray(Charsets.UTF_8)
@@ -351,18 +372,15 @@ window.adsbygoogle.push=function(){};
                         ): WebResourceResponse? {
                             val url = request.url.toString()
                             return when {
-                                // Serve patched avs.watch.js (blob interceptor đã inject)
                                 url.contains("avs.watch.js") -> WebResourceResponse(
                                     "application/javascript", "utf-8",
                                     ByteArrayInputStream(avsJsBytes)
                                 )
-                                // Fake adsbygoogle → bypass ad detector
                                 url.contains("adsbygoogle") ||
                                         url.contains("googlesyndication") -> WebResourceResponse(
                                     "application/javascript", "utf-8",
                                     ByteArrayInputStream(fakeAdsBytes)
                                 )
-                                // Block trackers + heavy resources không cần thiết
                                 url.contains("google-analytics") ||
                                         url.contains("doubleclick") ||
                                         url.contains("googletagmanager") ||
@@ -372,7 +390,6 @@ window.adsbygoogle.push=function(){};
                                     "application/javascript", "utf-8",
                                     ByteArrayInputStream("".toByteArray())
                                 )
-                                // Block fonts/CSS/images để page load nhanh hơn
                                 url.endsWith(".woff") || url.endsWith(".woff2") ||
                                         url.endsWith(".ttf") || url.endsWith(".eot") ||
                                         (url.endsWith(".css") && !url.contains(mainUrl)) -> WebResourceResponse(
@@ -426,8 +443,6 @@ window.adsbygoogle.push=function(){};
         }
     }
 
-    // ── Local HTTP server để serve M3U8 cho ExoPlayer ──────────────────────
-    // file:// không work Android 7+, dùng localhost thay thế
     private var localServer: LocalM3U8Server? = null
 
     inner class LocalM3U8Server(private val m3u8Content: String) {
@@ -439,11 +454,10 @@ window.adsbygoogle.push=function(){};
             Thread {
                 try {
                     val ss = serverSocket ?: return@Thread
-
                     repeat(10) {
                         try {
                             val client = ss.accept()
-                            client.getInputStream().bufferedReader().readLine() // consume request
+                            client.getInputStream().bufferedReader().readLine()
                             val body = m3u8Content.toByteArray(Charsets.UTF_8)
                             val crlf = "\r\n"
                             val response = "HTTP/1.1 200 OK${crlf}" +
@@ -494,7 +508,6 @@ window.adsbygoogle.push=function(){};
     ): Boolean {
         val epUrl = data.substringBefore("|")
 
-        // Lấy cookie từ /ajax/player
         val epId = Regex("""-(\d+)\.html""").find(epUrl)?.groupValues?.get(1) ?: return true
         val ajaxHdr = mapOf(
             "User-Agent" to UA,
@@ -511,15 +524,12 @@ window.adsbygoogle.push=function(){};
         val cookie = playerResp.cookies.entries
             .joinToString("; ") { "${it.key}=${it.value}" }
 
-        // Fetch avs.watch.js (cache lại)
         val avsJs = cachedAvsJs ?: fetchJs(
             "$mainUrl/statics/default/js/avs.watch.js?v=6.1.6", cookie
         )?.also { cachedAvsJs = it } ?: return true
 
-        // WebView load trang thật, serve patched avs.watch.js
         val m3u8 = getM3U8(epUrl, cookie, avsJs) ?: return true
 
-        // Serve M3U8 qua local HTTP server (file:// không work trên Android 7+)
         serveM3U8AndCallback(m3u8, callback)
 
         return true

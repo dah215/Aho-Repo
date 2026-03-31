@@ -221,7 +221,7 @@ class AnimeVietSubProvider : MainAPI() {
     // ════════════════════════════════════════════════════════════════
     //  TẠO MÔ TẢ HTML ĐẸP — NguonC style
     // ════════════════════════════════════════════════════════════════
-    private fun buildBeautifulDescription(
+        private fun buildBeautifulDescription(
         altTitle: String?,
         status: String?,
         duration: String?,
@@ -229,7 +229,6 @@ class AnimeVietSubProvider : MainAPI() {
         country: String?,
         year: String?,
         studio: String?,
-        season: String?,
         followers: String?,
         views: String?,
         latestEps: String?,
@@ -260,7 +259,6 @@ class AnimeVietSubProvider : MainAPI() {
             addInfo("🌍", "Quốc gia", country)
             addInfo("📅", "Năm", year?.ifBlank { null })
             addInfo("🎥", "Studio", studio)
-            addInfo("🗓", "Season", season)
             addInfo("👥", "Theo dõi", followers?.ifBlank { null })
             addInfo("👁", "Lượt xem", views)
             addInfo("🎞", "Tập mới", latestEps)

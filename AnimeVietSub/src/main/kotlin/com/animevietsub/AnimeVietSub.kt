@@ -108,15 +108,7 @@ class AnimeVietSubProvider : MainAPI() {
         val plotOriginal = watchDoc.selectFirst("div.Description")?.text()?.trim()
 
         // ===== TRÍCH XUẤT METADATA CHI TIẾT =====
-        // Rating: 6.6/10 từ 24 thành viên
-        val ratingValue = watchDoc.selectFirst("#average_score")?.text()?.trim()
-            ?: watchDoc.selectFirst("[data-percent]")?.attr("data-percent")?.let {
-                (it.toIntOrNull()?.div(10))?.toString()
-            }
-        val ratingCount = watchDoc.selectFirst(".num-rating")?.text()?.trim()
-            ?: watchDoc.selectFirst("span[itemprop=ratingCount]")?.text()?.trim()
-
-        // Lượt xem: 215,391 Lượt Xem
+        // Lượt xem
         val views = watchDoc.selectFirst("span.View")?.text()?.trim()
             ?.replace("Lượt Xem", "lượt xem")
 
@@ -154,86 +146,12 @@ class AnimeVietSubProvider : MainAPI() {
         val latestEps = watchDoc.select("li.latest_eps a").map { it.text().trim() }
             .take(3).joinToString(", ")
 
-        // ===== TẠO MÔ TẢ HTML ĐẸP =====
-        val description = buildString {
-            // Tên tiếng Anh (nếu có)
-            if (!altTitle.isNullOrBlank() && altTitle != title) {
-                append("<font color='#AAAAAA'><i>$altTitle</i></font><br><br>")
-            }
-
-            // Phần đánh giá sao giống website
-            if (ratingValue != null) {
-                val ratingFloat = ratingValue.toFloatOrNull() ?: 0f
-                val fullStars = ratingFloat.toInt()
-                val hasHalfStar = ratingFloat - fullStars >= 0.5
-                val emptyStars = 10 - fullStars - (if (hasHalfStar) 1 else 0)
-
-                val starBuilder = StringBuilder()
-                repeat(fullStars) { starBuilder.append("★") }
-                if (hasHalfStar) starBuilder.append("✬")
-                repeat(emptyStars) { starBuilder.append("☆") }
-
-                append("<font color='#FFD700' size='5'>$starBuilder</font><br>")
-                append("<b>Đánh giá:</b> <font color='#FF6B6B'>$ratingValue</font>/10")
-                if (!ratingCount.isNullOrBlank()) {
-                    append(" từ <b>$ratingCount</b> thành viên")
-                }
-                append("<br><br>")
-            }
-
-            // Thông tin chính dạng icon + text
-            append("<table cellpadding='2'>")
-
-            if (!views.isNullOrBlank()) {
-                append("<tr><td>👁</td><td><b>Lượt xem:</b> $views</td></tr>")
-            }
-            if (!status.isNullOrBlank()) {
-                val statusColor = when {
-                    status.contains("đang chiếu", ignoreCase = true) -> "#4CAF50"
-                    status.contains("hoàn thành", ignoreCase = true) -> "#2196F3"
-                    status.contains("sắp chiếu", ignoreCase = true) -> "#FF9800"
-                    else -> "#FFFFFF"
-                }
-                append("<tr><td>📺</td><td><b>Trạng thái:</b> <font color='$statusColor'>$status</font></td></tr>")
-            }
-            if (!duration.isNullOrBlank()) {
-                append("<tr><td>⏱</td><td><b>Thời lượng:</b> $duration</td></tr>")
-            }
-            if (!quality.isNullOrBlank()) {
-                append("<tr><td>🎬</td><td><b>Chất lượng:</b> <font color='#E91E63'>$quality</font></td></tr>")
-            }
-            if (!country.isNullOrBlank()) {
-                append("<tr><td>🌍</td><td><b>Quốc gia:</b> $country</td></tr>")
-            }
-            if (!season.isNullOrBlank()) {
-                append("<tr><td>📅</td><td><b>Season:</b> $season</td></tr>")
-            }
-            if (!studio.isNullOrBlank()) {
-                append("<tr><td>🎥</td><td><b>Studio:</b> $studio</td></tr>")
-            }
-            if (!followers.isNullOrBlank()) {
-                append("<tr><td>👥</td><td><b>Theo dõi:</b> $followers người</td></tr>")
-            }
-            if (latestEps.isNotBlank()) {
-                append("<tr><td>🎞</td><td><b>Tập mới:</b> $latestEps</td></tr>")
-            }
-
-            append("</table>")
-
-            // Nội dung phim
-            if (!plotOriginal.isNullOrBlank()) {
-                append("<br><b><font color='#FFEB3B'>✦ NỘI DUNG PHIM</font></b><br>")
-                append("<hr color='#333333' size='1'><br>")
-                append(plotOriginal)
-            }
-
-            // Footer nhắc nhở
-            append("<br><br><br>")
-            append("<font color='#666666' size='2'><i>")
-            append("Nguồn: AnimeVietSub<br>")
-            if (year != null) append("Năm phát hành: $year")
-            append("</i></font>")
-        }
+        // ===== TẠO MÔ TẢ HTML ĐẸP (NguonC style) =====
+        val description = buildBeautifulDescription(
+            altTitle, status, duration, quality, country,
+            year?.toString(), studio, season, followers, views,
+            latestEps.ifBlank { null }, tags.joinToString(", "), plotOriginal
+        )
 
         // ===== TRÍCH XUẤT DANH SÁCH TẬP =====
         val seen = mutableSetOf<String>()
@@ -273,6 +191,62 @@ class AnimeVietSubProvider : MainAPI() {
                 this.tags = tags
                 this.year = year
                 addEpisodes(DubStatus.Subbed, episodes)
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    //  TẠO MÔ TẢ HTML ĐẸP — Giống y hệt NguonC style
+    // ════════════════════════════════════════════════════════════════
+    private fun buildBeautifulDescription(
+        altTitle: String?,
+        status: String?,
+        duration: String?,
+        quality: String?,
+        country: String?,
+        year: String?,
+        studio: String?,
+        season: String?,
+        followers: String?,
+        views: String?,
+        latestEps: String?,
+        genre: String?,
+        description: String?
+    ): String {
+        return buildString {
+            altTitle?.takeIf { it.isNotBlank() }?.let {
+                append("<font color='#AAAAAA'><i>$it</i></font><br><br>")
+            }
+
+            fun addInfo(icon: String, label: String, value: String?, color: String = "#FFFFFF") {
+                if (!value.isNullOrBlank()) {
+                    append("$icon <b>$label:</b> <font color='$color'>$value</font><br>")
+                }
+            }
+
+            val statusColor = when {
+                status?.contains("đang chiếu", ignoreCase = true) == true -> "#4CAF50"
+                status?.contains("hoàn thành", ignoreCase = true) == true -> "#2196F3"
+                status?.contains("sắp chiếu", ignoreCase = true) == true -> "#FF9800"
+                else -> "#2196F3"
+            }
+
+            addInfo("📺", "Trạng thái", status, statusColor)
+            addInfo("⏱", "Thời lượng", duration)
+            addInfo("🎬", "Chất lượng", quality?.ifBlank { null }, "#E91E63")
+            addInfo("🌍", "Quốc gia", country)
+            addInfo("📅", "Năm", year?.ifBlank { null })
+            addInfo("🎥", "Studio", studio)
+            addInfo("🗓", "Season", season)
+            addInfo("👥", "Theo dõi", followers?.ifBlank { null })
+            addInfo("👁", "Lượt xem", views)
+            addInfo("🎞", "Tập mới", latestEps)
+            addInfo("🏷", "Thể loại", genre?.ifBlank { null })
+
+            description?.takeIf { it.isNotBlank() }?.let {
+                append("<br><b><font color='#FFEB3B'>✦ NỘI DUNG PHIM</font></b><br>")
+                append("<hr color='#333333' size='1'><br>")
+                append(it.trim())
             }
         }
     }

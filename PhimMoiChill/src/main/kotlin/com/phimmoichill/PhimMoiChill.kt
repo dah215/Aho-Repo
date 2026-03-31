@@ -110,64 +110,57 @@ class PhimMoiChillProvider : MainAPI() {
 
         // ===== THÔNG TIN CƠ BẢN =====
         val title    = doc.selectFirst("h1")?.text()?.trim() ?: "Phim"
-        val altTitle = doc.selectFirst(".film-original-name, h2.subtitle, .sub-name")?.text()?.trim()
-        val poster   = imgUrl(doc.selectFirst(".film-poster img, img[itemprop=image]"))
+        val altTitle = doc.selectFirst("h2")?.text()?.trim()
+        val poster   = imgUrl(doc.selectFirst(".film-info img[itemprop=image]"))
         val plotOriginal = getPlot(doc)
 
-        // ===== METADATA =====
-        val year = doc.selectFirst("a[href*='phim-nam-']")?.text()
-                      ?.let { Regex("""(20\d{2})""").find(it)?.value?.toIntOrNull() }
-
-        val tags = (doc.selectFirst(".film-info, .info-film, #film-info, .film-detail, ul.list-info")
-                       ?: doc.selectFirst(".film-content, .content-film"))
-                   ?.select("a[href*='/genre/'], a[href*='/the-loai/']")
-                   ?.map { it.text().trim() }?.filter { it.isNotBlank() }
-                   ?: doc.select("a[href*='/genre/']")
-                        .filter { it.parents().any { p -> p.className().contains("info") || p.className().contains("detail") || p.className().contains("film") } }
-                        .map { it.text().trim() }.filter { it.isNotBlank() }
-
-        // Thông tin từ bảng info
-        fun infoRow(label: String): String {
-            val allText = doc.select("ul.list-info li, .film-info p, table.film-info td, p")
-            for (el in allText) {
-                val txt = el.text()
-                if (txt.contains(label, ignoreCase = true)) {
-                    val child = el.selectFirst("span, b, strong, a")?.text()?.trim()
-                    return child?.ifBlank { txt.substringAfter(":").trim() }
-                        ?: txt.substringAfter(":").trim()
+        // ===== EXTRACT TỪ entry-meta (Cấu trúc đúng của phimmoichill.you) =====
+        fun metaValue(label: String): String {
+            val items = doc.select("ul.entry-meta li, ul.block-film li")
+            for (item in items) {
+                val lbl = item.selectFirst("label")
+                if (lbl != null && lbl.text().contains(label, ignoreCase = true)) {
+                    return item.text().substringAfter(lbl.text()).trim()
                 }
             }
             return ""
         }
 
-        // ===== EXTRACT FIELDS (NguonC data model equivalent) =====
-        val quality = doc.select("span, .badge, .label")
-                         .firstOrNull { el ->
-                             val t = el.text().trim().uppercase()
-                             t == "HD" || t == "FHD" || t == "4K" || t == "UHD" ||
-                             t == "CAM" || t == "FULL HD" || t == "SD"
-                         }?.text()?.trim() ?: ""
+        // Đang phát: "HD - Vietsub" hoặc "HD - Thuyết Minh" hoặc "Trailer"
+        val dangPhat = metaValue("Đang phát")
+        val quality = Regex("""(HD|FHD|4K|UHD|CAM|FULL HD|SD|Trailer)""").find(dangPhat)?.value ?: ""
+        val status  = Regex("""(Hoàn Tất|Tập\s*\d+/\d+|Tập\s*\d+|Vietsub|Thuyết Minh|Trailer)""").find(dangPhat)?.value
+            ?: if (quality.isNotBlank()) "$quality - Vietsub" else null
 
-        val status = doc.selectFirst(".current-episode, .episode-status, [class*=status]")
-                         ?.text()?.trim()?.let {
-                             if (it.contains("/") || it.any { c -> c.isDigit() }) it else null
-                         }
+        // Năm
+        val year = metaValue("Năm Phát Hành")
+                      ?.let { Regex("""(19\d{2}|20\d{2})""").find(it)?.value?.toIntOrNull() }
 
-        // Số tập: tìm pattern "X/Y" hoặc "X tập" trong status hoặc info
-        val totalEpisodes = Regex("""(\d+)\s*/\s*\d+""").find(status ?: "")?.groupValues?.get(1)?.toIntOrNull()
-            ?: Regex("""(\d+)\s*(tập|tap|episodes?)""", RegexOption.IGNORE_CASE)
-                .find(infoRow("Số tập") + " " + infoRow("Tập"))?.groupValues?.get(1)?.toIntOrNull()
-            ?: Regex("""(\d+)\s*(tập|tap)""", RegexOption.IGNORE_CASE)
-                .find(status ?: "")?.groupValues?.get(1)?.toIntOrNull()
+        // Quốc gia
+        val country = doc.selectFirst("ul.entry-meta a[href*='/country/']")?.text()?.trim()
+                          ?: metaValue("Quốc gia")
 
-        val duration = infoRow("Thời lượng").ifBlank { infoRow("Duration") }
-        val country  = doc.selectFirst("a[href*='/quoc-gia/']")?.text()?.trim()
-                          ?.ifBlank { infoRow("Quốc gia") } ?: infoRow("Quốc gia")
-        val director = doc.select("a[href*='/director/']").joinToString(", ") { it.text() }
-                          .ifBlank { infoRow("Đạo diễn") }
-        val cast     = doc.select("a[href*='/actor/'], a[href*='/dien-vien/']")
-                          .take(5).joinToString(", ") { it.text() }
-                          .ifBlank { infoRow("Diễn viên") }
+        // Thể loại
+        val tags = doc.select("ul.entry-meta a[href*='/genre/']")
+                       .map { it.text().trim() }.filter { it.isNotBlank() }
+
+        // Đạo diễn
+        val director = doc.select("ul.entry-meta a[href*='/dao-dien/']")
+                           .joinToString(", ") { it.text().trim() }.ifBlank { metaValue("Đạo diễn") }
+
+        // Diễn viên
+        val cast = doc.select("ul.entry-meta a[href*='/dien-vien/']")
+                      .take(5).joinToString(", ") { it.text().trim() }.ifBlank { metaValue("Diễn viên") }
+
+        // Thời lượng
+        val duration = metaValue("Thời lượng")
+
+        // IMDb score
+        val imdbScore = doc.selectFirst("ul.entry-meta .imdb, ul.entry-meta span.imdb")
+                           ?.text()?.trim()
+
+        // Số tập: tìm từ status
+        val totalEpisodes = Regex("""Tập\s*(\d+)\s*/\s*\d+""").find(dangPhat)?.groupValues?.get(1)?.toIntOrNull()
 
         val theLoai    = tags.joinToString(", ")
         val namPhatHanh = year?.toString() ?: ""

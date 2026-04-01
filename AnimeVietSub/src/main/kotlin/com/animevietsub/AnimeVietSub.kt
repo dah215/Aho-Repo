@@ -371,7 +371,7 @@ window.adsbygoogle.push=function(){};
                         ): WebResourceResponse? {
                             val url = request.url.toString()
                             return when {
-                                url.contains("watchbk") || url.contains("avs.watch") -> WebResourceResponse(
+                                url.contains("watchbk") || url.contains("avs.watch") || url.contains("stream.googleapiscdn.com/player") -> WebResourceResponse(
                                     "application/javascript", "utf-8",
                                     ByteArrayInputStream(avsJsBytes)
                                 )
@@ -507,30 +507,34 @@ window.adsbygoogle.push=function(){};
     ): Boolean {
         val epUrl = data.substringBefore("|")
 
+        // Fetch episode page → find iframe URL (stream.googleapiscdn.com/player/...)
+        val epPageHtml = try { app.get(epUrl, headers = baseHeaders).text } catch (_: Exception) { "" }
+        val iframeUrl = Regex("""https://stream\.googleapiscdn\.com/player/[a-fA-F0-9?=&%+._-]+""")
+            .find(epPageHtml)?.value?.replace("&amp;", "&")
+
+        // Get cookie
         val epId = Regex("""-(\d+)\.html""").find(epUrl)?.groupValues?.get(1) ?: return true
         val ajaxHdr = mapOf(
-            "User-Agent" to UA,
-            "X-Requested-With" to "XMLHttpRequest",
+            "User-Agent" to UA, "X-Requested-With" to "XMLHttpRequest",
             "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
-            "Referer" to epUrl,
-            "Origin" to mainUrl
+            "Referer" to epUrl, "Origin" to mainUrl
         )
-        val playerResp = app.post(
-            "$mainUrl/ajax/player",
-            headers = ajaxHdr,
-            data = mapOf("episodeId" to epId, "backup" to "1")
-        )
-        val cookie = playerResp.cookies.entries
-            .joinToString("; ") { "${it.key}=${it.value}" }
+        val cookie = try {
+            app.post("$mainUrl/ajax/player", headers = ajaxHdr,
+                data = mapOf("episodeId" to epId, "backup" to "1"))
+                .cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+        } catch (_: Exception) { "" }
 
+        // Get player JS
         val avsJs = cachedAvsJs ?: fetchJs(
             "$mainUrl/statics/default/js/pl.watchbk2.js?v=6.1.9", cookie
         )?.also { cachedAvsJs = it } ?: return true
 
-        val m3u8 = getM3U8(epUrl, cookie, avsJs) ?: return true
+        // Load iframe URL directly — blob M3U8 is created in iframe context
+        val targetUrl = iframeUrl ?: epUrl
+        val m3u8 = getM3U8(targetUrl, cookie, avsJs) ?: return true
 
         serveM3U8AndCallback(m3u8, callback)
-
         return true
     }
 }

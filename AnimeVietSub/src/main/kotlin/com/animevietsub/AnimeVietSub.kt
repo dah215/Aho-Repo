@@ -34,7 +34,7 @@ class AnimeVietSubPlugin : Plugin() {
 }
 
 class AnimeVietSubProvider : MainAPI() {
-    override var mainUrl = "https://animevietsub.be"
+    override var mainUrl = "https://animevietsub.id"
     override var name = "AnimeVietSub"
     override val hasMainPage = true
     override var lang = "vi"
@@ -291,8 +291,16 @@ window.adsbygoogle.push=function(){};
     suspend fun prefetchAvsJs() {
         if (cachedAvsJs != null) return
         try {
+            // Auto-detect player JS from page HTML first
+            val pageHtml = try { app.get("$mainUrl/", headers = baseHeaders).text } catch(_: Exception) { "" }
+            val detectedPath = Regex("""statics/default/js/((?:pl\.watchbk\d+|avs\.watch)\.js\?v=[0-9.]+)""")
+                .find(pageHtml)?.groupValues?.get(1)
+            val jsUrl = if (!detectedPath.isNullOrBlank())
+                "$mainUrl/statics/default/js/$detectedPath"
+            else
+                "$mainUrl/statics/default/js/pl.watchbk2.js?v=6.1.9"
             val js = app.get(
-                "$mainUrl/statics/default/js/avs.watch.js?v=6.1.6",
+                jsUrl,
                 headers = mapOf("User-Agent" to UA, "Referer" to "$mainUrl/", "Accept" to "*/*")
             ).text
             if (js.length > 500) cachedAvsJs = js
@@ -300,15 +308,23 @@ window.adsbygoogle.push=function(){};
     }
 
     private suspend fun fetchJs(url: String, cookie: String): String? {
-        return try {
+        // Try provided URL first
+        try {
             val resp = app.get(url, headers = mapOf(
-                "User-Agent" to UA,
-                "Referer" to "$mainUrl/",
-                "Accept" to "*/*",
-                "Accept-Language" to "vi-VN,vi;q=0.9",
-                "Cookie" to cookie
+                "User-Agent" to UA, "Referer" to "$mainUrl/",
+                "Accept" to "*/*", "Cookie" to cookie
             ))
-            if (resp.text.length > 500) resp.text else null
+            if (resp.text.length > 500) return resp.text
+        } catch (_: Exception) {}
+        // Auto-detect from page HTML
+        return try {
+            val html = app.get("$mainUrl/", headers = baseHeaders).text
+            val path = Regex("""statics/default/js/((?:pl\.watchbk\d+|avs\.watch)\.js\?v=[0-9.]+)""")
+                .find(html)?.groupValues?.get(1) ?: return null
+            val js = app.get("$mainUrl/statics/default/js/$path", headers = mapOf(
+                "User-Agent" to UA, "Referer" to "$mainUrl/", "Cookie" to cookie
+            )).text
+            if (js.length > 500) js else null
         } catch (_: Exception) { null }
     }
 
@@ -355,7 +371,7 @@ window.adsbygoogle.push=function(){};
                         ): WebResourceResponse? {
                             val url = request.url.toString()
                             return when {
-                                url.contains("avs.watch.js") -> WebResourceResponse(
+                                url.contains("watchbk") || url.contains("avs.watch") -> WebResourceResponse(
                                     "application/javascript", "utf-8",
                                     ByteArrayInputStream(avsJsBytes)
                                 )
@@ -508,7 +524,7 @@ window.adsbygoogle.push=function(){};
             .joinToString("; ") { "${it.key}=${it.value}" }
 
         val avsJs = cachedAvsJs ?: fetchJs(
-            "$mainUrl/statics/default/js/avs.watch.js?v=6.1.6", cookie
+            "$mainUrl/statics/default/js/pl.watchbk2.js?v=6.1.9", cookie
         )?.also { cachedAvsJs = it } ?: return true
 
         val m3u8 = getM3U8(epUrl, cookie, avsJs) ?: return true

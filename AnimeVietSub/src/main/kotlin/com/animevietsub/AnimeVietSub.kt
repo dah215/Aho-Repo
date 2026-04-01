@@ -281,7 +281,9 @@ window.adsbygoogle.push=function(){};
 """.trimIndent()
 
     inner class M3U8Bridge {
-        @Volatile var result: String? = null
+        @Volatile var result: String? = null     // blob M3U8 content
+        @Volatile var m3u8Url: String? = null    // direct playlist URL
+
         @JavascriptInterface
         fun onM3U8(content: String) {
             if (content.contains("#EXTM3U")) result = content
@@ -371,10 +373,15 @@ window.adsbygoogle.push=function(){};
                         ): WebResourceResponse? {
                             val url = request.url.toString()
                             return when {
-                                url.contains("watchbk") || url.contains("avs.watch") || url.contains("stream.googleapiscdn.com/player") -> WebResourceResponse(
+                                url.contains("watchbk") || url.contains("avs.watch") -> WebResourceResponse(
                                     "application/javascript", "utf-8",
                                     ByteArrayInputStream(avsJsBytes)
                                 )
+                                // Capture direct M3U8 URL from player
+                                url.contains("googleapiscdn.com/playlist/") && url.contains(".m3u8") -> {
+                                    bridge.m3u8Url = url
+                                    null // let the request proceed normally
+                                }
                                 url.contains("adsbygoogle") ||
                                         url.contains("googlesyndication") -> WebResourceResponse(
                                     "application/javascript", "utf-8",
@@ -415,11 +422,18 @@ window.adsbygoogle.push=function(){};
                     var elapsed = 0
                     val checker = object : Runnable {
                         override fun run() {
-                            val m = bridge.result
+                            // Priority: direct URL > blob content
+                            val directUrl = bridge.m3u8Url
+                            val blobContent = bridge.result
                             when {
-                                m != null -> {
+                                directUrl != null -> {
                                     wv.stopLoading(); wv.destroy()
-                                    if (cont.isActive) cont.resume(m)
+                                    // Return special marker so caller knows it's a URL
+                                    if (cont.isActive) cont.resume("DIRECT_URL::$directUrl")
+                                }
+                                blobContent != null -> {
+                                    wv.stopLoading(); wv.destroy()
+                                    if (cont.isActive) cont.resume(blobContent)
                                 }
                                 elapsed >= 25_000 -> {
                                     wv.stopLoading(); wv.destroy()
@@ -532,9 +546,27 @@ window.adsbygoogle.push=function(){};
 
         // Load iframe URL directly — blob M3U8 is created in iframe context
         val targetUrl = iframeUrl ?: epUrl
-        val m3u8 = getM3U8(targetUrl, cookie, avsJs) ?: return true
+        val m3u8Result = getM3U8(targetUrl, cookie, avsJs) ?: return true
 
-        serveM3U8AndCallback(m3u8, callback)
+        if (m3u8Result.startsWith("DIRECT_URL::")) {
+            // Direct playlist URL - serve to ExoPlayer with token header
+            val directM3u8Url = m3u8Result.removePrefix("DIRECT_URL::")
+            callback(newExtractorLink(
+                source = name, name = "$name - DU",
+                url = directM3u8Url,
+                type = ExtractorLinkType.M3U8
+            ) {
+                this.quality = Qualities.P1080.value
+                this.headers = mapOf(
+                    "User-Agent" to UA,
+                    "Referer" to "https://stream.googleapiscdn.com/",
+                    "Origin" to "https://stream.googleapiscdn.com"
+                )
+            })
+        } else {
+            // Blob M3U8 content - serve via local proxy
+            serveM3U8AndCallback(m3u8Result, callback)
+        }
         return true
     }
 }

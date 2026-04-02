@@ -333,11 +333,11 @@ window.adsbygoogle.push=function(){};
         } catch (_: Exception) { null }
     }
 
-    @SuppressLint("SetJavaScriptEnabled")
+        @SuppressLint("SetJavaScriptEnabled")
     private suspend fun getM3U8(epUrl: String, cookie: String, avsJs: String): Pair<String?, String?> {
         return withContext(Dispatchers.Main) {
-            withTimeoutOrNull(30_000L) {
-                suspendCancellableCoroutine { cont ->
+            withTimeoutOrNull<Pair<String?, String?>>(30_000L) {
+                suspendCancellableCoroutine<Pair<String?, String?>> { cont ->
                     val ctx = try { AcraApplication.context }
                     catch (_: Exception) { null }
                     if (ctx == null) { cont.resume(Pair(null, null)); return@suspendCancellableCoroutine }
@@ -359,7 +359,7 @@ window.adsbygoogle.push=function(){};
                         streamCookies.split(";").forEach { kv ->
                             val t = kv.trim()
                             if (t.isNotBlank()) cookieManager.setCookie("https://stream.googleapiscdn.com", t)
-                        }
+                        })
                     }
                     cookieManager.flush()
 

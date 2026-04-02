@@ -1,6 +1,7 @@
 package com.animevietsub
 
 import android.annotation.SuppressLint
+import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -10,7 +11,6 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
-import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -51,6 +51,9 @@ class AnimeVietSubProvider : MainAPI() {
     )
 
     private var cachedAvsJs: String? = null
+    
+    // Lưu trữ cookie cho stream domain
+    private var streamCookies: String = ""
 
     override val mainPage = mainPageOf(
         "$mainUrl/anime-moi/" to "Anime Mới",
@@ -331,24 +334,34 @@ window.adsbygoogle.push=function(){};
     }
 
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun getM3U8(epUrl: String, cookie: String, avsJs: String): String? {
+    private suspend fun getM3U8(epUrl: String, cookie: String, avsJs: String): Pair<String?, String?> {
         return withContext(Dispatchers.Main) {
             withTimeoutOrNull(30_000L) {
                 suspendCancellableCoroutine { cont ->
                     val ctx = try { AcraApplication.context }
                     catch (_: Exception) { null }
-                    if (ctx == null) { cont.resume(null); return@suspendCancellableCoroutine }
+                    if (ctx == null) { cont.resume(Pair(null, null)); return@suspendCancellableCoroutine }
 
                     val bridge = M3U8Bridge()
 
-                    android.webkit.CookieManager.getInstance().apply {
-                        setAcceptCookie(true)
-                        cookie.split(";").forEach { kv ->
-                            val t = kv.trim()
-                            if (t.isNotBlank()) setCookie(mainUrl, t)
-                        }
-                        flush()
+                    // Set cookie cho cả hai domain
+                    val cookieManager = CookieManager.getInstance()
+                    cookieManager.setAcceptCookie(true)
+                    
+                    // Parse và set cookie cho animevietsub
+                    cookie.split(";").forEach { kv ->
+                        val t = kv.trim()
+                        if (t.isNotBlank()) cookieManager.setCookie(mainUrl, t)
                     }
+                    
+                    // Set cookie cho stream.googleapiscdn.com nếu có
+                    if (streamCookies.isNotBlank()) {
+                        streamCookies.split(";").forEach { kv ->
+                            val t = kv.trim()
+                            if (t.isNotBlank()) cookieManager.setCookie("https://stream.googleapiscdn.com", t)
+                        }
+                    }
+                    cookieManager.flush()
 
                     val wv = WebView(ctx)
                     wv.settings.apply {
@@ -358,8 +371,7 @@ window.adsbygoogle.push=function(){};
                         userAgentString = UA
                         mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                     }
-                    android.webkit.CookieManager.getInstance()
-                        .setAcceptThirdPartyCookies(wv, true)
+                    cookieManager.setAcceptThirdPartyCookies(wv, true)
                     wv.addJavascriptInterface(bridge, "Android")
 
                     val patchedAvsJs = blobInterceptor + "\n" + avsJs
@@ -372,6 +384,17 @@ window.adsbygoogle.push=function(){};
                             request: WebResourceRequest
                         ): WebResourceResponse? {
                             val url = request.url.toString()
+                            
+                            // Capture cookies từ response
+                            val requestHeaders = request.requestHeaders
+                            if (url.contains("stream.googleapiscdn.com")) {
+                                // Lưu lại cookies để dùng sau
+                                val cookieHeader = requestHeaders["Cookie"]
+                                if (cookieHeader != null && cookieHeader.isNotBlank()) {
+                                    streamCookies = cookieHeader
+                                }
+                            }
+                            
                             return when {
                                 url.contains("watchbk") || url.contains("avs.watch") -> WebResourceResponse(
                                     "application/javascript", "utf-8",
@@ -380,7 +403,7 @@ window.adsbygoogle.push=function(){};
                                 // Capture direct M3U8 URL from player
                                 url.contains("googleapiscdn.com/playlist/") && url.contains(".m3u8") -> {
                                     bridge.m3u8Url = url
-                                    null // let the request proceed normally
+                                    null
                                 }
                                 url.contains("adsbygoogle") ||
                                         url.contains("googlesyndication") -> WebResourceResponse(
@@ -428,16 +451,15 @@ window.adsbygoogle.push=function(){};
                             when {
                                 directUrl != null -> {
                                     wv.stopLoading(); wv.destroy()
-                                    // Return special marker so caller knows it's a URL
-                                    if (cont.isActive) cont.resume("DIRECT_URL::$directUrl")
+                                    if (cont.isActive) cont.resume(Pair(directUrl, null))
                                 }
                                 blobContent != null -> {
                                     wv.stopLoading(); wv.destroy()
-                                    if (cont.isActive) cont.resume(blobContent)
+                                    if (cont.isActive) cont.resume(Pair(null, blobContent))
                                 }
                                 elapsed >= 25_000 -> {
                                     wv.stopLoading(); wv.destroy()
-                                    if (cont.isActive) cont.resume(null)
+                                    if (cont.isActive) cont.resume(Pair(null, null))
                                 }
                                 else -> {
                                     elapsed += 200
@@ -452,7 +474,7 @@ window.adsbygoogle.push=function(){};
                         wv.stopLoading(); wv.destroy()
                     }
                 }
-            }
+            } ?: Pair(null, null)
         }
     }
 
@@ -500,7 +522,7 @@ window.adsbygoogle.push=function(){};
         localServer = server
 
         callback(newExtractorLink(
-            source = name, name = "$name - DU",
+            source = name, name = "$name - Local",
             url = "http://127.0.0.1:${server.port}/stream.m3u8",
             type = ExtractorLinkType.M3U8
         ) {
@@ -526,18 +548,25 @@ window.adsbygoogle.push=function(){};
         val iframeUrl = Regex("""https://stream\.googleapiscdn\.com/player/[a-fA-F0-9?=&%+._-]+""")
             .find(epPageHtml)?.value?.replace("&amp;", "&")
 
-        // Get cookie
+        // Get cookie từ ajax request
         val epId = Regex("""-(\d+)\.html""").find(epUrl)?.groupValues?.get(1) ?: return true
         val ajaxHdr = mapOf(
             "User-Agent" to UA, "X-Requested-With" to "XMLHttpRequest",
             "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
             "Referer" to epUrl, "Origin" to mainUrl
         )
-        val cookie = try {
+        val cookieResponse = try {
             app.post("$mainUrl/ajax/player", headers = ajaxHdr,
                 data = mapOf("episodeId" to epId, "backup" to "1"))
-                .cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
-        } catch (_: Exception) { "" }
+        } catch (_: Exception) { null }
+        
+        val cookie = cookieResponse?.cookies?.entries?.joinToString("; ") { "${it.key}=${it.value}" } ?: ""
+        
+        // Lưu cookies từ response header nếu có
+        val setCookieHeader = cookieResponse?.headers?.get("Set-Cookie")
+        if (setCookieHeader != null) {
+            streamCookies = setCookieHeader
+        }
 
         // Get player JS
         val avsJs = cachedAvsJs ?: fetchJs(
@@ -546,26 +575,33 @@ window.adsbygoogle.push=function(){};
 
         // Load iframe URL directly — blob M3U8 is created in iframe context
         val targetUrl = iframeUrl ?: epUrl
-        val m3u8Result = getM3U8(targetUrl, cookie, avsJs) ?: return true
+        val (directUrl, blobContent) = getM3U8(targetUrl, cookie, avsJs)
 
-        if (m3u8Result.startsWith("DIRECT_URL::")) {
-            // Direct playlist URL - serve to ExoPlayer with token header
-            val directM3u8Url = m3u8Result.removePrefix("DIRECT_URL::")
-            callback(newExtractorLink(
-                source = name, name = "$name - DU",
-                url = directM3u8Url,
-                type = ExtractorLinkType.M3U8
-            ) {
-                this.quality = Qualities.P1080.value
-                this.headers = mapOf(
-                    "User-Agent" to UA,
-                    "Referer" to "https://stream.googleapiscdn.com/",
-                    "Origin" to "https://stream.googleapiscdn.com"
-                )
-            })
-        } else {
-            // Blob M3U8 content - serve via local proxy
-            serveM3U8AndCallback(m3u8Result, callback)
+        when {
+            directUrl != null -> {
+                // Direct playlist URL - serve to ExoPlayer với đầy đủ headers và cookies
+                callback(newExtractorLink(
+                    source = name, name = "$name - Direct",
+                    url = directUrl,
+                    type = ExtractorLinkType.M3U8
+                ) {
+                    this.quality = Qualities.P1080.value
+                    // Headers quan trọng để tránh lỗi 2004
+                    this.headers = mapOf(
+                        "User-Agent" to UA,
+                        "Referer" to (iframeUrl ?: "https://stream.googleapiscdn.com/player/"),
+                        "Origin" to "https://stream.googleapiscdn.com",
+                        "Accept" to "*/*",
+                        "Accept-Language" to "vi-VN,vi;q=0.9",
+                        "Cookie" to streamCookies.ifBlank { cookie }
+                    )
+                })
+            }
+            blobContent != null -> {
+                // Blob M3U8 content - serve via local proxy
+                serveM3U8AndCallback(blobContent, callback)
+            }
+            else -> return false
         }
         return true
     }

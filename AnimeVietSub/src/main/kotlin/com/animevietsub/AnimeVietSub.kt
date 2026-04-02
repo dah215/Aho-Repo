@@ -359,7 +359,7 @@ window.adsbygoogle.push=function(){};
                         streamCookies.split(";").forEach { kv ->
                             val t = kv.trim()
                             if (t.isNotBlank()) cookieManager.setCookie("https://stream.googleapiscdn.com", t)
-                        })
+                        }
                     }
                     cookieManager.flush()
 

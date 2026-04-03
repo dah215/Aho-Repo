@@ -6,6 +6,7 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.webkit.CookieManager
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
@@ -51,6 +52,8 @@ class AnimeVietSubProvider : MainAPI() {
     )
 
     private var cachedAvsJs: String? = null
+    /** Cookies extracted from WebView (cf_clearance etc.) for stream.googleapiscdn.com */
+    @Volatile private var lastStreamCookies: String = ""
 
     override val mainPage = mainPageOf(
         "$mainUrl/anime-moi/" to "Anime Mới",
@@ -271,7 +274,7 @@ var r=new FileReader();
 r.onload=function(e){try{Android.onM3U8(e.target.result);}catch(x){}};
 r.readAsText(b);}}catch(x){}
 return u;};
-})();
+});
 """.trimIndent()
 
     private val fakeAds = """
@@ -281,18 +284,13 @@ window.adsbygoogle.push=function(){};
 """.trimIndent()
 
     inner class M3U8Bridge {
-        @Volatile var result: String? = null
-        @Volatile var m3u8Url: String? = null
+        @Volatile var result: String? = null     // blob M3U8 content
+        @Volatile var m3u8Url: String? = null    // direct playlist URL
+        @Volatile var streamCookies: String? = null // cf_clearance cookies from WebView
 
         @JavascriptInterface
         fun onM3U8(content: String) {
             if (content.contains("#EXTM3U")) result = content
-        }
-
-        // Called from JS XHR override when player fetches playlist
-        @JavascriptInterface
-        fun onPlaylistUrl(url: String) {
-            if (url.contains("playlist.m3u8")) m3u8Url = url
         }
     }
 
@@ -337,7 +335,7 @@ window.adsbygoogle.push=function(){};
     }
 
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun getM3U8(epUrl: String, targetUrl: String, cookie: String, avsJs: String): String? {
+    private suspend fun getM3U8(epUrl: String, cookie: String, avsJs: String): String? {
         return withContext(Dispatchers.Main) {
             withTimeoutOrNull(30_000L) {
                 suspendCancellableCoroutine { cont ->
@@ -372,39 +370,7 @@ window.adsbygoogle.push=function(){};
                     val avsJsBytes = patchedAvsJs.toByteArray(Charsets.UTF_8)
                     val fakeAdsBytes = fakeAds.toByteArray(Charsets.UTF_8)
 
-                    // JS to inject into player page to capture playlist URL
-                    val xhrOverrideJs = """
-(function(){
-var origOpen = XMLHttpRequest.prototype.open;
-XMLHttpRequest.prototype.open = function(method, url) {
-  try {
-    if (url && typeof url === 'string' && url.indexOf('playlist.m3u8') !== -1) {
-      Android.onPlaylistUrl(url);
-    }
-  } catch(e) {}
-  return origOpen.apply(this, arguments);
-};
-var origFetch = window.fetch;
-if (origFetch) {
-  window.fetch = function(url, opts) {
-    try {
-      if (url && typeof url === 'string' && url.indexOf('playlist.m3u8') !== -1) {
-        Android.onPlaylistUrl(url);
-      }
-    } catch(e) {}
-    return origFetch.apply(this, arguments);
-  };
-}
-})();
-""".trimIndent()
-
                     wv.webViewClient = object : WebViewClient() {
-                        override fun onPageStarted(view: WebView, url: String, favicon: android.graphics.Bitmap?) {
-                            view.evaluateJavascript(xhrOverrideJs, null)
-                        }
-                        override fun onPageFinished(view: WebView, url: String) {
-                            view.evaluateJavascript(xhrOverrideJs, null)
-                        }
                         override fun shouldInterceptRequest(
                             view: WebView,
                             request: WebResourceRequest
@@ -415,10 +381,10 @@ if (origFetch) {
                                     "application/javascript", "utf-8",
                                     ByteArrayInputStream(avsJsBytes)
                                 )
-                                // Also capture via shouldInterceptRequest as backup
+                                // Capture direct M3U8 URL from player
                                 url.contains("googleapiscdn.com/playlist/") && url.contains(".m3u8") -> {
                                     bridge.m3u8Url = url
-                                    null
+                                    null // let the request proceed normally
                                 }
                                 url.contains("adsbygoogle") ||
                                         url.contains("googlesyndication") -> WebResourceResponse(
@@ -451,29 +417,37 @@ if (origFetch) {
                         }
                     }
 
-                    // Load target: iframe URL directly (or episode page as fallback)
-                    // Set Referer to episode page so player thinks it's inside the episode
-                    val loadHeaders = if (targetUrl != epUrl) {
-                        mapOf("Accept-Language" to "vi-VN,vi;q=0.9", "Referer" to epUrl)
-                    } else {
-                        mapOf("Accept-Language" to "vi-VN,vi;q=0.9", "Referer" to "$mainUrl/")
-                    }
-                    wv.loadUrl(targetUrl, loadHeaders)
+                    wv.loadUrl(epUrl, mapOf(
+                        "Accept-Language" to "vi-VN,vi;q=0.9",
+                        "Referer" to "$mainUrl/"
+                    ))
 
                     val handler = android.os.Handler(android.os.Looper.getMainLooper())
                     var elapsed = 0
                     val checker = object : Runnable {
                         override fun run() {
-                            // Priority: direct URL > blob content
                             val directUrl = bridge.m3u8Url
                             val blobContent = bridge.result
                             when {
                                 directUrl != null -> {
+                                    // ★ FIX: Extract cf_clearance cookies BEFORE destroying WebView
+                                    try {
+                                        val cookies = CookieManager.getInstance()
+                                            .getCookie("https://stream.googleapiscdn.com") ?: ""
+                                        bridge.streamCookies = cookies
+                                        lastStreamCookies = cookies
+                                    } catch (_: Exception) {}
                                     wv.stopLoading(); wv.destroy()
-                                    // Return special marker so caller knows it's a URL
                                     if (cont.isActive) cont.resume("DIRECT_URL::$directUrl")
                                 }
                                 blobContent != null -> {
+                                    // ★ FIX: Also extract cookies for blob path
+                                    try {
+                                        val cookies = CookieManager.getInstance()
+                                            .getCookie("https://stream.googleapiscdn.com") ?: ""
+                                        bridge.streamCookies = cookies
+                                        lastStreamCookies = cookies
+                                    } catch (_: Exception) {}
                                     wv.stopLoading(); wv.destroy()
                                     if (cont.isActive) cont.resume(blobContent)
                                 }
@@ -498,70 +472,196 @@ if (origFetch) {
         }
     }
 
-    private var localServer: PlaylistProxyServer? = null
+    // =========================================================================
+    // ★ FIX: StreamingProxyServer — Local proxy that handles BOTH M3U8 & segments
+    // =========================================================================
+    // Problem: ExoPlayer doesn't have cf_clearance cookie for segment requests,
+    // causing Cloudflare to return 404 on segments.
+    // Solution: Rewrite M3U8 to point segments to local proxy, proxy forwards
+    // segment requests with proper auth headers & cookies.
+    // =========================================================================
 
-    inner class PlaylistProxyServer(private val playlistContent: String) {
+    private var localServer: StreamingProxyServer? = null
+
+    inner class StreamingProxyServer(
+        private val m3u8Content: String,
+        private val segmentHeaders: Map<String, String>
+    ) {
         private var serverSocket: java.net.ServerSocket? = null
+        private val segMap = java.util.concurrent.ConcurrentHashMap<String, String>()
+        private var rewrittenM3U8: String = ""
+
         val port: Int get() = serverSocket?.localPort ?: 0
-        private val pool = java.util.concurrent.Executors.newCachedThreadPool()
 
         fun start() {
             serverSocket = java.net.ServerSocket(0)
+            rewrittenM3U8 = rewriteM3U8()
+
             Thread {
-                val ss = serverSocket ?: return@Thread
-                while (!ss.isClosed) {
-                    try { val c = ss.accept(); pool.execute { handle(c) } }
-                    catch (_: Exception) { break }
-                }
+                try {
+                    val ss = serverSocket ?: return@Thread
+                    while (!ss.isClosed) {
+                        try {
+                            val client = ss.accept()
+                            Thread { handleClient(client) }
+                                .also { it.isDaemon = true }
+                                .start()
+                        } catch (_: java.net.SocketException) { break }
+                        catch (_: Exception) { break }
+                    }
+                } catch (_: Exception) {}
             }.also { it.isDaemon = true }.start()
         }
 
-        private fun handle(client: java.net.Socket) {
-            try {
-                val lines = mutableListOf<String>()
-                val reader = client.getInputStream().bufferedReader()
-                var line = reader.readLine()
-                while (!line.isNullOrBlank()) { lines.add(line); line = reader.readLine() }
-                val path = lines.firstOrNull()?.split(" ")?.getOrNull(1) ?: "/"
-                val crlf = "\r\n"
-                val out = client.getOutputStream()
-
-                if (path == "/playlist.m3u8") {
-                    // Rewrite segment URLs to go through this proxy
-                    val base = "http://127.0.0.1:$port"
-                    val rewritten = playlistContent.lines().joinToString("\n") { l ->
-                        if (l.startsWith("https://stream.googleapiscdn.com/chunks/") && l.contains(".html")) {
-                            "$base/seg?url=${java.net.URLEncoder.encode(l.trim(), "UTF-8")}"
-                        } else l
-                    }.toByteArray(Charsets.UTF_8)
-                    out.write("HTTP/1.1 200 OK${crlf}Content-Type: application/vnd.apple.mpegurl${crlf}Content-Length: ${rewritten.size}${crlf}Access-Control-Allow-Origin: *${crlf}${crlf}".toByteArray())
-                    out.write(rewritten)
-                } else if (path.startsWith("/seg?url=")) {
-                    val segUrl = java.net.URLDecoder.decode(path.removePrefix("/seg?url="), "UTF-8")
-                    try {
-                        val conn = java.net.URL(segUrl).openConnection() as java.net.HttpURLConnection
-                        conn.instanceFollowRedirects = true
-                        conn.connectTimeout = 15000; conn.readTimeout = 30000
-                        conn.setRequestProperty("User-Agent", UA)
-                        conn.setRequestProperty("Referer", "https://stream.googleapiscdn.com/")
-                        conn.connect()
-                        val bytes = conn.inputStream.readBytes()
-                        conn.disconnect()
-                        out.write("HTTP/1.1 200 OK${crlf}Content-Type: video/mp2t${crlf}Content-Length: ${bytes.size}${crlf}Access-Control-Allow-Origin: *${crlf}${crlf}".toByteArray())
-                        out.write(bytes)
-                    } catch (_: Exception) {
-                        out.write("HTTP/1.1 502 Bad Gateway${crlf}${crlf}".toByteArray())
-                    }
+        /** Rewrite all segment URLs in M3U8 to go through local proxy */
+        private fun rewriteM3U8(): String {
+            val sb = StringBuilder()
+            var idx = 0
+            for (line in m3u8Content.lines()) {
+                val trimmed = line.trim()
+                if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
+                    val id = idx.toString()
+                    segMap[id] = trimmed
+                    sb.append("http://127.0.0.1:$port/s/$id")
+                    idx++
                 } else {
-                    out.write("HTTP/1.1 404 Not Found${crlf}${crlf}".toByteArray())
+                    sb.append(line)
                 }
-                out.flush(); client.close()
-            } catch (_: Exception) { try { client.close() } catch (_: Exception) {} }
+                sb.append("\n")
+            }
+            return sb.toString()
+        }
+
+        private fun handleClient(client: java.net.Socket) {
+            try {
+                client.soTimeout = 20_000
+                val reader = java.io.BufferedReader(
+                    java.io.InputStreamReader(client.getInputStream())
+                )
+                val requestLine = reader.readLine() ?: return
+                // Consume remaining headers
+                while (reader.readLine()?.isNotBlank() == true) {}
+
+                val parts = requestLine.split(" ")
+                if (parts.size < 2) { client.close(); return }
+                val method = parts[0]
+                val path = parts[1].substringBefore("?")
+
+                when {
+                    method == "OPTIONS" -> {
+                        val os = client.getOutputStream()
+                        os.write((
+                            "HTTP/1.1 200 OK\r\n" +
+                            "Access-Control-Allow-Origin: *\r\n" +
+                            "Access-Control-Allow-Methods: GET, HEAD, OPTIONS\r\n" +
+                            "Access-Control-Allow-Headers: *\r\n" +
+                            "Access-Control-Max-Age: 86400\r\n" +
+                            "Content-Length: 0\r\n" +
+                            "\r\n"
+                        ).toByteArray())
+                        os.flush()
+                    }
+                    path == "/stream.m3u8" || path.endsWith(".m3u8") -> {
+                        val body = rewrittenM3U8.toByteArray(Charsets.UTF_8)
+                        val os = client.getOutputStream()
+                        os.write("HTTP/1.1 200 OK\r\n".toByteArray())
+                        os.write("Content-Type: application/vnd.apple.mpegurl; charset=utf-8\r\n".toByteArray())
+                        os.write("Content-Length: ${body.size}\r\n".toByteArray())
+                        os.write("Access-Control-Allow-Origin: *\r\n".toByteArray())
+                        os.write("Connection: close\r\n".toByteArray())
+                        os.write("\r\n".toByteArray())
+                        os.write(body)
+                        os.flush()
+                    }
+                    path.startsWith("/s/") -> {
+                        val id = path.removePrefix("/s/")
+                        val origUrl = segMap[id]
+                        if (origUrl != null) {
+                            proxySegment(client, origUrl)
+                        } else {
+                            sendError(client, 404, "Segment not found")
+                        }
+                    }
+                    else -> sendError(client, 404, "Not found")
+                }
+            } catch (_: Exception) {} finally {
+                try { client.close() } catch (_: Exception) {}
+            }
+        }
+
+        /** Proxy a segment request to the actual server with proper auth headers */
+        private fun proxySegment(client: java.net.Socket, url: String) {
+            var conn: java.net.HttpURLConnection? = null
+            try {
+                conn = (java.net.URL(url).openConnection() as java.net.HttpURLConnection).apply {
+                    connectTimeout = 15_000
+                    readTimeout = 20_000
+                    instanceFollowRedirects = true
+                    segmentHeaders.forEach { (k, v) ->
+                        try { setRequestProperty(k, v) } catch (_: Exception) {}
+                    }
+                }
+
+                val code = conn.responseCode
+                when {
+                    code == 200 || code == 206 -> {
+                        val ct = conn.contentType ?: "video/mp2t"
+                        val len = conn.contentLength
+                        val os = client.getOutputStream()
+                        os.write("HTTP/1.1 200 OK\r\n".toByteArray())
+                        os.write("Content-Type: $ct\r\n".toByteArray())
+                        if (len > 0) os.write("Content-Length: $len\r\n".toByteArray())
+                        os.write("Access-Control-Allow-Origin: *\r\n".toByteArray())
+                        os.write("Connection: close\r\n".toByteArray())
+                        os.write("\r\n".toByteArray())
+
+                        val buf = ByteArray(16384)
+                        var read: Int
+                        conn.inputStream.use { inp ->
+                            while (inp.read(buf).also { read = it } != -1) {
+                                os.write(buf, 0, read)
+                            }
+                        }
+                        os.flush()
+                    }
+                    code in 300..399 -> {
+                        // Handle redirect — some CDNs redirect segments
+                        val loc = conn.getHeaderField("Location") ?: ""
+                        val os = client.getOutputStream()
+                        os.write("HTTP/1.1 302 Found\r\n".toByteArray())
+                        os.write("Location: $loc\r\n".toByteArray())
+                        os.write("Access-Control-Allow-Origin: *\r\n".toByteArray())
+                        os.write("Connection: close\r\n".toByteArray())
+                        os.write("\r\n".toByteArray())
+                        os.flush()
+                    }
+                    else -> sendError(client, code, "Upstream error: $code")
+                }
+            } catch (_: java.net.SocketException) {
+                // Client disconnected
+            } catch (_: Exception) {
+                try { sendError(client, 502, "Proxy error") } catch (_: Exception) {}
+            } finally {
+                conn?.disconnect()
+            }
+        }
+
+        private fun sendError(client: java.net.Socket, code: Int, msg: String = "") {
+            try {
+                val body = msg.toByteArray(Charsets.UTF_8)
+                val os = client.getOutputStream()
+                os.write("HTTP/1.1 $code\r\n".toByteArray())
+                os.write("Content-Type: text/plain\r\n".toByteArray())
+                os.write("Content-Length: ${body.size}\r\n".toByteArray())
+                os.write("Connection: close\r\n".toByteArray())
+                os.write("\r\n".toByteArray())
+                os.write(body)
+                os.flush()
+            } catch (_: Exception) {}
         }
 
         fun stop() {
             try { serverSocket?.close() } catch (_: Exception) {}
-            try { pool.shutdownNow() } catch (_: Exception) {}
         }
     }
 
@@ -573,113 +673,90 @@ if (origFetch) {
     ): Boolean {
         val epUrl = data.substringBefore("|")
 
-        // Step 1: get cookie from ajax/player
+        // Fetch episode page → find iframe URL (stream.googleapiscdn.com/player/...)
+        val epPageHtml = try { app.get(epUrl, headers = baseHeaders).text } catch (_: Exception) { "" }
+        val iframeUrl = Regex("""https://stream\.googleapiscdn\.com/player/[a-fA-F0-9?=&%+._-]+""")
+            .find(epPageHtml)?.value?.replace("&amp;", "&")
+
+        // Get cookie
         val epId = Regex("""-(\d+)\.html""").find(epUrl)?.groupValues?.get(1) ?: return true
+        val ajaxHdr = mapOf(
+            "User-Agent" to UA, "X-Requested-With" to "XMLHttpRequest",
+            "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
+            "Referer" to epUrl, "Origin" to mainUrl
+        )
         val cookie = try {
-            app.post("$mainUrl/ajax/player",
-                headers = mapOf("User-Agent" to UA, "X-Requested-With" to "XMLHttpRequest",
-                    "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
-                    "Referer" to epUrl, "Origin" to mainUrl),
+            app.post("$mainUrl/ajax/player", headers = ajaxHdr,
                 data = mapOf("episodeId" to epId, "backup" to "1"))
                 .cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
         } catch (_: Exception) { "" }
 
-        // Step 2: fetch episode page to find player iframe URL
-        val epHtml = try { app.get(epUrl, headers = baseHeaders + mapOf("Cookie" to cookie)).text }
-                     catch (_: Exception) { "" }
-
-        val iframeUrl = Regex("""https://stream\.googleapiscdn\.com/player/[a-zA-Z0-9]+""")
-            .find(epHtml)?.value
-
-        if (iframeUrl == null) {
-            // Fallback: try WebView approach
-            val avsJs = cachedAvsJs ?: fetchJs(
-                "$mainUrl/statics/default/js/pl.watchbk2.js?v=6.1.9", cookie
-            )?.also { cachedAvsJs = it } ?: return true
-            val m3u8Result = getM3U8(epUrl, epUrl, cookie, avsJs) ?: return true
-            if (m3u8Result.startsWith("DIRECT_URL::")) {
-                val playlistUrl = m3u8Result.removePrefix("DIRECT_URL::")
-                val playlistText = try { app.get(playlistUrl, headers = mapOf(
-                    "User-Agent" to UA, "Referer" to "https://stream.googleapiscdn.com/"
-                )).text } catch (_: Exception) { return true }
-                if (playlistText.contains("#EXTM3U"))
-                    servePlaylistViaProxy(playlistText, playlistUrl, callback)
-            }
-            return true
-        }
-
-        // Step 3: fetch player page via OkHttp to extract playlist URL + token
-        val playerHtml = try {
-            app.get(iframeUrl, headers = mapOf(
-                "User-Agent" to UA,
-                "Referer" to epUrl,
-                "Accept" to "text/html,*/*"
-            )).text
-        } catch (_: Exception) { return true }
-
-        // Playlist URL pattern: stream.googleapiscdn.com/playlist/{hash}/playlist.m3u8?token=...
-        val playlistUrl = Regex("""https://stream\.googleapiscdn\.com/playlist/[a-fA-F0-9]+/playlist\.m3u8\?token=[A-Za-z0-9._-]+""")
-            .find(playerHtml)?.value
-            // Also try JSON format: "url":"...playlist.m3u8?token=..."
-            ?: Regex(""""(?:url|src|file|hls)"\s*:\s*"(https://stream\.googleapiscdn\.com/playlist/[^"]+)"""")
-                .find(playerHtml)?.groupValues?.get(1)?.replace("\/", "/")
-
-        if (playlistUrl != null) {
-            // Step 4: fetch playlist content
-            val playlistText = try {
-                app.get(playlistUrl, headers = mapOf(
-                    "User-Agent" to UA,
-                    "Referer" to iframeUrl,
-                    "Origin" to "https://stream.googleapiscdn.com"
-                )).text
-            } catch (_: Exception) { return true }
-
-            if (playlistText.contains("#EXTM3U")) {
-                servePlaylistViaProxy(playlistText, playlistUrl, callback)
-                return true
-            }
-        }
-
-        // Step 5: fallback WebView if OkHttp couldn't get playlist
+        // Get player JS
         val avsJs = cachedAvsJs ?: fetchJs(
             "$mainUrl/statics/default/js/pl.watchbk2.js?v=6.1.9", cookie
         )?.also { cachedAvsJs = it } ?: return true
 
-        val m3u8Result = getM3U8(epUrl, iframeUrl, cookie, avsJs) ?: return true
-        val finalPlaylistUrl = if (m3u8Result.startsWith("DIRECT_URL::"))
-            m3u8Result.removePrefix("DIRECT_URL::")
-        else return true
+        // Load iframe URL directly — blob M3U8 is created in iframe context
+        val targetUrl = iframeUrl ?: epUrl
+        val m3u8Result = getM3U8(targetUrl, cookie, avsJs) ?: return true
 
-        val finalPlaylistText = try {
-            app.get(finalPlaylistUrl, headers = mapOf(
-                "User-Agent" to UA, "Referer" to "https://stream.googleapiscdn.com/"
-            )).text
-        } catch (_: Exception) { return true }
+        // ★ FIX: Build headers with cf_clearance cookie for segment proxying
+        val streamCookies = lastStreamCookies
+        val segHeaders = mutableMapOf(
+            "User-Agent" to UA,
+            "Referer" to "https://stream.googleapiscdn.com/player/",
+            "Origin" to "https://stream.googleapiscdn.com"
+        )
+        // Add cf_clearance cookie if available
+        if (streamCookies.isNotBlank()) {
+            segHeaders["Cookie"] = streamCookies
+        }
+        // Also add any cookies from ajax/player request
+        if (cookie.isNotBlank() && streamCookies.isBlank()) {
+            segHeaders["Cookie"] = cookie
+        }
 
-        if (finalPlaylistText.contains("#EXTM3U"))
-            servePlaylistViaProxy(finalPlaylistText, finalPlaylistUrl, callback)
-        return true
-    }
+        val m3u8Content: String
 
-    private fun servePlaylistViaProxy(
-        playlistText: String,
-        playlistUrl: String,
-        callback: suspend (ExtractorLink) -> Unit
-    ) {
+        if (m3u8Result.startsWith("DIRECT_URL::")) {
+            // ★ FIX: Fetch M3U8 content ourselves with proper auth, then proxy
+            val directM3u8Url = m3u8Result.removePrefix("DIRECT_URL::")
+            val fetchHeaders = mutableMapOf(
+                "User-Agent" to UA,
+                "Referer" to "https://stream.googleapiscdn.com/",
+                "Accept" to "*/*"
+            )
+            if (streamCookies.isNotBlank()) fetchHeaders["Cookie"] = streamCookies
+            else if (cookie.isNotBlank()) fetchHeaders["Cookie"] = cookie
+
+            m3u8Content = try {
+                app.get(directM3u8Url, headers = fetchHeaders).text
+            } catch (_: Exception) { "" }
+
+            if (!m3u8Content.contains("#EXTM3U")) return true
+        } else {
+            // Blob M3U8 content — still needs proxy for segments
+            m3u8Content = m3u8Result
+            if (!m3u8Content.contains("#EXTM3U")) return true
+        }
+
+        // ★ FIX: Always serve through StreamingProxyServer (handles both M3U8 + segments)
         localServer?.stop()
-        val server = PlaylistProxyServer(playlistText)
+        val server = StreamingProxyServer(m3u8Content, segHeaders)
         server.start()
         localServer = server
 
-        kotlinx.coroutines.GlobalScope.launch {
-            callback(newExtractorLink(
-                source = name, name = "$name - DU",
-                url = "http://127.0.0.1:${server.port}/playlist.m3u8",
-                type = ExtractorLinkType.M3U8
-            ) {
-                this.quality = Qualities.P1080.value
-                this.headers = mapOf("User-Agent" to UA)
-            })
-        }
+        callback(newExtractorLink(
+            source = name, name = "$name - Proxy",
+            url = "http://127.0.0.1:${server.port}/stream.m3u8",
+            type = ExtractorLinkType.M3U8
+        ) {
+            this.quality = Qualities.P1080.value
+            this.headers = mapOf(
+                "User-Agent" to UA,
+                "Referer" to "$mainUrl/"
+            )
+        })
+        return true
     }
 }

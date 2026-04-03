@@ -41,8 +41,8 @@ class AnimeVietSubProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA)
 
-    private val UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 " +
-            "(KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36"
+    // Cập nhật UA khớp với Chrome 137
+    private val UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36"
 
     private val baseHeaders = mapOf(
         "User-Agent" to UA,
@@ -211,37 +211,23 @@ class AnimeVietSubProvider : MainAPI() {
     }
 
     private fun buildBeautifulDescription(
-        altTitle: String?,
-        status: String?,
-        duration: String?,
-        quality: String?,
-        country: String?,
-        year: String?,
-        studio: String?,
-        followers: String?,
-        views: String?,
-        latestEps: String?,
-        genre: String?,
-        description: String?
+        altTitle: String?, status: String?, duration: String?, quality: String?,
+        country: String?, year: String?, studio: String?, followers: String?,
+        views: String?, latestEps: String?, genre: String?, description: String?
     ): String {
         return buildString {
             altTitle?.takeIf { it.isNotBlank() }?.let {
                 append("<font color='#AAAAAA'><i>$it</i></font><br><br>")
             }
-
             fun addInfo(icon: String, label: String, value: String?, color: String = "#FFFFFF") {
-                if (!value.isNullOrBlank()) {
-                    append("$icon <b>$label:</b> <font color='$color'>$value</font><br>")
-                }
+                if (!value.isNullOrBlank()) append("$icon <b>$label:</b> <font color='$color'>$value</font><br>")
             }
-
             val statusColor = when {
                 status?.contains("đang chiếu", ignoreCase = true) == true -> "#4CAF50"
                 status?.contains("hoàn thành", ignoreCase = true) == true -> "#2196F3"
                 status?.contains("sắp chiếu", ignoreCase = true) == true -> "#FF9800"
                 else -> "#2196F3"
             }
-
             addInfo("📺", "Trạng thái", status, statusColor)
             addInfo("⏱", "Thời lượng", duration)
             addInfo("🎬", "Chất lượng", quality?.ifBlank { null }, "#E91E63")
@@ -263,6 +249,7 @@ class AnimeVietSubProvider : MainAPI() {
 
     private val blobInterceptor = """
 ;(function(){
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
 var _oc=URL.createObjectURL;
 URL.createObjectURL=function(b){
 var u=_oc.apply(this,arguments);
@@ -283,6 +270,7 @@ window.adsbygoogle.push=function(){};
     inner class M3U8Bridge {
         @Volatile var result: String? = null     // blob M3U8 content
         @Volatile var m3u8Url: String? = null    // direct playlist URL
+        @Volatile var iframeUrl: String? = null  // captured referer
 
         @JavascriptInterface
         fun onM3U8(content: String) {
@@ -293,7 +281,6 @@ window.adsbygoogle.push=function(){};
     suspend fun prefetchAvsJs() {
         if (cachedAvsJs != null) return
         try {
-            // Auto-detect player JS from page HTML first
             val pageHtml = try { app.get("$mainUrl/", headers = baseHeaders).text } catch(_: Exception) { "" }
             val detectedPath = Regex("""statics/default/js/((?:pl\.watchbk\d+|avs\.watch)\.js\?v=[0-9.]+)""")
                 .find(pageHtml)?.groupValues?.get(1)
@@ -310,7 +297,6 @@ window.adsbygoogle.push=function(){};
     }
 
     private suspend fun fetchJs(url: String, cookie: String): String? {
-        // Try provided URL first
         try {
             val resp = app.get(url, headers = mapOf(
                 "User-Agent" to UA, "Referer" to "$mainUrl/",
@@ -318,7 +304,6 @@ window.adsbygoogle.push=function(){};
             ))
             if (resp.text.length > 500) return resp.text
         } catch (_: Exception) {}
-        // Auto-detect from page HTML
         return try {
             val html = app.get("$mainUrl/", headers = baseHeaders).text
             val path = Regex("""statics/default/js/((?:pl\.watchbk\d+|avs\.watch)\.js\?v=[0-9.]+)""")
@@ -331,12 +316,11 @@ window.adsbygoogle.push=function(){};
     }
 
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun getM3U8(epUrl: String, cookie: String, avsJs: String): String? {
+    private suspend fun getM3U8(epUrl: String, cookie: String, avsJs: String): M3U8Bridge? {
         return withContext(Dispatchers.Main) {
             withTimeoutOrNull(30_000L) {
                 suspendCancellableCoroutine { cont ->
-                    val ctx = try { AcraApplication.context }
-                    catch (_: Exception) { null }
+                    val ctx = try { AcraApplication.context } catch (_: Exception) { null }
                     if (ctx == null) { cont.resume(null); return@suspendCancellableCoroutine }
 
                     val bridge = M3U8Bridge()
@@ -358,8 +342,7 @@ window.adsbygoogle.push=function(){};
                         userAgentString = UA
                         mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                     }
-                    android.webkit.CookieManager.getInstance()
-                        .setAcceptThirdPartyCookies(wv, true)
+                    android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
                     wv.addJavascriptInterface(bridge, "Android")
 
                     val patchedAvsJs = blobInterceptor + "\n" + avsJs
@@ -367,89 +350,82 @@ window.adsbygoogle.push=function(){};
                     val fakeAdsBytes = fakeAds.toByteArray(Charsets.UTF_8)
 
                     wv.webViewClient = object : WebViewClient() {
-                        override fun shouldInterceptRequest(
-                            view: WebView,
-                            request: WebResourceRequest
-                        ): WebResourceResponse? {
+                        override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                             val url = request.url.toString()
+                            
+                            // Bắt chính xác link iframe player để làm Referer
+                            if (url.contains("googleapiscdn.com/player/")) {
+                                bridge.iframeUrl = url
+                            }
+                            
+                            // Bắt link m3u8 và chôm luôn Referer từ request header của nó
+                            if (url.contains("googleapiscdn.com/playlist/") && url.contains(".m3u8")) {
+                                bridge.m3u8Url = url
+                                val ref = request.requestHeaders?.get("Referer") ?: request.requestHeaders?.get("referer")
+                                if (ref != null) bridge.iframeUrl = ref
+                                return null
+                            }
+                            
                             return when {
                                 url.contains("watchbk") || url.contains("avs.watch") -> WebResourceResponse(
-                                    "application/javascript", "utf-8",
-                                    ByteArrayInputStream(avsJsBytes)
+                                    "application/javascript", "utf-8", ByteArrayInputStream(avsJsBytes)
                                 )
-                                // Capture direct M3U8 URL from player
-                                url.contains("googleapiscdn.com/playlist/") && url.contains(".m3u8") -> {
-                                    bridge.m3u8Url = url
-                                    null // let the request proceed normally
-                                }
-                                url.contains("adsbygoogle") ||
-                                        url.contains("googlesyndication") -> WebResourceResponse(
-                                    "application/javascript", "utf-8",
-                                    ByteArrayInputStream(fakeAdsBytes)
+                                url.contains("adsbygoogle") || url.contains("googlesyndication") -> WebResourceResponse(
+                                    "application/javascript", "utf-8", ByteArrayInputStream(fakeAdsBytes)
                                 )
-                                url.contains("google-analytics") ||
-                                        url.contains("doubleclick") ||
-                                        url.contains("googletagmanager") ||
-                                        url.contains("facebook.com") ||
-                                        url.contains("hotjar") ||
-                                        url.contains("disqus") -> WebResourceResponse(
-                                    "application/javascript", "utf-8",
-                                    ByteArrayInputStream("".toByteArray())
+                                url.contains("google-analytics") || url.contains("doubleclick") ||
+                                url.contains("googletagmanager") || url.contains("facebook.com") ||
+                                url.contains("hotjar") || url.contains("disqus") -> WebResourceResponse(
+                                    "application/javascript", "utf-8", ByteArrayInputStream("".toByteArray())
                                 )
-                                url.endsWith(".woff") || url.endsWith(".woff2") ||
-                                        url.endsWith(".ttf") || url.endsWith(".eot") ||
-                                        (url.endsWith(".css") && !url.contains(mainUrl)) -> WebResourceResponse(
-                                    "text/css", "utf-8",
-                                    ByteArrayInputStream("".toByteArray())
+                                url.endsWith(".woff") || url.endsWith(".woff2") || url.endsWith(".ttf") || 
+                                url.endsWith(".eot") || (url.endsWith(".css") && !url.contains(mainUrl)) -> WebResourceResponse(
+                                    "text/css", "utf-8", ByteArrayInputStream("".toByteArray())
                                 )
-                                url.endsWith(".png") || url.endsWith(".jpg") ||
-                                        url.endsWith(".jpeg") || url.endsWith(".gif") ||
-                                        url.endsWith(".webp") || url.endsWith(".svg") -> WebResourceResponse(
-                                    "image/png", "utf-8",
-                                    ByteArrayInputStream("".toByteArray())
+                                url.endsWith(".png") || url.endsWith(".jpg") || url.endsWith(".jpeg") || 
+                                url.endsWith(".gif") || url.endsWith(".webp") || url.endsWith(".svg") -> WebResourceResponse(
+                                    "image/png", "utf-8", ByteArrayInputStream("".toByteArray())
                                 )
                                 else -> null
                             }
                         }
+
+                        override fun onPageFinished(view: WebView?, url: String?) {
+                            // Tự động click nút Play nếu có để kích hoạt load m3u8
+                            view?.evaluateJavascript("""
+                                setInterval(function() {
+                                    var btn = document.querySelector('.jw-icon-display, .vjs-big-play-button, .play-btn');
+                                    if(btn) btn.click();
+                                }, 1000);
+                            """.trimIndent(), null)
+                        }
                     }
 
-                    wv.loadUrl(epUrl, mapOf(
-                        "Accept-Language" to "vi-VN,vi;q=0.9",
-                        "Referer" to "$mainUrl/"
-                    ))
+                    wv.loadUrl(epUrl, mapOf("Accept-Language" to "vi-VN,vi;q=0.9", "Referer" to "$mainUrl/"))
 
                     val handler = android.os.Handler(android.os.Looper.getMainLooper())
                     var elapsed = 0
                     val checker = object : Runnable {
                         override fun run() {
-                            // Priority: direct URL > blob content
-                            val directUrl = bridge.m3u8Url
-                            val blobContent = bridge.result
-                            when {
-                                directUrl != null -> {
-                                    wv.stopLoading(); wv.destroy()
-                                    // Return special marker so caller knows it's a URL
-                                    if (cont.isActive) cont.resume("DIRECT_URL::$directUrl")
-                                }
-                                blobContent != null -> {
-                                    wv.stopLoading(); wv.destroy()
-                                    if (cont.isActive) cont.resume(blobContent)
-                                }
-                                elapsed >= 25_000 -> {
-                                    wv.stopLoading(); wv.destroy()
-                                    if (cont.isActive) cont.resume(null)
-                                }
-                                else -> {
-                                    elapsed += 200
-                                    handler.postDelayed(this, 200)
-                                }
+                            if (bridge.m3u8Url != null || bridge.result != null) {
+                                wv.stopLoading()
+                                wv.destroy()
+                                if (cont.isActive) cont.resume(bridge)
+                            } else if (elapsed >= 25_000) {
+                                wv.stopLoading()
+                                wv.destroy()
+                                if (cont.isActive) cont.resume(bridge)
+                            } else {
+                                elapsed += 200
+                                handler.postDelayed(this, 200)
                             }
                         }
                     }
                     handler.postDelayed(checker, 800)
                     cont.invokeOnCancellation {
                         handler.removeCallbacks(checker)
-                        wv.stopLoading(); wv.destroy()
+                        wv.stopLoading()
+                        wv.destroy()
                     }
                 }
             }
@@ -458,6 +434,7 @@ window.adsbygoogle.push=function(){};
 
     private var localServer: LocalM3U8Server? = null
 
+    // Nâng cấp Local Server: Hỗ trợ đa luồng và chống ngắt kết nối sớm
     inner class LocalM3U8Server(private val m3u8Content: String) {
         private var serverSocket: java.net.ServerSocket? = null
         val port: Int get() = serverSocket?.localPort ?: 0
@@ -467,21 +444,29 @@ window.adsbygoogle.push=function(){};
             Thread {
                 try {
                     val ss = serverSocket ?: return@Thread
-                    repeat(10) {
+                    while (!ss.isClosed) {
                         try {
                             val client = ss.accept()
-                            client.getInputStream().bufferedReader().readLine()
-                            val body = m3u8Content.toByteArray(Charsets.UTF_8)
-                            val crlf = "\r\n"
-                            val response = "HTTP/1.1 200 OK${crlf}" +
-                                    "Content-Type: application/vnd.apple.mpegurl${crlf}" +
-                                    "Content-Length: ${body.size}${crlf}" +
-                                    "Access-Control-Allow-Origin: *${crlf}" +
-                                    crlf
-                            client.getOutputStream().write(response.toByteArray())
-                            client.getOutputStream().write(body)
-                            client.getOutputStream().flush()
-                            client.close()
+                            Thread {
+                                try {
+                                    client.getInputStream().bufferedReader().readLine()
+                                    val body = m3u8Content.toByteArray(Charsets.UTF_8)
+                                    val crlf = "\r\n"
+                                    val response = "HTTP/1.1 200 OK${crlf}" +
+                                            "Content-Type: application/vnd.apple.mpegurl${crlf}" +
+                                            "Content-Length: ${body.size}${crlf}" +
+                                            "Access-Control-Allow-Origin: *${crlf}" +
+                                            "Connection: close${crlf}" +
+                                            crlf
+                                    val out = client.getOutputStream()
+                                    out.write(response.toByteArray())
+                                    out.write(body)
+                                    out.flush()
+                                    // Đợi 500ms để ExoPlayer kịp đọc hết data trước khi đóng socket
+                                    Thread.sleep(500)
+                                    client.close()
+                                } catch (_: Exception) {}
+                            }.start()
                         } catch (_: Exception) {}
                     }
                 } catch (_: Exception) {}
@@ -501,12 +486,6 @@ window.adsbygoogle.push=function(){};
     ): Boolean {
         val epUrl = data.substringBefore("|")
 
-        // Fetch episode page → find iframe URL (stream.googleapiscdn.com/player/...)
-        val epPageHtml = try { app.get(epUrl, headers = baseHeaders).text } catch (_: Exception) { "" }
-        val iframeUrl = Regex("""https://stream\.googleapiscdn\.com/player/[a-fA-F0-9?=&%+._-]+""")
-            .find(epPageHtml)?.value?.replace("&amp;", "&")
-
-        // Get cookie
         val epId = Regex("""-(\d+)\.html""").find(epUrl)?.groupValues?.get(1) ?: return true
         val ajaxHdr = mapOf(
             "User-Agent" to UA, "X-Requested-With" to "XMLHttpRequest",
@@ -519,57 +498,66 @@ window.adsbygoogle.push=function(){};
                 .cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
         } catch (_: Exception) { "" }
 
-        // Get player JS
         val avsJs = cachedAvsJs ?: fetchJs(
             "$mainUrl/statics/default/js/pl.watchbk2.js?v=6.1.9", cookie
         )?.also { cachedAvsJs = it } ?: return true
 
-        // Load iframe URL directly — blob M3U8 is created in iframe context
-        val targetUrl = iframeUrl ?: epUrl
-        val m3u8Result = getM3U8(targetUrl, cookie, avsJs) ?: return true
+        val bridge = getM3U8(epUrl, cookie, avsJs) ?: return true
 
-        // 1. Lấy Cookie của stream.googleapiscdn.com (chứa cf_clearance) từ WebView
-        val streamCookie = android.webkit.CookieManager.getInstance().getCookie("https://stream.googleapiscdn.com") ?: ""
+        val m3u8Url = bridge.m3u8Url
+        val blobContent = bridge.result
         
-        // 2. Lấy Referer chuẩn xác nhất
-        val refererUrl = iframeUrl ?: "https://stream.googleapiscdn.com/"
+        // Lấy Referer chuẩn xác 100% từ WebView
+        val refererUrl = bridge.iframeUrl ?: "https://stream.googleapiscdn.com/"
+        
+        // Lấy Cookie cf_clearance
+        val streamCookie = android.webkit.CookieManager.getInstance().getCookie("https://stream.googleapiscdn.com") ?: ""
 
-        // 3. Tạo bộ Headers đầy đủ cho ExoPlayer
+        // Bơm toàn bộ Header bảo mật chuẩn 2026
         val streamHeaders = mapOf(
             "User-Agent" to UA,
             "Referer" to refererUrl,
             "Origin" to "https://stream.googleapiscdn.com",
+            "Accept" to "*/*",
+            "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Sec-Fetch-Dest" to "empty",
+            "Sec-Fetch-Mode" to "cors",
+            "Sec-Fetch-Site" to "same-origin",
+            "Sec-Ch-Ua" to "\"Chromium\";v=\"137\", \"Not/A)Brand\";v=\"24\"",
+            "Sec-Ch-Ua-Mobile" to "?1",
+            "Sec-Ch-Ua-Platform" to "\"Android\"",
             "Cookie" to streamCookie
         )
 
-        if (m3u8Result.startsWith("DIRECT_URL::")) {
-            // Direct playlist URL - serve to ExoPlayer with token header
-            val directM3u8Url = m3u8Result.removePrefix("DIRECT_URL::")
-            callback(newExtractorLink(
-                source = name, 
-                name = "$name - HD",
-                url = directM3u8Url,
-                type = ExtractorLinkType.M3U8
-            ) {
-                this.quality = Qualities.P1080.value
-                this.headers = streamHeaders
-            })
-        } else {
-            // Blob M3U8 content - serve via local proxy
+        if (m3u8Url != null) {
+            callback(
+                ExtractorLink(
+                    source = name,
+                    name = "$name - HD",
+                    url = m3u8Url,
+                    referer = refererUrl,
+                    quality = Qualities.P1080.value,
+                    type = ExtractorLinkType.M3U8,
+                    headers = streamHeaders
+                )
+            )
+        } else if (blobContent != null) {
             localServer?.stop()
-            val server = LocalM3U8Server(m3u8Result)
+            val server = LocalM3U8Server(blobContent)
             server.start()
             localServer = server
 
-            callback(newExtractorLink(
-                source = name, 
-                name = "$name - HD",
-                url = "http://127.0.0.1:${server.port}/stream.m3u8",
-                type = ExtractorLinkType.M3U8
-            ) {
-                this.quality = Qualities.P1080.value
-                this.headers = streamHeaders
-            })
+            callback(
+                ExtractorLink(
+                    source = name,
+                    name = "$name - HD",
+                    url = "http://127.0.0.1:${server.port}/stream.m3u8",
+                    referer = refererUrl,
+                    quality = Qualities.P1080.value,
+                    type = ExtractorLinkType.M3U8,
+                    headers = streamHeaders
+                )
+            )
         }
         return true
     }

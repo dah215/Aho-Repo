@@ -394,22 +394,26 @@ window.adsbygoogle.push=function(){};
                         override fun run() {
                             when {
                                 bridge.m3u8Url != null || bridge.m3u8Content != null -> {
-                                    try {
-                                        val c1 = CookieManager.getInstance().getCookie("https://stream.googleapiscdn.com") ?: ""
-                                        val c2 = CookieManager.getInstance().getCookie("http://stream.googleapiscdn.com") ?: ""
-                                        val c3 = CookieManager.getInstance().getCookie("https://animevietsub.id") ?: ""
-                                        lastStreamCookies = listOf(c1, c2, c3, cookie)
-                                            .filter { it.isNotBlank() }.distinct().joinToString("; ")
-                                    } catch (_: Exception) {}
+                                    // ★ Delay 1.5s để JS hoàn thành, cookies được set,
+                                    // nhưng KHÔNG destroy WebView (giữ alive cho segment fetch)
+                                    handler.postDelayed({
+                                        try {
+                                            val c1 = CookieManager.getInstance().getCookie("https://stream.googleapiscdn.com") ?: ""
+                                            val c2 = CookieManager.getInstance().getCookie("http://stream.googleapiscdn.com") ?: ""
+                                            val c3 = CookieManager.getInstance().getCookie("https://animevietsub.id") ?: ""
+                                            lastStreamCookies = listOf(c1, c2, c3, cookie)
+                                                .filter { it.isNotBlank() }.distinct().joinToString("; ")
+                                        } catch (_: Exception) {}
 
-                                    wv.stopLoading()
-                                    // ★ v4: KHÔNG destroy WebView — giữ alive cho segment fetch
-                                    activeWebView = wv
-                                    activeBridge = bridge
+                                        wv.stopLoading()
+                                        // ★ v4: KHÔNG destroy WebView — giữ alive cho segment fetch
+                                        activeWebView = wv
+                                        activeBridge = bridge
 
-                                    val res = bridge.m3u8Url?.let { "DIRECT_URL::$it" }
-                                        ?: bridge.m3u8Content
-                                    if (cont.isActive) cont.resume(res to (wv as WebView?))
+                                        val res = bridge.m3u8Url?.let { "DIRECT_URL::$it" }
+                                            ?: bridge.m3u8Content
+                                        if (cont.isActive) cont.resume(res to (wv as WebView?))
+                                    }, 1500)
                                 }
                                 elapsed >= 25_000 -> {
                                     wv.stopLoading(); wv.destroy()

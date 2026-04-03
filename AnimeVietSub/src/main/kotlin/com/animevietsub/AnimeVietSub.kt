@@ -41,7 +41,6 @@ class AnimeVietSubProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA)
 
-    // Cập nhật UA khớp với Chrome 137
     private val UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36"
 
     private val baseHeaders = mapOf(
@@ -358,12 +357,15 @@ window.adsbygoogle.push=function(){};
                                 bridge.iframeUrl = url
                             }
                             
-                            // Bắt link m3u8 và chôm luôn Referer từ request header của nó
+                            // Bắt link m3u8 và CHẶN KHÔNG CHO WEBVIEW TẢI để bảo toàn Token cho ExoPlayer
                             if (url.contains("googleapiscdn.com/playlist/") && url.contains(".m3u8")) {
-                                bridge.m3u8Url = url
-                                val ref = request.requestHeaders?.get("Referer") ?: request.requestHeaders?.get("referer")
-                                if (ref != null) bridge.iframeUrl = ref
-                                return null
+                                if (bridge.m3u8Url == null) {
+                                    bridge.m3u8Url = url
+                                    val ref = request.requestHeaders?.get("Referer") ?: request.requestHeaders?.get("referer")
+                                    if (ref != null) bridge.iframeUrl = ref
+                                }
+                                // Trả về file rỗng để WebView không tiêu thụ mất Token
+                                return WebResourceResponse("application/vnd.apple.mpegurl", "utf-8", ByteArrayInputStream("".toByteArray()))
                             }
                             
                             return when {
@@ -391,7 +393,6 @@ window.adsbygoogle.push=function(){};
                         }
 
                         override fun onPageFinished(view: WebView?, url: String?) {
-                            // Tự động click nút Play nếu có để kích hoạt load m3u8
                             view?.evaluateJavascript("""
                                 setInterval(function() {
                                     var btn = document.querySelector('.jw-icon-display, .vjs-big-play-button, .play-btn');
@@ -434,7 +435,6 @@ window.adsbygoogle.push=function(){};
 
     private var localServer: LocalM3U8Server? = null
 
-    // Nâng cấp Local Server: Hỗ trợ đa luồng và chống ngắt kết nối sớm
     inner class LocalM3U8Server(private val m3u8Content: String) {
         private var serverSocket: java.net.ServerSocket? = null
         val port: Int get() = serverSocket?.localPort ?: 0
@@ -462,7 +462,6 @@ window.adsbygoogle.push=function(){};
                                     out.write(response.toByteArray())
                                     out.write(body)
                                     out.flush()
-                                    // Đợi 500ms để ExoPlayer kịp đọc hết data trước khi đóng socket
                                     Thread.sleep(500)
                                     client.close()
                                 } catch (_: Exception) {}
@@ -507,14 +506,10 @@ window.adsbygoogle.push=function(){};
         val m3u8Url = bridge.m3u8Url
         val blobContent = bridge.result
         
-        // Lấy Referer chuẩn xác 100% từ WebView
         val refererUrl = bridge.iframeUrl ?: "https://stream.googleapiscdn.com/"
-        
-        // Lấy Cookie cf_clearance
         val streamCookie = android.webkit.CookieManager.getInstance().getCookie("https://stream.googleapiscdn.com") ?: ""
 
-        // Bơm toàn bộ Header bảo mật chuẩn 2026
-        val streamHeaders = mapOf(
+        val streamHeaders = mutableMapOf(
             "User-Agent" to UA,
             "Referer" to refererUrl,
             "Origin" to "https://stream.googleapiscdn.com",
@@ -525,9 +520,11 @@ window.adsbygoogle.push=function(){};
             "Sec-Fetch-Site" to "same-origin",
             "Sec-Ch-Ua" to "\"Chromium\";v=\"137\", \"Not/A)Brand\";v=\"24\"",
             "Sec-Ch-Ua-Mobile" to "?1",
-            "Sec-Ch-Ua-Platform" to "\"Android\"",
-            "Cookie" to streamCookie
+            "Sec-Ch-Ua-Platform" to "\"Android\""
         )
+        if (streamCookie.isNotEmpty()) {
+            streamHeaders["Cookie"] = streamCookie
+        }
 
         if (m3u8Url != null) {
             callback(
@@ -537,7 +534,7 @@ window.adsbygoogle.push=function(){};
                     url = m3u8Url,
                     referer = refererUrl,
                     quality = Qualities.P1080.value,
-                    type = ExtractorLinkType.M3U8,
+                    isM3u8 = true, // Đã fix lỗi API prerelease
                     headers = streamHeaders
                 )
             )
@@ -554,7 +551,7 @@ window.adsbygoogle.push=function(){};
                     url = "http://127.0.0.1:${server.port}/stream.m3u8",
                     referer = refererUrl,
                     quality = Qualities.P1080.value,
-                    type = ExtractorLinkType.M3U8,
+                    isM3u8 = true, // Đã fix lỗi API prerelease
                     headers = streamHeaders
                 )
             )

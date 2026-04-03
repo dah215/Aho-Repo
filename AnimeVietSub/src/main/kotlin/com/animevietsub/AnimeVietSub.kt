@@ -435,6 +435,7 @@ window.adsbygoogle.push=function(){};
 
     private var localServer: LocalM3U8Server? = null
 
+    // Nâng cấp Local Server: Hỗ trợ đa luồng và chống ngắt kết nối sớm
     inner class LocalM3U8Server(private val m3u8Content: String) {
         private var serverSocket: java.net.ServerSocket? = null
         val port: Int get() = serverSocket?.localPort ?: 0
@@ -462,6 +463,7 @@ window.adsbygoogle.push=function(){};
                                     out.write(response.toByteArray())
                                     out.write(body)
                                     out.flush()
+                                    // Đợi 500ms để ExoPlayer kịp đọc hết data trước khi đóng socket
                                     Thread.sleep(500)
                                     client.close()
                                 } catch (_: Exception) {}
@@ -506,9 +508,13 @@ window.adsbygoogle.push=function(){};
         val m3u8Url = bridge.m3u8Url
         val blobContent = bridge.result
         
+        // Lấy Referer chuẩn xác 100% từ WebView
         val refererUrl = bridge.iframeUrl ?: "https://stream.googleapiscdn.com/"
+        
+        // Lấy Cookie cf_clearance
         val streamCookie = android.webkit.CookieManager.getInstance().getCookie("https://stream.googleapiscdn.com") ?: ""
 
+        // Bơm toàn bộ Header bảo mật chuẩn 2026
         val streamHeaders = mutableMapOf(
             "User-Agent" to UA,
             "Referer" to refererUrl,
@@ -528,13 +534,13 @@ window.adsbygoogle.push=function(){};
 
         if (m3u8Url != null) {
             callback(
-                ExtractorLink(
+                newExtractorLink(
                     source = name,
                     name = "$name - HD",
                     url = m3u8Url,
                     referer = refererUrl,
                     quality = Qualities.P1080.value,
-                    isM3u8 = true, // Đã fix lỗi API prerelease
+                    isM3u8 = true,
                     headers = streamHeaders
                 )
             )
@@ -545,13 +551,13 @@ window.adsbygoogle.push=function(){};
             localServer = server
 
             callback(
-                ExtractorLink(
+                newExtractorLink(
                     source = name,
                     name = "$name - HD",
                     url = "http://127.0.0.1:${server.port}/stream.m3u8",
                     referer = refererUrl,
                     quality = Qualities.P1080.value,
-                    isM3u8 = true, // Đã fix lỗi API prerelease
+                    isM3u8 = true,
                     headers = streamHeaders
                 )
             )

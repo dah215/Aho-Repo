@@ -28,19 +28,18 @@ import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
 
 /**
- * AnimeVietSub Plugin v6 — Fix Error 2004 (ROOT CAUSE FOUND)
+ * AnimeVietSub Plugin v7 — Fix Error 2004
  *
- * ROOT CAUSE (from network capture analysis):
- *   1. stream.googleapiscdn.com KHÔNG có CORS headers → XHR cross-origin bị block
- *   2. WebView trên animevietsub.id → XHR tới stream.googleapiscdn.com = cross-origin → FAIL
- *   3. xhr.withCredentials = true thiếu → cf_clearance không được gửi
+ * Root cause (confirmed by network capture):
+ *   - stream.googleapiscdn.com KHÔNG có CORS headers
+ *   - XHR cross-origin bị block hoàn toàn
  *
- * v6 fix:
- *   - WebView PHẢI navigate trực tiếp tới stream.googleapiscdn.com/player/{token}
- *   - Tất cả XHR giờ là same-origin → không cần CORS
- *   - xhr.withCredentials = true cho mọi request
- *   - M3U8 re-fetch cũng qua WebView XHR (không dùng app.get() cho googleapiscdn.com)
- *   - Không inject player JS khi ở trên stream.googleapiscdn.com
+ * Strategy:
+ *   Phase 1: Load episode page (animevietsub.id) → inject playerJs + blobInterceptor
+ *            → shouldInterceptRequest bắt M3U8 URL → lấy cookies
+ *   Phase 2: Navigate WebView tới player URL (stream.googleapiscdn.com)
+ *            → giờ XHR là same-origin → withCredentials gửi cookies
+ *   Phase 3: Proxy dùng WebView XHR cho M3U8 refresh + segment fetch
  */
 @CloudstreamPlugin
 class AnimeVietSubPlugin : Plugin() {
@@ -211,35 +210,6 @@ class AnimeVietSubProvider : MainAPI() {
     // JavaScript injections
     // ================================================================
 
-    /**
-     * ★ Network interceptor — intercept fetch() và XHR để bắt M3U8 URL
-     */
-    private val networkInterceptor = """
-;(function(){
-function rp(url){
-    if(url && (url.indexOf('.m3u8')!==-1 || url.indexOf('mpegurl')!==-1 ||
-       url.indexOf('googleapiscdn.com/playlist')!==-1 || url.indexOf('googleapiscdn.com/video')!==-1)){
-        try{Android.onM3U8Url(url);}catch(x){}
-    }
-}
-var _fetch=window.fetch;
-if(_fetch){
-    window.fetch=function(){
-        if(arguments.length>0 && typeof arguments[0]==='string') rp(arguments[0]);
-        else if(arguments[0] && arguments[0].url) rp(arguments[0].url);
-        return _fetch.apply(this,arguments);
-    };
-}
-var _xo=XMLHttpRequest.prototype.open;
-if(_xo){
-    XMLHttpRequest.prototype.open=function(m,u){
-        if(typeof u==='string') rp(u);
-        return _xo.apply(this,arguments);
-    };
-}
-})();
-""".trimIndent()
-
     /** Blob interceptor — catch M3U8 content from URL.createObjectURL */
     private val blobInterceptor = """
 ;(function(){var _oc=URL.createObjectURL;URL.createObjectURL=function(b){var u=_oc.apply(this,arguments);
@@ -248,91 +218,102 @@ r.onload=function(e){try{Android.onM3U8(e.target.result);}catch(x){}};
 r.readAsText(b);}}catch(x){}return u;};})();
 """.trimIndent()
 
+    /**
+     * ★ Network interceptor — catch M3U8 URL via fetch() and XHR
+     * Injected via evaluateJavascript (not shouldInterceptRequest)
+     */
+    private val networkInterceptor = """
+;(function(){
+function rp(url){
+    if(url&&(url.indexOf('.m3u8')!==-1||url.indexOf('mpegurl')!==-1||
+       url.indexOf('/playlist/')!==-1||url.indexOf('/video/')!==-1)){
+        try{Android.onM3U8Url(url);}catch(x){}
+    }
+}
+var _f=window.fetch;
+if(_f)window.fetch=function(){
+    if(arguments.length>0&&typeof arguments[0]==='string')rp(arguments[0]);
+    else if(arguments[0]&&arguments[0].url)rp(arguments[0].url);
+    return _f.apply(this,arguments);
+};
+var _x=XMLHttpRequest.prototype.open;
+if(_x)XMLHttpRequest.prototype.open=function(m,u){
+    if(typeof u==='string')rp(u);
+    return _x.apply(this,arguments);
+};
+})();
+""".trimIndent()
+
     private val fakeAds = """
 window.adsbygoogle=window.adsbygoogle||[];window.adsbygoogle.loaded=true;
 window.adsbygoogle.push=function(){};
 """.trimIndent()
 
     // ================================================================
-    // JsBridge — JS↔Kotlin bridge cho text + binary transfer
+    // JsBridge
     // ================================================================
     inner class JsBridge {
         @Volatile var m3u8Content: String? = null
         @Volatile var m3u8Url: String? = null
+        @Volatile var pageLoaded: Boolean = false
         private val pending = ConcurrentHashMap<String, PendingReq>()
 
         inner class PendingReq {
             val latch = CountDownLatch(1)
-            @Volatile var data: ByteArray? = null       // for binary
-            @Volatile var text: String? = null          // for text
+            @Volatile var data: ByteArray? = null
+            @Volatile var text: String? = null
             @Volatile var error: String? = null
             @Volatile var done = false
             private val chunks = ConcurrentHashMap<Int, String>()
-            @Volatile var chunkTotal: Int = -1
+            @Volatile private var chunkTotal: Int = -1
 
             @Synchronized fun addChunk(idx: Int, chunk: String) {
                 chunks[idx] = chunk
-                if (chunkTotal > 0 && chunks.size >= chunkTotal) finishWithBinary()
+                if (chunkTotal > 0 && chunks.size >= chunkTotal) finishBinary()
             }
 
             @Synchronized fun setTotalChunks(n: Int) {
                 chunkTotal = n
-                if (n > 0 && chunks.size >= n) finishWithBinary()
+                if (n > 0 && chunks.size >= n) finishBinary()
             }
 
-            @Synchronized fun finishWithBinary() {
+            @Synchronized fun finishBinary() {
                 if (!done) {
                     done = true
-                    if (data == null) {
-                        val keys = chunks.keys.sorted()
-                        val full = keys.joinToString("") { chunks[it] ?: "" }
-                        data = try { android.util.Base64.decode(full, android.util.Base64.DEFAULT) }
-                        catch (e: Exception) { null }
-                    }
+                    val keys = chunks.keys.sorted()
+                    val full = keys.joinToString("") { chunks[it] ?: "" }
+                    data = try { android.util.Base64.decode(full, android.util.Base64.DEFAULT) }
+                    catch (e: Exception) { null }
                     latch.countDown()
                 }
             }
 
-            @Synchronized fun finishWithText(t: String) {
+            @Synchronized fun finishText(t: String) {
                 if (!done) { done = true; text = t; latch.countDown() }
             }
 
-            @Synchronized fun finishWithError(msg: String) {
+            @Synchronized fun finishError(msg: String) {
                 if (!done) { done = true; error = msg; latch.countDown() }
             }
         }
 
-        @JavascriptInterface
-        fun onM3U8(content: String) {
+        @JavascriptInterface fun onM3U8(content: String) {
             if (content.contains("#EXTM3U")) m3u8Content = content
         }
 
-        @JavascriptInterface
-        fun onM3U8Url(url: String) {
+        @JavascriptInterface fun onM3U8Url(url: String) {
             if (url.contains("m3u8") || url.contains("googleapiscdn")) m3u8Url = url
         }
 
-        @JavascriptInterface
-        fun onReqStart(id: String, total: Int) { pending[id]?.setTotalChunks(total) }
+        @JavascriptInterface fun onPageReady() { pageLoaded = true }
 
-        @JavascriptInterface
-        fun onReqChunk(id: String, index: Int, b64: String) { pending[id]?.addChunk(index, b64) }
+        @JavascriptInterface fun onReqStart(id: String, total: Int) { pending[id]?.setTotalChunks(total) }
+        @JavascriptInterface fun onReqChunk(id: String, index: Int, b64: String) { pending[id]?.addChunk(index, b64) }
+        @JavascriptInterface fun onReqDone(id: String) { pending[id]?.finishBinary() }
+        @JavascriptInterface fun onReqError(id: String, msg: String) { pending[id]?.finishError(msg) }
+        @JavascriptInterface fun onTextDone(id: String, txt: String) { pending[id]?.finishText(txt) }
 
-        @JavascriptInterface
-        fun onReqDone(id: String) { pending[id]?.finishWithBinary() }
-
-        @JavascriptInterface
-        fun onReqError(id: String, msg: String) { pending[id]?.finishWithError(msg) }
-
-        @JavascriptInterface
-        fun onTextDone(id: String, txt: String) { pending[id]?.finishWithText(txt) }
-
-        fun prepare(id: String): PendingReq {
-            val p = PendingReq()
-            pending[id] = p
-            return p
-        }
-
+        fun prepare(id: String): PendingReq { val p = PendingReq(); pending[id] = p; return p }
         fun cleanup(id: String) { pending.remove(id) }
     }
 
@@ -373,22 +354,31 @@ window.adsbygoogle.push=function(){};
     }
 
     // ================================================================
-    // ★ v6: initWebView — Navigate trực tiếp tới stream.googleapiscdn.com
-    // KHÔNG load trên animevietsub.id → tránh cross-origin XHR
+    // ★ v7: TWO-PHASE WebView setup
     // ================================================================
+    // Phase 1: Load episode page (animevietsub.id) → find M3U8 URL + cookies
+    // Phase 2: Navigate to player URL (stream.googleapiscdn.com) → same-origin XHR
+    // ================================================================
+
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun initWebViewOnStream(playerUrl: String, cookie: String): Pair<String?, WebView?> {
+    private suspend fun initTwoPhase(
+        epUrl: String,
+        playerUrl: String,
+        cookie: String,
+        avsJs: String
+    ): Triple<String?, String, WebView?> {
         return withContext(Dispatchers.Main) {
-            withTimeoutOrNull(35_000L) {
-                suspendCancellableCoroutine<Pair<String?, WebView?>> { cont ->
+            withTimeoutOrNull(45_000L) {
+                suspendCancellableCoroutine<Triple<String?, String, WebView?>> { cont ->
                     val ctx = try { AcraApplication.context } catch (_: Exception) { null }
                     if (ctx == null) {
-                        cont.resume(null as String? to null as WebView?)
+                        cont.resume(Triple(null, "", null))
                         return@suspendCancellableCoroutine
                     }
 
                     val bridge = JsBridge()
 
+                    // Set cookies for animevietsub.id
                     CookieManager.getInstance().apply {
                         setAcceptCookie(true)
                         cookie.split(";").forEach { kv ->
@@ -409,20 +399,18 @@ window.adsbygoogle.push=function(){};
                     CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
                     wv.addJavascriptInterface(bridge, "Android")
 
-                    // ★ Inject networkInterceptor + blobInterceptor vào player page
-                    val interceptorJs = (networkInterceptor + "\n" + blobInterceptor)
-                        .toByteArray(Charsets.UTF_8)
+                    // Phase 1: Inject playerJs + blobInterceptor
+                    val patchedJs = (blobInterceptor + "\n" + avsJs).toByteArray(Charsets.UTF_8)
                     val fakeAdsBytes = fakeAds.toByteArray(Charsets.UTF_8)
 
                     wv.webViewClient = object : WebViewClient() {
                         override fun shouldInterceptRequest(view: WebView, req: WebResourceRequest): WebResourceResponse? {
                             val url = req.url.toString()
                             return when {
-                                // ★ Inject interceptor vào player JS (nếu có)
-                                url.contains("player.") && url.endsWith(".js") ->
-                                    WebResourceResponse("application/javascript", "utf-8",
-                                        ByteArrayInputStream(interceptorJs))
-                                // ★ Bắt M3U8 URL qua network layer
+                                // Phase 1: Inject patched playerJs
+                                url.contains("watchbk") || url.contains("avs.watch") ->
+                                    WebResourceResponse("application/javascript", "utf-8", ByteArrayInputStream(patchedJs))
+                                // Catch M3U8 URL
                                 url.contains("googleapiscdn.com") &&
                                     (url.contains(".m3u8") || url.contains("playlist")) -> {
                                     bridge.m3u8Url = url; null
@@ -430,10 +418,11 @@ window.adsbygoogle.push=function(){};
                                 url.contains("adsbygoogle") || url.contains("googlesyndication") ->
                                     WebResourceResponse("application/javascript", "utf-8", ByteArrayInputStream(fakeAdsBytes))
                                 url.contains("google-analytics") || url.contains("doubleclick") ||
-                                url.contains("googletagmanager") || url.contains("facebook.com") ->
+                                url.contains("googletagmanager") || url.contains("facebook.com") ||
+                                url.contains("hotjar") || url.contains("disqus") ->
                                     WebResourceResponse("application/javascript", "utf-8", ByteArrayInputStream("".toByteArray()))
                                 url.endsWith(".woff") || url.endsWith(".woff2") || url.endsWith(".ttf") ||
-                                url.endsWith(".eot") || url.endsWith(".css") ->
+                                url.endsWith(".eot") || (url.endsWith(".css") && !url.contains(mainUrl)) ->
                                     WebResourceResponse("text/css", "utf-8", ByteArrayInputStream("".toByteArray()))
                                 url.endsWith(".png") || url.endsWith(".jpg") || url.endsWith(".jpeg") ||
                                 url.endsWith(".gif") || url.endsWith(".webp") || url.endsWith(".svg") ->
@@ -441,63 +430,98 @@ window.adsbygoogle.push=function(){};
                                 else -> null
                             }
                         }
-                    }
 
-                    // ★ Navigate trực tiếp tới player URL trên stream.googleapiscdn.com
-                    wv.loadUrl(playerUrl, mapOf(
-                        "Accept-Language" to "vi-VN,vi;q=0.9",
-                        "Referer" to "$mainUrl/"
-                    ))
-
-                    val handler = android.os.Handler(android.os.Looper.getMainLooper())
-                    var elapsed = 0
-                    val checker = object : Runnable {
-                        override fun run() {
-                            when {
-                                bridge.m3u8Url != null || bridge.m3u8Content != null -> {
-                                    // Delay để cookies được set + JS hoàn thành
-                                    handler.postDelayed({
-                                        try {
-                                            val c1 = CookieManager.getInstance().getCookie("https://stream.googleapiscdn.com") ?: ""
-                                            val c2 = CookieManager.getInstance().getCookie("http://stream.googleapiscdn.com") ?: ""
-                                            lastStreamCookies = listOf(c1, c2, cookie)
-                                                .filter { it.isNotBlank() }.distinct().joinToString("; ")
-                                        } catch (_: Exception) {}
-
-                                        wv.stopLoading()
-                                        activeWebView = wv
-                                        activeBridge = bridge
-
-                                        val res = bridge.m3u8Url?.let { "DIRECT_URL::$it" }
-                                            ?: bridge.m3u8Content
-                                        if (cont.isActive) cont.resume(res to (wv as WebView?))
-                                    }, 1500)
-                                }
-                                elapsed >= 30_000 -> {
-                                    wv.stopLoading(); wv.destroy()
-                                    if (cont.isActive) cont.resume(null as String? to null as WebView?)
-                                }
-                                else -> { elapsed += 200; handler.postDelayed(this, 200) }
+                        override fun onPageFinished(view: WebView, url: String?) {
+                            if (url != null && url.contains("googleapiscdn.com")) {
+                                bridge.pageLoaded = true
+                                // Phase 2: Inject network interceptor after page load
+                                view.evaluateJavascript(networkInterceptor, null)
                             }
                         }
                     }
-                    handler.postDelayed(checker, 500)
+
+                    // ======== PHASE 1: Load episode page ========
+                    wv.loadUrl(epUrl, mapOf(
+                        "Accept-Language" to "vi-VN,vi;q=0.9", "Referer" to "$mainUrl/"
+                    ))
+
+                    val handler = android.os.Handler(android.os.Looper.getMainLooper())
+                    var phase = 1  // 1=finding M3U8, 2=navigating to player
+                    var elapsed = 0
+
+                    val checker = object : Runnable {
+                        override fun run() {
+                            when {
+                                phase == 1 && (bridge.m3u8Url != null || bridge.m3u8Content != null) -> {
+                                    // Phase 1 complete: found M3U8 URL
+                                    handler.postDelayed({
+                                        // Extract cookies
+                                        try {
+                                            val c1 = CookieManager.getInstance().getCookie("https://stream.googleapiscdn.com") ?: ""
+                                            val c2 = CookieManager.getInstance().getCookie("http://stream.googleapiscdn.com") ?: ""
+                                            val c3 = CookieManager.getInstance().getCookie("https://animevietsub.id") ?: ""
+                                            lastStreamCookies = listOf(c1, c2, c3, cookie)
+                                                .filter { it.isNotBlank() }.distinct().joinToString("; ")
+                                        } catch (_: Exception) {}
+
+                                        val m3u8Url = bridge.m3u8Url
+                                            ?: bridge.m3u8Content?.let { "BLOB::$it" }
+
+                                        // ======== PHASE 2: Navigate to player URL ========
+                                        wv.stopLoading()
+                                        bridge.pageLoaded = false
+                                        bridge.m3u8Url = null  // Reset — player may load M3U8 again
+
+                                        wv.loadUrl(playerUrl, mapOf(
+                                            "Accept-Language" to "vi-VN,vi;q=0.9",
+                                            "Referer" to "$mainUrl/"
+                                        ))
+
+                                        phase = 2
+                                        elapsed = 0
+                                        handler.postDelayed(this, 500)
+                                    }, 1500)  // Delay 1.5s để cookies set
+                                }
+
+                                phase == 2 && bridge.pageLoaded -> {
+                                    // Phase 2 complete: player page loaded on stream.googleapiscdn.com
+                                    handler.postDelayed({
+                                        // Inject network interceptor
+                                        wv.evaluateJavascript(networkInterceptor, null)
+                                        activeWebView = wv
+                                        activeBridge = bridge
+
+                                        val m3u8Result = bridge.m3u8Url
+                                            ?: m3u8Url  // Use Phase 1 URL if Phase 2 didn't catch new one
+                                        if (cont.isActive) cont.resume(Triple(m3u8Result, lastStreamCookies, wv as WebView))
+                                    }, 2000)  // Delay 2s for Cloudflare + player JS
+                                }
+
+                                elapsed >= 40_000 -> {
+                                    wv.stopLoading(); wv.destroy()
+                                    if (cont.isActive) cont.resume(Triple(null, "", null))
+                                }
+
+                                else -> { elapsed += 300; handler.postDelayed(this, 300) }
+                            }
+                        }
+                    }
+                    handler.postDelayed(checker, 800)
                     cont.invokeOnCancellation {
                         handler.removeCallbacks(checker); wv.stopLoading()
                     }
                 }
-            } ?: Pair<String?, WebView?>(null, null)
+            } ?: Triple(null, "", null)
         }
     }
 
     // ================================================================
-    // v6: StreamProxy — ALL requests qua WebView XHR (same-origin!)
+    // v7: StreamProxy — ALL requests via WebView XHR (same-origin)
     // ================================================================
     inner class StreamProxy(
         private val webView: WebView,
         private val bridge: JsBridge,
-        private val m3u8BaseUrl: String?,      // URL để re-fetch M3U8
-        private val initialM3U8: String
+        initialM3U8: String
     ) {
         private var serverSocket: java.net.ServerSocket? = null
         private val m3u8Lock = Any()
@@ -525,115 +549,79 @@ window.adsbygoogle.push=function(){};
         fun stop() { try { serverSocket?.close() } catch (_: Exception) {} }
 
         // ----------------------------------------------------------
-        // ★ Re-fetch M3U8 qua WebView XHR (same-origin → no CORS!)
+        // Fetch TEXT via WebView XHR (same-origin, no CORS issues)
         // ----------------------------------------------------------
-        private fun refreshM3U8ViaWV(): String? {
-            val url = m3u8BaseUrl ?: return cachedM3U8
-            val text = fetchTextViaWebView(url) ?: return cachedM3U8
-            if (text.contains("#EXTM3U") && text.contains("http")) {
+        private fun fetchTextViaWV(url: String): String? {
+            val id = "t${System.currentTimeMillis()}"
+            val p = bridge.prepare(id)
+            val esc = url.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "").replace("\r", "")
+            try {
+                android.os.Handler(android.os.Looper.getMainLooper()).post {
+                    try { webView.evaluateJavascript("""
+(function(){try{var x=new XMLHttpRequest();x.open('GET','$esc',false);
+x.withCredentials=true;try{Android.onTextDone('$id',x.responseText);}catch(e){}
+}catch(e){Android.onReqError('$id',''+e);}})();
+""".trimIndent(), null) } catch (_: Exception) {}
+                }
+                p.latch.await(15, TimeUnit.SECONDS)
+                bridge.cleanup(id)
+                return if (p.error != null) null else p.text
+            } catch (_: Exception) { return null }
+            finally { bridge.cleanup(id) }
+        }
+
+        // ----------------------------------------------------------
+        // Fetch BINARY via WebView XHR (same-origin, no CORS issues)
+        // ----------------------------------------------------------
+        private fun fetchBinaryViaWV(url: String): ByteArray? {
+            val id = "b${System.currentTimeMillis()}"
+            val p = bridge.prepare(id)
+            val esc = url.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "").replace("\r", "")
+            try {
+                android.os.Handler(android.os.Looper.getMainLooper()).post {
+                    try { webView.evaluateJavascript("""
+(function(){try{
+var id='$id';var url='$esc';
+var x=new XMLHttpRequest();x.open('GET',url,true);
+x.responseType='arraybuffer';x.withCredentials=true;x.timeout=40000;
+x.onload=function(){
+if(x.status<200||x.status>=300){Android.onReqError(id,'HTTP_'+x.status);return;}
+var b=new Uint8Array(x.response);var n=Math.ceil(b.length/32768);
+Android.onReqStart(id,n);
+for(var i=0;i<n;i++){var s=i*32768;var e=Math.min(s+32768,b.length);
+var sl=b.subarray(s,e);var bin='';
+for(var j=0;j<sl.length;j++)bin+=String.fromCharCode(sl[j]);
+Android.onReqChunk(id,i,btoa(bin));}
+Android.onReqDone(id);};
+x.onerror=function(){Android.onReqError(id,'err');};
+x.ontimeout=function(){Android.onReqError(id,'timeout');};
+x.send();}catch(e){Android.onReqError('$id',''+e);}})();
+""".trimIndent(), null) } catch (_: Exception) {}
+                }
+                p.latch.await(50, TimeUnit.SECONDS)
+                bridge.cleanup(id)
+                return if (p.error != null) null else p.data
+            } catch (_: Exception) { return null }
+            finally { bridge.cleanup(id) }
+        }
+
+        // ----------------------------------------------------------
+        // Refresh M3U8 via WebView XHR
+        // ----------------------------------------------------------
+        private fun refreshM3U8(baseUrl: String): String {
+            // Extract base URL (remove query params for clean re-fetch)
+            val cleanUrl = baseUrl.substringBefore("?")
+            val busterUrl = "$cleanUrl?_t=${System.currentTimeMillis()}"
+            val text = fetchTextViaWV(busterUrl)
+            if (text != null && text.contains("#EXTM3U") && text.contains("http")) {
                 synchronized(m3u8Lock) { cachedM3U8 = text }
                 return cachedM3U8
             }
-            return cachedM3U8
+            // Fallback: return cached
+            return synchronized(m3u8Lock) { cachedM3U8 }
         }
 
-        /** ★ Fetch TEXT content qua WebView XHR (cho M3U8) */
-        private fun fetchTextViaWebView(targetUrl: String): String? {
-            val reqId = "t${System.currentTimeMillis()}"
-            val pending = bridge.prepare(reqId)
-            val esc = targetUrl.replace("\\", "\\\\").replace("'", "\\'")
-                .replace("\n", "").replace("\r", "")
-
-            val js = """
-(function(){
-try{
-var id='$reqId';
-var url='$esc';
-var xhr=new XMLHttpRequest();
-xhr.open('GET',url,true);
-xhr.withCredentials=true;
-xhr.timeout=15000;
-xhr.onload=function(){
-    if(xhr.status>=200&&xhr.status<300){
-        Android.onTextDone(id,xhr.responseText);
-    }else{
-        Android.onReqError(id,'HTTP_'+xhr.status);
-    }
-};
-xhr.onerror=function(){Android.onReqError(id,'xhr_error');};
-xhr.ontimeout=function(){Android.onReqError(id,'timeout');};
-xhr.send();
-}catch(e){Android.onReqError('$reqId','js_'+e.message);}
-})();
-""".trimIndent()
-
-            try {
-                android.os.Handler(android.os.Looper.getMainLooper()).post {
-                    try { webView.evaluateJavascript(js, null) } catch (_: Exception) {}
-                }
-                val ok = pending.latch.await(20, TimeUnit.SECONDS)
-                bridge.cleanup(reqId)
-                if (!ok || pending.error != null) return null
-                return pending.text
-            } catch (_: Exception) { return null }
-            finally { bridge.cleanup(reqId) }
-        }
-
-        /** ★ Fetch BINARY content qua WebView XHR (cho segments) */
-        private fun fetchBinaryViaWebView(targetUrl: String): ByteArray? {
-            val reqId = "b${System.currentTimeMillis()}"
-            val pending = bridge.prepare(reqId)
-            val esc = targetUrl.replace("\\", "\\\\").replace("'", "\\'")
-                .replace("\n", "").replace("\r", "")
-
-            val js = """
-(function(){
-try{
-var id='$reqId';
-var url='$esc';
-var xhr=new XMLHttpRequest();
-xhr.open('GET',url,true);
-xhr.responseType='arraybuffer';
-xhr.withCredentials=true;
-xhr.timeout=40000;
-xhr.onload=function(){
-    if(xhr.status<200||xhr.status>=300){
-        Android.onReqError(id,'HTTP_'+xhr.status);return;
-    }
-    var bytes=new Uint8Array(xhr.response);
-    var total=Math.ceil(bytes.length/32768);
-    Android.onReqStart(id,total);
-    for(var i=0;i<total;i++){
-        var s=i*32768;
-        var e=Math.min(s+32768,bytes.length);
-        var slice=bytes.subarray(s,e);
-        var bin='';
-        for(var j=0;j<slice.length;j++) bin+=String.fromCharCode(slice[j]);
-        Android.onReqChunk(id,i,btoa(bin));
-    }
-    Android.onReqDone(id);
-};
-xhr.onerror=function(){Android.onReqError(id,'xhr_error');};
-xhr.onabort=function(){Android.onReqError(id,'xhr_abort');};
-xhr.ontimeout=function(){Android.onReqError(id,'timeout');};
-xhr.send();
-}catch(e){Android.onReqError('$reqId','js_'+e.message);}
-})();
-""".trimIndent()
-
-            try {
-                android.os.Handler(android.os.Looper.getMainLooper()).post {
-                    try { webView.evaluateJavascript(js, null) } catch (_: Exception) {}
-                }
-                val ok = pending.latch.await(50, TimeUnit.SECONDS)
-                bridge.cleanup(reqId)
-                if (!ok || pending.error != null) return null
-                return pending.data
-            } catch (_: Exception) { return null }
-            finally { bridge.cleanup(reqId) }
-        }
-
-        // Parse N-th URL từ M3U8
+        // Parse N-th URL
         private fun parseNthUrl(m3u8: String, index: Int, isSegment: Boolean): String? {
             var urlIdx = -1
             for (line in m3u8.lines()) {
@@ -649,28 +637,19 @@ xhr.send();
             return null
         }
 
-        // Rewrite M3U8 (master)
+        // Rewrite master playlist
         private fun rewriteMaster(content: String): String {
             val sb = StringBuilder()
-            var idx = 0
-            var urlType = 0
+            var idx = 0; var uType = 0
             for (line in content.lines()) {
                 val t = line.trim()
-                if (t.startsWith("#EXT-X-STREAM-INF")) urlType = 1
-                else if (t.startsWith("#EXTINF:")) urlType = 2
+                if (t.startsWith("#EXT-X-STREAM-INF")) uType = 1
+                else if (t.startsWith("#EXTINF:")) uType = 2
                 if (t.startsWith("http://") || t.startsWith("https://")) {
-                    if (urlType == 1) {
-                        sb.append("http://127.0.0.1:$port/media/$idx")
-                        idx++; urlType = 0
-                    } else if (urlType == 2) {
-                        sb.append("http://127.0.0.1:$port/seg/$idx")
-                        idx++; urlType = 0
-                    } else {
-                        sb.append(t)
-                    }
-                } else {
-                    sb.append(line)
-                }
+                    if (uType == 1) { sb.append("http://127.0.0.1:$port/media/$idx"); idx++; uType = 0 }
+                    else if (uType == 2) { sb.append("http://127.0.0.1:$port/seg/$idx"); idx++; uType = 0 }
+                    else sb.append(t)
+                } else sb.append(line)
                 sb.append("\n")
             }
             return sb.toString()
@@ -678,16 +657,12 @@ xhr.send();
 
         // Rewrite media playlist
         private fun rewriteMedia(content: String, qIdx: Int): String {
-            val sb = StringBuilder()
-            var idx = 0
+            val sb = StringBuilder(); var idx = 0
             for (line in content.lines()) {
                 val t = line.trim()
                 if (t.startsWith("http://") || t.startsWith("https://")) {
-                    sb.append("http://127.0.0.1:$port/seg/${qIdx}_$idx")
-                    idx++
-                } else {
-                    sb.append(line)
-                }
+                    sb.append("http://127.0.0.1:$port/seg/${qIdx}_$idx"); idx++
+                } else sb.append(line)
                 sb.append("\n")
             }
             return sb.toString()
@@ -702,7 +677,6 @@ xhr.send();
                 val reader = java.io.BufferedReader(java.io.InputStreamReader(client.getInputStream()))
                 val requestLine = reader.readLine() ?: return
                 while (reader.readLine()?.isNotBlank() == true) {}
-
                 val parts = requestLine.split(" ")
                 if (parts.size < 2) { client.close(); return }
                 val path = parts[1].substringBefore("?")
@@ -715,30 +689,27 @@ xhr.send();
                         "Content-Length" to "0"), ByteArray(0))
 
                     path == "/stream.m3u8" -> {
-                        val fresh = refreshM3U8ViaWV() ?: cachedM3U8
-                        val rewritten = rewriteMaster(fresh)
-                        val body = rewritten.toByteArray(Charsets.UTF_8)
+                        val body = rewriteMaster(cachedM3U8).toByteArray(Charsets.UTF_8)
                         writeResp(client, 200, mapOf(
                             "Content-Type" to "application/vnd.apple.mpegurl; charset=utf-8",
                             "Content-Length" to body.size.toString(),
-                            "Cache-Control" to "no-cache, no-store, must-revalidate"), body)
+                            "Cache-Control" to "no-cache"), body)
                     }
 
                     path.startsWith("/media/") -> {
                         val qi = path.removePrefix("/media/").toIntOrNull() ?: -1
-                        serveMediaPlaylist(client, qi)
+                        serveMedia(client, qi)
                     }
 
                     path.startsWith("/seg/") -> {
                         val segId = path.removePrefix("/seg/")
                         val sep = segId.indexOf("_")
                         if (sep >= 0) {
-                            val qi = segId.substring(0, sep).toIntOrNull() ?: -1
-                            val si = segId.substring(sep + 1).toIntOrNull() ?: -1
-                            serveSegment(client, qi, si)
+                            serveSegment(client,
+                                segId.substring(0, sep).toIntOrNull() ?: -1,
+                                segId.substring(sep + 1).toIntOrNull() ?: -1)
                         } else {
-                            val si = segId.toIntOrNull() ?: -1
-                            serveSegment(client, -1, si)
+                            serveSegment(client, -1, segId.toIntOrNull() ?: -1)
                         }
                     }
 
@@ -746,84 +717,70 @@ xhr.send();
                         "Not found".toByteArray())
                 }
             } catch (_: java.net.SocketException) {}
-            catch (_: Exception) {} finally {
-                try { client.close() } catch (_: Exception) {}
-            }
+            catch (_: Exception) {} finally { try { client.close() } catch (_: Exception) {} }
         }
 
-        // ----------------------------------------------------------
-        // Serve media playlist
-        // ----------------------------------------------------------
-        private fun serveMediaPlaylist(client: java.net.Socket, qualityIndex: Int) {
-            val fresh = refreshM3U8ViaWV() ?: cachedM3U8
-            val mediaUrl = parseNthUrl(fresh, qualityIndex, isSegment = false)
+        private fun serveMedia(client: java.net.Socket, qi: Int) {
+            val mediaUrl = parseNthUrl(cachedM3U8, qi, isSegment = false)
             if (mediaUrl == null) {
                 writeResp(client, 404, mapOf("Content-Type" to "text/plain"),
                     "Media playlist not found".toByteArray())
                 return
             }
-
-            // ★ Fetch media playlist qua WebView XHR (same-origin!)
-            val content = fetchTextViaWebView(mediaUrl)
+            val content = fetchTextViaWV(mediaUrl)
             if (content == null || !content.contains("#EXTM3U")) {
                 writeResp(client, 502, mapOf("Content-Type" to "text/plain"),
                     "Failed to fetch media playlist".toByteArray())
                 return
             }
-
-            val rewritten = rewriteMedia(content, qualityIndex)
-            val body = rewritten.toByteArray(Charsets.UTF_8)
+            val body = rewriteMedia(content, qi).toByteArray(Charsets.UTF_8)
             writeResp(client, 200, mapOf(
                 "Content-Type" to "application/vnd.apple.mpegurl; charset=utf-8",
                 "Content-Length" to body.size.toString(),
                 "Cache-Control" to "no-cache"), body)
         }
 
-        // ----------------------------------------------------------
-        // ★ Serve segment — retry + WebView XHR
-        // ----------------------------------------------------------
-        private fun serveSegment(client: java.net.Socket, qualityIndex: Int, segIndex: Int) {
+        private fun serveSegment(client: java.net.Socket, qi: Int, si: Int) {
             for (attempt in 0 until 2) {
-                val segUrl = findSegmentUrl(qualityIndex, segIndex)
+                val segUrl = if (qi >= 0 && isMaster) {
+                    val mediaUrl = parseNthUrl(cachedM3U8, qi, isSegment = false) ?: continue
+                    val mc = fetchTextViaWV(mediaUrl)
+                    if (mc != null && mc.contains("#EXTM3U")) parseNthUrl(mc, si, isSegment = true)
+                    else null
+                } else {
+                    parseNthUrl(cachedM3U8, si, isSegment = true)
+                }
+
                 if (segUrl == null) {
                     writeResp(client, 404, mapOf("Content-Type" to "text/plain"),
-                        "Segment URL not found".toByteArray())
+                        "Segment not found".toByteArray())
                     return
                 }
 
-                // ★ PRIMARY: WebView XHR (same-origin, with credentials)
-                val data = fetchBinaryViaWebView(segUrl)
+                // ★ Fetch segment via same-origin WebView XHR
+                val data = fetchBinaryViaWV(segUrl)
                 if (data != null && data.size > 100) {
                     writeResp(client, 200, mapOf(
                         "Content-Type" to "video/mp2t",
                         "Content-Length" to data.size.toString(),
-                        "Accept-Ranges" to "bytes",
                         "Connection" to "close"), data)
                     return
                 }
 
-                // Retry: refresh M3U8 để lấy token mới
+                // Retry: refresh M3U8 for fresh tokens
                 if (attempt == 0) {
-                    refreshM3U8ViaWV()
-                    try { Thread.sleep(300) } catch (_: Exception) {}
+                    val m3u8Base = parseNthUrl(cachedM3U8, 0, isSegment = true) ?: ""
+                    if (m3u8Base.isNotEmpty()) {
+                        // Extract M3U8 base URL from segment URL
+                        val m3u8UrlFromSeg = Regex("""(https?://[^/]+/playlist/[^?#]+)""")
+                            .find(m3u8Base)?.groupValues?.get(1)
+                        if (m3u8UrlFromSeg != null) refreshM3U8(m3u8UrlFromSeg)
+                    }
+                    try { Thread.sleep(500) } catch (_: Exception) {}
                 }
             }
-
             writeResp(client, 502, mapOf("Content-Type" to "text/plain"),
                 "Segment fetch failed".toByteArray())
-        }
-
-        private fun findSegmentUrl(qualityIndex: Int, segIndex: Int): String? {
-            return if (qualityIndex >= 0 && isMaster) {
-                val fresh = refreshM3U8ViaWV() ?: cachedM3U8
-                val mediaUrl = parseNthUrl(fresh, qualityIndex, isSegment = false) ?: return null
-                val mediaContent = fetchTextViaWebView(mediaUrl) ?: return null
-                if (mediaContent.contains("#EXTM3U")) parseNthUrl(mediaContent, segIndex, isSegment = true)
-                else null
-            } else {
-                val fresh = refreshM3U8ViaWV() ?: cachedM3U8
-                parseNthUrl(fresh, segIndex, isSegment = true)
-            }
         }
 
         private fun writeResp(client: java.net.Socket, code: Int, headers: Map<String, String>, body: ByteArray) {
@@ -849,83 +806,69 @@ xhr.send();
         cleanupSession()
         val epUrl = data.substringBefore("|")
 
-        // 1. ★ Tìm iframe URL — BẮT BUỘC phải có
+        // 1. Find iframe URL from episode page
         val epPageHtml = try { app.get(epUrl, headers = baseHeaders).text } catch (_: Exception) { "" }
         val iframeUrl = Regex("""https://stream\.googleapiscdn\.com/player/[a-fA-F0-9?=&%+._-]+""")
             .find(epPageHtml)?.value?.replace("&amp;", "&")
 
-        if (iframeUrl == null) {
-            // Fallback: thử tìm trong page source bằng regex khác
-            val altMatch = Regex("""https://stream\.googleapiscdn\.com/player/\w+""")
-                .find(epPageHtml)?.value
-            if (altMatch != null) {
-                return initAndPlay(altMatch, callback)
-            }
-            return true
-        }
+        if (iframeUrl == null) return true  // No player found
 
-        return initAndPlay(iframeUrl, callback)
-    }
-
-    private suspend fun initAndPlay(playerUrl: String, callback: (ExtractorLink) -> Unit): Boolean {
-        // 2. Get cookies from animevietsub.id (cho cf_clearance ban đầu)
+        // 2. Get cookies
+        val epId = Regex("""-(\d+)\.html""").find(epUrl)?.groupValues?.get(1) ?: return true
         val ajaxCookie = try {
-            val epId = Regex("""-(\d+)\.html""").find(playerUrl)?.groupValues?.get(1)
-            if (epId != null) {
-                app.post("$mainUrl/ajax/player", headers = mapOf(
-                    "User-Agent" to UA, "X-Requested-With" to "XMLHttpRequest",
-                    "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
-                    "Referer" to "$mainUrl/", "Origin" to mainUrl
-                ), data = mapOf("episodeId" to epId, "backup" to "1"))
-                    .cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
-            } else ""
+            app.post("$mainUrl/ajax/player", headers = mapOf(
+                "User-Agent" to UA, "X-Requested-With" to "XMLHttpRequest",
+                "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
+                "Referer" to epUrl, "Origin" to mainUrl
+            ), data = mapOf("episodeId" to epId, "backup" to "1"))
+                .cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
         } catch (_: Exception) { "" }
 
-        // 3. ★ Navigate WebView trực tiếp tới stream.googleapiscdn.com
-        val (m3u8Result, webView) = initWebViewOnStream(playerUrl, ajaxCookie)
-        if (m3u8Result == null || webView == null) { cleanupSession(); return true }
+        // 3. Get player JS
+        val avsJs = cachedAvsJs ?: fetchJs(
+            "$mainUrl/statics/default/js/pl.watchbk2.js?v=6.1.9", ajaxCookie
+        )?.also { cachedAvsJs = it } ?: return true
+
+        // 4. ★ TWO-PHASE: Phase 1 (find M3U8) → Phase 2 (navigate to player for same-origin)
+        val (m3u8Result, cookies, webView) = initTwoPhase(epUrl, iframeUrl, ajaxCookie, avsJs)
+        if (webView == null) { cleanupSession(); return true }
         val bridge = activeBridge
         if (bridge == null) { cleanupSession(); return true }
 
-        // 4. Lấy M3U8 content — ưu tiên URL để re-fetch
+        // 5. Resolve M3U8 content
         val m3u8Content: String
         val m3u8BaseUrl: String?
 
-        if (m3u8Result.startsWith("DIRECT_URL::")) {
-            m3u8BaseUrl = m3u8Result.removePrefix("DIRECT_URL::")
-            // ★ Fetch M3U8 qua WebView XHR (same-origin, no CORS!)
+        if (m3u8Result == null) { cleanupSession(); return true }
+
+        if (m3u8Result.startsWith("BLOB::")) {
+            // M3U8 content từ blob (Phase 1)
+            m3u8BaseUrl = bridge.m3u8Url  // Phase 2 URL (nếu có)
+            m3u8Content = m3u8Result.removePrefix("BLOB::")
+            if (!m3u8Content.contains("#EXTM3U")) { cleanupSession(); return true }
+        } else {
+            // M3U8 URL
+            m3u8BaseUrl = m3u8Result
+            // ★ Fetch M3U8 content qua WebView XHR (same-origin!)
             m3u8Content = try {
-                // Dùng evaluateJavascript để fetch text
                 android.os.Handler(android.os.Looper.getMainLooper()).post {
                     try {
                         val esc = m3u8BaseUrl.replace("\\", "\\\\").replace("'", "\\'")
                         webView.evaluateJavascript("""
-(function(){
-var xhr=new XMLHttpRequest();
-xhr.open('GET','$esc',false);
-xhr.withCredentials=true;
-try{Android.onM3U8(xhr.responseText);}catch(x){}
-})();
+(function(){try{var x=new XMLHttpRequest();x.open('GET','$esc',false);
+x.withCredentials=true;try{Android.onM3U8(x.responseText);}catch(e){}
+}catch(e){}})();
 """.trimIndent(), null)
                     } catch (_: Exception) {}
                 }
-                Thread.sleep(1000)
+                Thread.sleep(1500)
                 bridge.m3u8Content ?: ""
             } catch (_: Exception) { "" }
-        } else {
-            m3u8BaseUrl = bridge.m3u8Url
-            m3u8Content = m3u8Result
+            if (!m3u8Content.contains("#EXTM3U")) { cleanupSession(); return true }
         }
 
-        if (!m3u8Content.contains("#EXTM3U")) { cleanupSession(); return true }
-
-        // 5. Tạo proxy
-        val server = StreamProxy(
-            webView = webView,
-            bridge = bridge,
-            m3u8BaseUrl = m3u8BaseUrl,
-            initialM3U8 = m3u8Content
-        )
+        // 6. Create proxy
+        val server = StreamProxy(webView, bridge, m3u8Content)
         server.start()
         activeProxy = server
 

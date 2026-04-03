@@ -328,9 +328,9 @@ window.adsbygoogle.push=function(){};
     private suspend fun getM3U8KeepAlive(epUrl: String, cookie: String, avsJs: String): Pair<String?, WebView?> {
         return withContext(Dispatchers.Main) {
             withTimeoutOrNull(30_000L) {
-                suspendCancellableCoroutine { cont ->
+                suspendCancellableCoroutine<Pair<String?, WebView?>> { cont ->
                     val ctx = try { AcraApplication.context } catch (_: Exception) { null }
-                    if (ctx == null) { cont.resume(null to null); return@suspendCancellableCoroutine }
+                    if (ctx == null) { cont.resume(null as String? to null as WebView?); return@suspendCancellableCoroutine }
 
                     val bridge = SegmentBridge()
 
@@ -409,11 +409,11 @@ window.adsbygoogle.push=function(){};
 
                                     val res = bridge.m3u8Url?.let { "DIRECT_URL::$it" }
                                         ?: bridge.m3u8Content
-                                    if (cont.isActive) cont.resume(res to wv)
+                                    if (cont.isActive) cont.resume(res to (wv as WebView?))
                                 }
                                 elapsed >= 25_000 -> {
                                     wv.stopLoading(); wv.destroy()
-                                    if (cont.isActive) cont.resume(null to null)
+                                    if (cont.isActive) cont.resume(null as String? to null as WebView?)
                                 }
                                 else -> { elapsed += 200; handler.postDelayed(this, 200) }
                             }
@@ -424,7 +424,7 @@ window.adsbygoogle.push=function(){};
                         handler.removeCallbacks(checker); wv.stopLoading()
                     }
                 }
-            } ?: (null to null)
+            } ?: Pair<String?, WebView?>(null, null)
         }
     }
 

@@ -268,15 +268,15 @@ window.adsbygoogle.push=function(){};
             @Volatile var error: String? = null
             @Volatile var done = false
             private val chunks = ConcurrentHashMap<Int, String>()
-            @Volatile var totalChunks: Int = -1
+            @Volatile var chunkTotal: Int = -1
 
             @Synchronized fun addChunk(idx: Int, chunk: String) {
                 chunks[idx] = chunk
-                if (totalChunks > 0 && chunks.size >= totalChunks) finishWithBinary()
+                if (chunkTotal > 0 && chunks.size >= chunkTotal) finishWithBinary()
             }
 
             @Synchronized fun setTotalChunks(n: Int) {
-                totalChunks = n
+                chunkTotal = n
                 if (n > 0 && chunks.size >= n) finishWithBinary()
             }
 

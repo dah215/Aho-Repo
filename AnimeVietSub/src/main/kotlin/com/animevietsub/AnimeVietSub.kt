@@ -281,18 +281,12 @@ window.adsbygoogle.push=function(){};
 """.trimIndent()
 
     inner class M3U8Bridge {
-        @Volatile var result: String? = null
-        @Volatile var m3u8Url: String? = null
+        @Volatile var result: String? = null     // blob M3U8 content
+        @Volatile var m3u8Url: String? = null    // direct playlist URL
 
         @JavascriptInterface
         fun onM3U8(content: String) {
             if (content.contains("#EXTM3U")) result = content
-        }
-
-        // Called from JS XHR override when player fetches playlist
-        @JavascriptInterface
-        fun onPlaylistUrl(url: String) {
-            if (url.contains("playlist.m3u8")) m3u8Url = url
         }
     }
 
@@ -337,7 +331,7 @@ window.adsbygoogle.push=function(){};
     }
 
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun getM3U8(epUrl: String, targetUrl: String, cookie: String, avsJs: String): String? {
+    private suspend fun getM3U8(epUrl: String, cookie: String, avsJs: String): String? {
         return withContext(Dispatchers.Main) {
             withTimeoutOrNull(30_000L) {
                 suspendCancellableCoroutine { cont ->
@@ -372,39 +366,7 @@ window.adsbygoogle.push=function(){};
                     val avsJsBytes = patchedAvsJs.toByteArray(Charsets.UTF_8)
                     val fakeAdsBytes = fakeAds.toByteArray(Charsets.UTF_8)
 
-                    // JS to inject into player page to capture playlist URL
-                    val xhrOverrideJs = """
-(function(){
-var origOpen = XMLHttpRequest.prototype.open;
-XMLHttpRequest.prototype.open = function(method, url) {
-  try {
-    if (url && typeof url === 'string' && url.indexOf('playlist.m3u8') !== -1) {
-      Android.onPlaylistUrl(url);
-    }
-  } catch(e) {}
-  return origOpen.apply(this, arguments);
-};
-var origFetch = window.fetch;
-if (origFetch) {
-  window.fetch = function(url, opts) {
-    try {
-      if (url && typeof url === 'string' && url.indexOf('playlist.m3u8') !== -1) {
-        Android.onPlaylistUrl(url);
-      }
-    } catch(e) {}
-    return origFetch.apply(this, arguments);
-  };
-}
-})();
-""".trimIndent()
-
                     wv.webViewClient = object : WebViewClient() {
-                        override fun onPageStarted(view: WebView, url: String, favicon: android.graphics.Bitmap?) {
-                            view.evaluateJavascript(xhrOverrideJs, null)
-                        }
-                        override fun onPageFinished(view: WebView, url: String) {
-                            view.evaluateJavascript(xhrOverrideJs, null)
-                        }
                         override fun shouldInterceptRequest(
                             view: WebView,
                             request: WebResourceRequest
@@ -415,10 +377,10 @@ if (origFetch) {
                                     "application/javascript", "utf-8",
                                     ByteArrayInputStream(avsJsBytes)
                                 )
-                                // Also capture via shouldInterceptRequest as backup
+                                // Capture direct M3U8 URL from player
                                 url.contains("googleapiscdn.com/playlist/") && url.contains(".m3u8") -> {
                                     bridge.m3u8Url = url
-                                    null
+                                    null // let the request proceed normally
                                 }
                                 url.contains("adsbygoogle") ||
                                         url.contains("googlesyndication") -> WebResourceResponse(
@@ -451,14 +413,10 @@ if (origFetch) {
                         }
                     }
 
-                    // Load target: iframe URL directly (or episode page as fallback)
-                    // Set Referer to episode page so player thinks it's inside the episode
-                    val loadHeaders = if (targetUrl != epUrl) {
-                        mapOf("Accept-Language" to "vi-VN,vi;q=0.9", "Referer" to epUrl)
-                    } else {
-                        mapOf("Accept-Language" to "vi-VN,vi;q=0.9", "Referer" to "$mainUrl/")
-                    }
-                    wv.loadUrl(targetUrl, loadHeaders)
+                    wv.loadUrl(epUrl, mapOf(
+                        "Accept-Language" to "vi-VN,vi;q=0.9",
+                        "Referer" to "$mainUrl/"
+                    ))
 
                     val handler = android.os.Handler(android.os.Looper.getMainLooper())
                     var elapsed = 0
@@ -498,70 +456,40 @@ if (origFetch) {
         }
     }
 
-    private var localServer: PlaylistProxyServer? = null
+    private var localServer: LocalM3U8Server? = null
 
-    inner class PlaylistProxyServer(private val playlistContent: String) {
+    inner class LocalM3U8Server(private val m3u8Content: String) {
         private var serverSocket: java.net.ServerSocket? = null
         val port: Int get() = serverSocket?.localPort ?: 0
-        private val pool = java.util.concurrent.Executors.newCachedThreadPool()
 
         fun start() {
             serverSocket = java.net.ServerSocket(0)
             Thread {
-                val ss = serverSocket ?: return@Thread
-                while (!ss.isClosed) {
-                    try { val c = ss.accept(); pool.execute { handle(c) } }
-                    catch (_: Exception) { break }
-                }
-            }.also { it.isDaemon = true }.start()
-        }
-
-        private fun handle(client: java.net.Socket) {
-            try {
-                val lines = mutableListOf<String>()
-                val reader = client.getInputStream().bufferedReader()
-                var line = reader.readLine()
-                while (!line.isNullOrBlank()) { lines.add(line); line = reader.readLine() }
-                val path = lines.firstOrNull()?.split(" ")?.getOrNull(1) ?: "/"
-                val crlf = "\r\n"
-                val out = client.getOutputStream()
-
-                if (path == "/playlist.m3u8") {
-                    // Rewrite segment URLs to go through this proxy
-                    val base = "http://127.0.0.1:$port"
-                    val rewritten = playlistContent.lines().joinToString("\n") { l ->
-                        if (l.startsWith("https://stream.googleapiscdn.com/chunks/") && l.contains(".html")) {
-                            "$base/seg?url=${java.net.URLEncoder.encode(l.trim(), "UTF-8")}"
-                        } else l
-                    }.toByteArray(Charsets.UTF_8)
-                    out.write("HTTP/1.1 200 OK${crlf}Content-Type: application/vnd.apple.mpegurl${crlf}Content-Length: ${rewritten.size}${crlf}Access-Control-Allow-Origin: *${crlf}${crlf}".toByteArray())
-                    out.write(rewritten)
-                } else if (path.startsWith("/seg?url=")) {
-                    val segUrl = java.net.URLDecoder.decode(path.removePrefix("/seg?url="), "UTF-8")
-                    try {
-                        val conn = java.net.URL(segUrl).openConnection() as java.net.HttpURLConnection
-                        conn.instanceFollowRedirects = true
-                        conn.connectTimeout = 15000; conn.readTimeout = 30000
-                        conn.setRequestProperty("User-Agent", UA)
-                        conn.setRequestProperty("Referer", "https://stream.googleapiscdn.com/")
-                        conn.connect()
-                        val bytes = conn.inputStream.readBytes()
-                        conn.disconnect()
-                        out.write("HTTP/1.1 200 OK${crlf}Content-Type: video/mp2t${crlf}Content-Length: ${bytes.size}${crlf}Access-Control-Allow-Origin: *${crlf}${crlf}".toByteArray())
-                        out.write(bytes)
-                    } catch (_: Exception) {
-                        out.write("HTTP/1.1 502 Bad Gateway${crlf}${crlf}".toByteArray())
+                try {
+                    val ss = serverSocket ?: return@Thread
+                    repeat(10) {
+                        try {
+                            val client = ss.accept()
+                            client.getInputStream().bufferedReader().readLine()
+                            val body = m3u8Content.toByteArray(Charsets.UTF_8)
+                            val crlf = "\r\n"
+                            val response = "HTTP/1.1 200 OK${crlf}" +
+                                    "Content-Type: application/vnd.apple.mpegurl${crlf}" +
+                                    "Content-Length: ${body.size}${crlf}" +
+                                    "Access-Control-Allow-Origin: *${crlf}" +
+                                    crlf
+                            client.getOutputStream().write(response.toByteArray())
+                            client.getOutputStream().write(body)
+                            client.getOutputStream().flush()
+                            client.close()
+                        } catch (_: Exception) {}
                     }
-                } else {
-                    out.write("HTTP/1.1 404 Not Found${crlf}${crlf}".toByteArray())
-                }
-                out.flush(); client.close()
-            } catch (_: Exception) { try { client.close() } catch (_: Exception) {} }
+                } catch (_: Exception) {}
+            }.also { it.isDaemon = true }.start()
         }
 
         fun stop() {
             try { serverSocket?.close() } catch (_: Exception) {}
-            try { pool.shutdownNow() } catch (_: Exception) {}
         }
     }
 
@@ -573,83 +501,76 @@ if (origFetch) {
     ): Boolean {
         val epUrl = data.substringBefore("|")
 
-        // Step 1: get cookie
+        // Fetch episode page → find iframe URL (stream.googleapiscdn.com/player/...)
+        val epPageHtml = try { app.get(epUrl, headers = baseHeaders).text } catch (_: Exception) { "" }
+        val iframeUrl = Regex("""https://stream\.googleapiscdn\.com/player/[a-fA-F0-9?=&%+._-]+""")
+            .find(epPageHtml)?.value?.replace("&amp;", "&")
+
+        // Get cookie
         val epId = Regex("""-(\d+)\.html""").find(epUrl)?.groupValues?.get(1) ?: return true
+        val ajaxHdr = mapOf(
+            "User-Agent" to UA, "X-Requested-With" to "XMLHttpRequest",
+            "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
+            "Referer" to epUrl, "Origin" to mainUrl
+        )
         val cookie = try {
-            app.post("$mainUrl/ajax/player",
-                headers = mapOf("User-Agent" to UA, "X-Requested-With" to "XMLHttpRequest",
-                    "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
-                    "Referer" to epUrl, "Origin" to mainUrl),
+            app.post("$mainUrl/ajax/player", headers = ajaxHdr,
                 data = mapOf("episodeId" to epId, "backup" to "1"))
                 .cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
         } catch (_: Exception) { "" }
 
-        // Step 2: get player JS
+        // Get player JS
         val avsJs = cachedAvsJs ?: fetchJs(
             "$mainUrl/statics/default/js/pl.watchbk2.js?v=6.1.9", cookie
         )?.also { cachedAvsJs = it } ?: return true
 
-        // Step 3: load player iframe in WebView → capture playlist.m3u8 URL
-        // Fetch episode HTML to find the player iframe URL
-        val epPageHtml = try { app.get(epUrl, headers = baseHeaders).text } catch (_: Exception) { "" }
-        val iframeUrl = Regex("""https://stream\.googleapiscdn\.com/player/[a-zA-Z0-9]+[^"'\s<>]*""")
-            .find(epPageHtml)?.value?.replace("&amp;", "&")
-            // If not in HTML, also check AJAX response
-            ?: try {
-                val epId2 = Regex("""-(\d+)\.html""").find(epUrl)?.groupValues?.get(1) ?: ""
-                val ajaxResp = app.post("$mainUrl/ajax/player",
-                    headers = mapOf("User-Agent" to UA, "X-Requested-With" to "XMLHttpRequest",
-                        "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
-                        "Referer" to epUrl, "Origin" to mainUrl),
-                    data = mapOf("episodeId" to epId2, "backup" to "1")).text
-                Regex("""https://stream\.googleapiscdn\.com/player/[a-zA-Z0-9]+[^"'\s<>]*""")
-                    .find(ajaxResp)?.value?.replace("&amp;", "&")
-            } catch (_: Exception) { null }
-
-        // Load iframe directly with episode page as Referer - more reliable than full episode page
+        // Load iframe URL directly — blob M3U8 is created in iframe context
         val targetUrl = iframeUrl ?: epUrl
+        val m3u8Result = getM3U8(targetUrl, cookie, avsJs) ?: return true
 
-        val m3u8Result = getM3U8(epUrl, targetUrl, cookie, avsJs) ?: return true
+        // 1. Lấy Cookie của stream.googleapiscdn.com (chứa cf_clearance) từ WebView
+        val streamCookie = android.webkit.CookieManager.getInstance().getCookie("https://stream.googleapiscdn.com") ?: ""
+        
+        // 2. Lấy Referer chuẩn xác nhất
+        val refererUrl = iframeUrl ?: "https://stream.googleapiscdn.com/"
 
-        val playlistUrl = if (m3u8Result.startsWith("DIRECT_URL::"))
-            m3u8Result.removePrefix("DIRECT_URL::")
-        else return true  // blob fallback not supported here
+        // 3. Tạo bộ Headers đầy đủ cho ExoPlayer
+        val streamHeaders = mapOf(
+            "User-Agent" to UA,
+            "Referer" to refererUrl,
+            "Origin" to "https://stream.googleapiscdn.com",
+            "Cookie" to streamCookie
+        )
 
-        // Step 4: fetch playlist M3U8 content
-        val playlistText = try {
-            app.get(playlistUrl, headers = mapOf(
-                "User-Agent" to UA,
-                "Referer" to "https://stream.googleapiscdn.com/",
-                "Origin" to "https://stream.googleapiscdn.com"
-            )).text
-        } catch (_: Exception) { return true }
-
-        if (!playlistText.contains("#EXTM3U")) return true
-
-        // Step 5: serve via proxy that resolves segN.html → lh3 redirect
-        servePlaylistViaProxy(playlistText, playlistUrl, callback)
-        return true
-    }
-
-    private fun servePlaylistViaProxy(
-        playlistText: String,
-        playlistUrl: String,
-        callback: suspend (ExtractorLink) -> Unit
-    ) {
-        localServer?.stop()
-        val server = PlaylistProxyServer(playlistText)
-        server.start()
-        localServer = server
-
-        kotlinx.coroutines.GlobalScope.launch {
+        if (m3u8Result.startsWith("DIRECT_URL::")) {
+            // Direct playlist URL - serve to ExoPlayer with token header
+            val directM3u8Url = m3u8Result.removePrefix("DIRECT_URL::")
             callback(newExtractorLink(
-                source = name, name = "$name - DU",
-                url = "http://127.0.0.1:${server.port}/playlist.m3u8",
+                source = name, 
+                name = "$name - HD",
+                url = directM3u8Url,
                 type = ExtractorLinkType.M3U8
             ) {
                 this.quality = Qualities.P1080.value
-                this.headers = mapOf("User-Agent" to UA)
+                this.headers = streamHeaders
+            })
+        } else {
+            // Blob M3U8 content - serve via local proxy
+            localServer?.stop()
+            val server = LocalM3U8Server(m3u8Result)
+            server.start()
+            localServer = server
+
+            callback(newExtractorLink(
+                source = name, 
+                name = "$name - HD",
+                url = "http://127.0.0.1:${server.port}/stream.m3u8",
+                type = ExtractorLinkType.M3U8
+            ) {
+                this.quality = Qualities.P1080.value
+                this.headers = streamHeaders
             })
         }
+        return true
     }
 }

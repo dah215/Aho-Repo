@@ -448,6 +448,7 @@ window.adsbygoogle.push=function(){};
                     val handler = android.os.Handler(android.os.Looper.getMainLooper())
                     var phase = 1  // 1=finding M3U8, 2=navigating to player
                     var elapsed = 0
+                    var phase1M3u8Url: String? = null  // ★ Capture Phase 1 result
 
                     val checker = object : Runnable {
                         override fun run() {
@@ -464,7 +465,7 @@ window.adsbygoogle.push=function(){};
                                                 .filter { it.isNotBlank() }.distinct().joinToString("; ")
                                         } catch (_: Exception) {}
 
-                                        val m3u8Url = bridge.m3u8Url
+                                        phase1M3u8Url = bridge.m3u8Url
                                             ?: bridge.m3u8Content?.let { "BLOB::$it" }
 
                                         // ======== PHASE 2: Navigate to player URL ========
@@ -492,7 +493,7 @@ window.adsbygoogle.push=function(){};
                                         activeBridge = bridge
 
                                         val m3u8Result = bridge.m3u8Url
-                                            ?: m3u8Url  // Use Phase 1 URL if Phase 2 didn't catch new one
+                                            ?: phase1M3u8Url
                                         if (cont.isActive) cont.resume(Triple(m3u8Result, lastStreamCookies, wv as WebView))
                                     }, 2000)  // Delay 2s for Cloudflare + player JS
                                 }

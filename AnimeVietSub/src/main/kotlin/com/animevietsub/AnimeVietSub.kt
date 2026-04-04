@@ -603,7 +603,7 @@ if (origFetch) {
 
         // Parse iframe URL from JSON response: {"link":"https://storage.googleapiscdn.com/player/HASH"}
         val iframeUrl = Regex(""""link"\s*:\s*"([^"]+)"""").find(ajaxResp)
-            ?.groupValues?.get(1)?.replace("\/", "/") ?: return true
+    ?.groupValues?.get(1)?.replace("\\/", "/") ?: return true
 
         // Step 3: GET iframe URL → HTML contains <source src="...playlist.m3u8?token=...">
         val playerHtml = try {

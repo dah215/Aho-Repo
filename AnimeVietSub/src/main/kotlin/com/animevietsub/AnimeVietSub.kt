@@ -630,7 +630,23 @@ if (origFetch) {
         } catch (_: Exception) { return true }
 
         if (!playlistText.contains("#EXTM3U")) return true
-        servePlaylistViaProxy(playlistText, playlistUrl, callback)
+        // Primary: direct playlist (often more stable, avoids localhost proxy issues)
+        callback(newExtractorLink(
+            source = name,
+            name = "$name - Direct",
+            url = playlistUrl,
+            type = ExtractorLinkType.M3U8
+        ) {
+            this.quality = Qualities.P1080.value
+            this.headers = mapOf(
+                "User-Agent" to UA,
+                "Referer" to "$playlistOrigin/",
+                "Origin" to playlistOrigin
+            )
+        })
+
+        // Secondary fallback: localhost proxy for players needing rewritten chunks
+        servePlaylistViaProxy(playlistText, callback)
         return true
     }
 
@@ -709,7 +725,6 @@ if (origFetch) {
 
     private fun servePlaylistViaProxy(
         playlistText: String,
-        playlistUrl: String,
         callback: suspend (ExtractorLink) -> Unit
     ) {
         localServer?.stop()

@@ -617,8 +617,33 @@ if (origFetch) {
                 }
         }
 
-        // Use WebView to load iframe - shouldInterceptRequest catches playlist.m3u8 request
-        val playlistUrl = capturePlaylistUrl(iframeUrl, epUrl, cookie) ?: return true
+        // Prefer extracting player URL from ajax/player API response (new site flow)
+        val ajaxPlayerUrl = Regex(""""link":"(https?:\\/\\/[^"]+/player/[^"]+)"""")
+            .find(ajaxHtml)?.groupValues?.getOrNull(1)
+            ?.replace("\\/", "/")
+
+        val finalPlayerUrl = ajaxPlayerUrl ?: iframeUrl
+
+        // Try direct parse from player page first (faster + avoids WebView timing/token races)
+        val playlistUrlFromPlayerPage = try {
+            val playerDoc = app.get(
+                finalPlayerUrl,
+                headers = mapOf(
+                    "User-Agent" to UA,
+                    "Referer" to epUrl,
+                    "Origin" to mainUrl,
+                    "Cookie" to cookie
+                )
+            ).document
+            playerDoc.selectFirst("video source[src*=playlist]")?.attr("src")
+                ?.replace("&amp;", "&")
+                ?.takeIf { it.contains(".m3u8") }
+        } catch (_: Exception) { null }
+
+        // Fallback: Use WebView interception for sites that render source via JS
+        val playlistUrl = playlistUrlFromPlayerPage
+            ?: capturePlaylistUrl(finalPlayerUrl, epUrl, cookie)
+            ?: return true
 
         // Fetch playlist content
         val playlistHost = try { java.net.URL(playlistUrl).host } catch (_: Exception) { "storage.googleapiscdn.com" }

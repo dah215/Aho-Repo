@@ -1,11 +1,6 @@
 package com.animevietsub
 
 import android.annotation.SuppressLint
-import android.webkit.JavascriptInterface
-import android.webkit.WebResourceRequest
-import android.webkit.WebResourceResponse
-import android.webkit.WebView
-import android.webkit.WebViewClient
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
@@ -13,14 +8,9 @@ import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
 import org.jsoup.nodes.Element
-import java.io.ByteArrayInputStream
 import java.net.URLEncoder
 import java.util.EnumSet
-import kotlin.coroutines.resume
 
 @CloudstreamPlugin
 class AnimeVietSubPlugin : Plugin() {
@@ -31,18 +21,18 @@ class AnimeVietSubPlugin : Plugin() {
 }
 
 class AnimeVietSubProvider : MainAPI() {
-    override var mainUrl = "https://animevietsub.id"
+    override var mainUrl = "https://www.animevietsub.id"
     override var name = "AnimeVietSub"
     override val hasMainPage = true
     override var lang = "vi"
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA)
 
-    private val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+    private val UA = "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0"
 
     private val baseHeaders = mapOf(
         "User-Agent" to UA,
-        "Accept-Language" to "vi-VN,vi;q=0.9",
+        "Accept-Language" to "vi-VN,vi;q=0.8,en-US;q=0.5,en;q=0.3",
         "Referer" to "$mainUrl/"
     )
 
@@ -60,10 +50,8 @@ class AnimeVietSubProvider : MainAPI() {
         val article = el.selectFirst("article.TPost") ?: return null
         val a = article.selectFirst("a[href]") ?: return null
         val href = a.attr("href").let { if (it.startsWith("http")) it else "$mainUrl$it" }
-        val title = article.selectFirst("h2.Title")?.text()?.trim()
-            ?.takeIf { it.isNotBlank() } ?: return null
-        val poster = article.selectFirst("div.Image img, figure img")?.attr("src")
-            ?.let { if (it.startsWith("http")) it else "$mainUrl$it" }
+        val title = article.selectFirst("h2.Title")?.text()?.trim()?.takeIf { it.isNotBlank() } ?: return null
+        val poster = article.selectFirst("div.Image img, figure img")?.attr("src")?.let { if (it.startsWith("http")) it else "$mainUrl$it" }
         val epiNum = article.selectFirst("span.mli-eps i")?.text()?.trim()?.toIntOrNull()
         return newAnimeSearchResponse(title, href, TvType.Anime) {
             this.posterUrl = poster
@@ -80,10 +68,7 @@ class AnimeVietSubProvider : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val doc = app.get(
-            "$mainUrl/tim-kiem/${URLEncoder.encode(query, "UTF-8")}/",
-            headers = baseHeaders
-        ).document
+        val doc = app.get("$mainUrl/tim-kiem/${URLEncoder.encode(query, "UTF-8")}/", headers = baseHeaders).document
         return doc.select("ul.MovieList li.TPostMv").mapNotNull { parseCard(it) }
     }
 
@@ -92,16 +77,10 @@ class AnimeVietSubProvider : MainAPI() {
         val infoDoc = try { app.get("$base/", headers = baseHeaders).document } catch (_: Exception) { null }
         val watchDoc = app.get("$base/xem-phim.html", headers = baseHeaders).document
 
-        val title = watchDoc.selectFirst("h1.Title")?.text()?.trim()
-            ?: infoDoc?.selectFirst("h1.Title")?.text()?.trim()
-            ?: watchDoc.title()
-        val altTitle = watchDoc.selectFirst("h2.SubTitle")?.text()?.trim()
-            ?: infoDoc?.selectFirst("h2.SubTitle")?.text()?.trim()
-        val poster = watchDoc.selectFirst("div.Image figure img")?.attr("src")
-            ?: infoDoc?.selectFirst("div.Image figure img")?.attr("src")
-            ?.let { if (it.startsWith("http")) it else "$mainUrl$it" }
-        val plotOriginal = watchDoc.selectFirst("div.Description")?.text()?.trim()
-            ?: infoDoc?.selectFirst("div.Description")?.text()?.trim()
+        val title = watchDoc.selectFirst("h1.Title")?.text()?.trim() ?: infoDoc?.selectFirst("h1.Title")?.text()?.trim() ?: watchDoc.title()
+        val altTitle = watchDoc.selectFirst("h2.SubTitle")?.text()?.trim() ?: infoDoc?.selectFirst("h2.SubTitle")?.text()?.trim()
+        val poster = watchDoc.selectFirst("div.Image figure img")?.attr("src") ?: infoDoc?.selectFirst("div.Image figure img")?.attr("src")?.let { if (it.startsWith("http")) it else "$mainUrl$it" }
+        val plotOriginal = watchDoc.selectFirst("div.Description")?.text()?.trim() ?: infoDoc?.selectFirst("div.Description")?.text()?.trim()
 
         fun metaValue(doc: org.jsoup.nodes.Document?, label: String): String? {
             if (doc == null) return null
@@ -111,17 +90,18 @@ class AnimeVietSubProvider : MainAPI() {
                     return li.text().substringAfter(lbl.text()).trim().ifBlank { null }
                 }
             }
-            return null
+            return doc.selectFirst("li:contains($label)")?.text()?.replace(label, "")?.trim()?.ifBlank { null }
         }
 
         val views = watchDoc.selectFirst("span.View")?.text()?.trim()?.replace("Lượt Xem", "lượt xem")
         val quality = watchDoc.selectFirst("span.Qlty")?.text()?.trim() ?: "HD"
         val year = (watchDoc.selectFirst("p.Info .Date a, p.Info .Date, span.Date a")?.text()?.filter { it.isDigit() }?.take(4)?.toIntOrNull())
-        val status = metaValue(infoDoc, "Trạng thái")?.replace("VietSub", "Vietsub")
-        val duration = metaValue(infoDoc, "Thời lượng")
-        val country = infoDoc?.selectFirst("li:contains(Quốc gia:) a")?.text()?.trim()
-        val studio = metaValue(infoDoc, "Studio") ?: metaValue(infoDoc, "Đạo diễn")
-        val followers = metaValue(infoDoc, "Theo dõi")
+            ?: (infoDoc?.selectFirst("p.Info .Date a, p.Info .Date, span.Date a")?.text()?.filter { it.isDigit() }?.take(4)?.toIntOrNull())
+        val status = (metaValue(infoDoc, "Trạng thái") ?: metaValue(watchDoc, "Trạng thái"))?.replace("VietSub", "Vietsub")
+        val duration = metaValue(infoDoc, "Thời lượng") ?: metaValue(watchDoc, "Thời lượng")
+        val country = infoDoc?.selectFirst("li:contains(Quốc gia:) a")?.text()?.trim() ?: watchDoc.selectFirst("li:contains(Quốc gia:) a")?.text()?.trim()
+        val studio = (metaValue(infoDoc, "Studio") ?: metaValue(infoDoc, "Đạo diễn")) ?: (metaValue(watchDoc, "Studio") ?: metaValue(watchDoc, "Đạo diễn"))
+        val followers = metaValue(infoDoc, "Theo dõi") ?: metaValue(infoDoc, "Số người theo dõi") ?: metaValue(watchDoc, "Theo dõi") ?: metaValue(watchDoc, "Số người theo dõi")
         val tags = (infoDoc?.select("p.Genre a, li:contains(Thể loại:) a") ?: watchDoc.select("p.Genre a, li:contains(Thể loại:) a")).map { it.text().trim() }.filter { it.isNotBlank() }.distinct()
         val latestEps = (infoDoc?.select("li.latest_eps a") ?: watchDoc.select("li.latest_eps a")).map { it.text().trim() }.take(3).joinToString(", ")
 
@@ -133,25 +113,17 @@ class AnimeVietSubProvider : MainAPI() {
                 val href = a.attr("href").let { if (it.startsWith("http")) it else "$mainUrl$it" }
                 if (href.isBlank() || !seen.add(href)) return@mapNotNull null
                 val epNum = Regex("""\d+""").find(a.text())?.value?.toIntOrNull()
-                newEpisode(href) {
-                    this.name = a.attr("title").ifBlank { "Tập ${a.text().trim()}" }
-                    this.episode = epNum
-                }
+                val epTitle = a.attr("title").ifBlank { "Tập ${a.text().trim()}" }
+                newEpisode(href) { this.name = epTitle; this.episode = epNum }
             }.distinctBy { it.episode ?: it.data }.sortedBy { it.episode ?: 0 }
 
         return if (episodes.size <= 1) {
             newMovieLoadResponse(title, url, TvType.AnimeMovie, episodes.firstOrNull()?.data ?: "$base/xem-phim.html") {
-                this.posterUrl = poster
-                this.plot = description
-                this.tags = tags
-                this.year = year
+                this.posterUrl = poster; this.plot = description; this.tags = tags; this.year = year
             }
         } else {
             newAnimeLoadResponse(title, url, TvType.Anime, true) {
-                this.posterUrl = poster
-                this.plot = description
-                this.tags = tags
-                this.year = year
+                this.posterUrl = poster; this.plot = description; this.tags = tags; this.year = year
                 addEpisodes(DubStatus.Subbed, episodes)
             }
         }
@@ -160,140 +132,146 @@ class AnimeVietSubProvider : MainAPI() {
     private fun buildBeautifulDescription(altTitle: String?, status: String?, duration: String?, quality: String?, country: String?, year: String?, studio: String?, followers: String?, views: String?, latestEps: String?, genre: String?, description: String?): String {
         return buildString {
             altTitle?.takeIf { it.isNotBlank() }?.let { append("<font color='#AAAAAA'><i>$it</i></font><br><br>") }
-            fun addInfo(icon: String, label: String, value: String?, color: String = "#FFFFFF") { if (!value.isNullOrBlank()) append("$icon <b>$label:</b> <font color='$color'>$value</font><br>") }
-            addInfo("📺", "Trạng thái", status)
+            fun addInfo(icon: String, label: String, value: String?, color: String = "#FFFFFF") {
+                if (!value.isNullOrBlank()) append("$icon <b>$label:</b> <font color='$color'>$value</font><br>")
+            }
+            val statusColor = when {
+                status?.contains("đang chiếu", ignoreCase = true) == true -> "#4CAF50"
+                status?.contains("hoàn thành", ignoreCase = true) == true -> "#2196F3"
+                status?.contains("sắp chiếu", ignoreCase = true) == true -> "#FF9800"
+                else -> "#2196F3"
+            }
+            addInfo("📺", "Trạng thái", status, statusColor)
             addInfo("⏱", "Thời lượng", duration)
-            addInfo("🎬", "Chất lượng", quality, "#E91E63")
+            addInfo("🎬", "Chất lượng", quality?.ifBlank { null }, "#E91E63")
             addInfo("🌍", "Quốc gia", country)
-            addInfo("📅", "Năm", year)
+            addInfo("📅", "Năm", year?.ifBlank { null })
             addInfo("🎥", "Studio", studio)
-            addInfo("👥", "Theo dõi", followers)
+            addInfo("👥", "Theo dõi", followers?.ifBlank { null })
             addInfo("👁", "Lượt xem", views)
+            addInfo("🎞", "Tập mới", latestEps)
+            addInfo("🏷", "Thể loại", genre?.ifBlank { null })
             description?.takeIf { it.isNotBlank() }?.let {
-                append("<br><b><font color='#FFEB3B'>✦ NỘI DUNG PHIM</font></b><br>")
-                append("<hr color='#333333' size='1'><br>")
+                append("<br><b><font color='#FFEB3B'>✦ NỘI DUNG PHIM</font></b><br><hr color='#333333' size='1'><br>")
                 append(it.trim())
             }
         }
     }
 
-    override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
-        val epUrl = data.substringBefore("|")
-        
-        // SỬA LỖI FINAL WEAPON: Sử dụng WebView để lấy link Iframe sinh ra bởi JavaScript
-        val iframeUrl = captureIframeUrl(epUrl) ?: return true
+    private var localServer: PlaylistProxyServer? = null
 
-        // Bắt link m3u8 từ Iframe thật qua WebView
-        val playlistUrl = capturePlaylistUrlFinalWeapon(iframeUrl.replace("&amp;", "&"), epUrl) ?: return true
+    inner class PlaylistProxyServer(private val playlistContent: String, private val segmentReferer: String) {
+        private var serverSocket: java.net.ServerSocket? = null
+        val port: Int get() = serverSocket?.localPort ?: 0
+        private val pool = java.util.concurrent.Executors.newCachedThreadPool()
 
-        val playlistHost = java.net.URI(playlistUrl).host
-        val playerReferer = "https://$playlistHost/player/${iframeUrl.substringAfter("/player/").substringBefore("?")}"
-
-        callback(newExtractorLink(source = name, name = "$name - Final Weapon", url = playlistUrl, type = ExtractorLinkType.M3U8) {
-            this.quality = Qualities.P1080.value
-            this.headers = mapOf(
-                "User-Agent" to UA,
-                "Referer" to playerReferer,
-                "Origin" to "https://$playlistHost",
-                "Accept" to "*/*",
-                "Accept-Language" to "vi-VN,vi;q=0.9",
-                "Sec-Fetch-Dest" to "empty",
-                "Sec-Fetch-Mode" to "cors",
-                "Sec-Fetch-Site" to "same-origin",
-                "X-Requested-With" to "XMLHttpRequest"
-            )
-        })
-        return true
-    }
-
-    @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun captureIframeUrl(epUrl: String): String? {
-        return withContext(Dispatchers.Main) {
-            withTimeoutOrNull(30_000L) {
-                suspendCancellableCoroutine { cont ->
-                    val ctx = try { AcraApplication.context } catch (_: Exception) { null }
-                    if (ctx == null) { cont.resume(null); return@suspendCancellableCoroutine }
-
-                    val wv = WebView(ctx)
-                    wv.settings.javaScriptEnabled = true
-                    wv.settings.domStorageEnabled = true
-                    wv.settings.userAgentString = UA
-                    
-                    wv.webViewClient = object : WebViewClient() {
-                        override fun onPageFinished(view: WebView, url: String) {
-                            // Quét Iframe sau khi JavaScript đã chạy xong
-                            val jsGetIframe = """
-                                (function() {
-                                    var ifr = document.querySelector('iframe[src*="storage.googleapiscdn.com/player/"]');
-                                    return ifr ? ifr.src : null;
-                                })();
-                            """.trimIndent()
-                            view.evaluateJavascript(jsGetIframe) { result ->
-                                val src = result?.trim('"')?.takeIf { it != "null" && it.isNotBlank() }
-                                if (src != null && cont.isActive) cont.resume(src)
-                            }
-                        }
-                    }
-                    wv.loadUrl(epUrl)
-                    
-                    // Checker định kỳ nếu onPageFinished không kích hoạt đúng lúc
-                    val handler = android.os.Handler(android.os.Looper.getMainLooper())
-                    val checker = object : Runnable {
-                        override fun run() {
-                            if (!cont.isActive) return
-                            wv.evaluateJavascript("(function(){ var ifr = document.querySelector('iframe[src*=\"storage.googleapiscdn.com/player/\"]'); return ifr ? ifr.src : null; })();") { result ->
-                                val src = result?.trim('"')?.takeIf { it != "null" && it.isNotBlank() }
-                                if (src != null && cont.isActive) {
-                                    cont.resume(src)
-                                } else {
-                                    handler.postDelayed(this, 1000)
-                                }
-                            }
-                        }
-                    }
-                    handler.postDelayed(checker, 2000)
-
-                    cont.invokeOnCancellation { wv.stopLoading(); wv.destroy() }
+        fun start() {
+            serverSocket = java.net.ServerSocket(0)
+            val thread = Thread {
+                val ss = serverSocket ?: return@Thread
+                while (!ss.isClosed) {
+                    try {
+                        val c = ss.accept()
+                        pool.execute { handle(c) }
+                    } catch (_: Exception) { break }
                 }
             }
+            thread.isDaemon = true
+            thread.start()
+        }
+
+        private fun handle(client: java.net.Socket) {
+            try {
+                val reader = client.getInputStream().bufferedReader()
+                var line = reader.readLine()
+                if (line == null) return
+                val path = line.split(" ").getOrNull(1) ?: "/"
+                val crlf = "\r\n"
+                val out = client.getOutputStream()
+                if (path == "/playlist.m3u8") {
+                    val base = "http://127.0.0.1:$port"
+                    val rewritten = playlistContent.lines().joinToString("\n") { l ->
+                        if (l.startsWith("http") && l.contains(".html")) "$base/seg?url=${java.net.URLEncoder.encode(l.trim(), "UTF-8")}" else l
+                    }.toByteArray(Charsets.UTF_8)
+                    out.write("HTTP/1.1 200 OK${crlf}Content-Type: application/vnd.apple.mpegurl${crlf}Content-Length: ${rewritten.size}${crlf}Access-Control-Allow-Origin: *${crlf}${crlf}".toByteArray())
+                    out.write(rewritten)
+                } else if (path.startsWith("/seg?url=")) {
+                    val segUrl = java.net.URLDecoder.decode(path.removePrefix("/seg?url="), "UTF-8")
+                    try {
+                        val conn = java.net.URL(segUrl).openConnection() as java.net.HttpURLConnection
+                        conn.setRequestProperty("User-Agent", UA)
+                        conn.setRequestProperty("Referer", segmentReferer)
+                        val bytes = conn.inputStream.readBytes()
+                        out.write("HTTP/1.1 200 OK${crlf}Content-Type: video/mp2t${crlf}Content-Length: ${bytes.size}${crlf}Access-Control-Allow-Origin: *${crlf}${crlf}".toByteArray())
+                        out.write(bytes)
+                    } catch (_: Exception) {
+                        out.write("HTTP/1.1 502 Bad Gateway${crlf}${crlf}".toByteArray())
+                    }
+                } else {
+                    out.write("HTTP/1.1 404 Not Found${crlf}${crlf}".toByteArray())
+                }
+                out.flush()
+                client.close()
+            } catch (_: Exception) {
+                try { client.close() } catch (_: Exception) {}
+            }
+        }
+
+        fun stop() {
+            try { serverSocket?.close() } catch (_: Exception) {}
+            try { pool.shutdownNow() } catch (_: Exception) {}
         }
     }
 
-    @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun capturePlaylistUrlFinalWeapon(iframeUrl: String, referer: String): String? {
-        return withContext(Dispatchers.Main) {
-            withTimeoutOrNull(30_000L) {
-                suspendCancellableCoroutine { cont ->
-                    val ctx = try { AcraApplication.context } catch (_: Exception) { null }
-                    if (ctx == null) { cont.resume(null); return@suspendCancellableCoroutine }
+    override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
+        val epUrl = data.substringBefore("|")
+        val epHtml = try { app.get(epUrl, headers = baseHeaders).text } catch (_: Exception) { "" }
+        
+        val linkToken = Regex("""["']link["']\s*[:=]\s*["']([A-Za-z0-9_\-]{20,})["']""").find(epHtml)?.groupValues?.getOrNull(1) ?: return true
 
-                    val wv = WebView(ctx)
-                    wv.settings.apply {
-                        javaScriptEnabled = true
-                        domStorageEnabled = true
-                        userAgentString = UA
-                    }
-                    
-                    android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
+        val ajaxPlayer = try {
+            app.post("$mainUrl/ajax/player", 
+                headers = mapOf("User-Agent" to UA, "Referer" to epUrl, "X-Requested-With" to "XMLHttpRequest"), 
+                data = mapOf("link" to linkToken, "play" to "api", "id" to "0", "backuplinks" to "1"))
+        } catch (_: Exception) { null }
 
-                    wv.webViewClient = object : WebViewClient() {
-                        override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
-                            val url = request.url.toString()
-                            if (url.contains(".m3u8") && url.contains("token=")) {
-                                android.webkit.CookieManager.getInstance().flush()
-                                if (cont.isActive) cont.resume(url)
-                            }
-                            return null
-                        }
-                        override fun onPageFinished(view: WebView, url: String) {
-                            view.evaluateJavascript("document.querySelector('video')?.play();", null)
-                        }
-                    }
+        val playerUrl = Regex(""""link"\s*:\s*"(https?://[^"]+/player/[^"]+)"""").find(ajaxPlayer?.text ?: "")?.groupValues?.getOrNull(1)?.replace("\\/", "/") ?: return true
 
-                    wv.loadUrl(iframeUrl, mapOf("Referer" to referer))
-                    cont.invokeOnCancellation { wv.stopLoading(); wv.destroy() }
-                }
-            }
+        // TRÍCH XUẤT ID VÀ TOKEN TỪ HTML CỦA PLAYER
+        val playerHtml = try { app.get(playerUrl, headers = mapOf("User-Agent" to UA, "Referer" to epUrl)).text } catch (_: Exception) { "" }
+        val id = Regex("""var id\s*=\s*"([^"]+)"""").find(playerHtml)?.groupValues?.getOrNull(1) ?: return true
+        val token = Regex("""var avsToken\s*=\s*"([^"]+)"""").find(playerHtml)?.groupValues?.getOrNull(1) ?: return true
+
+        // TẠO LINK M3U8 THẬT
+        val playlistUrl = "https://storage.googleapiscdn.com/playlist/$id/playlist.m3u8?token=$token"
+        val playerReferer = playerUrl 
+        val playlistOrigin = "https://storage.googleapiscdn.com"
+
+        val playlistText = try {
+            app.get(playlistUrl, headers = mapOf("User-Agent" to UA, "Referer" to playerReferer, "Origin" to playlistOrigin)).text
+        } catch (_: Exception) { return true }
+
+        if (!playlistText.contains("#EXTM3U")) return true
+
+        callback(newExtractorLink(source = name, name = "$name - Direct", url = playlistUrl, type = ExtractorLinkType.M3U8) {
+            this.quality = Qualities.P1080.value
+            this.headers = mapOf("User-Agent" to UA, "Referer" to playerReferer, "Origin" to playlistOrigin)
+        })
+
+        servePlaylistViaProxy(playlistText, playerReferer, callback)
+        return true
+    }
+
+    private fun servePlaylistViaProxy(playlistText: String, segmentReferer: String, callback: suspend (ExtractorLink) -> Unit) {
+        localServer?.stop()
+        val server = PlaylistProxyServer(playlistText, segmentReferer)
+        server.start()
+        localServer = server
+        GlobalScope.launch {
+            callback(newExtractorLink(source = name, name = "$name - DU", url = "http://127.0.0.1:${server.port}/playlist.m3u8", type = ExtractorLinkType.M3U8) {
+                this.quality = Qualities.P1080.value
+                this.headers = mapOf("User-Agent" to UA)
+            })
         }
     }
 }

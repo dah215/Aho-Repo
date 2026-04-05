@@ -41,7 +41,6 @@ class AnimeVietSubProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA)
 
-    // Cập nhật User-Agent mới nhất để tránh bị server chặn
     private val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
     private val baseHeaders = mapOf(
@@ -140,11 +139,17 @@ class AnimeVietSubProvider : MainAPI() {
 
         return if (episodes.size <= 1) {
             newMovieLoadResponse(title, url, TvType.AnimeMovie, episodes.firstOrNull()?.data ?: "$base/xem-phim.html") {
-                this.posterUrl = poster; this.plot = description; this.tags = tags; this.year = year
+                this.posterUrl = poster
+                this.plot = description
+                this.tags = tags
+                this.year = year
             }
         } else {
             newAnimeLoadResponse(title, url, TvType.Anime, true) {
-                this.posterUrl = poster; this.plot = description; this.tags = tags; this.year = year
+                this.posterUrl = poster
+                this.plot = description
+                this.tags = tags
+                this.year = year
                 addEpisodes(DubStatus.Subbed, episodes)
             }
         }
@@ -260,24 +265,33 @@ class AnimeVietSubProvider : MainAPI() {
     }
 
     private var localServer: PlaylistProxyServer? = null
+
     inner class PlaylistProxyServer(private val playlistContent: String, private val segmentReferer: String) {
         private var serverSocket: java.net.ServerSocket? = null
         val port: Int get() = serverSocket?.localPort ?: 0
         private val pool = java.util.concurrent.Executors.newCachedThreadPool()
+
         fun start() {
             serverSocket = java.net.ServerSocket(0)
             Thread {
                 val ss = serverSocket ?: return@Thread
-                while (!ss.isClosed) { try { val c = ss.accept(); pool.execute { handle(c) } } catch (_: Exception) { break }
+                while (!ss.isClosed) {
+                    try {
+                        val c = ss.accept()
+                        pool.execute { handle(c) }
+                    } catch (_: Exception) { break }
+                }
             }.also { it.isDaemon = true }.start()
         }
+
         private fun handle(client: java.net.Socket) {
             try {
                 val reader = client.getInputStream().bufferedReader()
                 var line = reader.readLine()
                 if (line == null) return
                 val path = line.split(" ").getOrNull(1) ?: "/"
-                val crlf = "\r\n"; val out = client.getOutputStream()
+                val crlf = "\r\n"
+                val out = client.getOutputStream()
                 if (path == "/playlist.m3u8") {
                     val base = "http://127.0.0.1:$port"
                     val rewritten = playlistContent.lines().joinToString("\n") { l ->
@@ -289,16 +303,28 @@ class AnimeVietSubProvider : MainAPI() {
                     val segUrl = java.net.URLDecoder.decode(path.removePrefix("/seg?url="), "UTF-8")
                     try {
                         val conn = java.net.URL(segUrl).openConnection() as java.net.HttpURLConnection
-                        conn.setRequestProperty("User-Agent", UA); conn.setRequestProperty("Referer", segmentReferer)
+                        conn.setRequestProperty("User-Agent", UA)
+                        conn.setRequestProperty("Referer", segmentReferer)
                         val bytes = conn.inputStream.readBytes()
                         out.write("HTTP/1.1 200 OK${crlf}Content-Type: video/mp2t${crlf}Content-Length: ${bytes.size}${crlf}Access-Control-Allow-Origin: *${crlf}${crlf}".toByteArray())
                         out.write(bytes)
-                    } catch (_: Exception) { out.write("HTTP/1.1 502 Bad Gateway${crlf}${crlf}".toByteArray()) }
-                } else { out.write("HTTP/1.1 404 Not Found${crlf}${crlf}".toByteArray()) }
-                out.flush(); client.close()
-            } catch (_: Exception) { try { client.close() } catch (_: Exception) {} }
+                    } catch (_: Exception) {
+                        out.write("HTTP/1.1 502 Bad Gateway${crlf}${crlf}".toByteArray())
+                    }
+                } else {
+                    out.write("HTTP/1.1 404 Not Found${crlf}${crlf}".toByteArray())
+                }
+                out.flush()
+                client.close()
+            } catch (_: Exception) {
+                try { client.close() } catch (_: Exception) {}
+            }
         }
-        fun stop() { try { serverSocket?.close() } catch (_: Exception) {} ; try { pool.shutdownNow() } catch (_: Exception) {} }
+
+        fun stop() {
+            try { serverSocket?.close() } catch (_: Exception) {}
+            try { pool.shutdownNow() } catch (_: Exception) {}
+        }
     }
 
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
@@ -320,7 +346,6 @@ class AnimeVietSubProvider : MainAPI() {
             playerDoc.selectFirst("video source[src*=playlist]")?.attr("src")?.replace("&amp;", "&")
         } catch (_: Exception) { null } ?: return true
 
-        // FIX QUAN TRỌNG: Sử dụng epUrl làm Referer cho toàn bộ quá trình phát
         val playerReferer = epUrl 
         val playlistHost = try { java.net.URL(playlistUrl).host } catch (_: Exception) { "storage.googleapiscdn.com" }
         val playlistOrigin = "https://$playlistHost"
@@ -331,13 +356,11 @@ class AnimeVietSubProvider : MainAPI() {
 
         if (!playlistText.contains("#EXTM3U")) return true
 
-        // Nguồn Direct (Ưu tiên)
         callback(newExtractorLink(source = name, name = "$name - Direct", url = playlistUrl, type = ExtractorLinkType.M3U8) {
             this.quality = Qualities.P1080.value
             this.headers = mapOf("User-Agent" to UA, "Referer" to playerReferer, "Origin" to playlistOrigin)
         })
 
-        // Nguồn Proxy (Dự phòng)
         servePlaylistViaProxy(playlistText, playerReferer, callback)
         return true
     }

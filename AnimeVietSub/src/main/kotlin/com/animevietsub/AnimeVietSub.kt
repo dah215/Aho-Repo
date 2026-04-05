@@ -181,29 +181,40 @@ class AnimeVietSubProvider : MainAPI() {
         val epUrl = data.substringBefore("|")
         val epHtml = try { app.get(epUrl, headers = baseHeaders).text } catch (_: Exception) { "" }
         
-        // Thuật toán lấy linkToken mạnh mẽ hơn
+        // 1. Lấy linkToken từ nhiều nguồn khác nhau
         val linkToken = Regex("""["']link["']\s*[:=]\s*["']([A-Za-z0-9_\-]{20,})["']""").find(epHtml)?.groupValues?.getOrNull(1)
             ?: Regex("""data-link=["']([A-Za-z0-9_\-]{20,})["']""").find(epHtml)?.groupValues?.getOrNull(1)
+            ?: Regex("""link\s*=\s*["']([A-Za-z0-9_\-]{20,})["']""").find(epHtml)?.groupValues?.getOrNull(1)
             ?: return true
 
+        // 2. Gọi API ajax/player để lấy link trình phát
         val ajaxResponse = try {
             app.post("$mainUrl/ajax/player",
-                headers = mapOf("User-Agent" to UA, "X-Requested-With" to "XMLHttpRequest", "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8", "Referer" to epUrl, "Origin" to mainUrl),
+                headers = mapOf(
+                    "User-Agent" to UA,
+                    "X-Requested-With" to "XMLHttpRequest",
+                    "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
+                    "Referer" to epUrl,
+                    "Origin" to mainUrl,
+                    "Accept" to "application/json, text/javascript, */*; q=0.01"
+                ),
                 data = mapOf("link" to linkToken, "play" to "api", "id" to "0", "backuplinks" to "1")
             )
         } catch (_: Exception) { null } ?: return true
 
-        val ajaxHtml = ajaxResponse.text
-        val playerUrl = Regex(""""link"\s*:\s*"(https?://[^"]+/player/[^"]+)"""").find(ajaxHtml.replace("\\/", "/"))?.groupValues?.getOrNull(1) ?: return true
+        val ajaxJson = ajaxResponse.text
+        val playerUrl = Regex(""""link"\s*:\s*"(https?://[^"]+/player/[^"]+)"""").find(ajaxJson.replace("\\/", "/"))?.groupValues?.getOrNull(1)
+            ?: Regex("""https?://[^"'\s<>]+/player/[A-Za-z0-9_\-]+""").find(ajaxJson.replace("\\/", "/"))?.value
+            ?: return true
 
-        // Bắt link m3u8 qua WebView với thuật toán "Deep Interception"
-        val playlistUrl = capturePlaylistUrl(playerUrl, epUrl) ?: return true
+        // 3. Đánh chặn link m3u8 qua WebView với phương pháp "God Mode"
+        val playlistUrl = capturePlaylistUrlGodMode(playerUrl, epUrl) ?: return true
 
         val playlistHost = java.net.URI(playlistUrl).host
         val playerReferer = "https://$playlistHost/player/${playerUrl.substringAfterLast("/")}"
 
-        // SỬA LỖI 2004 & CLOUDFLARE: Thuật toán mạng mạnh nhất
-        callback(newExtractorLink(source = name, name = "$name - Ultra", url = playlistUrl, type = ExtractorLinkType.M3U8) {
+        // 4. Trả về link video với đầy đủ tiêu đề bảo mật để tránh lỗi 2004
+        callback(newExtractorLink(source = name, name = "$name - GodMode", url = playlistUrl, type = ExtractorLinkType.M3U8) {
             this.quality = Qualities.P1080.value
             this.headers = mapOf(
                 "User-Agent" to UA,
@@ -221,9 +232,9 @@ class AnimeVietSubProvider : MainAPI() {
     }
 
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun capturePlaylistUrl(iframeUrl: String, referer: String): String? {
+    private suspend fun capturePlaylistUrlGodMode(iframeUrl: String, referer: String): String? {
         return withContext(Dispatchers.Main) {
-            withTimeoutOrNull(30_000L) {
+            withTimeoutOrNull(45_000L) { // Tăng timeout lên 45s để vượt qua Cloudflare
                 suspendCancellableCoroutine { cont ->
                     val ctx = try { AcraApplication.context } catch (_: Exception) { null }
                     if (ctx == null) { cont.resume(null); return@suspendCancellableCoroutine }
@@ -237,22 +248,36 @@ class AnimeVietSubProvider : MainAPI() {
                         mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                     }
                     
+                    // Xóa cookie cũ để tránh xung đột phiên làm việc
+                    android.webkit.CookieManager.getInstance().removeAllCookies(null)
+
                     wv.webViewClient = object : WebViewClient() {
                         override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                             val url = request.url.toString()
-                            // Thuật toán bắt link m3u8 nhạy bén hơn
-                            if (url.contains(".m3u8") && (url.contains("token=") || url.contains("expires="))) {
+                            // Đánh chặn link m3u8 với bất kỳ tham số xác thực nào
+                            if (url.contains(".m3u8") && (url.contains("token=") || url.contains("expires=") || url.contains("auth="))) {
                                 if (cont.isActive) cont.resume(url)
                             }
                             return null
                         }
+
                         override fun onPageFinished(view: WebView, url: String) {
-                            // Tự động kích hoạt trình phát nếu cần
-                            view.evaluateJavascript("document.querySelector('video')?.play();", null)
+                            // Tự động hóa tương tác: Tìm và nhấn nút Play, hoặc kích hoạt video tag
+                            val jsTrigger = """
+                                (function() {
+                                    var v = document.querySelector('video');
+                                    if (v) { v.play(); v.muted = true; }
+                                    var btn = document.querySelector('.vjs-big-play-button') || document.querySelector('#play-button');
+                                    if (btn) btn.click();
+                                })();
+                            """.trimIndent()
+                            view.evaluateJavascript(jsTrigger, null)
                         }
                     }
 
+                    // Tải link trình phát với Referer là trang tập phim
                     wv.loadUrl(iframeUrl, mapOf("Referer" to referer))
+                    
                     cont.invokeOnCancellation { wv.stopLoading(); wv.destroy() }
                 }
             }

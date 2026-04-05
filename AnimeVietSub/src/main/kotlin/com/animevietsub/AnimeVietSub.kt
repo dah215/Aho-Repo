@@ -179,31 +179,17 @@ class AnimeVietSubProvider : MainAPI() {
 
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         val epUrl = data.substringBefore("|")
-        val epHtml = try { app.get(epUrl, headers = baseHeaders).text } catch (_: Exception) { "" }
         
-        // SỬA LỖI ULTIMATE: Trích xuất trực tiếp link Iframe từ HTML (Bỏ qua API ajax/player nếu cần)
-        val iframeUrl = Regex("""<iframe[^>]+src=["'](https?://storage\.googleapiscdn\.com/player/[^"']+)["']""").find(epHtml)?.groupValues?.getOrNull(1)
-            ?: run {
-                // Fallback: Nếu không thấy iframe trực tiếp, thử lấy linkToken và gọi API như cũ
-                val linkToken = Regex("""["']link["']\s*[:=]\s*["']([A-Za-z0-9_\-]{20,})["']""").find(epHtml)?.groupValues?.getOrNull(1)
-                if (linkToken != null) {
-                    val ajaxResponse = try {
-                        app.post("$mainUrl/ajax/player",
-                            headers = mapOf("User-Agent" to UA, "X-Requested-With" to "XMLHttpRequest", "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8", "Referer" to epUrl, "Origin" to mainUrl),
-                            data = mapOf("link" to linkToken, "play" to "api", "id" to "0", "backuplinks" to "1")
-                        )
-                    } catch (_: Exception) { null }
-                    Regex(""""link"\s*:\s*"(https?://[^"]+/player/[^"]+)"""").find(ajaxResponse?.text?.replace("\\/", "/") ?: "")?.groupValues?.getOrNull(1)
-                } else null
-            } ?: return true
+        // SỬA LỖI FINAL WEAPON: Sử dụng WebView để lấy link Iframe sinh ra bởi JavaScript
+        val iframeUrl = captureIframeUrl(epUrl) ?: return true
 
         // Bắt link m3u8 từ Iframe thật qua WebView
-        val playlistUrl = capturePlaylistUrlUltimate(iframeUrl.replace("&amp;", "&"), epUrl) ?: return true
+        val playlistUrl = capturePlaylistUrlFinalWeapon(iframeUrl.replace("&amp;", "&"), epUrl) ?: return true
 
         val playlistHost = java.net.URI(playlistUrl).host
         val playerReferer = "https://$playlistHost/player/${iframeUrl.substringAfter("/player/").substringBefore("?")}"
 
-        callback(newExtractorLink(source = name, name = "$name - Ultimate", url = playlistUrl, type = ExtractorLinkType.M3U8) {
+        callback(newExtractorLink(source = name, name = "$name - Final Weapon", url = playlistUrl, type = ExtractorLinkType.M3U8) {
             this.quality = Qualities.P1080.value
             this.headers = mapOf(
                 "User-Agent" to UA,
@@ -221,9 +207,62 @@ class AnimeVietSubProvider : MainAPI() {
     }
 
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun capturePlaylistUrlUltimate(iframeUrl: String, referer: String): String? {
+    private suspend fun captureIframeUrl(epUrl: String): String? {
         return withContext(Dispatchers.Main) {
-            withTimeoutOrNull(45_000L) {
+            withTimeoutOrNull(30_000L) {
+                suspendCancellableCoroutine { cont ->
+                    val ctx = try { AcraApplication.context } catch (_: Exception) { null }
+                    if (ctx == null) { cont.resume(null); return@suspendCancellableCoroutine }
+
+                    val wv = WebView(ctx)
+                    wv.settings.javaScriptEnabled = true
+                    wv.settings.domStorageEnabled = true
+                    wv.settings.userAgentString = UA
+                    
+                    wv.webViewClient = object : WebViewClient() {
+                        override fun onPageFinished(view: WebView, url: String) {
+                            // Quét Iframe sau khi JavaScript đã chạy xong
+                            val jsGetIframe = """
+                                (function() {
+                                    var ifr = document.querySelector('iframe[src*="storage.googleapiscdn.com/player/"]');
+                                    return ifr ? ifr.src : null;
+                                })();
+                            """.trimIndent()
+                            view.evaluateJavascript(jsGetIframe) { result ->
+                                val src = result?.trim('"')?.takeIf { it != "null" && it.isNotBlank() }
+                                if (src != null && cont.isActive) cont.resume(src)
+                            }
+                        }
+                    }
+                    wv.loadUrl(epUrl)
+                    
+                    // Checker định kỳ nếu onPageFinished không kích hoạt đúng lúc
+                    val handler = android.os.Handler(android.os.Looper.getMainLooper())
+                    val checker = object : Runnable {
+                        override fun run() {
+                            if (!cont.isActive) return
+                            wv.evaluateJavascript("(function(){ var ifr = document.querySelector('iframe[src*=\"storage.googleapiscdn.com/player/\"]'); return ifr ? ifr.src : null; })();") { result ->
+                                val src = result?.trim('"')?.takeIf { it != "null" && it.isNotBlank() }
+                                if (src != null && cont.isActive) {
+                                    cont.resume(src)
+                                } else {
+                                    handler.postDelayed(this, 1000)
+                                }
+                            }
+                        }
+                    }
+                    handler.postDelayed(checker, 2000)
+
+                    cont.invokeOnCancellation { wv.stopLoading(); wv.destroy() }
+                }
+            }
+        }
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private suspend fun capturePlaylistUrlFinalWeapon(iframeUrl: String, referer: String): String? {
+        return withContext(Dispatchers.Main) {
+            withTimeoutOrNull(30_000L) {
                 suspendCancellableCoroutine { cont ->
                     val ctx = try { AcraApplication.context } catch (_: Exception) { null }
                     if (ctx == null) { cont.resume(null); return@suspendCancellableCoroutine }
@@ -240,7 +279,6 @@ class AnimeVietSubProvider : MainAPI() {
                     wv.webViewClient = object : WebViewClient() {
                         override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                             val url = request.url.toString()
-                            // Bắt link m3u8 kèm token xác thực
                             if (url.contains(".m3u8") && url.contains("token=")) {
                                 android.webkit.CookieManager.getInstance().flush()
                                 if (cont.isActive) cont.resume(url)
@@ -248,7 +286,6 @@ class AnimeVietSubProvider : MainAPI() {
                             return null
                         }
                         override fun onPageFinished(view: WebView, url: String) {
-                            // Ép trình phát chạy để sinh link m3u8
                             view.evaluateJavascript("document.querySelector('video')?.play();", null)
                         }
                     }

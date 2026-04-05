@@ -27,9 +27,6 @@ class AnimeVietSubPlugin : Plugin() {
     override fun load() {
         val provider = AnimeVietSubProvider()
         registerMainAPI(provider)
-        kotlinx.coroutines.GlobalScope.launch {
-            provider.prefetchAvsJs()
-        }
     }
 }
 
@@ -48,8 +45,6 @@ class AnimeVietSubProvider : MainAPI() {
         "Accept-Language" to "vi-VN,vi;q=0.9",
         "Referer" to "$mainUrl/"
     )
-
-    private var cachedAvsJs: String? = null
 
     override val mainPage = mainPageOf(
         "$mainUrl/anime-moi/" to "Anime Mới",
@@ -94,11 +89,7 @@ class AnimeVietSubProvider : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse {
         val base = url.trimEnd('/')
-
-        val infoDoc = try {
-            app.get("$base/", headers = baseHeaders).document
-        } catch (_: Exception) { null }
-
+        val infoDoc = try { app.get("$base/", headers = baseHeaders).document } catch (_: Exception) { null }
         val watchDoc = app.get("$base/xem-phim.html", headers = baseHeaders).document
 
         val title = watchDoc.selectFirst("h1.Title")?.text()?.trim()
@@ -120,79 +111,36 @@ class AnimeVietSubProvider : MainAPI() {
                     return li.text().substringAfter(lbl.text()).trim().ifBlank { null }
                 }
             }
-            val found = doc.selectFirst("li:contains($label)")
-            if (found != null) {
-                return found.text().replace(label, "").trim().ifBlank { null }
-            }
             return null
         }
 
-        val views = watchDoc.selectFirst("span.View")?.text()?.trim()
-            ?.replace("Lượt Xem", "lượt xem")
-
+        val views = watchDoc.selectFirst("span.View")?.text()?.trim()?.replace("Lượt Xem", "lượt xem")
         val quality = watchDoc.selectFirst("span.Qlty")?.text()?.trim() ?: "HD"
-
-        val year = (watchDoc.selectFirst("p.Info .Date a, p.Info .Date, span.Date a")
-            ?.text()?.filter { it.isDigit() }?.take(4)?.toIntOrNull())
-            ?: (infoDoc?.selectFirst("p.Info .Date a, p.Info .Date, span.Date a")
-            ?.text()?.filter { it.isDigit() }?.take(4)?.toIntOrNull())
-
-        val status = (metaValue(infoDoc, "Trạng thái") ?: metaValue(watchDoc, "Trạng thái"))
-            ?.replace("VietSub", "Vietsub")
-
-        val duration = metaValue(infoDoc, "Thời lượng") ?: metaValue(watchDoc, "Thời lượng")
-
+        val year = (watchDoc.selectFirst("p.Info .Date a, p.Info .Date, span.Date a")?.text()?.filter { it.isDigit() }?.take(4)?.toIntOrNull())
+        val status = metaValue(infoDoc, "Trạng thái")?.replace("VietSub", "Vietsub")
+        val duration = metaValue(infoDoc, "Thời lượng")
         val country = infoDoc?.selectFirst("li:contains(Quốc gia:) a")?.text()?.trim()
-            ?: watchDoc.selectFirst("li:contains(Quốc gia:) a")?.text()?.trim()
-
-        val studio = (metaValue(infoDoc, "Studio") ?: metaValue(infoDoc, "Đạo diễn"))
-            ?: (metaValue(watchDoc, "Studio") ?: metaValue(watchDoc, "Đạo diễn"))
-
+        val studio = metaValue(infoDoc, "Studio") ?: metaValue(infoDoc, "Đạo diễn")
         val followers = metaValue(infoDoc, "Theo dõi")
-            ?: metaValue(infoDoc, "Số người theo dõi")
-            ?: metaValue(watchDoc, "Theo dõi")
-            ?: metaValue(watchDoc, "Số người theo dõi")
+        val tags = (infoDoc?.select("p.Genre a, li:contains(Thể loại:) a") ?: watchDoc.select("p.Genre a, li:contains(Thể loại:) a")).map { it.text().trim() }.filter { it.isNotBlank() }.distinct()
+        val latestEps = (infoDoc?.select("li.latest_eps a") ?: watchDoc.select("li.latest_eps a")).map { it.text().trim() }.take(3).joinToString(", ")
 
-        val tags = (infoDoc?.select("p.Genre a, li:contains(Thể loại:) a")
-            ?: watchDoc.select("p.Genre a, li:contains(Thể loại:) a")).map {
-            it.text().trim()
-        }.filter { it.isNotBlank() }.distinct()
-
-        val latestEps = (infoDoc?.select("li.latest_eps a")
-            ?: watchDoc.select("li.latest_eps a")).map { it.text().trim() }
-            .take(3).joinToString(", ")
-
-        val description = buildBeautifulDescription(
-            altTitle, status, duration, quality, country,
-            year?.toString(), studio, followers, views,
-            latestEps.ifBlank { null }, tags.joinToString(", "), plotOriginal
-        )
+        val description = buildBeautifulDescription(altTitle, status, duration, quality, country, year?.toString(), studio, followers, views, latestEps.ifBlank { null }, tags.joinToString(", "), plotOriginal)
 
         val seen = mutableSetOf<String>()
-        val episodes = watchDoc.select("#list-server .list-episode a.episode-link, " +
-                ".listing.items a[href*=/tap-], " +
-                "a[href*=-tap-]")
+        val episodes = watchDoc.select("#list-server .list-episode a.episode-link, .listing.items a[href*=/tap-], a[href*=-tap-]")
             .mapNotNull { a ->
-                val href = a.attr("href").let {
-                    if (it.startsWith("http")) it else "$mainUrl$it"
-                }
+                val href = a.attr("href").let { if (it.startsWith("http")) it else "$mainUrl$it" }
                 if (href.isBlank() || !seen.add(href)) return@mapNotNull null
-
                 val epNum = Regex("""\d+""").find(a.text())?.value?.toIntOrNull()
-                val epTitle = a.attr("title").ifBlank { "Tập ${a.text().trim()}" }
-
                 newEpisode(href) {
-                    this.name = epTitle
+                    this.name = a.attr("title").ifBlank { "Tập ${a.text().trim()}" }
                     this.episode = epNum
                 }
-            }.distinctBy { it.episode ?: it.data }
-            .sortedBy { it.episode ?: 0 }
+            }.distinctBy { it.episode ?: it.data }.sortedBy { it.episode ?: 0 }
 
         return if (episodes.size <= 1) {
-            newMovieLoadResponse(
-                title, url, TvType.AnimeMovie,
-                episodes.firstOrNull()?.data ?: "$base/xem-phim.html"
-            ) {
+            newMovieLoadResponse(title, url, TvType.AnimeMovie, episodes.firstOrNull()?.data ?: "$base/xem-phim.html") {
                 this.posterUrl = poster
                 this.plot = description
                 this.tags = tags
@@ -209,47 +157,18 @@ class AnimeVietSubProvider : MainAPI() {
         }
     }
 
-    private fun buildBeautifulDescription(
-        altTitle: String?,
-        status: String?,
-        duration: String?,
-        quality: String?,
-        country: String?,
-        year: String?,
-        studio: String?,
-        followers: String?,
-        views: String?,
-        latestEps: String?,
-        genre: String?,
-        description: String?
-    ): String {
+    private fun buildBeautifulDescription(altTitle: String?, status: String?, duration: String?, quality: String?, country: String?, year: String?, studio: String?, followers: String?, views: String?, latestEps: String?, genre: String?, description: String?): String {
         return buildString {
-            altTitle?.takeIf { it.isNotBlank() }?.let {
-                append("<font color='#AAAAAA'><i>$it</i></font><br><br>")
-            }
-
-            fun addInfo(icon: String, label: String, value: String?, color: String = "#FFFFFF") {
-                if (!value.isNullOrBlank()) {
-                    append("$icon <b>$label:</b> <font color='$color'>$value</font><br>")
-                }
-            }
-
-            val statusColor = when {
-                status?.contains("đang chiếu", ignoreCase = true) == true -> "#4CAF50"
-                status?.contains("hoàn thành", ignoreCase = true) == true -> "#2196F3"
-                status?.contains("sắp chiếu", ignoreCase = true) == true -> "#FF9800"
-                else -> "#2196F3"
-            }
-
-            addInfo("📺", "Trạng thái", status, statusColor)
+            altTitle?.takeIf { it.isNotBlank() }?.let { append("<font color='#AAAAAA'><i>$it</i></font><br><br>") }
+            fun addInfo(icon: String, label: String, value: String?, color: String = "#FFFFFF") { if (!value.isNullOrBlank()) append("$icon <b>$label:</b> <font color='$color'>$value</font><br>") }
+            addInfo("📺", "Trạng thái", status)
             addInfo("⏱", "Thời lượng", duration)
-            addInfo("🎬", "Chất lượng", quality?.ifBlank { null }, "#E91E63")
+            addInfo("🎬", "Chất lượng", quality, "#E91E63")
             addInfo("🌍", "Quốc gia", country)
-            addInfo("📅", "Năm", year?.ifBlank { null })
+            addInfo("📅", "Năm", year)
             addInfo("🎥", "Studio", studio)
-            addInfo("👥", "Theo dõi", followers?.ifBlank { null })
+            addInfo("👥", "Theo dõi", followers)
             addInfo("👁", "Lượt xem", views)
-            
             description?.takeIf { it.isNotBlank() }?.let {
                 append("<br><b><font color='#FFEB3B'>✦ NỘI DUNG PHIM</font></b><br>")
                 append("<hr color='#333333' size='1'><br>")
@@ -258,116 +177,83 @@ class AnimeVietSubProvider : MainAPI() {
         }
     }
 
-    suspend fun prefetchAvsJs() {
-        if (cachedAvsJs != null) return
-        try {
-            val pageHtml = try { app.get("$mainUrl/", headers = baseHeaders).text } catch(_: Exception) { "" }
-            val detectedPath = Regex("""statics/default/js/((?:pl\.watchbk\d+|avs\.watch)\.js\?v=[0-9.]+)""")
-                .find(pageHtml)?.groupValues?.get(1)
-            val jsUrl = if (!detectedPath.isNullOrBlank())
-                "$mainUrl/statics/default/js/$detectedPath"
-            else
-                "$mainUrl/statics/default/js/pl.watchbk2.js?v=6.1.9"
-            val js = app.get(
-                jsUrl,
-                headers = mapOf("User-Agent" to UA, "Referer" to "$mainUrl/", "Accept" to "*/*")
-            ).text
-            if (js.length > 500) cachedAvsJs = js
-        } catch (_: Exception) {}
-    }
-
-    override suspend fun loadLinks(
-        data: String,
-        isCasting: Boolean,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
+    override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         val epUrl = data.substringBefore("|")
-        val epHtml = try { app.get(epUrl, headers = baseHeaders).text }
-                     catch (_: Exception) { "" }
+        val epHtml = try { app.get(epUrl, headers = baseHeaders).text } catch (_: Exception) { "" }
         
-        val linkToken = Regex("""["']link["']\s*[:=]\s*["']([A-Za-z0-9_\-]{20,})["']""")
-            .find(epHtml)?.groupValues?.getOrNull(1) ?: return true
+        // Thuật toán lấy linkToken mạnh mẽ hơn
+        val linkToken = Regex("""["']link["']\s*[:=]\s*["']([A-Za-z0-9_\-]{20,})["']""").find(epHtml)?.groupValues?.getOrNull(1)
+            ?: Regex("""data-link=["']([A-Za-z0-9_\-]{20,})["']""").find(epHtml)?.groupValues?.getOrNull(1)
+            ?: return true
 
-        val ajaxPlayerApi = try {
-            app.post(
-                "$mainUrl/ajax/player",
-                headers = mapOf(
-                    "User-Agent" to UA,
-                    "X-Requested-With" to "XMLHttpRequest",
-                    "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
-                    "Referer" to epUrl,
-                    "Origin" to mainUrl
-                ),
-                data = mapOf(
-                    "link" to linkToken,
-                    "play" to "api",
-                    "id" to "0",
-                    "backuplinks" to "1"
-                )
+        val ajaxResponse = try {
+            app.post("$mainUrl/ajax/player",
+                headers = mapOf("User-Agent" to UA, "X-Requested-With" to "XMLHttpRequest", "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8", "Referer" to epUrl, "Origin" to mainUrl),
+                data = mapOf("link" to linkToken, "play" to "api", "id" to "0", "backuplinks" to "1")
             )
         } catch (_: Exception) { null } ?: return true
 
-        val ajaxHtml = ajaxPlayerApi.text
-        val ajaxPlayerUrl = Regex(""""link"\s*:\s*"(https?://[^"]+/player/[^"]+)"""")
-            .find(ajaxHtml.replace("\\/", "/"))?.groupValues?.getOrNull(1) ?: return true
+        val ajaxHtml = ajaxResponse.text
+        val playerUrl = Regex(""""link"\s*:\s*"(https?://[^"]+/player/[^"]+)"""").find(ajaxHtml.replace("\\/", "/"))?.groupValues?.getOrNull(1) ?: return true
 
-        // Bắt link m3u8 có token mới nhất qua WebView
-        val playlistUrl = capturePlaylistUrl(ajaxPlayerUrl, epUrl) ?: return true
+        // Bắt link m3u8 qua WebView với thuật toán "Deep Interception"
+        val playlistUrl = capturePlaylistUrl(playerUrl, epUrl) ?: return true
 
-        val playlistUri = java.net.URI(playlistUrl)
-        val playlistHost = playlistUri.host
-        val playerReferer = "https://$playlistHost/player/${ajaxPlayerUrl.substringAfterLast("/")}"
+        val playlistHost = java.net.URI(playlistUrl).host
+        val playerReferer = "https://$playlistHost/player/${playerUrl.substringAfterLast("/")}"
 
-        // SỬA LỖI 2004: Thêm đầy đủ Referer, Origin và đồng bộ User-Agent
-        callback(newExtractorLink(
-            source = name,
-            name = "$name - Fixed",
-            url = playlistUrl,
-            type = ExtractorLinkType.M3U8
-        ) {
+        // SỬA LỖI 2004 & CLOUDFLARE: Thuật toán mạng mạnh nhất
+        callback(newExtractorLink(source = name, name = "$name - Ultra", url = playlistUrl, type = ExtractorLinkType.M3U8) {
             this.quality = Qualities.P1080.value
             this.headers = mapOf(
                 "User-Agent" to UA,
                 "Referer" to playerReferer,
                 "Origin" to "https://$playlistHost",
-                "Accept" to "*/*"
+                "Accept" to "*/*",
+                "Accept-Language" to "vi-VN,vi;q=0.9",
+                "Sec-Fetch-Dest" to "empty",
+                "Sec-Fetch-Mode" to "cors",
+                "Sec-Fetch-Site" to "same-origin",
+                "X-Requested-With" to "XMLHttpRequest"
             )
         })
-
         return true
     }
 
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun capturePlaylistUrl(iframeUrl: String, referer: String): String? {
         return withContext(Dispatchers.Main) {
-            withTimeoutOrNull(25_000L) {
+            withTimeoutOrNull(30_000L) {
                 suspendCancellableCoroutine { cont ->
                     val ctx = try { AcraApplication.context } catch (_: Exception) { null }
                     if (ctx == null) { cont.resume(null); return@suspendCancellableCoroutine }
 
                     val wv = WebView(ctx)
-                    wv.settings.javaScriptEnabled = true
-                    wv.settings.domStorageEnabled = true
-                    wv.settings.userAgentString = UA
+                    wv.settings.apply {
+                        javaScriptEnabled = true
+                        domStorageEnabled = true
+                        databaseEnabled = true
+                        userAgentString = UA
+                        mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                    }
                     
                     wv.webViewClient = object : WebViewClient() {
                         override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                             val url = request.url.toString()
-                            // Bắt link m3u8 chứa token xác thực
-                            if (url.contains("playlist.m3u8") && url.contains("token=")) {
+                            // Thuật toán bắt link m3u8 nhạy bén hơn
+                            if (url.contains(".m3u8") && (url.contains("token=") || url.contains("expires="))) {
                                 if (cont.isActive) cont.resume(url)
                             }
                             return null
                         }
+                        override fun onPageFinished(view: WebView, url: String) {
+                            // Tự động kích hoạt trình phát nếu cần
+                            view.evaluateJavascript("document.querySelector('video')?.play();", null)
+                        }
                     }
 
                     wv.loadUrl(iframeUrl, mapOf("Referer" to referer))
-
-                    cont.invokeOnCancellation {
-                        wv.stopLoading()
-                        wv.destroy()
-                    }
+                    cont.invokeOnCancellation { wv.stopLoading(); wv.destroy() }
                 }
             }
         }

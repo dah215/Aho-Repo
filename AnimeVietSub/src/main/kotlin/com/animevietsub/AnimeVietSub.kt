@@ -38,7 +38,6 @@ class AnimeVietSubProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA)
 
-    // SỬA LỖI 2004: Sử dụng User-Agent đồng bộ và hiện đại nhất
     private val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
 
     private val baseHeaders = mapOf(
@@ -182,27 +181,29 @@ class AnimeVietSubProvider : MainAPI() {
         val epUrl = data.substringBefore("|")
         val epHtml = try { app.get(epUrl, headers = baseHeaders).text } catch (_: Exception) { "" }
         
-        val linkToken = Regex("""["']link["']\s*[:=]\s*["']([A-Za-z0-9_\-]{20,})["']""").find(epHtml)?.groupValues?.getOrNull(1)
-            ?: Regex("""data-link=["']([A-Za-z0-9_\-]{20,})["']""").find(epHtml)?.groupValues?.getOrNull(1)
-            ?: return true
+        // SỬA LỖI ULTIMATE: Trích xuất trực tiếp link Iframe từ HTML (Bỏ qua API ajax/player nếu cần)
+        val iframeUrl = Regex("""<iframe[^>]+src=["'](https?://storage\.googleapiscdn\.com/player/[^"']+)["']""").find(epHtml)?.groupValues?.getOrNull(1)
+            ?: run {
+                // Fallback: Nếu không thấy iframe trực tiếp, thử lấy linkToken và gọi API như cũ
+                val linkToken = Regex("""["']link["']\s*[:=]\s*["']([A-Za-z0-9_\-]{20,})["']""").find(epHtml)?.groupValues?.getOrNull(1)
+                if (linkToken != null) {
+                    val ajaxResponse = try {
+                        app.post("$mainUrl/ajax/player",
+                            headers = mapOf("User-Agent" to UA, "X-Requested-With" to "XMLHttpRequest", "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8", "Referer" to epUrl, "Origin" to mainUrl),
+                            data = mapOf("link" to linkToken, "play" to "api", "id" to "0", "backuplinks" to "1")
+                        )
+                    } catch (_: Exception) { null }
+                    Regex(""""link"\s*:\s*"(https?://[^"]+/player/[^"]+)"""").find(ajaxResponse?.text?.replace("\\/", "/") ?: "")?.groupValues?.getOrNull(1)
+                } else null
+            } ?: return true
 
-        val ajaxResponse = try {
-            app.post("$mainUrl/ajax/player",
-                headers = mapOf("User-Agent" to UA, "X-Requested-With" to "XMLHttpRequest", "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8", "Referer" to epUrl, "Origin" to mainUrl),
-                data = mapOf("link" to linkToken, "play" to "api", "id" to "0", "backuplinks" to "1")
-            )
-        } catch (_: Exception) { null } ?: return true
-
-        val ajaxJson = ajaxResponse.text
-        val playerUrl = Regex(""""link"\s*:\s*"(https?://[^"]+/player/[^"]+)"""").find(ajaxJson.replace("\\/", "/"))?.groupValues?.getOrNull(1) ?: return true
-
-        // SỬA LỖI: Bắt link m3u8 và đồng bộ Cookie triệt để
-        val playlistUrl = capturePlaylistUrlFinal(playerUrl, epUrl) ?: return true
+        // Bắt link m3u8 từ Iframe thật qua WebView
+        val playlistUrl = capturePlaylistUrlUltimate(iframeUrl.replace("&amp;", "&"), epUrl) ?: return true
 
         val playlistHost = java.net.URI(playlistUrl).host
-        val playerReferer = "https://$playlistHost/player/${playerUrl.substringAfterLast("/")}"
+        val playerReferer = "https://$playlistHost/player/${iframeUrl.substringAfter("/player/").substringBefore("?")}"
 
-        callback(newExtractorLink(source = name, name = "$name - Final Fix", url = playlistUrl, type = ExtractorLinkType.M3U8) {
+        callback(newExtractorLink(source = name, name = "$name - Ultimate", url = playlistUrl, type = ExtractorLinkType.M3U8) {
             this.quality = Qualities.P1080.value
             this.headers = mapOf(
                 "User-Agent" to UA,
@@ -220,9 +221,9 @@ class AnimeVietSubProvider : MainAPI() {
     }
 
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun capturePlaylistUrlFinal(iframeUrl: String, referer: String): String? {
+    private suspend fun capturePlaylistUrlUltimate(iframeUrl: String, referer: String): String? {
         return withContext(Dispatchers.Main) {
-            withTimeoutOrNull(40_000L) {
+            withTimeoutOrNull(45_000L) {
                 suspendCancellableCoroutine { cont ->
                     val ctx = try { AcraApplication.context } catch (_: Exception) { null }
                     if (ctx == null) { cont.resume(null); return@suspendCancellableCoroutine }
@@ -234,14 +235,13 @@ class AnimeVietSubProvider : MainAPI() {
                         userAgentString = UA
                     }
                     
-                    // SỬA LỖI: Chấp nhận Cookie bên thứ 3 để vượt Cloudflare trên CDN
                     android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
 
                     wv.webViewClient = object : WebViewClient() {
                         override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                             val url = request.url.toString()
+                            // Bắt link m3u8 kèm token xác thực
                             if (url.contains(".m3u8") && url.contains("token=")) {
-                                // SỬA LỖI: Đồng bộ Cookie ngay khi bắt được link
                                 android.webkit.CookieManager.getInstance().flush()
                                 if (cont.isActive) cont.resume(url)
                             }

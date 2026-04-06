@@ -667,7 +667,7 @@ if (origFetch) {
                     ).text
                 } catch (_: Exception) { return true }
                 Regex(""""link"\s*:\s*"([^"]+)"""").find(ajaxResp)
-                    ?.groupValues?.get(1)?.replace("\/", "/") ?: return true
+                    ?.groupValues?.get(1)?.replace("\\/", "/") ?: return true
             }
 
         // Step 3: WebView loads iframe with Referer=epUrl

@@ -645,20 +645,37 @@ if (origFetch) {
     ): Boolean {
         val epUrl = data.substringBefore("|")
 
-        // Step 1: episode page HTML → find iframe URL
+        // Step 1: fetch episode page HTML
         val epHtml = try { app.get(epUrl, headers = baseHeaders).text }
                      catch (_: Exception) { return true }
 
-        // iframe is on stream.googleapiscdn.com/player/HASH (with various query params)
-        val iframeUrl = Regex("""https://stream\.googleapiscdn\.com/player/[a-fA-F0-9]{40,}[^"'\s<>]*""")
-            .find(epHtml)?.value?.replace("&amp;", "&")
-            ?: return true
+        // Step 2: get iframe URL - it's in the static HTML
+        val iframeUrl = Regex("""src=["'](https://stream\.googleapiscdn\.com/player/[a-fA-F0-9]{20,}[^"']*)["']""")
+            .find(epHtml)?.groupValues?.get(1)?.replace("&amp;", "&")
+            ?: run {
+                // Fallback: use _epHash -> POST ajax/player
+                val epHash = Regex("""var\s+_epHash\s*=\s*['"]([A-Za-z0-9_\-]{40,})['"]""")
+                    .find(epHtml)?.groupValues?.get(1) ?: return true
+                val ajaxResp = try {
+                    app.post("$mainUrl/ajax/player",
+                        headers = mapOf(
+                            "User-Agent" to UA, "X-Requested-With" to "XMLHttpRequest",
+                            "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
+                            "Referer" to epUrl, "Origin" to mainUrl
+                        ),
+                        data = mapOf("link" to epHash, "play" to "api", "id" to "0", "backuplinks" to "1")
+                    ).text
+                } catch (_: Exception) { return true }
+                Regex(""""link"\s*:\s*"([^"]+)"""").find(ajaxResp)
+                    ?.groupValues?.get(1)?.replace("\/", "/") ?: return true
+            }
 
-        // Step 2: WebView loads iframe → shouldInterceptRequest catches playlist.m3u8?token=...
-        // Player JS fetches: storage.googleapiscdn.com/playlist/{id}/playlist.m3u8?token=JWT
+        // Step 3: WebView loads iframe with Referer=epUrl
+        // Player JS inside fetches storage.googleapiscdn.com/playlist/HASH/playlist.m3u8?token=JWT
+        // shouldInterceptRequest catches that URL
         val playlistUrl = captureM3U8Url(iframeUrl, epUrl) ?: return true
 
-        // Step 3: fetch playlist content
+        // Step 4: fetch playlist
         val playlistText = try {
             app.get(playlistUrl, headers = mapOf(
                 "User-Agent" to UA,
@@ -669,7 +686,7 @@ if (origFetch) {
 
         if (!playlistText.contains("#EXTM3U")) return true
 
-        // Step 4: proxy segments (.html → 302 → lh3.googleusercontent.com)
+        // Step 5: proxy segments (.html -> 302 -> lh3.googleusercontent.com)
         servePlaylistViaProxy(playlistText, playlistUrl, callback)
         return true
     }

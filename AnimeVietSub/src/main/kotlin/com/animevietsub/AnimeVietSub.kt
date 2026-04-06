@@ -593,9 +593,9 @@ if (origFetch) {
                             ) { result ->
                                 if (result == null || result == "null") return@evaluateJavascript
                                 try {
-                                    val clean = result.trim('"').replace("\"", """)
-                                    val idMatch = Regex(""""id"\s*:\s*"([a-fA-F0-9]+)"""").find(clean)
-                                    val tokenMatch = Regex(""""token"\s*:\s*"([A-Za-z0-9._\-]+)"""").find(clean)
+                                    val clean = result.trim('"').replace("\\"", "\"")
+                                    val idMatch = Regex(""""id"[^:]*:[^"]*"([a-fA-F0-9]{10,})"""").find(clean)
+                                    val tokenMatch = Regex(""""token"[^:]*:[^"]*"([A-Za-z0-9._-]{20,})"""").find(clean)
                                     val id = idMatch?.groupValues?.get(1)
                                     val token = tokenMatch?.groupValues?.get(1)
                                     if (!id.isNullOrBlank() && !token.isNullOrBlank() && !done) {

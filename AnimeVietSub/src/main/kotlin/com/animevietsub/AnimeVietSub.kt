@@ -660,23 +660,55 @@ if (origFetch) {
     ): Boolean {
         val epUrl = data.substringBefore("|")
 
-        // Step 1: fetch episode page → iframe URL is directly in HTML
+        // Step 1: fetch episode page → get data-href hash for this episode
         val epHtml = try { app.get(epUrl, headers = baseHeaders).text }
                      catch (_: Exception) { return true }
 
-        // Iframe is already embedded: <iframe src="https://stream.googleapiscdn.com/player/HASH...">
-        val iframeUrl = Regex("""<iframe[^>]+src=["'](https://(?:stream|storage)\.googleapiscdn\.com/player/[a-fA-F0-9]+[^"']*)["']""")
-            .find(epHtml)?.groupValues?.get(1)?.replace("&amp;", "&")
+        // Extract episode ID and data-href hash
+        val epId = Regex("""filmInfo\.episodeID\s*=\s*parseInt\('(\d+)'\)""")
+            .find(epHtml)?.groupValues?.get(1) ?: return true
+
+        // data-href is on the <a> element for this episode
+        val epHash = Regex("""data-id=["']$epId["'][^>]*data-href=["']([A-Za-z0-9_\-]+)["']""")
+            .find(epHtml)?.groupValues?.get(1)
+            ?: Regex("""data-href=["']([A-Za-z0-9_\-]{40,})["'][^>]*data-id=["']$epId["']""")
+                .find(epHtml)?.groupValues?.get(1)
             ?: return true
 
-        // Step 2: load iframe in WebView with correct Referer → extract var id + var avsToken
-        val vars = extractPlayerVars(iframeUrl, epUrl) ?: return true
+        // Step 2: POST /ajax/player → get player URL
+        // Format: link=HASH&play=api&id=0&backuplinks=1
+        val ajaxResp = try {
+            app.post("$mainUrl/ajax/player",
+                headers = mapOf(
+                    "User-Agent"       to UA,
+                    "X-Requested-With" to "XMLHttpRequest",
+                    "Content-Type"     to "application/x-www-form-urlencoded; charset=UTF-8",
+                    "Accept"           to "application/json, text/javascript, */*; q=0.01",
+                    "Referer"          to epUrl,
+                    "Origin"           to mainUrl
+                ),
+                data = mapOf(
+                    "link"        to epHash,
+                    "play"        to "api",
+                    "id"          to "0",
+                    "backuplinks" to "1"
+                )
+            ).text
+        } catch (_: Exception) { return true }
+
+        // Response: {"success":1,"link":"https://storage.googleapiscdn.com/player/HASH","playTech":"iframe"}
+        val playerUrl = Regex(""""link"\s*:\s*"(https://[^"]+googleapiscdn\.com/player/[^"]+)"""")
+            .find(ajaxResp)?.groupValues?.get(1)?.replace("\/", "/")
+            ?: return true
+
+        // Step 3: WebView loads player page with correct Referer → polls for var id + var avsToken
+        val vars = extractPlayerVars(playerUrl, epUrl) ?: return true
         val (videoId, avsToken) = vars
 
-        // Step 3: construct playlist URL directly from id + token
+        // Step 4: construct playlist URL
         val playlistUrl = "https://storage.googleapiscdn.com/playlist/$videoId/playlist.m3u8?token=$avsToken"
 
-        // Step 4: fetch playlist
+        // Step 5: fetch playlist content
         val playlistText = try {
             app.get(playlistUrl, headers = mapOf(
                 "User-Agent" to UA,
@@ -687,7 +719,7 @@ if (origFetch) {
 
         if (!playlistText.contains("#EXTM3U")) return true
 
-        // Step 5: proxy segments (.html → 302 → lh3.googleusercontent.com)
+        // Step 6: proxy segments (.html → 302 → lh3.googleusercontent.com)
         servePlaylistViaProxy(playlistText, playlistUrl, callback)
         return true
     }

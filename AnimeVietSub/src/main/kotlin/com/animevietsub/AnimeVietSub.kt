@@ -565,15 +565,18 @@ if (origFetch) {
         }
     }
 
-    // Extract var id and var avsToken from player page via WebView
-    // Extract var id and var avsToken from player page via WebView (with JS polling)
+    // Load iframe in WebView, intercept playlist.m3u8 request URL via shouldInterceptRequest
     @android.annotation.SuppressLint("SetJavaScriptEnabled")
-    private suspend fun extractPlayerVars(iframeUrl: String, referer: String): Pair<String, String>? {
+    private suspend fun captureM3U8Url(iframeUrl: String, referer: String): String? {
         return kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
             kotlinx.coroutines.withTimeoutOrNull(25_000L) {
                 kotlinx.coroutines.suspendCancellableCoroutine { cont ->
                     val ctx = try { AcraApplication.context } catch (_: Exception) { null }
                     if (ctx == null) { cont.resume(null); return@suspendCancellableCoroutine }
+
+                    android.webkit.CookieManager.getInstance().apply {
+                        setAcceptCookie(true); flush()
+                    }
 
                     val wv = android.webkit.WebView(ctx)
                     wv.settings.apply {
@@ -581,47 +584,32 @@ if (origFetch) {
                         domStorageEnabled = true
                         userAgentString = UA
                         mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                        mediaPlaybackRequiresUserGesture = false
                     }
                     android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
 
                     var done = false
-                    val handler = android.os.Handler(android.os.Looper.getMainLooper())
-
-                    // Poll for var id + var avsToken every 500ms after page starts loading
-                    val JS_EXTRACT = """
-(function(){
-  try {
-    var i = (typeof id !== 'undefined' && id) ? id : null;
-    var t = (typeof avsToken !== 'undefined' && avsToken) ? avsToken : null;
-    if (i && t) return i + '|' + t;
-  } catch(e) {}
-  return '';
-})()
-""".trimIndent()
-
-                    fun tryExtract() {
-                        if (done) return
-                        wv.evaluateJavascript(JS_EXTRACT) { result ->
-                            if (done) return@evaluateJavascript
-                            val clean = result?.trim('"') ?: ""
-                            if (clean.contains("|") && clean.length > 10) {
-                                val parts = clean.split("|", limit = 2)
-                                if (parts.size == 2 && parts[0].length >= 10 && parts[1].length >= 20) {
-                                    done = true
-                                    wv.stopLoading(); wv.destroy()
-                                    if (cont.isActive) cont.resume(Pair(parts[0], parts[1]))
-                                    return@evaluateJavascript
-                                }
-                            }
-                            // Not ready yet, retry after 500ms
-                            if (!done) handler.postDelayed({ tryExtract() }, 500)
-                        }
-                    }
 
                     wv.webViewClient = object : android.webkit.WebViewClient() {
-                        override fun onPageFinished(view: android.webkit.WebView, url: String) {
-                            // Start polling 1s after page finishes
-                            handler.postDelayed({ tryExtract() }, 1000)
+                        override fun shouldInterceptRequest(
+                            view: android.webkit.WebView,
+                            request: android.webkit.WebResourceRequest
+                        ): android.webkit.WebResourceResponse? {
+                            val url = request.url.toString()
+                            // Capture playlist.m3u8 with token
+                            if (!done &&
+                                url.contains("storage.googleapiscdn.com") &&
+                                url.contains("playlist.m3u8") &&
+                                url.contains("token=")) {
+                                done = true
+                                val handler = android.os.Handler(android.os.Looper.getMainLooper())
+                                handler.post {
+                                    wv.stopLoading()
+                                    wv.destroy()
+                                }
+                                if (cont.isActive) cont.resume(url)
+                            }
+                            return null
                         }
                     }
 
@@ -630,10 +618,7 @@ if (origFetch) {
                         "Accept-Language" to "vi-VN,vi;q=0.9"
                     ))
 
-                    // Start first poll after 3s regardless of page load events
-                    handler.postDelayed({ tryExtract() }, 3000)
-
-                    // Timeout cleanup
+                    val handler = android.os.Handler(android.os.Looper.getMainLooper())
                     handler.postDelayed({
                         if (!done) {
                             done = true
@@ -660,55 +645,20 @@ if (origFetch) {
     ): Boolean {
         val epUrl = data.substringBefore("|")
 
-        // Step 1: fetch episode page → get data-href hash for this episode
+        // Step 1: episode page HTML → find iframe URL
         val epHtml = try { app.get(epUrl, headers = baseHeaders).text }
                      catch (_: Exception) { return true }
 
-        // Extract episode ID and data-href hash
-        val epId = Regex("""filmInfo\.episodeID\s*=\s*parseInt\('(\d+)'\)""")
-            .find(epHtml)?.groupValues?.get(1) ?: return true
-
-        // data-href is on the <a> element for this episode
-        val epHash = Regex("""data-id=["']$epId["'][^>]*data-href=["']([A-Za-z0-9_\-]+)["']""")
-            .find(epHtml)?.groupValues?.get(1)
-            ?: Regex("""data-href=["']([A-Za-z0-9_\-]{40,})["'][^>]*data-id=["']$epId["']""")
-                .find(epHtml)?.groupValues?.get(1)
+        // iframe is on stream.googleapiscdn.com/player/HASH (with various query params)
+        val iframeUrl = Regex("""https://stream\.googleapiscdn\.com/player/[a-fA-F0-9]{40,}[^"'\s<>]*""")
+            .find(epHtml)?.value?.replace("&amp;", "&")
             ?: return true
 
-        // Step 2: POST /ajax/player → get player URL
-        // Format: link=HASH&play=api&id=0&backuplinks=1
-        val ajaxResp = try {
-            app.post("$mainUrl/ajax/player",
-                headers = mapOf(
-                    "User-Agent"       to UA,
-                    "X-Requested-With" to "XMLHttpRequest",
-                    "Content-Type"     to "application/x-www-form-urlencoded; charset=UTF-8",
-                    "Accept"           to "application/json, text/javascript, */*; q=0.01",
-                    "Referer"          to epUrl,
-                    "Origin"           to mainUrl
-                ),
-                data = mapOf(
-                    "link"        to epHash,
-                    "play"        to "api",
-                    "id"          to "0",
-                    "backuplinks" to "1"
-                )
-            ).text
-        } catch (_: Exception) { return true }
+        // Step 2: WebView loads iframe → shouldInterceptRequest catches playlist.m3u8?token=...
+        // Player JS fetches: storage.googleapiscdn.com/playlist/{id}/playlist.m3u8?token=JWT
+        val playlistUrl = captureM3U8Url(iframeUrl, epUrl) ?: return true
 
-        // Response: {"success":1,"link":"https://storage.googleapiscdn.com/player/HASH","playTech":"iframe"}
-        val playerUrl = Regex(""""link"\s*:\s*"(https://[^"]+googleapiscdn\.com/player/[^"]+)"""")
-            .find(ajaxResp)?.groupValues?.get(1)?.replace("\\/", "/")
-            ?: return true
-
-        // Step 3: WebView loads player page with correct Referer → polls for var id + var avsToken
-        val vars = extractPlayerVars(playerUrl, epUrl) ?: return true
-        val (videoId, avsToken) = vars
-
-        // Step 4: construct playlist URL
-        val playlistUrl = "https://storage.googleapiscdn.com/playlist/$videoId/playlist.m3u8?token=$avsToken"
-
-        // Step 5: fetch playlist content
+        // Step 3: fetch playlist content
         val playlistText = try {
             app.get(playlistUrl, headers = mapOf(
                 "User-Agent" to UA,
@@ -719,7 +669,7 @@ if (origFetch) {
 
         if (!playlistText.contains("#EXTM3U")) return true
 
-        // Step 6: proxy segments (.html → 302 → lh3.googleusercontent.com)
+        // Step 4: proxy segments (.html → 302 → lh3.googleusercontent.com)
         servePlaylistViaProxy(playlistText, playlistUrl, callback)
         return true
     }

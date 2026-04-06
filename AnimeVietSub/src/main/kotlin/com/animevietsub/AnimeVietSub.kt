@@ -698,7 +698,7 @@ if (origFetch) {
 
         // Response: {"success":1,"link":"https://storage.googleapiscdn.com/player/HASH","playTech":"iframe"}
         val playerUrl = Regex(""""link"\s*:\s*"(https://[^"]+googleapiscdn\.com/player/[^"]+)"""")
-            .find(ajaxResp)?.groupValues?.get(1)?.replace("\/", "/")
+            .find(ajaxResp)?.groupValues?.get(1)?.replace("\\/", "/")
             ?: return true
 
         // Step 3: WebView loads player page with correct Referer → polls for var id + var avsToken

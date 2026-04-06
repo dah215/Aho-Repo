@@ -565,6 +565,69 @@ if (origFetch) {
         }
     }
 
+    // Extract var id and var avsToken from player page via WebView
+    @android.annotation.SuppressLint("SetJavaScriptEnabled")
+    private suspend fun extractPlayerVars(iframeUrl: String, referer: String): Pair<String, String>? {
+        return kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+            kotlinx.coroutines.withTimeoutOrNull(20_000L) {
+                kotlinx.coroutines.suspendCancellableCoroutine { cont ->
+                    val ctx = try { AcraApplication.context } catch (_: Exception) { null }
+                    if (ctx == null) { cont.resume(null); return@suspendCancellableCoroutine }
+
+                    val wv = android.webkit.WebView(ctx)
+                    wv.settings.apply {
+                        javaScriptEnabled = true
+                        domStorageEnabled = true
+                        userAgentString = UA
+                        mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                    }
+                    android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
+
+                    var done = false
+                    wv.webViewClient = object : android.webkit.WebViewClient() {
+                        override fun onPageFinished(view: android.webkit.WebView, url: String) {
+                            if (done) return
+                            // Read var id and var avsToken injected into <script> by player page
+                            view.evaluateJavascript(
+                                "(function(){ try { return JSON.stringify({id: typeof id !== 'undefined' ? id : null, token: typeof avsToken !== 'undefined' ? avsToken : null}); } catch(e){ return null; } })()"
+                            ) { result ->
+                                if (result == null || result == "null") return@evaluateJavascript
+                                try {
+                                    val clean = result.trim('"').replace("\"", """)
+                                    val idMatch = Regex(""""id"\s*:\s*"([a-fA-F0-9]+)"""").find(clean)
+                                    val tokenMatch = Regex(""""token"\s*:\s*"([A-Za-z0-9._\-]+)"""").find(clean)
+                                    val id = idMatch?.groupValues?.get(1)
+                                    val token = tokenMatch?.groupValues?.get(1)
+                                    if (!id.isNullOrBlank() && !token.isNullOrBlank() && !done) {
+                                        done = true
+                                        wv.stopLoading(); wv.destroy()
+                                        if (cont.isActive) cont.resume(Pair(id, token))
+                                    }
+                                } catch (_: Exception) {}
+                            }
+                        }
+                    }
+
+                    wv.loadUrl(iframeUrl, mapOf(
+                        "Referer" to referer,
+                        "Accept-Language" to "vi-VN,vi;q=0.9"
+                    ))
+
+                    val handler = android.os.Handler(android.os.Looper.getMainLooper())
+                    handler.postDelayed({
+                        if (!done) {
+                            done = true
+                            wv.stopLoading(); wv.destroy()
+                            if (cont.isActive) cont.resume(null)
+                        }
+                    }, 18_000)
+
+                    cont.invokeOnCancellation { wv.stopLoading(); wv.destroy() }
+                }
+            }
+        }
+    }
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -573,70 +636,23 @@ if (origFetch) {
     ): Boolean {
         val epUrl = data.substringBefore("|")
 
-        // Step 1: fetch episode page → get data-hash for this episode
+        // Step 1: fetch episode page → iframe URL is directly in HTML
         val epHtml = try { app.get(epUrl, headers = baseHeaders).text }
                      catch (_: Exception) { return true }
 
-        // Extract epHash from data-hash attribute of current episode link
-        // data-hash is the encrypted link for POST /ajax/player
-        val epId = Regex("""filmInfo\.episodeID\s*=\s*parseInt\('(\d+)'\)""")
-            .find(epHtml)?.groupValues?.get(1) ?: return true
-
-        val epHash = Regex("""data-id=["']$epId["'][^>]+data-hash=["']([A-Za-z0-9_\-]+)["']""")
-            .find(epHtml)?.groupValues?.get(1)
-            ?: Regex("""data-hash=["']([A-Za-z0-9_\-]+)["'][^>]+data-id=["']$epId["']""")
-                .find(epHtml)?.groupValues?.get(1)
+        // Iframe is already embedded: <iframe src="https://stream.googleapiscdn.com/player/HASH...">
+        val iframeUrl = Regex("""<iframe[^>]+src=["'](https://(?:stream|storage)\.googleapiscdn\.com/player/[a-fA-F0-9]+[^"']*)["']""")
+            .find(epHtml)?.groupValues?.get(1)?.replace("&amp;", "&")
             ?: return true
 
-        // Step 2: POST /ajax/player with hash → get player iframe URL
-        val ajaxResp = try {
-            app.post("$mainUrl/ajax/player",
-                headers = mapOf(
-                    "User-Agent"       to UA,
-                    "X-Requested-With" to "XMLHttpRequest",
-                    "Content-Type"     to "application/x-www-form-urlencoded; charset=UTF-8",
-                    "Accept"           to "application/json, text/javascript, */*; q=0.01",
-                    "Referer"          to epUrl,
-                    "Origin"           to mainUrl
-                ),
-                data = mapOf(
-                    "link"        to epHash,
-                    "play"        to "api",
-                    "id"          to "0",
-                    "backuplinks" to "1"
-                )
-            ).text
-        } catch (_: Exception) { return true }
+        // Step 2: load iframe in WebView with correct Referer → extract var id + var avsToken
+        val vars = extractPlayerVars(iframeUrl, epUrl) ?: return true
+        val (videoId, avsToken) = vars
 
-        // Response: {"_fxStatus":1,"success":1,"link":"https://storage.googleapiscdn.com/player/HASH","playTech":"iframe"}
-        val playerUrl = Regex(""""link"\s*:\s*"(https://(?:stream|storage)\.googleapiscdn\.com/player/[^"]+)"""")
-            .find(ajaxResp)?.groupValues?.get(1)?.replace("\\/", "/")
-            ?: return true
-
-        // Step 3: GET player page with correct Referer → parse var id + var avsToken
-        val playerHtml = try {
-            app.get(playerUrl, headers = mapOf(
-                "User-Agent" to UA,
-                "Referer"    to epUrl,  // MUST be episode page URL
-                "Accept"     to "text/html,application/xhtml+xml,*/*",
-                "Accept-Language" to "vi-VN,vi;q=0.9"
-            )).text
-        } catch (_: Exception) { return true }
-
-        // Check for block page
-        if (playerHtml.contains("Truy cập bị chặn") || playerHtml.contains("bị chặn")) {
-            return true
-        }
-
-        val videoId   = Regex("""var\s+id\s*=\s*["']([a-fA-F0-9]+)["']""")
-            .find(playerHtml)?.groupValues?.get(1) ?: return true
-        val avsToken  = Regex("""var\s+avsToken\s*=\s*["']([A-Za-z0-9._\-]+)["']""")
-            .find(playerHtml)?.groupValues?.get(1) ?: return true
-
-        // Step 4: construct playlist URL
+        // Step 3: construct playlist URL directly from id + token
         val playlistUrl = "https://storage.googleapiscdn.com/playlist/$videoId/playlist.m3u8?token=$avsToken"
 
-        // Step 5: fetch playlist
+        // Step 4: fetch playlist
         val playlistText = try {
             app.get(playlistUrl, headers = mapOf(
                 "User-Agent" to UA,
@@ -647,7 +663,7 @@ if (origFetch) {
 
         if (!playlistText.contains("#EXTM3U")) return true
 
-        // Step 6: serve segments via proxy (segments are .html → redirect → lh3.googleusercontent.com)
+        // Step 5: proxy segments (.html → 302 → lh3.googleusercontent.com)
         servePlaylistViaProxy(playlistText, playlistUrl, callback)
         return true
     }

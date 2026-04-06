@@ -176,13 +176,13 @@ class AnimeVietSubProvider : MainAPI() {
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         val epUrl = data.substringBefore("|")
         
-        // THE LAST STAND: Sử dụng WebView để xử lý Redirect và bắt link m3u8 từ ArtPlayer
-        val playlistUrl = capturePlaylistUrlTheLastStand(epUrl) ?: return true
+        // FINAL VICTORY: Sử dụng WebView với cơ chế giả lập tương tác người dùng thật sự
+        val playlistUrl = capturePlaylistUrlFinalVictory(epUrl) ?: return true
 
         val playlistHost = java.net.URI(playlistUrl).host
         val playerReferer = "https://$playlistHost/"
 
-        callback(newExtractorLink(source = name, name = "$name - The Last Stand", url = playlistUrl, type = ExtractorLinkType.M3U8) {
+        callback(newExtractorLink(source = name, name = "$name - Final Victory", url = playlistUrl, type = ExtractorLinkType.M3U8) {
             this.quality = Qualities.P1080.value
             this.headers = mapOf(
                 "User-Agent" to UA,
@@ -200,9 +200,9 @@ class AnimeVietSubProvider : MainAPI() {
     }
 
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun capturePlaylistUrlTheLastStand(epUrl: String): String? {
+    private suspend fun capturePlaylistUrlFinalVictory(epUrl: String): String? {
         return withContext(Dispatchers.Main) {
-            withTimeoutOrNull(60_000L) { // Tăng timeout lên 60s để xử lý Redirect
+            withTimeoutOrNull(60_000L) {
                 suspendCancellableCoroutine { cont ->
                     val ctx = try { AcraApplication.context } catch (_: Exception) { null }
                     if (ctx == null) { cont.resume(null); return@suspendCancellableCoroutine }
@@ -212,6 +212,7 @@ class AnimeVietSubProvider : MainAPI() {
                         javaScriptEnabled = true
                         domStorageEnabled = true
                         userAgentString = UA
+                        mediaPlaybackRequiresUserGesture = false // Ép trình duyệt cho phép phát video
                     }
                     
                     android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
@@ -219,7 +220,6 @@ class AnimeVietSubProvider : MainAPI() {
                     wv.webViewClient = object : WebViewClient() {
                         override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                             val url = request.url.toString()
-                            // Đánh chặn link m3u8 trước khi nó biến thành blob
                             if (url.contains(".m3u8") && (url.contains("token=") || url.contains("expires="))) {
                                 android.webkit.CookieManager.getInstance().flush()
                                 if (cont.isActive) cont.resume(url)
@@ -228,28 +228,40 @@ class AnimeVietSubProvider : MainAPI() {
                         }
 
                         override fun onPageFinished(view: WebView, url: String) {
-                            // Tự động kích hoạt trình phát ArtPlayer để sinh link m3u8
-                            val jsTrigger = """
+                            // GIẢ LẬP TƯƠNG TÁC NGƯỜI DÙNG THẬT SỰ (User Gesture)
+                            val jsVictory = """
                                 (function() {
-                                    // 1. Thử nhấn nút Play của ArtPlayer
-                                    var playBtn = document.querySelector('.art-video-control-play') || document.querySelector('.art-state');
-                                    if (playBtn) playBtn.click();
-                                    
-                                    // 2. Ép thẻ video chạy
-                                    var v = document.querySelector('video');
-                                    if (v) { v.play(); v.muted = true; }
-                                    
-                                    // 3. Nếu link m3u8 nằm trong biến JavaScript (dựa trên file.txt)
-                                    if (window.art && window.art.option && window.art.option.url) {
-                                        console.log("ART_URL:" + window.art.option.url);
+                                    function triggerPlay() {
+                                        // 1. Giả lập cú click chuột thật sự vào trung tâm màn hình
+                                        var event = new MouseEvent('click', {
+                                            'view': window,
+                                            'bubbles': true,
+                                            'cancelable': true
+                                        });
+                                        var el = document.querySelector('.art-video-control-play') || document.querySelector('.art-state') || document.body;
+                                        el.dispatchEvent(event);
+                                        
+                                        // 2. Ép thẻ video chạy
+                                        var v = document.querySelector('video');
+                                        if (v) { v.play(); v.muted = true; }
                                     }
+                                    
+                                    // Chạy ngay và chạy lại sau 2 giây để đảm bảo
+                                    triggerPlay();
+                                    setTimeout(triggerPlay, 2000);
+                                    
+                                    // 3. Quét sâu vào bộ nhớ ArtPlayer để cướp link
+                                    setInterval(function() {
+                                        if (window.art && window.art.option && window.art.option.url) {
+                                            console.log("FOUND_M3U8:" + window.art.option.url);
+                                        }
+                                    }, 1000);
                                 })();
                             """.trimIndent()
-                            view.evaluateJavascript(jsTrigger, null)
+                            view.evaluateJavascript(jsVictory, null)
                         }
                     }
 
-                    // Tải trang tập phim, WebView sẽ tự xử lý Redirect sang Iframe và trình phát thật
                     wv.loadUrl(epUrl)
                     cont.invokeOnCancellation { wv.stopLoading(); wv.destroy() }
                 }

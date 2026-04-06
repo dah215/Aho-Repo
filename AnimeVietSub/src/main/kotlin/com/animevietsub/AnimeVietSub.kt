@@ -566,10 +566,11 @@ if (origFetch) {
     }
 
     // Extract var id and var avsToken from player page via WebView
+    // Extract var id and var avsToken from player page via WebView (with JS polling)
     @android.annotation.SuppressLint("SetJavaScriptEnabled")
     private suspend fun extractPlayerVars(iframeUrl: String, referer: String): Pair<String, String>? {
         return kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
-            kotlinx.coroutines.withTimeoutOrNull(20_000L) {
+            kotlinx.coroutines.withTimeoutOrNull(25_000L) {
                 kotlinx.coroutines.suspendCancellableCoroutine { cont ->
                     val ctx = try { AcraApplication.context } catch (_: Exception) { null }
                     if (ctx == null) { cont.resume(null); return@suspendCancellableCoroutine }
@@ -584,27 +585,43 @@ if (origFetch) {
                     android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
 
                     var done = false
+                    val handler = android.os.Handler(android.os.Looper.getMainLooper())
+
+                    // Poll for var id + var avsToken every 500ms after page starts loading
+                    val JS_EXTRACT = """
+(function(){
+  try {
+    var i = (typeof id !== 'undefined' && id) ? id : null;
+    var t = (typeof avsToken !== 'undefined' && avsToken) ? avsToken : null;
+    if (i && t) return i + '|' + t;
+  } catch(e) {}
+  return '';
+})()
+""".trimIndent()
+
+                    fun tryExtract() {
+                        if (done) return
+                        wv.evaluateJavascript(JS_EXTRACT) { result ->
+                            if (done) return@evaluateJavascript
+                            val clean = result?.trim('"') ?: ""
+                            if (clean.contains("|") && clean.length > 10) {
+                                val parts = clean.split("|", limit = 2)
+                                if (parts.size == 2 && parts[0].length >= 10 && parts[1].length >= 20) {
+                                    done = true
+                                    wv.stopLoading(); wv.destroy()
+                                    if (cont.isActive) cont.resume(Pair(parts[0], parts[1]))
+                                    return@evaluateJavascript
+                                }
+                            }
+                            // Not ready yet, retry after 500ms
+                            if (!done) handler.postDelayed({ tryExtract() }, 500)
+                        }
+                    }
+
                     wv.webViewClient = object : android.webkit.WebViewClient() {
                         override fun onPageFinished(view: android.webkit.WebView, url: String) {
-                            if (done) return
-                            // Read var id and var avsToken injected into <script> by player page
-                            view.evaluateJavascript(
-                                "(function(){ try { return JSON.stringify({id: typeof id !== 'undefined' ? id : null, token: typeof avsToken !== 'undefined' ? avsToken : null}); } catch(e){ return null; } })()"
-                            ) { result ->
-                                if (result == null || result == "null") return@evaluateJavascript
-                                try {
-                                    val clean = result ?: ""
-                                    val idMatch = Regex(""""id"[^:]*:[^"]*"([a-fA-F0-9]{10,})"""").find(clean)
-                                    val tokenMatch = Regex(""""token"[^:]*:[^"]*"([A-Za-z0-9._-]{20,})"""").find(clean)
-                                    val id = idMatch?.groupValues?.get(1)
-                                    val token = tokenMatch?.groupValues?.get(1)
-                                    if (!id.isNullOrBlank() && !token.isNullOrBlank() && !done) {
-                                        done = true
-                                        wv.stopLoading(); wv.destroy()
-                                        if (cont.isActive) cont.resume(Pair(id, token))
-                                    }
-                                } catch (_: Exception) {}
-                            }
+                            // Start polling 1s after page finishes
+                            handler.postDelayed({ tryExtract() }, 1000)
                         }
                     }
 
@@ -613,16 +630,23 @@ if (origFetch) {
                         "Accept-Language" to "vi-VN,vi;q=0.9"
                     ))
 
-                    val handler = android.os.Handler(android.os.Looper.getMainLooper())
+                    // Start first poll after 3s regardless of page load events
+                    handler.postDelayed({ tryExtract() }, 3000)
+
+                    // Timeout cleanup
                     handler.postDelayed({
                         if (!done) {
                             done = true
                             wv.stopLoading(); wv.destroy()
                             if (cont.isActive) cont.resume(null)
                         }
-                    }, 18_000)
+                    }, 23_000)
 
-                    cont.invokeOnCancellation { wv.stopLoading(); wv.destroy() }
+                    cont.invokeOnCancellation {
+                        done = true
+                        handler.removeCallbacksAndMessages(null)
+                        wv.stopLoading(); wv.destroy()
+                    }
                 }
             }
         }

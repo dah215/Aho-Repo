@@ -669,55 +669,116 @@ if (origFetch) {
         val epHtml = try { app.get(epUrl, headers = baseHeaders).text }
                      catch (_: Exception) { return true }
 
-        // Player iframe URL - multiple possible formats, all on stream.googleapiscdn.com
+        // The player URL hash == playlist hash. Extract directly from iframe or ajax.
+        // Method 1: get hash from iframe URL in static HTML
         val playerUrl =
-            Regex("""<iframe[^>]+src=["'](https://stream\.googleapiscdn\.com/player/[a-fA-F0-9]{10,}[^"'<>]*)["']""")
-                .find(epHtml)?.groupValues?.get(1)?.replace("&amp;", "&")
-            ?: Regex("""(https://stream\.googleapiscdn\.com/player/[a-fA-F0-9]{10,}[^\s"'<>]*)""")
+            Regex("""src=["'](https://stream\.googleapiscdn\.com/player/[a-fA-F0-9]{20,}[^"'<>]*)["']""")
                 .find(epHtml)?.groupValues?.get(1)?.replace("&amp;", "&")
             ?: run {
-                // Last resort: use _epHash -> POST /ajax/player -> get player URL
+                // Method 2: _epHash -> POST /ajax/player -> get player URL
                 val hash = Regex("""var\s+_epHash\s*=\s*['"]([A-Za-z0-9_\-]{20,})['"]""")
                     .find(epHtml)?.groupValues?.get(1) ?: return true
                 try {
                     val resp = app.post("$mainUrl/ajax/player",
                         headers = mapOf(
-                            "User-Agent" to UA,
-                            "X-Requested-With" to "XMLHttpRequest",
+                            "User-Agent" to UA, "X-Requested-With" to "XMLHttpRequest",
                             "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
                             "Referer" to epUrl, "Origin" to mainUrl
                         ),
                         data = mapOf("link" to hash, "play" to "api", "id" to "0", "backuplinks" to "1")
                     ).text
-                    Regex(""""link"\s*:\s*"([^"]+)"""").find(resp)
-                        ?.groupValues?.get(1)?.replace("\\/", "/")
+                    // {"link":"https:\/\/stream.googleapiscdn.com\/player\/HASH","playTech":"iframe"}
+                    Regex(""""link"\s*:\s*"(https:\/\/stream\.googleapiscdn\.com\/player\/[^"]+)"""")
+                        .find(resp)?.groupValues?.get(1)?.replace("\/", "/")
                 } catch (_: Exception) { null }
             } ?: return true
 
-        // WebView loads player page -> shouldInterceptRequest catches playlist.m3u8?token=...
-        val result = capturePlaylist(playerUrl, epUrl) ?: return true
-        val playlistUrl = result.url
-        val wvCookie   = result.cookie
+        // Extract hash from player URL: stream.googleapiscdn.com/player/HASH?...
+        // This hash IS the playlist ID
+        val videoHash = Regex("""/player/([a-fA-F0-9]{20,})""")
+            .find(playerUrl)?.groupValues?.get(1) ?: return true
 
-        // Fetch playlist with WebView cookies + standard headers
-        val playlistDomain = try { java.net.URI(playlistUrl).let { "${it.scheme}://${it.host}" } }
-                             catch (_: Exception) { "https://stream.googleapiscdn.com" }
+        // Get avsToken: POST /ajax/player already gives us the player URL
+        // Now GET player page to read var avsToken from its <script>
+        // Use WebView to bypass Cloudflare if OkHttp fails
+        val playerHtml = try {
+            app.get(playerUrl, headers = mapOf(
+                "User-Agent" to UA,
+                "Referer"    to epUrl,
+                "Accept"     to "text/html,*/*",
+                "Accept-Language" to "vi-VN,vi;q=0.9"
+            )).text.takeIf { it.contains("avsToken") }
+        } catch (_: Exception) { null }
+            ?: getPlayerHtmlViaWebView(playerUrl, epUrl)
+            ?: return true
 
-        val fetchHeaders = buildMap {
-            put("User-Agent", UA)
-            put("Referer", playerUrl)   // MUST be full player URL, not just domain
-            put("Origin", "https://stream.googleapiscdn.com")
-            if (wvCookie.isNotBlank()) put("Cookie", wvCookie)
-        }
+        val avsToken = Regex("""var\s+avsToken\s*=\s*["']([A-Za-z0-9._\-]{20,})["']""")
+            .find(playerHtml)?.groupValues?.get(1) ?: return true
 
+        // Construct playlist URL directly
+        val playlistUrl = "https://stream.googleapiscdn.com/playlist/$videoHash/playlist.m3u8?token=$avsToken"
+
+        // Fetch playlist with correct Referer = player URL
         val playlistText = try {
-            app.get(playlistUrl, headers = fetchHeaders).text
+            app.get(playlistUrl, headers = mapOf(
+                "User-Agent" to UA,
+                "Referer"    to playerUrl,
+                "Origin"     to "https://stream.googleapiscdn.com"
+            )).text
         } catch (_: Exception) { return true }
 
         if (!playlistText.contains("#EXTM3U")) return true
 
-        servePlaylistViaProxy(playlistText, playlistUrl, playerUrl, wvCookie, callback)
+        servePlaylistViaProxy(playlistText, playlistUrl, playerUrl, "", callback)
         return true
+    }
+
+    @android.annotation.SuppressLint("SetJavaScriptEnabled")
+    private suspend fun getPlayerHtmlViaWebView(playerUrl: String, referer: String): String? {
+        return kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+            kotlinx.coroutines.withTimeoutOrNull(15_000L) {
+                kotlinx.coroutines.suspendCancellableCoroutine { cont ->
+                    val ctx = try { AcraApplication.context } catch (_: Exception) { null }
+                    if (ctx == null) { cont.resume(null); return@suspendCancellableCoroutine }
+
+                    val wv = android.webkit.WebView(ctx)
+                    wv.settings.apply {
+                        javaScriptEnabled = true
+                        domStorageEnabled = true
+                        userAgentString = UA
+                        mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                    }
+                    android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
+                    var done = false
+
+                    wv.webViewClient = object : android.webkit.WebViewClient() {
+                        override fun onPageFinished(view: android.webkit.WebView, url: String) {
+                            if (done) return
+                            view.evaluateJavascript("document.documentElement.outerHTML") { html ->
+                                if (done) return@evaluateJavascript
+                                val clean = html?.trim('"')
+                                    ?.replace("\n", "
+")?.replace("\"", """)?.replace("\/", "/")
+                                if (!clean.isNullOrBlank() && clean.contains("avsToken")) {
+                                    done = true
+                                    wv.stopLoading(); wv.destroy()
+                                    if (cont.isActive) cont.resume(clean)
+                                }
+                            }
+                        }
+                    }
+
+                    wv.loadUrl(playerUrl, mapOf("Referer" to referer, "Accept-Language" to "vi-VN,vi;q=0.9"))
+
+                    val handler = android.os.Handler(android.os.Looper.getMainLooper())
+                    handler.postDelayed({
+                        if (!done) { done = true; wv.stopLoading(); wv.destroy()
+                            if (cont.isActive) cont.resume(null) }
+                    }, 13_000)
+                    cont.invokeOnCancellation { done = true; wv.stopLoading(); wv.destroy() }
+                }
+            }
+        }
     }
 
     @android.annotation.SuppressLint("SetJavaScriptEnabled")

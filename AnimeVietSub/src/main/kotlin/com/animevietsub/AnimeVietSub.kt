@@ -795,7 +795,7 @@ if (origFetch) {
         }
     }
 
-        private fun servePlaylistViaProxy(
+        private suspend fun servePlaylistViaProxy(
         playlistText: String,
         playlistUrl: String,
         playerUrl: String,

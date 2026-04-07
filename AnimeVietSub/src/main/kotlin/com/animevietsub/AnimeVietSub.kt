@@ -530,7 +530,7 @@ if (origFetch) {
                     // Rewrite segment URLs to go through this proxy
                     val base = "http://127.0.0.1:$port"
                     val rewritten = playlistContent.lines().joinToString("\n") { l ->
-                        if (l.startsWith("https://storage.googleapiscdn.com/chunks/") && l.contains(".html")) {
+                        if ((l.startsWith("https://stream.googleapiscdn.com/chunks/") || l.startsWith("https://storage.googleapiscdn.com/chunks/")) && l.contains(".html")) {
                             "$base/seg?url=${java.net.URLEncoder.encode(l.trim(), "UTF-8")}"
                         } else l
                     }.toByteArray(Charsets.UTF_8)
@@ -565,17 +565,19 @@ if (origFetch) {
         }
     }
 
-    // Load iframe in WebView, intercept playlist.m3u8 request URL via shouldInterceptRequest
     @android.annotation.SuppressLint("SetJavaScriptEnabled")
-    private suspend fun captureM3U8Url(iframeUrl: String, referer: String): String? {
+    private suspend fun capturePlaylistM3U8(playerUrl: String, referer: String): String? {
         return kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
-            kotlinx.coroutines.withTimeoutOrNull(25_000L) {
+            kotlinx.coroutines.withTimeoutOrNull(30_000L) {
                 kotlinx.coroutines.suspendCancellableCoroutine { cont ->
-                    val ctx = try { AcraApplication.context } catch (_: Exception) { null }
+                    val ctx = try { AcraApplication.context } catch(_:Exception){ null }
                     if (ctx == null) { cont.resume(null); return@suspendCancellableCoroutine }
 
+                    // Set CF clearance cookie for stream.googleapiscdn.com if available
                     android.webkit.CookieManager.getInstance().apply {
-                        setAcceptCookie(true); flush()
+                        setAcceptCookie(true)
+                        setAcceptThirdPartyCookies(android.webkit.WebView(ctx), true)
+                        flush()
                     }
 
                     val wv = android.webkit.WebView(ctx)
@@ -589,6 +591,7 @@ if (origFetch) {
                     android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
 
                     var done = false
+                    val handler = android.os.Handler(android.os.Looper.getMainLooper())
 
                     wv.webViewClient = object : android.webkit.WebViewClient() {
                         override fun shouldInterceptRequest(
@@ -596,41 +599,33 @@ if (origFetch) {
                             request: android.webkit.WebResourceRequest
                         ): android.webkit.WebResourceResponse? {
                             val url = request.url.toString()
-                            // Capture playlist.m3u8 with token
-                            if (!done &&
-                                url.contains("storage.googleapiscdn.com") &&
-                                url.contains("playlist.m3u8") &&
-                                url.contains("token=")) {
+                            // playlist.m3u8 is on stream.googleapiscdn.com (not storage)
+                            if (!done && url.contains("googleapiscdn.com") &&
+                                url.contains("playlist.m3u8") && url.contains("token=")) {
                                 done = true
-                                val handler = android.os.Handler(android.os.Looper.getMainLooper())
-                                handler.post {
-                                    wv.stopLoading()
-                                    wv.destroy()
-                                }
+                                handler.post { try { wv.stopLoading(); wv.destroy() } catch(_:Exception){} }
                                 if (cont.isActive) cont.resume(url)
                             }
                             return null
                         }
                     }
 
-                    wv.loadUrl(iframeUrl, mapOf(
+                    wv.loadUrl(playerUrl, mapOf(
                         "Referer" to referer,
                         "Accept-Language" to "vi-VN,vi;q=0.9"
                     ))
 
-                    val handler = android.os.Handler(android.os.Looper.getMainLooper())
                     handler.postDelayed({
-                        if (!done) {
-                            done = true
-                            wv.stopLoading(); wv.destroy()
+                        if (!done) { done = true
+                            try { wv.stopLoading(); wv.destroy() } catch(_:Exception){}
                             if (cont.isActive) cont.resume(null)
                         }
-                    }, 23_000)
+                    }, 28_000)
 
                     cont.invokeOnCancellation {
                         done = true
                         handler.removeCallbacksAndMessages(null)
-                        wv.stopLoading(); wv.destroy()
+                        try { wv.stopLoading(); wv.destroy() } catch(_:Exception){}
                     }
                 }
             }
@@ -645,48 +640,45 @@ if (origFetch) {
     ): Boolean {
         val epUrl = data.substringBefore("|")
 
-        // Step 1: fetch episode page HTML
         val epHtml = try { app.get(epUrl, headers = baseHeaders).text }
                      catch (_: Exception) { return true }
 
-        // Step 2: get iframe URL - it's in the static HTML
-        val iframeUrl = Regex("""src=["'](https://stream\.googleapiscdn\.com/player/[a-fA-F0-9]{20,}[^"']*)["']""")
+        // Iframe is in static HTML: stream.googleapiscdn.com/player/HASH?...
+        val playerUrl = Regex("""src=["'](https://stream\.googleapiscdn\.com/player/[a-fA-F0-9]{20,}[^"']*)["']""")
             .find(epHtml)?.groupValues?.get(1)?.replace("&amp;", "&")
             ?: run {
-                // Fallback: use _epHash -> POST ajax/player
-                val epHash = Regex("""var\s+_epHash\s*=\s*['"]([A-Za-z0-9_\-]{40,})['"]""")
+                // Fallback: _epHash -> POST /ajax/player
+                val hash = Regex("""var\s+_epHash\s*=\s*['"]([A-Za-z0-9_\-]{40,})['"]""")
                     .find(epHtml)?.groupValues?.get(1) ?: return true
-                val ajaxResp = try {
-                    app.post("$mainUrl/ajax/player",
-                        headers = mapOf(
-                            "User-Agent" to UA, "X-Requested-With" to "XMLHttpRequest",
-                            "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
-                            "Referer" to epUrl, "Origin" to mainUrl
-                        ),
-                        data = mapOf("link" to epHash, "play" to "api", "id" to "0", "backuplinks" to "1")
-                    ).text
-                } catch (_: Exception) { return true }
-                Regex(""""link"\s*:\s*"([^"]+)"""").find(ajaxResp)
-                    ?.groupValues?.get(1)?.replace("\\/", "/") ?: return true
+                val resp = try { app.post("$mainUrl/ajax/player",
+                    headers = mapOf("User-Agent" to UA, "X-Requested-With" to "XMLHttpRequest",
+                        "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
+                        "Referer" to epUrl, "Origin" to mainUrl),
+                    data = mapOf("link" to hash, "play" to "api", "id" to "0", "backuplinks" to "1")
+                ).text } catch (_: Exception) { return true }
+                Regex(""""link"\s*:\s*"([^"]+)"""").find(resp)
+                    ?.groupValues?.get(1)?.replace("\/", "/") ?: return true
             }
 
-        // Step 3: WebView loads iframe with Referer=epUrl
-        // Player JS inside fetches storage.googleapiscdn.com/playlist/HASH/playlist.m3u8?token=JWT
-        // shouldInterceptRequest catches that URL
-        val playlistUrl = captureM3U8Url(iframeUrl, epUrl) ?: return true
+        // WebView loads stream.googleapiscdn.com/player/HASH
+        // -> player JS fetches stream.googleapiscdn.com/playlist/HASH/playlist.m3u8?token=JWT
+        // -> shouldInterceptRequest catches it
+        val playlistUrl = capturePlaylistM3U8(playerUrl, epUrl) ?: return true
 
-        // Step 4: fetch playlist
+        // Fetch playlist - use same domain as captured URL
+        val playlistDomain = Regex("""(https://[^/]+)""").find(playlistUrl)?.groupValues?.get(1)
+            ?: "https://stream.googleapiscdn.com"
         val playlistText = try {
             app.get(playlistUrl, headers = mapOf(
                 "User-Agent" to UA,
-                "Referer"    to "https://storage.googleapiscdn.com/",
-                "Origin"     to "https://storage.googleapiscdn.com"
+                "Referer"    to "$playlistDomain/",
+                "Origin"     to playlistDomain
             )).text
         } catch (_: Exception) { return true }
 
         if (!playlistText.contains("#EXTM3U")) return true
 
-        // Step 5: proxy segments (.html -> 302 -> lh3.googleusercontent.com)
+        // Proxy segments - they go .html -> 302 -> lh3.googleusercontent.com
         servePlaylistViaProxy(playlistText, playlistUrl, callback)
         return true
     }

@@ -48,7 +48,7 @@ class AnimeVietSubProvider : MainAPI() {
         "User-Agent" to UA,
         "Accept-Language" to "vi-VN,vi;q=0.9",
         "Referer" to "$mainUrl/"
-    ) 
+    )
 
     private var cachedAvsJs: String? = null
 
@@ -500,10 +500,18 @@ if (origFetch) {
 
     private var localServer: PlaylistProxyServer? = null
 
-    inner class PlaylistProxyServer(private val playlistContent: String) {
+    inner class PlaylistProxyServer(
+        private val playlistContent: String,
+        private val playlistUrl: String,   // full playlist URL to resolve relative segs
+        private val playerUrl: String,     // player URL used as Referer
+        private val cookie: String         // cf_clearance cookie
+    ) {
         private var serverSocket: java.net.ServerSocket? = null
         val port: Int get() = serverSocket?.localPort ?: 0
         private val pool = java.util.concurrent.Executors.newCachedThreadPool()
+
+        // Base URL for resolving relative segment URIs
+        private val playlistBase: String = playlistUrl.substringBeforeLast("/") + "/"
 
         fun start() {
             serverSocket = java.net.ServerSocket(0)
@@ -516,23 +524,39 @@ if (origFetch) {
             }.also { it.isDaemon = true }.start()
         }
 
+        private fun resolveSegUrl(line: String): String {
+            val l = line.trim()
+            return when {
+                l.startsWith("http://") || l.startsWith("https://") -> l
+                else -> playlistBase + l  // relative URI
+            }
+        }
+
         private fun handle(client: java.net.Socket) {
             try {
-                val lines = mutableListOf<String>()
                 val reader = client.getInputStream().bufferedReader()
-                var line = reader.readLine()
-                while (!line.isNullOrBlank()) { lines.add(line); line = reader.readLine() }
-                val path = lines.firstOrNull()?.split(" ")?.getOrNull(1) ?: "/"
+                val firstLine = reader.readLine() ?: ""
+                // drain headers
+                var h = reader.readLine()
+                while (!h.isNullOrBlank()) { h = reader.readLine() }
+
+                val path = firstLine.split(" ").getOrNull(1) ?: "/"
                 val crlf = "\r\n"
                 val out = client.getOutputStream()
 
                 if (path == "/playlist.m3u8") {
-                    // Rewrite segment URLs to go through this proxy
                     val base = "http://127.0.0.1:$port"
                     val rewritten = playlistContent.lines().joinToString("\n") { l ->
-                        if (l.contains("googleapiscdn.com/chunks/") && l.contains(".html")) {
-                            "$base/seg?url=${java.net.URLEncoder.encode(l.trim(), "UTF-8")}"
-                        } else l
+                        val trimmed = l.trim()
+                        when {
+                            // Skip comments and directives
+                            trimmed.startsWith("#") || trimmed.isEmpty() -> l
+                            // All non-comment lines after #EXTINF are segment URIs
+                            else -> {
+                                val absUrl = resolveSegUrl(trimmed)
+                                "$base/seg?url=${java.net.URLEncoder.encode(absUrl, "UTF-8")}"
+                            }
+                        }
                     }.toByteArray(Charsets.UTF_8)
                     out.write("HTTP/1.1 200 OK${crlf}Content-Type: application/vnd.apple.mpegurl${crlf}Content-Length: ${rewritten.size}${crlf}Access-Control-Allow-Origin: *${crlf}${crlf}".toByteArray())
                     out.write(rewritten)
@@ -541,9 +565,13 @@ if (origFetch) {
                     try {
                         val conn = java.net.URL(segUrl).openConnection() as java.net.HttpURLConnection
                         conn.instanceFollowRedirects = true
-                        conn.connectTimeout = 15000; conn.readTimeout = 30000
+                        conn.connectTimeout = 15000
+                        conn.readTimeout = 30000
                         conn.setRequestProperty("User-Agent", UA)
-                        conn.setRequestProperty("Referer", "https://storage.googleapiscdn.com/")
+                        // Correct Referer: player URL (matching what browser sends)
+                        conn.setRequestProperty("Referer", playerUrl)
+                        conn.setRequestProperty("Origin", "https://stream.googleapiscdn.com")
+                        if (cookie.isNotBlank()) conn.setRequestProperty("Cookie", cookie)
                         conn.connect()
                         val bytes = conn.inputStream.readBytes()
                         conn.disconnect()
@@ -555,7 +583,8 @@ if (origFetch) {
                 } else {
                     out.write("HTTP/1.1 404 Not Found${crlf}${crlf}".toByteArray())
                 }
-                out.flush(); client.close()
+                out.flush()
+                client.close()
             } catch (_: Exception) { try { client.close() } catch (_: Exception) {} }
         }
 
@@ -676,8 +705,8 @@ if (origFetch) {
 
         val fetchHeaders = buildMap {
             put("User-Agent", UA)
-            put("Referer", "$playlistDomain/")
-            put("Origin", playlistDomain)
+            put("Referer", playerUrl)   // MUST be full player URL, not just domain
+            put("Origin", "https://stream.googleapiscdn.com")
             if (wvCookie.isNotBlank()) put("Cookie", wvCookie)
         }
 
@@ -687,8 +716,7 @@ if (origFetch) {
 
         if (!playlistText.contains("#EXTM3U")) return true
 
-        // Fix: proxy handles both stream. and storage. googleapiscdn.com segments
-        servePlaylistViaProxy(playlistText, playlistUrl, callback)
+        servePlaylistViaProxy(playlistText, playlistUrl, playerUrl, wvCookie, callback)
         return true
     }
 
@@ -770,22 +798,21 @@ if (origFetch) {
         private fun servePlaylistViaProxy(
         playlistText: String,
         playlistUrl: String,
-        callback: suspend (ExtractorLink) -> Unit
+        playerUrl: String,
+        cookie: String,
+        callback: (ExtractorLink) -> Unit
     ) {
         localServer?.stop()
-        val server = PlaylistProxyServer(playlistText)
+        val server = PlaylistProxyServer(playlistText, playlistUrl, playerUrl, cookie)
         server.start()
         localServer = server
-
-        kotlinx.coroutines.GlobalScope.launch {
-            callback(newExtractorLink(
-                source = name, name = "$name - DU",
-                url = "http://127.0.0.1:${server.port}/playlist.m3u8",
-                type = ExtractorLinkType.M3U8
-            ) {
-                this.quality = Qualities.P1080.value
-                this.headers = mapOf("User-Agent" to UA)
-            })
-        }
+        callback(newExtractorLink(
+            source = name, name = "$name - DU",
+            url = "http://127.0.0.1:${server.port}/playlist.m3u8",
+            type = ExtractorLinkType.M3U8
+        ) {
+            this.quality = Qualities.P1080.value
+            this.headers = mapOf("User-Agent" to UA)
+        })
     }
 }

@@ -688,8 +688,8 @@ if (origFetch) {
                         data = mapOf("link" to hash, "play" to "api", "id" to "0", "backuplinks" to "1")
                     ).text
                     // {"link":"https:\/\/stream.googleapiscdn.com\/player\/HASH","playTech":"iframe"}
-                    Regex(""""link"\s*:\s*"(https:\/\/stream\.googleapiscdn\.com\/player\/[^"]+)"""")
-                        .find(resp)?.groupValues?.get(1)?.replace("\/", "/")
+                    Regex("""link[^:]*:[^"]*"(https://stream\.googleapiscdn\.com/player/[^"]+)"""")
+                        .find(resp)?.groupValues?.get(1)
                 } catch (_: Exception) { null }
             } ?: return true
 
@@ -757,8 +757,7 @@ if (origFetch) {
                             view.evaluateJavascript("document.documentElement.outerHTML") { html ->
                                 if (done) return@evaluateJavascript
                                 val clean = html?.trim('"')
-                                    ?.replace("\n", "
-")?.replace("\"", """)?.replace("\/", "/")
+                                    ?.replace("\\n", "\n")?.replace("\\"", """)?.replace("\\/", "/")
                                 if (!clean.isNullOrBlank() && clean.contains("avsToken")) {
                                     done = true
                                     wv.stopLoading(); wv.destroy()
@@ -856,7 +855,7 @@ if (origFetch) {
         }
     }
 
-        private suspend fun servePlaylistViaProxy(
+    private suspend fun servePlaylistViaProxy(
         playlistText: String,
         playlistUrl: String,
         playerUrl: String,

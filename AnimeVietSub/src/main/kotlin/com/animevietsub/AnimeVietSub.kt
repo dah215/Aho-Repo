@@ -48,7 +48,7 @@ class AnimeVietSubProvider : MainAPI() {
         "User-Agent" to UA,
         "Accept-Language" to "vi-VN,vi;q=0.9",
         "Referer" to "$mainUrl/"
-    )
+    ) 
 
     private var cachedAvsJs: String? = null
 

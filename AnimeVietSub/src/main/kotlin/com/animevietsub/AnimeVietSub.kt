@@ -657,7 +657,7 @@ if (origFetch) {
                     data = mapOf("link" to hash, "play" to "api", "id" to "0", "backuplinks" to "1")
                 ).text } catch (_: Exception) { return true }
                 Regex(""""link"\s*:\s*"([^"]+)"""").find(resp)
-                    ?.groupValues?.get(1)?.replace("\/", "/") ?: return true
+                    ?.groupValues?.get(1)?.replace("\\/", "/") ?: return true
             }
 
         // WebView loads stream.googleapiscdn.com/player/HASH

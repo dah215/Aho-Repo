@@ -756,8 +756,8 @@ if (origFetch) {
                             if (done) return
                             view.evaluateJavascript("document.documentElement.outerHTML") { html ->
                                 if (done) return@evaluateJavascript
-                                val clean = html?.trim('"')
-                                    ?.replace("\\n", "\n")?.replace("\\"", """)?.replace("\\/", "/")
+                                val clean = html?.trim('"') ?: ""
+
                                 if (!clean.isNullOrBlank() && clean.contains("avsToken")) {
                                     done = true
                                     wv.stopLoading(); wv.destroy()

@@ -666,10 +666,11 @@ if (origFetch) {
     ): Boolean {
         val epUrl = data.substringBefore("|")
 
+        // Step 1: get episode HTML
         val epHtml = try { app.get(epUrl, headers = baseHeaders).text }
                      catch (_: Exception) { return true }
 
-        // Get player URL from iframe in HTML
+        // Step 2: get player URL from iframe (already in static HTML)
         val playerUrl =
             Regex("""src=["'](https://stream\.googleapiscdn\.com/player/[a-fA-F0-9]{20,}[^"'<>]*)["']""")
                 .find(epHtml)?.groupValues?.get(1)?.replace("&amp;", "&")
@@ -688,16 +689,30 @@ if (origFetch) {
                 } catch (_: Exception) { null }
             } ?: return true
 
-        // Hash = playlist ID
+        // Step 3: hash in player URL = playlist ID
         val videoHash = Regex("""/player/([a-fA-F0-9]{20,})""")
             .find(playerUrl)?.groupValues?.get(1) ?: return true
 
-        // Get avsToken
-        val avsToken = getAvsToken(playerUrl, epUrl) ?: return true
+        // Step 4: GET player page via cfInterceptor — bypasses Cloudflare, returns HTML with var avsToken
+        val cfInt = com.lagradost.cloudstream3.network.WebViewResolver(
+            Regex("""stream\.googleapiscdn\.com""")
+        )
+        val playerHtml = try {
+            app.get(playerUrl, headers = mapOf(
+                "User-Agent" to UA,
+                "Referer"    to epUrl,
+                "Accept"     to "text/html,*/*",
+                "Accept-Language" to "vi-VN,vi;q=0.9"
+            ), interceptor = cfInt).text
+        } catch (_: Exception) { return true }
 
+        // Parse: var avsToken = "JWT...";
+        val avsToken = Regex("""avsToken\s*=\s*["']([A-Za-z0-9._\-]{20,})["']""")
+            .find(playerHtml)?.groupValues?.get(1) ?: return true
+
+        // Step 5: construct and deliver playlist URL directly to ExoPlayer
         val playlistUrl = "https://stream.googleapiscdn.com/playlist/$videoHash/playlist.m3u8?token=$avsToken"
 
-        // Pass directly to ExoPlayer — it follows 302 redirects on segments natively
         callback(newExtractorLink(
             source = name,
             name   = "$name - DU",
@@ -712,82 +727,6 @@ if (origFetch) {
             )
         })
         return true
-    }
-
-    private val TOKEN_REGEX = Regex("""avsToken\s*=\s*["']([A-Za-z0-9._\-]{20,})["']""")
-
-    private suspend fun getAvsToken(playerUrl: String, referer: String): String? {
-        val headers = mapOf("User-Agent" to UA, "Referer" to referer,
-            "Accept" to "text/html,*/*", "Accept-Language" to "vi-VN,vi;q=0.9")
-
-        // Try 1: plain OkHttp
-        try {
-            val html = app.get(playerUrl, headers = headers).text
-            TOKEN_REGEX.find(html)?.groupValues?.get(1)?.let { return it }
-        } catch (_: Exception) {}
-
-        // Try 2: cfInterceptor
-        try {
-            val cfInt = com.lagradost.cloudstream3.network.WebViewResolver(Regex("stream.googleapiscdn.com"))
-            val html = app.get(playerUrl, headers = headers, interceptor = cfInt).text
-            TOKEN_REGEX.find(html)?.groupValues?.get(1)?.let { return it }
-        } catch (_: Exception) {}
-
-        // Try 3: WebView reads page source
-        return getTokenViaWebView(playerUrl, referer)
-    }
-
-    @android.annotation.SuppressLint("SetJavaScriptEnabled")
-    private suspend fun getTokenViaWebView(playerUrl: String, referer: String): String? {
-        return kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
-            kotlinx.coroutines.withTimeoutOrNull(20_000L) {
-                kotlinx.coroutines.suspendCancellableCoroutine { cont ->
-                    val ctx = try { AcraApplication.context } catch (_: Exception) { null }
-                    if (ctx == null) { cont.resume(null); return@suspendCancellableCoroutine }
-
-                    val wv = android.webkit.WebView(ctx)
-                    wv.settings.apply {
-                        javaScriptEnabled = true; domStorageEnabled = true
-                        userAgentString = UA
-                        mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                    }
-                    android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
-
-                    var done = false
-                    val handler = android.os.Handler(android.os.Looper.getMainLooper())
-
-                    fun tryGetToken() {
-                        // Read avsToken directly from JS global scope - try window.avsToken
-                        wv.evaluateJavascript(
-                            """(function(){var s=document.querySelectorAll('script');for(var i=0;i<s.length;i++){var t=s[i].textContent;var p=t.indexOf('avsToken');if(p>=0){var r=t.slice(p).match(/=\s*['"]([\.\w\-]{20,})['"]/);if(r)return r[1];}}return '';})()"""
-                        ) { result ->
-                            if (done) return@evaluateJavascript
-                            val token = result?.trim('"') ?: ""
-                            if (token.length >= 20) {
-                                done = true
-                                handler.removeCallbacksAndMessages(null)
-                                wv.stopLoading(); wv.destroy()
-                                if (cont.isActive) cont.resume(token)
-                            }
-                        }
-                    }
-
-                    wv.webViewClient = object : android.webkit.WebViewClient() {
-                        override fun onPageFinished(v: android.webkit.WebView, url: String) {
-                            handler.postDelayed({ if (!done) tryGetToken() }, 500)
-                        }
-                    }
-
-                    wv.loadUrl(playerUrl, mapOf("Referer" to referer, "Accept-Language" to "vi-VN,vi;q=0.9"))
-                    handler.postDelayed({ if (!done) tryGetToken() }, 5000)
-                    handler.postDelayed({
-                        if (!done) { done = true; wv.stopLoading(); wv.destroy()
-                            if (cont.isActive) cont.resume(null) }
-                    }, 18_000)
-                    cont.invokeOnCancellation { done = true; wv.stopLoading(); wv.destroy() }
-                }
-            }
-        }
     }
 
     @android.annotation.SuppressLint("SetJavaScriptEnabled")

@@ -669,7 +669,7 @@ if (origFetch) {
         val epHtml = try { app.get(epUrl, headers = baseHeaders).text }
                      catch (_: Exception) { return true }
 
-        // Get player URL from static HTML iframe
+        // Get player URL from iframe in HTML
         val playerUrl =
             Regex("""src=["'](https://stream\.googleapiscdn\.com/player/[a-fA-F0-9]{20,}[^"'<>]*)["']""")
                 .find(epHtml)?.groupValues?.get(1)?.replace("&amp;", "&")
@@ -684,30 +684,33 @@ if (origFetch) {
                         data = mapOf("link" to hash, "play" to "api", "id" to "0", "backuplinks" to "1")
                     ).text
                     Regex(""""link"\s*:\s*"([^"]+)"""").find(resp)
-                        ?.groupValues?.get(1)?.replace("\\/", "/")
+                        ?.groupValues?.get(1)?.replace("\/", "/")
                 } catch (_: Exception) { null }
             } ?: return true
 
-        // Hash in player URL = playlist ID
+        // Hash = playlist ID
         val videoHash = Regex("""/player/([a-fA-F0-9]{20,})""")
             .find(playerUrl)?.groupValues?.get(1) ?: return true
 
-        // Get avsToken: try OkHttp first, then cfInterceptor, then WebView
+        // Get avsToken
         val avsToken = getAvsToken(playerUrl, epUrl) ?: return true
 
         val playlistUrl = "https://stream.googleapiscdn.com/playlist/$videoHash/playlist.m3u8?token=$avsToken"
 
-        val playlistText = try {
-            app.get(playlistUrl, headers = mapOf(
+        // Pass directly to ExoPlayer — it follows 302 redirects on segments natively
+        callback(newExtractorLink(
+            source = name,
+            name   = "$name - DU",
+            url    = playlistUrl,
+            type   = ExtractorLinkType.M3U8
+        ) {
+            this.quality = Qualities.P1080.value
+            this.headers = mapOf(
                 "User-Agent" to UA,
                 "Referer"    to playerUrl,
                 "Origin"     to "https://stream.googleapiscdn.com"
-            )).text
-        } catch (_: Exception) { return true }
-
-        if (!playlistText.contains("#EXTM3U")) return true
-
-        servePlaylistViaProxy(playlistText, playlistUrl, playerUrl, "", callback)
+            )
+        })
         return true
     }
 

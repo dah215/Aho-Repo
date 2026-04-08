@@ -684,7 +684,7 @@ if (origFetch) {
                         data = mapOf("link" to hash, "play" to "api", "id" to "0", "backuplinks" to "1")
                     ).text
                     Regex(""""link"\s*:\s*"([^"]+)"""").find(resp)
-                        ?.groupValues?.get(1)?.replace("\/", "/")
+                        ?.groupValues?.get(1)?.replace("\\/", "/")
                 } catch (_: Exception) { null }
             } ?: return true
 

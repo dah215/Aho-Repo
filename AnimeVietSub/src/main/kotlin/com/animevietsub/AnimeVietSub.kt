@@ -684,7 +684,7 @@ if (origFetch) {
                         data = mapOf("link" to hash, "play" to "api", "id" to "0", "backuplinks" to "1")
                     ).text
                     Regex(""""link"\s*:\s*"([^"]+)"""").find(resp)
-                        ?.groupValues?.get(1)?.replace("\/", "/")
+                        ?.groupValues?.get(1)?.replace("\\/", "/")
                 } catch (_: Exception) { null }
             } ?: return true
 
@@ -756,11 +756,7 @@ if (origFetch) {
                     fun tryGetToken() {
                         // Read avsToken directly from JS global scope - try window.avsToken
                         wv.evaluateJavascript(
-                            "(function(){ var scripts=document.querySelectorAll('script'); " +
-                            "for(var i=0;i<scripts.length;i++){" +
-                            "var t=scripts[i].textContent;" +
-                            "var m=t.match(/avsToken\s*=\s*["']([A-Za-z0-9._\-]{20,})["']/);" +
-                            "if(m)return m[1];} return ''; })()"
+                            """(function(){var s=document.querySelectorAll('script');for(var i=0;i<s.length;i++){var t=s[i].textContent;var p=t.indexOf('avsToken');if(p>=0){var r=t.slice(p).match(/=\s*['"]([\.\w\-]{20,})['"]/);if(r)return r[1];}}return '';})()"""
                         ) { result ->
                             if (done) return@evaluateJavascript
                             val token = result?.trim('"') ?: ""

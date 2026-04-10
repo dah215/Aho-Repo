@@ -63,12 +63,14 @@ class AnimeVietSubProvider : MainAPI() {
         else "${base.trimEnd('/')}/trang-$page.html"
 
     private fun parseCard(el: Element): SearchResponse? {
-        val article = el.selectFirst("article.TPost") ?: return null
-        val a = article.selectFirst("a[href]") ?: return null
+        val article = el.selectFirst("article.TPost") ?: el
+        val a = article.selectFirst("a[href*='/phim/']") ?: return null
         val href = a.attr("href").let { if (it.startsWith("http")) it else "$mainUrl$it" }
-        val title = article.selectFirst("h2.Title")?.text()?.trim()
-            ?.takeIf { it.isNotBlank() } ?: return null
-        val poster = article.selectFirst("div.Image img, figure img")?.attr("src")
+        val title = (article.selectFirst("h2.Title") ?: article.selectFirst("h3, .Title, [title]"))
+            ?.text()?.trim()?.takeIf { it.isNotBlank() }
+            ?: a.attr("title").trim().ifBlank { return null }
+        val poster = article.selectFirst("img")
+            ?.let { it.attr("data-src").ifBlank { it.attr("src") } }
             ?.let { if (it.startsWith("http")) it else "$mainUrl$it" }
         val epiNum = article.selectFirst("span.mli-eps i")?.text()?.trim()?.toIntOrNull()
         return newAnimeSearchResponse(title, href, TvType.Anime) {
@@ -81,7 +83,11 @@ class AnimeVietSubProvider : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val doc = app.get(pageUrl(request.data, page), headers = baseHeaders).document
-        val items = doc.select("ul.MovieList li.TPostMv").mapNotNull { parseCard(it) }
+        val items = (
+            doc.select("ul.MovieList li.TPostMv") +
+            doc.select("div.TPostMv") +
+            doc.select("li.TPostMv")
+        ).distinctBy { it.text() }.mapNotNull { parseCard(it) }
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
 
@@ -90,7 +96,9 @@ class AnimeVietSubProvider : MainAPI() {
             "$mainUrl/tim-kiem/${URLEncoder.encode(query, "UTF-8")}/",
             headers = baseHeaders
         ).document
-        return doc.select("ul.MovieList li.TPostMv").mapNotNull { parseCard(it) }
+        return (doc.select("ul.MovieList li.TPostMv") +
+            doc.select("div.TPostMv") + doc.select("li.TPostMv"))
+            .distinctBy { it.text() }.mapNotNull { parseCard(it) }
     }
 
     override suspend fun load(url: String): LoadResponse {

@@ -666,13 +666,12 @@ if (origFetch) {
     ): Boolean {
         val epUrl = data.substringBefore("|")
 
-        // Step 1: get episode HTML
         val epHtml = try { app.get(epUrl, headers = baseHeaders).text }
                      catch (_: Exception) { return true }
 
-        // Step 2: get player URL from iframe (already in static HTML)
+        // iframe is on either stream. or storage. googleapiscdn.com
         val playerUrl =
-            Regex("""src=["'](https://stream\.googleapiscdn\.com/player/[a-fA-F0-9]{20,}[^"'<>]*)["']""")
+            Regex("""src=["'](https://(?:stream|storage)\.googleapiscdn\.com/player/[a-fA-F0-9]{20,}[^"'<>]*)["']""")
                 .find(epHtml)?.groupValues?.get(1)?.replace("&amp;", "&")
             ?: run {
                 val hash = Regex("""var\s+_epHash\s*=\s*['"]([A-Za-z0-9_\-]{20,})['"]""")
@@ -689,13 +688,17 @@ if (origFetch) {
                 } catch (_: Exception) { null }
             } ?: return true
 
-        // Step 3: hash in player URL = playlist ID
+        // Extract base domain from player URL (stream. or storage.)
+        val playerDomain = Regex("""(https://(?:stream|storage)\.googleapiscdn\.com)""")
+            .find(playerUrl)?.groupValues?.get(1) ?: "https://storage.googleapiscdn.com"
+
+        // Hash in player URL = playlist ID
         val videoHash = Regex("""/player/([a-fA-F0-9]{20,})""")
             .find(playerUrl)?.groupValues?.get(1) ?: return true
 
-        // Step 4: GET player page via cfInterceptor — bypasses Cloudflare, returns HTML with var avsToken
+        // GET player page via cfInterceptor — bypasses Cloudflare, returns HTML with var avsToken
         val cfInt = com.lagradost.cloudstream3.network.WebViewResolver(
-            Regex("""stream\.googleapiscdn\.com""")
+            Regex("""googleapiscdn\.com""")
         )
         val playerHtml = try {
             app.get(playerUrl, headers = mapOf(
@@ -706,13 +709,14 @@ if (origFetch) {
             ), interceptor = cfInt).text
         } catch (_: Exception) { return true }
 
-        // Parse: var avsToken = "JWT...";
         val avsToken = Regex("""avsToken\s*=\s*["']([A-Za-z0-9._\-]{20,})["']""")
             .find(playerHtml)?.groupValues?.get(1) ?: return true
 
-        // Step 5: construct and deliver playlist URL directly to ExoPlayer
-        val playlistUrl = "https://stream.googleapiscdn.com/playlist/$videoHash/playlist.m3u8?token=$avsToken"
+        // Playlist URL uses same domain as player
+        val playlistUrl = "$playerDomain/playlist/$videoHash/playlist.m3u8?token=$avsToken"
 
+        // Pass directly to ExoPlayer with correct headers
+        // Segments are plain URLs (no redirect, no .html token) — ExoPlayer handles natively
         callback(newExtractorLink(
             source = name,
             name   = "$name - DU",
@@ -723,7 +727,7 @@ if (origFetch) {
             this.headers = mapOf(
                 "User-Agent" to UA,
                 "Referer"    to playerUrl,
-                "Origin"     to "https://stream.googleapiscdn.com"
+                "Origin"     to playerDomain
             )
         })
         return true

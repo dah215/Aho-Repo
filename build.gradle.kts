@@ -26,6 +26,7 @@ allprojects {
     }
     configurations.all {
         resolutionStrategy.cacheChangingModulesFor(0, java.util.concurrent.TimeUnit.SECONDS)
+        resolutionStrategy.force("com.github.vidstige:jadb:v1.2.1")
     }
 }
 

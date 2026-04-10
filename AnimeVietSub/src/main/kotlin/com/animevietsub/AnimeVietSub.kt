@@ -53,26 +53,28 @@ class AnimeVietSubProvider : MainAPI() {
     private var cachedAvsJs: String? = null
 
     override val mainPage = mainPageOf(
-        "$mainUrl/anime-moi/" to "Anime Mới",
-        "$mainUrl/anime-le/" to "Anime Lẻ",
-        "$mainUrl/anime-bo/" to "Anime Bộ"
+        "anime-moi" to "Anime Mới",
+        "anime-le"  to "Anime Lẻ",
+        "anime-bo"  to "Anime Bộ"
     )
 
     private fun pageUrl(base: String, page: Int) =
-        if (page == 1) "${base.trimEnd('/')}/"
-        else "${base.trimEnd('/')}/trang-$page.html"
+        if (page == 1) "$mainUrl/$base/"
+        else "$mainUrl/$base/trang-$page.html"
 
     private fun parseCard(el: Element): SearchResponse? {
-        val article = el.selectFirst("article.TPost") ?: el
-        val a = article.selectFirst("a[href*='/phim/']") ?: return null
+        // Structure: li.TPostMv > article.TPost.C... > a[href=/phim/...] > img, h2.Title
+        val a = el.selectFirst("a[href*='/phim/']") ?: return null
         val href = a.attr("href").let { if (it.startsWith("http")) it else "$mainUrl$it" }
-        val title = (article.selectFirst("h2.Title") ?: article.selectFirst("h3, .Title, [title]"))
-            ?.text()?.trim()?.takeIf { it.isNotBlank() }
-            ?: a.attr("title").trim().ifBlank { return null }
-        val poster = article.selectFirst("img")
-            ?.let { it.attr("data-src").ifBlank { it.attr("src") } }
+        val title = el.selectFirst("h2.Title")?.text()?.trim()
+            ?.takeIf { it.isNotBlank() }
+            ?: a.attr("title").trim().ifBlank { null }
+            ?: el.selectFirst(".Title")?.text()?.trim()?.ifBlank { null }
+            ?: return null
+        val poster = el.selectFirst("img")
+            ?.let { img -> img.attr("src").ifBlank { img.attr("data-src") } }
             ?.let { if (it.startsWith("http")) it else "$mainUrl$it" }
-        val epiNum = article.selectFirst("span.mli-eps i")?.text()?.trim()?.toIntOrNull()
+        val epiNum = el.selectFirst("span.mli-eps i")?.text()?.trim()?.toIntOrNull()
         return newAnimeSearchResponse(title, href, TvType.Anime) {
             this.posterUrl = poster
             this.quality = SearchQuality.HD
@@ -82,12 +84,14 @@ class AnimeVietSubProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val doc = app.get(pageUrl(request.data, page), headers = baseHeaders).document
-        val items = (
-            doc.select("ul.MovieList li.TPostMv") +
-            doc.select("div.TPostMv") +
-            doc.select("li.TPostMv")
-        ).distinctBy { it.text() }.mapNotNull { parseCard(it) }
+        val url = pageUrl(request.data, page)
+        val doc = try {
+            app.get(url, headers = baseHeaders).document
+        } catch (_: Exception) {
+            val cfInt = com.lagradost.cloudstream3.network.WebViewResolver(Regex("""animevietsub"""))
+            app.get(url, headers = baseHeaders, interceptor = cfInt).document
+        }
+        val items = doc.select("ul.MovieList li.TPostMv, li.TPostMv").mapNotNull { parseCard(it) }
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
 
@@ -96,123 +100,49 @@ class AnimeVietSubProvider : MainAPI() {
             "$mainUrl/tim-kiem/${URLEncoder.encode(query, "UTF-8")}/",
             headers = baseHeaders
         ).document
-        return (doc.select("ul.MovieList li.TPostMv") +
-            doc.select("div.TPostMv") + doc.select("li.TPostMv"))
-            .distinctBy { it.text() }.mapNotNull { parseCard(it) }
+        return doc.select("ul.MovieList li.TPostMv, li.TPostMv").mapNotNull { parseCard(it) }
     }
 
     override suspend fun load(url: String): LoadResponse {
         val base = url.trimEnd('/')
+        val doc = app.get(base, headers = baseHeaders).document
 
-        val infoDoc = try {
-            app.get("$base/", headers = baseHeaders).document
-        } catch (_: Exception) { null }
-
-        val watchDoc = app.get("$base/xem-phim.html", headers = baseHeaders).document
-
-        val title = watchDoc.selectFirst("h1.Title")?.text()?.trim()
-            ?: infoDoc?.selectFirst("h1.Title")?.text()?.trim()
-            ?: watchDoc.title()
-        val altTitle = watchDoc.selectFirst("h2.SubTitle")?.text()?.trim()
-            ?: infoDoc?.selectFirst("h2.SubTitle")?.text()?.trim()
-        val poster = watchDoc.selectFirst("div.Image figure img")?.attr("src")
-            ?: infoDoc?.selectFirst("div.Image figure img")?.attr("src")
+        val title    = doc.selectFirst("h1.Title")?.text()?.trim() ?: doc.title()
+        val altTitle = doc.selectFirst("h2.SubTitle")?.text()?.trim()
+        val poster   = doc.selectFirst("div.Image figure img, .Image img")?.attr("src")
             ?.let { if (it.startsWith("http")) it else "$mainUrl$it" }
-        val plotOriginal = watchDoc.selectFirst("div.Description")?.text()?.trim()
-            ?: infoDoc?.selectFirst("div.Description")?.text()?.trim()
+        val plot     = doc.selectFirst("div.Description")?.text()?.trim()
+        val year     = doc.selectFirst("span.Date a, .Date a")?.text()
+            ?.filter { it.isDigit() }?.take(4)?.toIntOrNull()
+        val tags     = doc.select("p.Genre a, li:contains(Thể loại) a")
+            .map { it.text().trim() }.filter { it.isNotBlank() }
 
-        fun metaValue(doc: org.jsoup.nodes.Document?, label: String): String? {
-            if (doc == null) return null
-            for (li in doc.select("li")) {
-                val lbl = li.selectFirst("label")
-                if (lbl != null && lbl.text().contains(label, ignoreCase = true)) {
-                    return li.text().substringAfter(lbl.text()).trim().ifBlank { null }
-                }
-            }
-            val found = doc.selectFirst("li:contains($label)")
-            if (found != null) {
-                return found.text().replace(label, "").trim().ifBlank { null }
-            }
-            return null
-        }
+        val description = buildBeautifulDescription(altTitle, null, null,
+            doc.selectFirst("span.Qlty")?.text()?.trim() ?: "HD",
+            null, year?.toString(), null, null,
+            doc.selectFirst("span.View")?.text()?.trim(), null,
+            tags.joinToString(", "), plot)
 
-        val views = watchDoc.selectFirst("span.View")?.text()?.trim()
-            ?.replace("Lượt Xem", "lượt xem")
-
-        val quality = watchDoc.selectFirst("span.Qlty")?.text()?.trim() ?: "HD"
-
-        val year = (watchDoc.selectFirst("p.Info .Date a, p.Info .Date, span.Date a")
-            ?.text()?.filter { it.isDigit() }?.take(4)?.toIntOrNull())
-            ?: (infoDoc?.selectFirst("p.Info .Date a, p.Info .Date, span.Date a")
-            ?.text()?.filter { it.isDigit() }?.take(4)?.toIntOrNull())
-
-        val status = (metaValue(infoDoc, "Trạng thái") ?: metaValue(watchDoc, "Trạng thái"))
-            ?.replace("VietSub", "Vietsub")
-
-        val duration = metaValue(infoDoc, "Thời lượng") ?: metaValue(watchDoc, "Thời lượng")
-
-        val country = infoDoc?.selectFirst("li:contains(Quốc gia:) a")?.text()?.trim()
-            ?: watchDoc.selectFirst("li:contains(Quốc gia:) a")?.text()?.trim()
-
-        val studio = (metaValue(infoDoc, "Studio") ?: metaValue(infoDoc, "Đạo diễn"))
-            ?: (metaValue(watchDoc, "Studio") ?: metaValue(watchDoc, "Đạo diễn"))
-
-        val followers = metaValue(infoDoc, "Theo dõi")
-            ?: metaValue(infoDoc, "Số người theo dõi")
-            ?: metaValue(watchDoc, "Theo dõi")
-            ?: metaValue(watchDoc, "Số người theo dõi")
-
-        val tags = (infoDoc?.select("p.Genre a, li:contains(Thể loại:) a")
-            ?: watchDoc.select("p.Genre a, li:contains(Thể loại:) a")).map {
-            it.text().trim()
-        }.filter { it.isNotBlank() }.distinct()
-
-        val latestEps = (infoDoc?.select("li.latest_eps a")
-            ?: watchDoc.select("li.latest_eps a")).map { it.text().trim() }
-            .take(3).joinToString(", ")
-
-        val description = buildBeautifulDescription(
-            altTitle, status, duration, quality, country,
-            year?.toString(), studio, followers, views,
-            latestEps.ifBlank { null }, tags.joinToString(", "), plotOriginal
-        )
-
+        // Episodes: #list-server .list-episode a.episode-link
         val seen = mutableSetOf<String>()
-        val episodes = watchDoc.select("#list-server .list-episode a.episode-link, " +
-                ".listing.items a[href*=/tap-], " +
-                "a[href*=-tap-]")
+        val episodes = doc.select("#list-server .list-episode a.episode-link, .list-episode a[data-id]")
             .mapNotNull { a ->
-                val href = a.attr("href").let {
-                    if (it.startsWith("http")) it else "$mainUrl$it"
-                }
+                val href = a.attr("href").let { if (it.startsWith("http")) it else "$mainUrl$it" }
                 if (href.isBlank() || !seen.add(href)) return@mapNotNull null
-
                 val epNum = Regex("""\d+""").find(a.text())?.value?.toIntOrNull()
                 val epTitle = a.attr("title").ifBlank { "Tập ${a.text().trim()}" }
-
-                newEpisode(href) {
-                    this.name = epTitle
-                    this.episode = epNum
-                }
+                newEpisode(href) { this.name = epTitle; this.episode = epNum }
             }.distinctBy { it.episode ?: it.data }
             .sortedBy { it.episode ?: 0 }
 
         return if (episodes.size <= 1) {
-            newMovieLoadResponse(
-                title, url, TvType.AnimeMovie,
-                episodes.firstOrNull()?.data ?: "$base/xem-phim.html"
-            ) {
-                this.posterUrl = poster
-                this.plot = description
-                this.tags = tags
-                this.year = year
+            newMovieLoadResponse(title, url, TvType.AnimeMovie,
+                episodes.firstOrNull()?.data ?: url) {
+                this.posterUrl = poster; this.plot = description; this.tags = tags; this.year = year
             }
         } else {
             newAnimeLoadResponse(title, url, TvType.Anime, true) {
-                this.posterUrl = poster
-                this.plot = description
-                this.tags = tags
-                this.year = year
+                this.posterUrl = poster; this.plot = description; this.tags = tags; this.year = year
                 addEpisodes(DubStatus.Subbed, episodes)
             }
         }

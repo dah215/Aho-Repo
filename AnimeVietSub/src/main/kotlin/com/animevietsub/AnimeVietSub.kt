@@ -46,6 +46,10 @@ class AnimeVietSubProvider : MainAPI() {
     private val UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 " +
             "(KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36"
 
+    /** Desktop UA: một số bản CF / theme chỉ render đủ grid khi UA giống desktop. */
+    private val UA_DESKTOP = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
     private val baseHeaders = mapOf(
         "User-Agent" to UA,
         "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -53,8 +57,17 @@ class AnimeVietSubProvider : MainAPI() {
         "Referer" to "$mainUrl/"
     )
 
-    /** Cloudflare on listing/search often returns 200 with a challenge — plain OkHttp yields empty grids. */
-    private val cfInterceptor = WebViewResolver(Regex("""animevietsub"""))
+    private fun headers(ua: String) = baseHeaders + ("User-Agent" to ua)
+
+    /**
+     * Phải khớp cả host site và các request phụ (challenge / beacon) để WebViewResolver lấy đủ cookie + HTML.
+     */
+    private val cfInterceptor = WebViewResolver(
+        Regex(
+            """animevietsub\.(id|vip|lol|net|run|mobi|com)|""" +
+                """challenges\.cloudflare\.com|cloudflareinsights\.com"""
+        )
+    )
 
     private var cachedAvsJs: String? = null
 
@@ -64,23 +77,65 @@ class AnimeVietSubProvider : MainAPI() {
         "anime-bo"  to "Anime Bộ"
     )
 
-    private fun pageUrl(base: String, page: Int) =
-        if (page == 1) "$mainUrl/$base/"
-        else "$mainUrl/$base/trang-$page.html"
+    /** Nhiều bản skin AVS dùng `trang-N.html`, một số dùng thư mục hoặc query. */
+    private fun pageUrlCandidates(base: String, page: Int): List<String> {
+        if (page <= 1) return listOf("$mainUrl/$base/")
+        return listOf(
+            "$mainUrl/$base/trang-$page.html",
+            "$mainUrl/$base/trang-$page/",
+            "$mainUrl/$base/?page=$page",
+            "$mainUrl/$base/page/$page/"
+        )
+    }
+
+    private fun pathOnly(href: String): String =
+        href.substringBefore("#").substringBefore("?").lowercase()
+
+    private fun isNavOrJunkHref(href: String): Boolean {
+        val p = pathOnly(href)
+        return p.isEmpty() ||
+            p.startsWith("javascript:") ||
+            "/tim-kiem" in p ||
+            "/dang-nhap" in p ||
+            "/dang-ky" in p ||
+            "/ho-so" in p ||
+            p.contains("/chu-de/") ||
+            p.contains("/tag/")
+    }
+
+    private fun isVideoCardHref(href: String): Boolean {
+        if (isNavOrJunkHref(href)) return false
+        val p = pathOnly(href)
+        return "/phim/" in p || "/xem-phim/" in p || "/hoathinh/" in p
+    }
+
+    private fun pickCardAnchor(el: Element): Element? {
+        val all = el.select("a[href]")
+        val scored = all.mapNotNull { a ->
+            val h = a.attr("href")
+            if (!isVideoCardHref(h)) return@mapNotNull null
+            val score = when {
+                "/phim/" in pathOnly(h) -> 3
+                "/xem-phim/" in pathOnly(h) -> 2
+                else -> 1
+            }
+            score to a
+        }
+        return scored.maxByOrNull { it.first }?.second
+    }
 
     private fun parseCard(el: Element): SearchResponse? {
-        // Structure: li.TPostMv > article.TPost.C... > a[href=/phim/...] > img, h2.Title
-        val a = el.selectFirst("a[href*='/phim/']") ?: return null
+        val a = pickCardAnchor(el) ?: return null
         val href = a.attr("href").let { if (it.startsWith("http")) it else "$mainUrl$it" }
-        val title = el.selectFirst("h2.Title")?.text()?.trim()
+        val title = el.selectFirst("h2.Title, h3.Title, .Title, .name, .film-name")?.text()?.trim()
             ?.takeIf { it.isNotBlank() }
             ?: a.attr("title").trim().ifBlank { null }
-            ?: el.selectFirst(".Title")?.text()?.trim()?.ifBlank { null }
+            ?: el.selectFirst("img")?.attr("alt")?.trim()?.ifBlank { null }
             ?: return null
         val poster = el.selectFirst("img")
-            ?.let { img -> img.attr("src").ifBlank { img.attr("data-src") } }
+            ?.let { img -> img.attr("src").ifBlank { img.attr("data-src") }.ifBlank { img.attr("data-lazy-src") } }
             ?.let { if (it.startsWith("http")) it else "$mainUrl$it" }
-        val epiNum = el.selectFirst("span.mli-eps i")?.text()?.trim()?.toIntOrNull()
+        val epiNum = el.selectFirst("span.mli-eps i, .mli-eps i, span.eps i")?.text()?.trim()?.toIntOrNull()
         return newAnimeSearchResponse(title, href, TvType.Anime) {
             this.posterUrl = poster
             this.quality = SearchQuality.HD
@@ -92,9 +147,15 @@ class AnimeVietSubProvider : MainAPI() {
     private fun parseListingCards(doc: Document): List<SearchResponse> {
         val selectors = listOf(
             "ul.MovieList li.TPostMv",
+            "ul.MovieList li",
             "li.TPostMv",
-            "ul.MovieList > li",
-            ".MovieList li"
+            "article.TPost",
+            "li.TPostMv article.TPost",
+            ".MovieList article",
+            ".MovieList li",
+            "div.items article",
+            "[class*=MovieList] li",
+            "[class*=TPost]"
         )
         for (sel in selectors) {
             val found = doc.select(sel).mapNotNull { parseCard(it) }.distinctBy { it.url }
@@ -102,35 +163,65 @@ class AnimeVietSubProvider : MainAPI() {
         }
         return emptyList()
     }
+
+    /** Luôn ưu tiên WebView (CF + DOM đầy đủ); fallback UA desktop nếu grid vẫn rỗng. */
+    private suspend fun fetchListingDocument(url: String): Document {
+        val wvMobile = runCatching {
+            app.get(url, headers = baseHeaders, interceptor = cfInterceptor).document
+        }.getOrNull()
+        if (wvMobile != null && parseListingCards(wvMobile).isNotEmpty()) return wvMobile
+
+        val wvDesktop = runCatching {
+            app.get(url, headers = headers(UA_DESKTOP), interceptor = cfInterceptor).document
+        }.getOrNull()
+        if (wvDesktop != null && parseListingCards(wvDesktop).isNotEmpty()) return wvDesktop
+
+        val plain = runCatching { app.get(url, headers = baseHeaders).document }.getOrNull()
+        if (plain != null && parseListingCards(plain).isNotEmpty()) return plain
+
+        return wvDesktop ?: wvMobile ?: plain
+            ?: runCatching {
+                app.get(url, headers = headers(UA_DESKTOP), interceptor = cfInterceptor).document
+            }.getOrElse { throw it }
+    }
+
+    private suspend fun fetchDetailDocument(url: String): Document {
+        val plain = runCatching { app.get(url, headers = baseHeaders).document }.getOrNull()
+        val ok = plain != null && (
+            plain.selectFirst("h1.Title, h1.title, .info-film h1") != null ||
+                plain.select("#list-server .list-episode a, .list-episode a[data-id]").isNotEmpty()
+            )
+        if (ok) return plain
+        return runCatching {
+            app.get(url, headers = baseHeaders, interceptor = cfInterceptor).document
+        }.getOrNull()
+            ?: runCatching {
+                app.get(url, headers = headers(UA_DESKTOP), interceptor = cfInterceptor).document
+            }.getOrNull()
+            ?: plain
+            ?: app.get(url, headers = baseHeaders, interceptor = cfInterceptor).document
+    }
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = pageUrl(request.data, page)
-        var items = runCatching { app.get(url, headers = baseHeaders).document }
-            .getOrNull()
-            ?.let { parseListingCards(it) }
-            ?: emptyList()
-        if (items.isEmpty()) {
-            val doc = app.get(url, headers = baseHeaders, interceptor = cfInterceptor).document
+        val urls = pageUrlCandidates(request.data, page)
+        var items = emptyList<SearchResponse>()
+        for (u in urls) {
+            val doc = fetchListingDocument(u)
             items = parseListingCards(doc)
+            if (items.isNotEmpty()) break
         }
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/tim-kiem/${URLEncoder.encode(query, "UTF-8")}/"
-        var items = runCatching { app.get(url, headers = baseHeaders).document }
-            .getOrNull()
-            ?.let { parseListingCards(it) }
-            ?: emptyList()
-        if (items.isEmpty()) {
-            val doc = app.get(url, headers = baseHeaders, interceptor = cfInterceptor).document
-            items = parseListingCards(doc)
-        }
-        return items
+        val doc = fetchListingDocument(url)
+        return parseListingCards(doc)
     }
 
     override suspend fun load(url: String): LoadResponse {
         val base = url.trimEnd('/')
-        val doc = app.get(base, headers = baseHeaders).document
+        val doc = fetchDetailDocument(base)
 
         val title    = doc.selectFirst("h1.Title")?.text()?.trim() ?: doc.title()
         val altTitle = doc.selectFirst("h2.SubTitle")?.text()?.trim()

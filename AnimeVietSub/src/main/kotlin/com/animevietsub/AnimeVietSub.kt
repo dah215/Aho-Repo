@@ -102,7 +102,6 @@ class AnimeVietSubProvider : MainAPI() {
         }
         return emptyList()
     }
-
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = pageUrl(request.data, page)
         var items = runCatching { app.get(url, headers = baseHeaders).document }

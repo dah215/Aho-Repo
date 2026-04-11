@@ -7,6 +7,7 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
@@ -16,6 +17,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.io.ByteArrayInputStream
 import java.net.URLEncoder
@@ -46,9 +48,13 @@ class AnimeVietSubProvider : MainAPI() {
 
     private val baseHeaders = mapOf(
         "User-Agent" to UA,
+        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language" to "vi-VN,vi;q=0.9",
         "Referer" to "$mainUrl/"
     )
+
+    /** Cloudflare on listing/search often returns 200 with a challenge — plain OkHttp yields empty grids. */
+    private val cfInterceptor = WebViewResolver(Regex("""animevietsub"""))
 
     private var cachedAvsJs: String? = null
 
@@ -83,24 +89,44 @@ class AnimeVietSubProvider : MainAPI() {
         }
     }
 
+    private fun parseListingCards(doc: Document): List<SearchResponse> {
+        val selectors = listOf(
+            "ul.MovieList li.TPostMv",
+            "li.TPostMv",
+            "ul.MovieList > li",
+            ".MovieList li"
+        )
+        for (sel in selectors) {
+            val found = doc.select(sel).mapNotNull { parseCard(it) }.distinctBy { it.url }
+            if (found.isNotEmpty()) return found
+        }
+        return emptyList()
+    }
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = pageUrl(request.data, page)
-        val doc = try {
-            app.get(url, headers = baseHeaders).document
-        } catch (_: Exception) {
-            val cfInt = com.lagradost.cloudstream3.network.WebViewResolver(Regex("""animevietsub"""))
-            app.get(url, headers = baseHeaders, interceptor = cfInt).document
+        var items = runCatching { app.get(url, headers = baseHeaders).document }
+            .getOrNull()
+            ?.let { parseListingCards(it) }
+            ?: emptyList()
+        if (items.isEmpty()) {
+            val doc = app.get(url, headers = baseHeaders, interceptor = cfInterceptor).document
+            items = parseListingCards(doc)
         }
-        val items = doc.select("ul.MovieList li.TPostMv, li.TPostMv").mapNotNull { parseCard(it) }
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val doc = app.get(
-            "$mainUrl/tim-kiem/${URLEncoder.encode(query, "UTF-8")}/",
-            headers = baseHeaders
-        ).document
-        return doc.select("ul.MovieList li.TPostMv, li.TPostMv").mapNotNull { parseCard(it) }
+        val url = "$mainUrl/tim-kiem/${URLEncoder.encode(query, "UTF-8")}/"
+        var items = runCatching { app.get(url, headers = baseHeaders).document }
+            .getOrNull()
+            ?.let { parseListingCards(it) }
+            ?: emptyList()
+        if (items.isEmpty()) {
+            val doc = app.get(url, headers = baseHeaders, interceptor = cfInterceptor).document
+            items = parseListingCards(doc)
+        }
+        return items
     }
 
     override suspend fun load(url: String): LoadResponse {
@@ -634,17 +660,15 @@ if (origFetch) {
         val videoHash = Regex("""/player/([a-fA-F0-9]{20,})""")
             .find(playerUrl)?.groupValues?.get(1) ?: return true
 
-        // GET player page via cfInterceptor — bypasses Cloudflare, returns HTML with var avsToken
-        val cfInt = com.lagradost.cloudstream3.network.WebViewResolver(
-            Regex("""googleapiscdn\.com""")
-        )
+        // GET player page via WebView — bypasses Cloudflare, returns HTML with var avsToken
+        val googleCfInterceptor = WebViewResolver(Regex("""googleapiscdn\.com"""))
         val playerHtml = try {
             app.get(playerUrl, headers = mapOf(
                 "User-Agent" to UA,
                 "Referer"    to epUrl,
                 "Accept"     to "text/html,*/*",
                 "Accept-Language" to "vi-VN,vi;q=0.9"
-            ), interceptor = cfInt).text
+            ), interceptor = googleCfInterceptor).text
         } catch (_: Exception) { return true }
 
         val avsToken = Regex("""avsToken\s*=\s*["']([A-Za-z0-9._\-]{20,})["']""")

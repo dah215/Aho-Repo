@@ -14,7 +14,7 @@ class PhimMoiChillPlugin : Plugin() {
 }
 
 class PhimMoiChillProvider : MainAPI() {
-    override var mainUrl = "https://phimmoichill.you"
+    override var mainUrl = "https://phimmoichill.men"
     override var name = "PhimMoiChill"
     override val hasMainPage = true
     override var lang = "vi"

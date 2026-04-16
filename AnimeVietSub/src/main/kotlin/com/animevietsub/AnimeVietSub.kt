@@ -93,7 +93,7 @@ class AnimeVietSubProvider : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = pageUrl(request.data, page)
-        val doc = app.get(url, headers = baseHeaders, interceptor = cfInterceptor).document
+        val doc = app.get(url, headers = baseHeaders).document
         val items = doc.select("ul.MovieList li.TPostMv, li.TPostMv").mapNotNull { parseCard(it) }
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
@@ -101,14 +101,14 @@ class AnimeVietSubProvider : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         val doc = app.get(
             "$mainUrl/tim-kiem/${URLEncoder.encode(query, "UTF-8")}/",
-            headers = baseHeaders, interceptor = cfInterceptor
+            headers = baseHeaders
         ).document
         return doc.select("ul.MovieList li.TPostMv, li.TPostMv").mapNotNull { parseCard(it) }
     }
 
     override suspend fun load(url: String): LoadResponse {
         val base = url.trimEnd('/')
-        val doc = app.get(base, headers = baseHeaders, interceptor = cfInterceptor).document
+        val doc = app.get(base, headers = baseHeaders).document
 
         val title    = doc.selectFirst("h1.Title")?.text()?.trim() ?: doc.title()
         val altTitle = doc.selectFirst("h2.SubTitle")?.text()?.trim()

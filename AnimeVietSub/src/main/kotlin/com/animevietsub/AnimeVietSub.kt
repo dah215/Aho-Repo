@@ -94,8 +94,8 @@ class AnimeVietSubProvider : MainAPI() {
         } catch (_: Exception) {
             app.get(url, headers = baseHeaders).document
         }
-        val items = doc.select("ul.NameList li, ul.MovieList li, ul.Films li, .NameList li, li.film-item, li.TPostMv, li.post-item, li.Name, li:has(a[href*='/phim/']), li:has(.film-name), li a[href*='/phim/']:parent").mapNotNull { parseCard(it) }
-        return newHomePageResponse(request.name, items, hasNext = doc.select("li.next a, .next a, a.next, a[rel=next], .pagination li:last-child a").firstOrNull() != null)
+        val items = doc.select("ul.MovieList li.TPostMv").mapNotNull { parseCard(it) }
+newHomePageResponse(request.name, items, hasNext = doc.select("div.wp-pagenavi a.page").size > 1)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {

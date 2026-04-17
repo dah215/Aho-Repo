@@ -68,9 +68,9 @@ class AnimeVietSubProvider : MainAPI() {
 
     private fun parseCard(el: Element): SearchResponse? {
         // Structure: li.TPostMv > article.TPost.C... > a[href=/phim/...] > img, h2.Title
-        val a = el.selectFirst("a[href*='/phim/']") ?: return null
+    val a = el.selectFirst("a[href*='/phim/'], h3 a, h2 a, .film-name a, .Name a, .thumb a, a.title") ?: return null
         val href = a.attr("href").let { if (it.startsWith("http")) it else "$mainUrl$it" }
-        val title = el.selectFirst("h2.Title")?.text()?.trim()
+    val title = el.selectFirst("h2.Title, h3.Title, h3.Name, h3.film-name, .film-name, .Name, .post-title")?.text()?.trim()
             ?.takeIf { it.isNotBlank() }
             ?: a.attr("title").trim().ifBlank { null }
             ?: el.selectFirst(".Title")?.text()?.trim()?.ifBlank { null }
@@ -94,8 +94,9 @@ class AnimeVietSubProvider : MainAPI() {
         } catch (_: Exception) {
             app.get(url, headers = baseHeaders).document
         }
-        val items = doc.select("ul.MovieList li.TPostMv, li.TPostMv").mapNotNull { parseCard(it) }
-        return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
+        val items = doc.select("ul.NameList li, ul.MovieList li, ul.Films li, .NameList li, li.film-item, li.TPostMv, li.post-item, li.Name, li:has(a[href*=\\'/phim/\\']), li:has(.film-name), li a[href*=\'/phim/\']:parent").mapNotNull { parseCard(it) }
+        logPrint("AnimeVietSub DEBUG [${'$'}request.name] page ${'$'}page: ${'$'}{items.size} items")
+        return newHomePageResponse(request.name, items, hasNext = doc.select("li.next a, .next a, a.next, a[rel=next], .pagination li:last-child a").firstOrNull() != null)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
@@ -103,7 +104,7 @@ class AnimeVietSubProvider : MainAPI() {
             "$mainUrl/tim-kiem/${URLEncoder.encode(query, "UTF-8")}/",
             headers = baseHeaders
         ).document
-        return doc.select("ul.MovieList li.TPostMv, li.TPostMv").mapNotNull { parseCard(it) }
+        return doc.select("ul.NameList li, ul.MovieList li, ul.Films li, .NameList li, li.film-item, li.TPostMv, li.post-item, li.Name, li:has(a[href*=\\'/phim/\\']), li:has(.film-name), li a[href*=\'/phim/\']:parent").mapNotNull { parseCard(it) }
     }
 
     override suspend fun load(url: String): LoadResponse {

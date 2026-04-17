@@ -48,10 +48,6 @@ class AnimeVietSubProvider : MainAPI() {
         Regex("""animevietsub\.id""")
     )
 
-    private val cfInterceptor = com.lagradost.cloudstream3.network.WebViewResolver(
-        Regex("""animevietsub\.id""")
-    )
-
     private val baseHeaders = mapOf(
         "User-Agent" to UA,
         "Accept-Language" to "vi-VN,vi;q=0.9",

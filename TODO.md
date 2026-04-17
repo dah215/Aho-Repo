@@ -1,4 +1,4 @@
-# Fix AnimeVietsub.kt Home Page Issue - Black screen with only category names
+u# Fix AnimeVietsub.kt Home Page Issue - Black screen with only category names
 
 ## Status
 - Pending

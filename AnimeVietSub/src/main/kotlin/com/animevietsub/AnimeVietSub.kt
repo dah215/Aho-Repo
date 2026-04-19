@@ -156,6 +156,7 @@ class AnimeVietSubProvider : MainAPI() {
         val epiNum = el.selectFirst("span.mli-eps i")?.text()?.trim()?.toIntOrNull()
         return newAnimeSearchResponse(title, href, TvType.Anime) {
             this.posterUrl = poster
+            this.posterHeaders = mapOf("Referer" to "$mainUrl/")
             this.quality = SearchQuality.HD
             this.dubStatus = EnumSet.of(DubStatus.Subbed)
             if (epiNum != null) this.episodes = mutableMapOf(DubStatus.Subbed to epiNum)

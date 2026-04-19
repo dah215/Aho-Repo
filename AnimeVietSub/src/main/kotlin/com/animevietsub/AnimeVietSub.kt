@@ -54,6 +54,21 @@ class AnimeVietSubProvider : MainAPI() {
         "Referer" to "$mainUrl/"
     )
 
+    // Full browser headers to bypass Cloudflare on HTML pages
+    private val browserHeaders = mapOf(
+        "User-Agent"      to UA,
+        "Accept"          to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding" to "gzip, deflate, br",
+        "Referer"         to "$mainUrl/",
+        "Sec-Fetch-Dest"  to "document",
+        "Sec-Fetch-Mode"  to "navigate",
+        "Sec-Fetch-Site"  to "same-origin",
+        "Sec-Fetch-User"  to "?1",
+        "Upgrade-Insecure-Requests" to "1",
+        "Cache-Control"   to "max-age=0"
+    )
+
     private var cachedAvsJs: String? = null
 
     override val mainPage = mainPageOf(
@@ -68,9 +83,9 @@ class AnimeVietSubProvider : MainAPI() {
 
     private fun parseCard(el: Element): SearchResponse? {
         // Structure: li.TPostMv > article.TPost.C... > a[href=/phim/...] > img, h2.Title
-    val a = el.selectFirst("a[href*='/phim/'], h3 a, h2 a, .film-name a, .Name a, .thumb a, a.title") ?: return null
+        val a = el.selectFirst("a[href*='/phim/']") ?: return null
         val href = a.attr("href").let { if (it.startsWith("http")) it else "$mainUrl$it" }
-    val title = el.selectFirst("h2.Title, h3.Title, h3.Name, h3.film-name, .film-name, .Name, .post-title")?.text()?.trim()
+        val title = el.selectFirst("h2.Title")?.text()?.trim()
             ?.takeIf { it.isNotBlank() }
             ?: a.attr("title").trim().ifBlank { null }
             ?: el.selectFirst(".Title")?.text()?.trim()?.ifBlank { null }
@@ -89,30 +104,22 @@ class AnimeVietSubProvider : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = pageUrl(request.data, page)
-        val doc = try {
-            app.get(url, headers = baseHeaders, interceptor = cfInterceptor).document
-        } catch (_: Exception) {
-            app.get(url, headers = baseHeaders).document
-        }
-val items = doc.select("ul.MovieList li.TPostMv").mapNotNull { parseCard(it) }
-return newHomePageResponse(request.name, items, hasNext = doc.select("div.wp-pagenavi a.page").size > 1)
+        val doc = app.get(url, headers = browserHeaders).document
+        val items = doc.select("ul.MovieList li.TPostMv").mapNotNull { parseCard(it) }
+        return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         val doc = app.get(
             "$mainUrl/tim-kiem/${URLEncoder.encode(query, "UTF-8")}/",
-            headers = baseHeaders
+            headers = browserHeaders
         ).document
-return doc.select("ul.MovieList li.TPostMv").mapNotNull { parseCard(it) }
+        return doc.select("ul.MovieList li.TPostMv, li.TPostMv").mapNotNull { parseCard(it) }
     }
 
     override suspend fun load(url: String): LoadResponse {
         val base = url.trimEnd('/')
-        val doc = try {
-            app.get(base, headers = baseHeaders, interceptor = cfInterceptor).document
-        } catch (_: Exception) {
-            app.get(base, headers = baseHeaders).document
-        }
+        val doc = app.get(base, headers = browserHeaders).document
 
         val title    = doc.selectFirst("h1.Title")?.text()?.trim() ?: doc.title()
         val altTitle = doc.selectFirst("h2.SubTitle")?.text()?.trim()

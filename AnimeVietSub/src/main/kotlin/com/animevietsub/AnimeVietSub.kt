@@ -54,20 +54,80 @@ class AnimeVietSubProvider : MainAPI() {
         "Referer" to "$mainUrl/"
     )
 
-    // Full browser headers to bypass Cloudflare on HTML pages
+    // Full browser headers
     private val browserHeaders = mapOf(
         "User-Agent"      to UA,
         "Accept"          to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Accept-Encoding" to "gzip, deflate, br",
         "Referer"         to "$mainUrl/",
         "Sec-Fetch-Dest"  to "document",
         "Sec-Fetch-Mode"  to "navigate",
         "Sec-Fetch-Site"  to "same-origin",
-        "Sec-Fetch-User"  to "?1",
-        "Upgrade-Insecure-Requests" to "1",
-        "Cache-Control"   to "max-age=0"
+        "Upgrade-Insecure-Requests" to "1"
     )
+
+    // Get cf_clearance cookie by loading mainUrl in WebView
+    @android.annotation.SuppressLint("SetJavaScriptEnabled")
+    private suspend fun getCfClearance(): String? {
+        return kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+            kotlinx.coroutines.withTimeoutOrNull(30_000L) {
+                kotlinx.coroutines.suspendCancellableCoroutine { cont ->
+                    val ctx = try { AcraApplication.context } catch (_: Exception) { null }
+                    if (ctx == null) { cont.resume(null); return@suspendCancellableCoroutine }
+
+                    val wv = android.webkit.WebView(ctx)
+                    wv.settings.apply {
+                        javaScriptEnabled = true
+                        domStorageEnabled = true
+                        userAgentString = UA
+                    }
+                    android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
+
+                    var done = false
+                    val handler = android.os.Handler(android.os.Looper.getMainLooper())
+
+                    wv.webViewClient = object : android.webkit.WebViewClient() {
+                        override fun onPageFinished(view: android.webkit.WebView, url: String) {
+                            if (done) return
+                            val cookie = android.webkit.CookieManager.getInstance()
+                                .getCookie(mainUrl) ?: ""
+                            // cf_clearance cookie means Cloudflare passed
+                            if (cookie.contains("cf_clearance")) {
+                                done = true
+                                wv.stopLoading(); wv.destroy()
+                                if (cont.isActive) cont.resume(cookie)
+                            }
+                        }
+                    }
+
+                    wv.loadUrl(mainUrl, mapOf("Accept-Language" to "vi-VN,vi;q=0.9"))
+
+                    handler.postDelayed({
+                        if (!done) {
+                            done = true
+                            // Return whatever cookie we have even without cf_clearance
+                            val cookie = android.webkit.CookieManager.getInstance()
+                                .getCookie(mainUrl) ?: ""
+                            wv.stopLoading(); wv.destroy()
+                            if (cont.isActive) cont.resume(cookie.ifBlank { null })
+                        }
+                    }, 28_000)
+
+                    cont.invokeOnCancellation { done = true; wv.stopLoading(); wv.destroy() }
+                }
+            }
+        }
+    }
+
+    private var cachedCfCookie: String? = null
+
+    private suspend fun headersWithCf(): Map<String, String> {
+        if (cachedCfCookie == null) {
+            cachedCfCookie = getCfClearance()
+        }
+        val cookie = cachedCfCookie ?: return browserHeaders
+        return browserHeaders + mapOf("Cookie" to cookie)
+    }
 
     private var cachedAvsJs: String? = null
 
@@ -104,7 +164,7 @@ class AnimeVietSubProvider : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = pageUrl(request.data, page)
-        val doc = app.get(url, headers = browserHeaders).document
+        val doc = app.get(url, headers = headersWithCf()).document
         val items = doc.select("ul.MovieList li.TPostMv").mapNotNull { parseCard(it) }
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
@@ -112,14 +172,14 @@ class AnimeVietSubProvider : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         val doc = app.get(
             "$mainUrl/tim-kiem/${URLEncoder.encode(query, "UTF-8")}/",
-            headers = browserHeaders
+            headers = headersWithCf()
         ).document
         return doc.select("ul.MovieList li.TPostMv, li.TPostMv").mapNotNull { parseCard(it) }
     }
 
     override suspend fun load(url: String): LoadResponse {
         val base = url.trimEnd('/')
-        val doc = app.get(base, headers = browserHeaders).document
+        val doc = app.get(base, headers = headersWithCf()).document
 
         val title    = doc.selectFirst("h1.Title")?.text()?.trim() ?: doc.title()
         val altTitle = doc.selectFirst("h2.SubTitle")?.text()?.trim()

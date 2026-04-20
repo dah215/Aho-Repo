@@ -45,7 +45,7 @@ class AnimeVietSubProvider : MainAPI() {
             "(KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36"
 
     private val cfInterceptor = com.lagradost.cloudstream3.network.WebViewResolver(
-        Regex("""animevietsub\.id""")
+        Regex("""https://animevietsub\.id.*""")
     )
 
     private val baseHeaders = mapOf(
@@ -97,19 +97,8 @@ class AnimeVietSubProvider : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = pageUrl(request.data, page)
-        android.util.Log.d("AVS", "getMainPage url=$url")
-        val resp = try {
-            app.get(url, headers = browserHeaders)
-        } catch (e: Exception) {
-            android.util.Log.e("AVS", "fetch failed: $e")
-            return newHomePageResponse(request.name, emptyList(), hasNext = false)
-        }
-        android.util.Log.d("AVS", "HTTP ${resp.code} body_len=${resp.text.length}")
-        val doc = resp.document
-        val cards = doc.select("ul.MovieList li.TPostMv")
-        android.util.Log.d("AVS", "cards found=${cards.size}")
-        val items = cards.mapNotNull { parseCard(it) }
-        android.util.Log.d("AVS", "items parsed=${items.size}")
+        val doc = app.get(url, headers = browserHeaders, interceptor = cfInterceptor).document
+        val items = doc.select("ul.MovieList li.TPostMv").mapNotNull { parseCard(it) }
         return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
 
@@ -123,7 +112,7 @@ class AnimeVietSubProvider : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse {
         val base = url.trimEnd('/')
-        val doc = app.get(base, headers = browserHeaders).document
+        val doc = app.get(base, headers = browserHeaders, interceptor = cfInterceptor).document
 
         val title    = doc.selectFirst("h1.Title")?.text()?.trim() ?: doc.title()
         val altTitle = doc.selectFirst("h2.SubTitle")?.text()?.trim()

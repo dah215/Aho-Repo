@@ -54,6 +54,12 @@ class AnimeVietSubProvider : MainAPI() {
         "Referer" to "$mainUrl/"
     )
 
+    private fun pageUrl(base: String, page: Int) =
+        if (page == 1) "$mainUrl/$base/"
+        else "$mainUrl/$base/trang-$page.html"
+
+    private var cachedAvsJs: String? = null
+
     // Full browser headers
     private val browserHeaders = mapOf(
         "User-Agent"      to UA,
